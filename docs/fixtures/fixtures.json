@@ -1,0 +1,145 @@
+{
+  "pixel": "r=(x*7+y*3)&255 g=(x*13+y*5+40)&255 b=(x+y*11)&255 a=255-((x+y)&63)",
+  "messages": [
+    {
+      "name": "base_small",
+      "file": "base_small.bin",
+      "frame": "base_small",
+      "valid": true,
+      "size": 104,
+      "header": {
+        "type": 1,
+        "flags": 1,
+        "frameEnd": true,
+        "frameId": 1,
+        "docW": 5,
+        "docH": 4,
+        "x": 0,
+        "y": 0,
+        "w": 5,
+        "h": 4
+      },
+      "payloadSha256": "f029f014ccd21bcc30bdb1780e02b56211c93c4054cb1ce8245b2c00e81369bf"
+    },
+    {
+      "name": "composite_band0",
+      "file": "composite_band0.bin",
+      "frame": "composite_multiband",
+      "valid": true,
+      "size": 56,
+      "header": {
+        "type": 2,
+        "flags": 0,
+        "frameEnd": false,
+        "frameId": 7,
+        "docW": 6,
+        "docH": 7,
+        "x": 1,
+        "y": 1,
+        "w": 4,
+        "h": 2
+      },
+      "payloadSha256": "e555fbce8123cdc53063f11e6d9f0ddc9635eb4813b53b96dd2444617ba31fe4"
+    },
+    {
+      "name": "composite_band1",
+      "file": "composite_band1.bin",
+      "frame": "composite_multiband",
+      "valid": true,
+      "size": 56,
+      "header": {
+        "type": 2,
+        "flags": 0,
+        "frameEnd": false,
+        "frameId": 7,
+        "docW": 6,
+        "docH": 7,
+        "x": 1,
+        "y": 3,
+        "w": 4,
+        "h": 2
+      },
+      "payloadSha256": "7d7c51e380ecfcc4d57524f59d759f1992ee23de4040276d87044a557e8a443c"
+    },
+    {
+      "name": "composite_band2",
+      "file": "composite_band2.bin",
+      "frame": "composite_multiband",
+      "valid": true,
+      "size": 56,
+      "header": {
+        "type": 2,
+        "flags": 1,
+        "frameEnd": true,
+        "frameId": 7,
+        "docW": 6,
+        "docH": 7,
+        "x": 1,
+        "y": 5,
+        "w": 4,
+        "h": 2
+      },
+      "payloadSha256": "02700915b2153c86b12b88243e2f8eb49f8b97d48c50e6d9a0d87a84c0776af9"
+    },
+    {
+      "name": "composite_no_end",
+      "file": "composite_no_end.bin",
+      "frame": "composite_no_end",
+      "valid": true,
+      "size": 36,
+      "header": {
+        "type": 2,
+        "flags": 0,
+        "frameEnd": false,
+        "frameId": 4294967295,
+        "docW": 3,
+        "docH": 3,
+        "x": 0,
+        "y": 2,
+        "w": 3,
+        "h": 1
+      },
+      "payloadSha256": "9bc3becda296380e21a36440faba609ba8762cdc75e903bfa9f3ef6ab917aa08"
+    },
+    {
+      "name": "invalid_bad_magic",
+      "file": "invalid_bad_magic.bin",
+      "frame": "invalid",
+      "valid": false,
+      "size": 40,
+      "error": "bad magic"
+    },
+    {
+      "name": "invalid_rect_outside",
+      "file": "invalid_rect_outside.bin",
+      "frame": "invalid",
+      "valid": false,
+      "size": 40,
+      "error": "rect outside document"
+    },
+    {
+      "name": "invalid_payload_short",
+      "file": "invalid_payload_short.bin",
+      "frame": "invalid",
+      "valid": false,
+      "size": 39,
+      "error": "payload length mismatch"
+    },
+    {
+      "name": "invalid_type",
+      "file": "invalid_type.bin",
+      "frame": "invalid",
+      "valid": false,
+      "size": 40,
+      "error": "unknown type"
+    },
+    {
+      "name": "invalid_too_short",
+      "file": "invalid_too_short.bin",
+      "frame": "invalid",
+      "valid": false,
+      "size": 10,
+      "error": "message too short"
+    }
+  ]
+}

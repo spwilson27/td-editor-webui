@@ -1,0 +1,107 @@
+import type { HistoryEntry } from './types';
+
+export interface HistoryItem {
+  label: string;
+  bytes: number; // memory held by this entry, counted against the cap
+  undo(): void;
+  redo(): void;
+  /** Consecutive pushes with the same key within `coalesceMs` merge into one entry (slider drags). */
+  coalesceKey?: string;
+}
+
+interface Stored extends HistoryItem {
+  id: number;
+  time: number;
+}
+
+export interface HistoryOptions {
+  maxSteps?: number;
+  maxBytes?: number;
+  coalesceMs?: number;
+  now?: () => number;
+}
+
+export class History {
+  private items: Stored[] = [];
+  private cur = -1;
+  private nextId = 1;
+  private total = 0;
+  private readonly maxSteps: number;
+  private readonly maxBytes: number;
+  private readonly coalesceMs: number;
+  private readonly now: () => number;
+
+  constructor(o: HistoryOptions = {}) {
+    this.maxSteps = o.maxSteps ?? 100;
+    this.maxBytes = o.maxBytes ?? 256 * 1024 * 1024;
+    this.coalesceMs = o.coalesceMs ?? 1000;
+    this.now = o.now ?? Date.now;
+  }
+
+  get index(): number {
+    return this.cur;
+  }
+
+  get bytes(): number {
+    return this.total;
+  }
+
+  entries(): HistoryEntry[] {
+    return this.items.map((e) => ({ id: e.id, label: e.label }));
+  }
+
+  /** The item is already applied; this only records how to undo/redo it. */
+  push(item: HistoryItem): void {
+    this.dropRedoTail();
+    const t = this.now();
+    const top = this.items[this.cur];
+    if (item.coalesceKey && top && top.coalesceKey === item.coalesceKey && t - top.time < this.coalesceMs) {
+      this.total += item.bytes - top.bytes;
+      top.redo = item.redo;
+      top.bytes = item.bytes;
+      top.label = item.label;
+      top.time = t;
+      return;
+    }
+    this.items.push({ ...item, id: this.nextId++, time: t });
+    this.total += item.bytes;
+    this.cur = this.items.length - 1;
+    while (this.items.length > 1 && (this.items.length > this.maxSteps || this.total > this.maxBytes)) {
+      this.total -= this.items[0].bytes;
+      this.items.shift();
+      this.cur--;
+    }
+  }
+
+  undo(): boolean {
+    if (this.cur < 0) return false;
+    this.items[this.cur].undo();
+    this.cur--;
+    return true;
+  }
+
+  redo(): boolean {
+    if (this.cur >= this.items.length - 1) return false;
+    this.cur++;
+    this.items[this.cur].redo();
+    return true;
+  }
+
+  /** Move so that `index` is the last applied entry (-1 = nothing applied). */
+  jumpTo(index: number): void {
+    const target = Math.max(-1, Math.min(this.items.length - 1, Math.trunc(index)));
+    while (this.cur > target) this.undo();
+    while (this.cur < target) this.redo();
+  }
+
+  clear(): void {
+    this.items = [];
+    this.cur = -1;
+    this.total = 0;
+  }
+
+  private dropRedoTail(): void {
+    for (let i = this.cur + 1; i < this.items.length; i++) this.total -= this.items[i].bytes;
+    this.items.length = this.cur + 1;
+  }
+}

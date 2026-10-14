@@ -111,6 +111,7 @@ export interface EditorEngine {
   redo(): void;
   history(): { entries: HistoryEntry[]; index: number }; // index = last applied entry
   jumpTo(index: number): void;
+  clearHistory(): void; // drop all undo/redo entries (document setup)
 
   dispose(): void;
 }

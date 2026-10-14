@@ -1,0 +1,19 @@
+html,body{margin:0;background:#1c1c1c}
+#app button{font:inherit;color:inherit;border:0;background:none;cursor:pointer;padding:0}
+#app .ib{display:inline-flex;align-items:center;justify-content:center;border-radius:5px}
+#app .ib:hover{background:#3a3a3a}
+#app .menu:hover,#app .menu.open{background:#3a3a3a}
+#app .row:hover{background:#353535}
+#app .row.sel,#app .row.sel:hover{background:#3d6fb4}
+#app .sw:hover{outline:2px solid #e8e8e8;outline-offset:1px}
+#app .mi:hover:not([aria-disabled=true]){background:#3d6fb4;color:#fff}
+#app [aria-disabled=true]{cursor:default}
+#app .ib[aria-disabled=true]:hover{background:none}
+#app input[type=range]{accent-color:#4a8fe0;height:14px;margin:0}
+#app select{font:inherit;color:#e3e3e3;background:#1f1f1f;border:1px solid #474747;border-radius:4px;padding:2px 6px;height:24px}
+#app input{font:inherit}
+#app .lockbtn{opacity:0}
+#app .row:hover .lockbtn{opacity:.55}
+#app .lockbtn.on{opacity:1}
+#app ::-webkit-scrollbar{width:10px;height:10px}
+#app ::-webkit-scrollbar-thumb{background:#444;border-radius:5px;border:2px solid transparent;background-clip:padding-box}
