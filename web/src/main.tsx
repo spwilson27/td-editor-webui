@@ -16,7 +16,7 @@ function boot() {
   installKeyboard(store);
 
   const status = {
-    setConnection: store.setConnection, setActive: store.setActive, setNotice: store.setNotice,
+    setConnection: store.setConnection, setActive: store.setActive, setNotice: store.setNotice, setFatal: store.setFatal,
     docName: store.docName,
   };
   let bridge: Bridge;

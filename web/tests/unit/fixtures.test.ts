@@ -1,15 +1,20 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { decodeFrame, encodeFrame, type FrameHeader } from '../../src/bridge/codec';
+import { decodeFrame, encodeFrame, isStale, type FrameHeader } from '../../src/bridge/codec';
 
 const dir = new URL('../../../docs/fixtures/', import.meta.url);
 const manifest = JSON.parse(readFileSync(new URL('fixtures.json', dir), 'utf8')) as {
-  messages: { name: string; file: string; valid: boolean; size: number; error?: string; header?: FrameHeader & { flags: number }; payloadSha256?: string }[];
+  messages: { name: string; file: string; valid: boolean; size: number; error?: string; header?: FrameHeader & { flags: number }; payloadSha256?: string; currentDoc?: { w: number; h: number } }[];
 };
 const load = (f: string) => new Uint8Array(readFileSync(new URL(f, dir)));
 
 describe('shared fixtures (docs/fixtures)', () => {
+  it('includes the stale-docsize and zero-size-rect fixtures', () => {
+    expect(manifest.messages.find((m) => m.name === 'stale_docsize')?.currentDoc).toBeTruthy();
+    expect(manifest.messages.find((m) => m.name === 'invalid_zero_size_rect')?.valid).toBe(false);
+  });
+
   it('manifest is non-empty and covers valid and invalid messages', () => {
     expect(manifest.messages.some((m) => m.valid)).toBe(true);
     expect(manifest.messages.some((m) => !m.valid)).toBe(true);
@@ -29,6 +34,8 @@ describe('shared fixtures (docs/fixtures)', () => {
         expect(h.flags).toBe(h.frameEnd ? 1 : 0);
         expect(createHash('sha256').update(r.frame.payload).digest('hex')).toBe(m.payloadSha256);
         expect(Array.from(encodeFrame(r.frame, r.frame.payload))).toEqual(Array.from(bytes));
+        if (m.currentDoc) expect(isStale(r.frame, m.currentDoc.w, m.currentDoc.h)).toBe(true);
+        else expect(isStale(r.frame, h.docW, h.docH)).toBe(false);
       });
     } else {
       it(`${m.name}: is rejected (${m.error})`, () => {

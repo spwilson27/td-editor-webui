@@ -52,9 +52,12 @@ def entry(name, file, data, frame, valid=True, error=None):
 
 def main():
     os.makedirs(OUT, exist_ok=True)
-    for f in os.listdir(OUT):
-        if f.endswith(".bin"):
-            os.remove(os.path.join(OUT, f))
+    old = os.path.join(OUT, "fixtures.json")
+    if os.path.exists(old):  # remove only files this generator wrote earlier
+        for e in json.load(open(old)).get("messages", []):
+            path = os.path.join(OUT, e["file"])
+            if os.path.exists(path):
+                os.remove(path)
     entries = []
 
     def write(name, data, frame, **kw):
@@ -77,6 +80,13 @@ def main():
     h = P.Header(P.TYPE_COMPOSITE, 0, 0xFFFFFFFF, 3, 3, 0, 2, 3, 1)
     write("composite_no_end", P.encode_message(h, rect_pixels(0, 2, 3, 1)), "composite_no_end")
 
+    # 4. valid on the wire but stale: produced for a 7x7 document while the receiver's is 6x7;
+    #    decode_frame accepts it, receivers must drop it silently (PROTOCOL.md rules)
+    stale = P.Header(P.TYPE_COMPOSITE, 1, 11, 7, 7, 0, 0, 2, 2)
+    write("stale_docsize", P.encode_message(stale, rect_pixels(0, 0, 2, 2)), "stale_docsize")
+    entries[-1]["currentDoc"] = {"w": 6, "h": 7}
+    entries[-1]["note"] = "decodes fine; a receiver whose document is currentDoc must drop it"
+
     # invalid messages: not decodable, receivers drop them
     good = P.encode_message(P.Header(P.TYPE_BASE, 1, 9, 4, 4, 0, 0, 2, 2), rect_pixels(0, 0, 2, 2))
     write("invalid_bad_magic", b"XXXX" + good[4:], "invalid", valid=False, error="bad magic")
@@ -84,6 +94,8 @@ def main():
           valid=False, error="rect outside document")
     write("invalid_payload_short", good[:-1], "invalid", valid=False, error="payload length mismatch")
     write("invalid_type", good[:4] + bytes([9]) + good[5:], "invalid", valid=False, error="unknown type")
+    write("invalid_zero_size_rect", bytearray(good[:20]) + struct.pack("<HH", 0, 2) , "invalid",
+          valid=False, error="zero-width rect")
     write("invalid_too_short", good[:10], "invalid", valid=False, error="message too short")
 
     with open(os.path.join(OUT, "fixtures.json"), "w") as fh:

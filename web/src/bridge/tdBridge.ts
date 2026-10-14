@@ -10,6 +10,7 @@ export interface BridgeStatus {
   setConnection(c: Connection): void;
   setActive(active: boolean): void;
   setNotice(msg: string): void;
+  setFatal?(msg: string): void; // persistent, until reload
 }
 
 export interface Bridge { takeover(): void; dispose(): void }
@@ -17,6 +18,7 @@ export interface Bridge { takeover(): void; dispose(): void }
 export interface TdBridgeOptions {
   url?: string;
   client?: 'panel' | 'external';
+  token?: string;
   version?: string;
   WebSocketCtor?: typeof WebSocket;
   forwardLogs?: boolean;
@@ -32,6 +34,12 @@ export function resolveWsUrl(search: string, loc: { protocol: string; host: stri
   return `${loc.protocol === 'https:' ? 'wss:' : 'ws:'}//${loc.host}/ws`;
 }
 
+export function resolveToken(search: string): string {
+  return new URLSearchParams(search).get('token') ?? '';
+}
+
+export const TOKEN_EXPIRED_MESSAGE = 'Reopen from TouchDesigner — session expired';
+
 export function resolveClient(search: string): 'panel' | 'external' {
   return new URLSearchParams(search).get('client') === 'panel' ? 'panel' : 'external';
 }
@@ -45,11 +53,13 @@ const unionRect = (a: Rect | null, b: Rect): Rect => {
 export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: TdBridgeOptions = {}): Bridge {
   const url = opts.url ?? resolveWsUrl(location.search, location);
   const client = opts.client ?? resolveClient(location.search);
+  const token = opts.token ?? resolveToken(location.search);
   const WS = opts.WebSocketCtor ?? WebSocket;
   const now = opts.now ?? (() => performance.now());
 
   let ws: WebSocket | null = null;
   let disposed = false;
+  let rejected = false; // TD refused the token; only a reload with a fresh URL can fix it
   let active = false;
   let backoff = BACKOFF_MIN;
   let maxFps = DEFAULT_FPS;
@@ -127,7 +137,10 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         setActive(m.active);
         break;
       case 'error':
-        status.setNotice(m.msg);
+        if (/token/i.test(m.msg)) {
+          rejected = true;
+          (status.setFatal ?? status.setNotice)(TOKEN_EXPIRED_MESSAGE);
+        } else status.setNotice(m.msg);
         break;
     }
   }
@@ -142,7 +155,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   }
 
   function scheduleReconnect() {
-    if (disposed || reconnectTimer) return;
+    if (disposed || rejected || reconnectTimer) return;
     reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, backoff);
     backoff = Math.min(BACKOFF_MAX, backoff * 2);
   }
@@ -160,7 +173,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     ws = sock;
     sock.binaryType = 'arraybuffer';
     sock.onopen = () => {
-      if (ws === sock) sendJson({ t: 'ready', protocol: PROTOCOL_VERSION, client, version: '0.1.0' });
+      if (ws === sock) sendJson({ t: 'ready', protocol: PROTOCOL_VERSION, client, version: '0.1.0', token });
     };
     sock.onmessage = (ev) => {
       if (ws !== sock) return;

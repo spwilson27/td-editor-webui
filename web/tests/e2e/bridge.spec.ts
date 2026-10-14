@@ -6,7 +6,7 @@ test.beforeEach(async () => { td = await FakeTd.start({ w: 160, h: 90 }); });
 test.afterEach(async () => { await td.close(); });
 
 const open = async (page: Page, extra = '') => {
-  await page.goto(`/?test=1&client=panel&ws=${encodeURIComponent(td.url)}${extra}`);
+  await page.goto(`/?test=1&client=panel&ws=${encodeURIComponent(td.url)}&token=${td.token}${extra}`);
   await expect(page.locator('[data-tool]').first()).toBeVisible();
 };
 const hook = <T,>(page: Page, fn: string, ...args: unknown[]) =>
@@ -15,13 +15,13 @@ const hook = <T,>(page: Page, fn: string, ...args: unknown[]) =>
 test('connects, says ready as the panel client and shows the linked state', async ({ page }) => {
   await open(page);
   await td.waitFor(() => td.messages.length > 0);
-  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 1, client: 'panel' });
+  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 1, client: 'panel', token: td.token });
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   expect((await hook<any>(page, 'state')).doc).toEqual({ w: 160, h: 90 });
 });
 
 test('defaults to the external client', async ({ page }) => {
-  await page.goto(`/?ws=${encodeURIComponent(td.url)}`);
+  await page.goto(`/?ws=${encodeURIComponent(td.url)}&token=${td.token}`);
   await td.waitFor(() => td.messages.length > 0);
   expect(td.messages[0]).toMatchObject({ t: 'ready', client: 'external' });
 });
@@ -102,4 +102,16 @@ test('forwards page errors to TD as log messages', async ({ page }) => {
   await td.waitFor(() => td.messages.length > 0);
   await page.evaluate(() => console.error('boom from test'));
   await td.waitFor(() => td.messages.some((m) => m.t === 'log' && m.msg.includes('boom from test')));
+});
+
+test('a missing or wrong token is rejected and the status bar says to reopen from TouchDesigner', async ({ page }) => {
+  await page.goto(`/?test=1&ws=${encodeURIComponent(td.url)}&token=wrong`);
+  await expect(page.locator('[data-status=fatal]')).toHaveText('Reopen from TouchDesigner — session expired');
+  await page.waitForTimeout(1500);
+  expect(td.rejected).toBe(1); // no reconnect storm
+  expect(td.messages[0]).toMatchObject({ t: 'ready', token: 'wrong' });
+
+  await page.goto(`/?test=1&ws=${encodeURIComponent(td.url)}`);
+  await expect(page.locator('[data-status=fatal]')).toBeVisible();
+  expect(td.messages[td.messages.length - 1]).toMatchObject({ t: 'ready', token: '' });
 });

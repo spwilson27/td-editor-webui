@@ -3,7 +3,7 @@ import {
   FRAME_BASE, FRAME_COMPOSITE, decodeFrame, decodeWebMessage, encodeBands, encodeMessage,
   type Frame, type TdMessage,
 } from '../../src/bridge/codec';
-import { BACKPRESSURE_BYTES, installLogForwarding, resolveClient, resolveWsUrl, startTdBridge, type Bridge, type Connection } from '../../src/bridge/tdBridge';
+import { BACKPRESSURE_BYTES, installLogForwarding, resolveClient, resolveToken, resolveWsUrl, TOKEN_EXPIRED_MESSAGE, startTdBridge, type Bridge, type Connection } from '../../src/bridge/tdBridge';
 import { FakeEngine } from '../browser/fakeEngine';
 
 class FakeSocket {
@@ -45,7 +45,7 @@ function start(w = 64, h = 48) {
     conn: [], active: [], notices: [],
     setConnection(c) { this.conn.push(c); }, setActive(a) { this.active.push(a); }, setNotice(m) { this.notices.push(m); },
   };
-  bridge = startTdBridge(engine, status, { url: 'ws://td/ws', client: 'panel', WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false });
+  bridge = startTdBridge(engine, status, { url: 'ws://td/ws', client: 'panel', token: 'tok-123', WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false });
 }
 function connectActive() { sock().open(); sock().tell(hello({ doc: { w: engine.width, h: engine.height } })); }
 
@@ -59,7 +59,7 @@ describe('tdBridge session', () => {
     expect(sock().url).toBe('ws://td/ws');
     expect(sock().binaryType).toBe('arraybuffer');
     sock().open();
-    expect(sock().json()).toEqual([{ t: 'ready', protocol: 1, client: 'panel', version: '0.1.0' }]);
+    expect(sock().json()).toEqual([{ t: 'ready', protocol: 1, client: 'panel', version: '0.1.0', token: 'tok-123' }]);
   });
 
   it('becomes linked on hello and sends a full composite frame', () => {
@@ -246,7 +246,7 @@ describe('tdBridge reconnect', () => {
     class Flaky extends FakeSocket { constructor(u: string) { if (fail) throw new Error('blocked'); super(u); } }
     engine = new FakeEngine(64, 48);
     status = { conn: [], active: [], notices: [], setConnection(c) { this.conn.push(c); }, setActive(a) { this.active.push(a); }, setNotice(m) { this.notices.push(m); } };
-    bridge = startTdBridge(engine, status, { url: 'ws://td/ws', client: 'panel', WebSocketCtor: Flaky as unknown as typeof WebSocket, forwardLogs: false });
+    bridge = startTdBridge(engine, status, { url: 'ws://td/ws', client: 'panel', token: 't', WebSocketCtor: Flaky as unknown as typeof WebSocket, forwardLogs: false });
     expect(FakeSocket.all.length).toBe(0);
     fail = false;
     vi.advanceTimersByTime(500);
@@ -369,6 +369,39 @@ describe('tdBridge base frames', () => {
     [...encodeBands({ type: FRAME_COMPOSITE, frameId: 1, docW: 64, docH: 48, rect: { x: 0, y: 0, w: 2, h: 2 }, pixels: pixels(2, 2, 1) })].forEach((b) => sock().binary(b));
     expect(engine.baseWrites.length).toBe(0);
     expect(engine.commits).toBe(0);
+  });
+});
+
+describe('tdBridge token', () => {
+  it('resolves the token verbatim from the query string, empty when absent', () => {
+    expect(resolveToken('?token=a%2Bb-_9&x=1')).toBe('a+b-_9');
+    expect(resolveToken('?x=1')).toBe('');
+    expect(resolveToken('')).toBe('');
+  });
+
+  it('a token rejection shows a persistent message and stops reconnecting', () => {
+    start();
+    const fatal: string[] = [];
+    (status as unknown as { setFatal: (m: string) => void }).setFatal = (m) => fatal.push(m);
+    sock().open();
+    sock().tell({ t: 'error', msg: 'bad token' });
+    sock().close();
+    expect(fatal).toEqual([TOKEN_EXPIRED_MESSAGE]);
+    expect(TOKEN_EXPIRED_MESSAGE).toBe('Reopen from TouchDesigner — session expired');
+    const n = FakeSocket.all.length;
+    vi.advanceTimersByTime(60000);
+    expect(FakeSocket.all.length).toBe(n);
+  });
+
+  it('other errors are transient notices and reconnecting continues', () => {
+    start();
+    sock().open();
+    sock().tell({ t: 'error', msg: 'protocol mismatch' });
+    sock().close();
+    expect(status.notices).toEqual(['protocol mismatch']);
+    const n = FakeSocket.all.length;
+    vi.advanceTimersByTime(500);
+    expect(FakeSocket.all.length).toBe(n + 1);
   });
 });
 

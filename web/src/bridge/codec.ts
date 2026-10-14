@@ -117,7 +117,7 @@ export function isStale(f: FrameHeader, docW: number, docH: number): boolean {
 // ---- JSON messages ----
 
 export type WebMessage =
-  | { t: 'ready'; protocol: number; client: 'panel' | 'external'; version: string }
+  | { t: 'ready'; protocol: number; client: 'panel' | 'external'; version: string; token: string }
   | { t: 'takeover' }
   | { t: 'requestBase' }
   | { t: 'log'; level: 'info' | 'warn' | 'error'; msg: string };
@@ -174,7 +174,7 @@ export function decodeWebMessage(text: string): WebMessage | null {
   switch (o.t) {
     case 'ready':
       return isNum(o.protocol) && (o.client === 'panel' || o.client === 'external') && isStr(o.version)
-        ? { t: 'ready', protocol: o.protocol, client: o.client, version: o.version }
+        ? { t: 'ready', protocol: o.protocol, client: o.client, version: o.version, token: isStr(o.token) ? o.token : '' }
         : null;
     case 'takeover':
       return { t: 'takeover' };

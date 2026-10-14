@@ -142,7 +142,7 @@ describe('banding', () => {
 describe('json messages', () => {
   it('web messages round trip', () => {
     const msgs = [
-      { t: 'ready', protocol: 1, client: 'panel', version: '0.1.0' },
+      { t: 'ready', protocol: 1, client: 'panel', version: '0.1.0', token: 'abc' },
       { t: 'takeover' },
       { t: 'requestBase' },
       { t: 'log', level: 'warn', msg: 'x' },

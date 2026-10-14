@@ -102,6 +102,31 @@
       "payloadSha256": "9bc3becda296380e21a36440faba609ba8762cdc75e903bfa9f3ef6ab917aa08"
     },
     {
+      "name": "stale_docsize",
+      "file": "stale_docsize.bin",
+      "frame": "stale_docsize",
+      "valid": true,
+      "size": 40,
+      "header": {
+        "type": 2,
+        "flags": 1,
+        "frameEnd": true,
+        "frameId": 11,
+        "docW": 7,
+        "docH": 7,
+        "x": 0,
+        "y": 0,
+        "w": 2,
+        "h": 2
+      },
+      "payloadSha256": "d8277da61fa6efe246f000edbdcf54fca9874e52d3701daa1700ed8cfca69601",
+      "currentDoc": {
+        "w": 6,
+        "h": 7
+      },
+      "note": "decodes fine; a receiver whose document is currentDoc must drop it"
+    },
+    {
       "name": "invalid_bad_magic",
       "file": "invalid_bad_magic.bin",
       "frame": "invalid",
@@ -132,6 +157,14 @@
       "valid": false,
       "size": 40,
       "error": "unknown type"
+    },
+    {
+      "name": "invalid_zero_size_rect",
+      "file": "invalid_zero_size_rect.bin",
+      "frame": "invalid",
+      "valid": false,
+      "size": 24,
+      "error": "zero-width rect"
     },
     {
       "name": "invalid_too_short",

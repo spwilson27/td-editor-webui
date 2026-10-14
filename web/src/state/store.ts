@@ -38,6 +38,7 @@ export function createStore() {
   const connection = signal<Connection>('reconnecting');
   const active = signal(true);
   const notice = signal('');
+  const fatal = signal('');
 
   // Counters bumped by engine events; components read them to re-render engine-backed lists.
   const docVersion = signal(0);
@@ -61,7 +62,7 @@ export function createStore() {
 
   const store = {
     tool, hsv, primary, secondary, alpha, recent, customSwatches, brush, brushPreset, fillTolerance,
-    colorTab, layerTab, view, zoom, spaceHeld, docSize, docName, connection, active, notice,
+    colorTab, layerTab, view, zoom, spaceHeld, docSize, docName, connection, active, notice, fatal,
     docVersion, historyVersion, selectionVersion, thumbTick,
     takeover: null as (() => void) | null,
     /** Time of the last Space keydown (incl. auto-repeat); lets a missing keyup be detected. */
@@ -231,6 +232,7 @@ export function createStore() {
     setConnection: (c: Connection) => { connection.value = c; },
     setActive: (a: boolean) => { active.value = a; },
     setNotice,
+    setFatal: (msg: string) => { fatal.value = msg; },
   };
   return store;
 }

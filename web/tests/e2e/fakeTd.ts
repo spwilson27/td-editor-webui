@@ -4,7 +4,7 @@ import {
   type Frame, type TdMessage, type WebMessage,
 } from '../../src/bridge/codec';
 
-export interface FakeTdOptions { w: number; h: number; active?: boolean; hasInput?: boolean; maxSendFps?: number }
+export interface FakeTdOptions { token?: string; w: number; h: number; active?: boolean; hasInput?: boolean; maxSendFps?: number }
 
 /** A stand-in for the TouchDesigner web server DAT: speaks docs/PROTOCOL.md to one browser client. */
 export class FakeTd {
@@ -14,12 +14,15 @@ export class FakeTd {
   composite: Uint8ClampedArray;
   client: WebSocket | null = null;
   connections = 0;
+  rejected = 0;
+  token: string;
   w: number;
   h: number;
   active: boolean;
   private nextFrameId = 1;
 
   private constructor(private wss: WebSocketServer, private opts: FakeTdOptions) {
+    this.token = opts.token ?? 'tok-e2e';
     this.w = opts.w;
     this.h = opts.h;
     this.active = opts.active ?? true;
@@ -43,7 +46,15 @@ export class FakeTd {
         const m = decodeWebMessage(data.toString());
         if (!m) return;
         this.messages.push(m);
-        if (m.t === 'ready') this.send(this.hello());
+        if (m.t === 'ready') {
+          if (m.token !== this.token) {
+            this.rejected++;
+            this.send({ t: 'error', msg: 'bad token' });
+            ws.close();
+            return;
+          }
+          this.send(this.hello());
+        }
         if (m.t === 'takeover') { this.active = true; this.send({ t: 'active', active: true }); }
         return;
       }
