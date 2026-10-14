@@ -243,3 +243,47 @@ test('window.__editorTest is only installed with ?test=1', async ({ page }) => {
   await expect(page.locator('[data-tool]').first()).toBeVisible();
   expect(await page.evaluate(() => '__editorTest' in window)).toBe(false);
 });
+
+for (const [w, h] of [[1280, 800], [1024, 700]] as const) {
+  test(`layout fits at ${w}x${h}: single-row context bar, unscrolled rail with every tool visible`, async ({ page }) => {
+    await page.setViewportSize({ width: w, height: h });
+    await page.goto(URL);
+    await expect(page.locator('[data-tool]')).toHaveCount(17);
+    const bar = page.locator('[data-context-bar]');
+    const rows = await bar.evaluate((el) => {
+      const tops = new Set([...el.querySelectorAll<HTMLElement>('.ctx-tool, .opts > *')].filter((c) => c.offsetParent !== null).map((c) => Math.round(c.getBoundingClientRect().top + c.getBoundingClientRect().height / 2)));
+      return { rows: tops.size, overflowX: el.scrollWidth > el.clientWidth + 1, height: el.getBoundingClientRect().height };
+    });
+    if (w >= 1180) {
+      expect(rows.rows).toBe(1);
+      expect(rows.overflowX).toBe(false);
+      expect(rows.height).toBeLessThan(60);
+    }
+    await expect(page.locator('[data-context=name]')).toBeVisible();
+    await expect(page.getByLabel('Width')).toBeVisible();
+    const rail = await page.locator('[data-rail]').evaluate((el) => ({ scrollable: el.scrollHeight > el.clientHeight, bottom: el.getBoundingClientRect().bottom }));
+    expect(rail.scrollable).toBe(false);
+    for (const b of await page.locator('[data-tool]').all()) {
+      const box = (await b.boundingBox())!;
+      expect(box.height).toBeGreaterThan(20);
+      expect(box.y + box.height).toBeLessThanOrEqual(rail.bottom + 0.5);
+    }
+    for (const label of ['Primary colour', 'Secondary colour']) {
+      const box = (await page.locator('[data-rail]').getByLabel(label).boundingBox())!;
+      expect(box.y + box.height).toBeLessThanOrEqual(rail.bottom + 0.5);
+    }
+    await page.mouse.move(w / 2, h / 2);
+    mkdirSync(REVIEW, { recursive: true });
+    await page.screenshot({ path: resolve(REVIEW, `app-${w}x${h}.png`) });
+  });
+}
+
+test('at 1600 px the mockup slider widths are kept (Width 110, Tolerance 140); they shrink when narrower', async ({ page }) => {
+  const width = (sel: string) => page.locator(sel).evaluate((e) => e.getBoundingClientRect().width);
+  expect(await width('#bw')).toBe(110);
+  expect(await width('#bo')).toBe(80);
+  await page.keyboard.press('g');
+  expect(await width('#ft')).toBe(140);
+  await page.setViewportSize({ width: 1280, height: 960 });
+  expect(await width('#ft')).toBeLessThan(140);
+});

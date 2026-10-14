@@ -184,8 +184,11 @@ def test_json_decode_rejects(bad):
 
 
 def test_json_builders():
-    assert json.loads(P.hello(10, 20, True, 30, False)) == {
-        "t": "hello", "protocol": 1, "doc": {"w": 10, "h": 20}, "hasInput": True, "maxSendFps": 30, "active": False}
+    assert json.loads(P.hello(10, 20, True, 30, False, "abc")) == {
+        "t": "hello", "protocol": 2, "doc": {"w": 10, "h": 20}, "hasInput": True, "maxSendFps": 30, "active": False,
+        "clientId": "abc"}
+    assert json.loads(P.base_notice(7, 100, 50)) == {"t": "base", "frameId": 7, "docW": 100, "docH": 50,
+                                                      "x": 0, "y": 0, "w": 100, "h": 50}
     assert json.loads(P.doc_size(1, 2, False)) == {"t": "docSize", "w": 1, "h": 2, "hasInput": False}
     assert json.loads(P.active(True)) == {"t": "active", "active": True}
     assert json.loads(P.error("x")) == {"t": "error", "msg": "x"}

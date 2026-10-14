@@ -67,7 +67,7 @@ Keep TD glue thin. All pixel math lives in `frames.py`, all byte layout in
 - **State**: clients `{id: {kind, active}}`, active client id, `doc_w/doc_h/has_input`,
   output buffer `np.uint8[h, w, 4]` in **TD order** (bottom row first, premultiplied if
   `Premultiplied`), `dirty` flag, `got_composite` flag, last input signature, timing stats.
-- **Web server callbacks**: HTTP GET `/` → `ui_html.text` (or 404); WS open → register;
+- **Web server callbacks**: HTTP GET `/` → `ui_html.text` (or 404), `GET /base` → the stored BASE frame; WS open → register;
   WS text → JSON dispatch (`ready`, `takeover`, `requestBase`, `log`); WS binary →
   `protocol.decode_frame` → `frames.paste_band(buffer, x, y, w, h, payload, premultiply)` →
   on `FRAME_END` set `dirty`, `got_composite` (the Pump then does one `composite.cook(force=True)`
@@ -84,12 +84,12 @@ Keep TD glue thin. All pixel math lives in `frames.py`, all byte layout in
     readback while no client is ready. Readback is the two-step `in1.numpyArray(delayed=True)`
     (first call issues the GPU read and returns None, the next returns it: no stall).
     `frames.WireConverter.convert_rows` then converts ≤ 4 ms of rows per pump (flip to
-    top-left, float→uint8, unpremultiply; 1080p ≈ 27 ms total) and `protocol.encode_frames`
-    bands go out **at most ~2 MB per pump in total** across all clients, round-robin (a 2 MB
-    `webSocketSendBinary` costs 5–10 ms of main thread). Each client has at most one pending BASE frame; a
-    newer one replaces what a slow client has not been sent yet. Conversion outputs are double-buffered. The finished wire image is cached for late joiners and `requestBase`;
-    a newer input frame supersedes a half-sent one. Standby clients get the base too.
-  - each Pump step (module check, panel keep-alive, mouse flush, doc size, input, send, cook, switch) is
+    top-left, float→uint8, unpremultiply; 1080p ≈ 27 ms total). The finished image is published as
+    one immutable `bytes` BASE message (`protocol.encode_message`, one copy, ~3 ms for 1080p) that
+    `GET /base` serves, and each client gets a tiny `base` notice (at most one un-fetched notice per
+    client; no fetch for 10 s → stalled, no more notices; docs/PROTOCOL.md §4). Nothing large is ever
+    written to a WebSocket. New clients, `requestBase` and resizes re-notify from the stored frame.
+  - each Pump step (module check, panel keep-alive, mouse flush, doc size, input, notify, cook, switch) is
     isolated: one failing step is reported and the others still run;
   - update `Status`, `out_switch.par.index` (`Active` off → index 0, composite forgotten).
 - **Mouse**: `interactMouse(u, v, left=..., middle=..., right=..., wheel=...)` with the
@@ -162,3 +162,18 @@ Panels / DATs
 - Keyboard In DAT callbacks: `onKey(dat, keyInfo)`; `keyInfo.key/.character/.state/.shift/.alt/.ctrl/.cmd`; its `panels` par restricts events to when one of the listed panels has focus.
 - Parameter Execute DAT only fires if its `op` par is set to the COMP; callbacks are not synchronous with the par assignment.
 - `Execute DAT` `onFrameStart` fires every frame (Pump median 0.04 ms idle, 0.1–0.2 ms while streaming).
+
+Why BASE frames are pulled over HTTP (measured)
+- `webSocketSendBinary` is **synchronous on the cook thread**: when the peer's socket buffer is full it blocks
+  until the peer reads. A client that never reads (a test client with a 4 KB receive buffer; a frozen tab) froze
+  TouchDesigner completely three times (cook thread in a Web Server DAT `pthread_join`/send, td-mcp port 8765 and
+  the UI stop answering until TD is killed). Per-frame acks and a 1x1 probe only narrowed it: a client that acked
+  the probe and then froze would still block on the next ≤ 2 MB write.
+- Web Server DAT **HTTP responses are not written on the cook thread**: a client that sent `GET` for a 32 MB
+  `response['data']` (bytes) and never read the body left TD fully responsive for 30 s (870 frames advanced, td_call
+  round trips 60 ms), and it recovered after the client reset. `bytes` bodies work; an 8 MB GET from a normal reader
+  takes 28 ms, 32 MB 124 ms. So protocol v2 (docs/PROTOCOL.md §4) sends only tiny JSON `base` notices over the
+  WebSocket and serves the frame from `GET /base`. The stored frame is one immutable `bytes` object (one 8 MB copy
+  per published frame), so the HTTP thread can never see a half-rewritten buffer. Remaining risk: tiny JSON writes
+  (`hello`, `docSize`, `active`, `base` notices; capped to one notice per client) cannot fill a socket buffer
+  unless a client is dead for a very long time.

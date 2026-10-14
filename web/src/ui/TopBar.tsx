@@ -36,7 +36,7 @@ function MenuBar() {
   }, [open]);
 
   return (
-    <div ref={ref} style="display:flex;align-items:center;gap:2px;flex:1 1 0;min-width:0">
+    <div ref={ref} class="topbar-left">
       <div aria-hidden="true" style="width:22px;height:22px;margin-right:8px;border-radius:6px;background:#4a8fe0;display:flex;align-items:center;justify-content:center">
         <Icon d="M18 3l3 3-9 9-3-3 9-9zM9 12c-3 0-5 2-5 5 0 1.5-1 3-2 3 4 1 9 0 9-5" size={14} sw={2.2} stroke="#ffffff" />
       </div>
@@ -101,7 +101,7 @@ export function TopBar() {
           );
         })}
       </div>
-      <div style="flex:1 1 0;display:flex;justify-content:flex-end;align-items:center;gap:4px">
+      <div class="topbar-right">
         <button class="ib" aria-label="Undo" title="Undo (Ctrl+Z)" onClick={() => store.undo()} style="width:30px;height:30px"><Icon d="M9 14L4 9l5-5M4 9h11a5 5 0 010 10h-3" /></button>
         <button class="ib" aria-label="Redo" title="Redo (Ctrl+Shift+Z)" onClick={() => store.redo()} style="width:30px;height:30px"><Icon d="M15 14l5-5-5-5M20 9H9a5 5 0 000 10h3" /></button>
         <div style="width:1px;height:18px;background:#444;margin:0 6px" />

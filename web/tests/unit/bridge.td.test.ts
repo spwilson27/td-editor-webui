@@ -3,7 +3,7 @@ import {
   FRAME_BASE, FRAME_COMPOSITE, decodeFrame, decodeWebMessage, encodeBands, encodeMessage,
   type Frame, type TdMessage,
 } from '../../src/bridge/codec';
-import { BACKPRESSURE_BYTES, installLogForwarding, resolveClient, resolveToken, resolveWsUrl, TOKEN_EXPIRED_MESSAGE, startTdBridge, type Bridge, type Connection } from '../../src/bridge/tdBridge';
+import { BACKPRESSURE_BYTES, installLogForwarding, httpOrigin, resolveClient, resolveToken, resolveWsUrl, TOKEN_EXPIRED_MESSAGE, startTdBridge, type Bridge, type Connection } from '../../src/bridge/tdBridge';
 import { FakeEngine } from '../browser/fakeEngine';
 
 class FakeSocket {
@@ -31,7 +31,7 @@ class FakeSocket {
   }
 }
 
-const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({ t: 'hello', protocol: 1, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, ...over });
+const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({ t: 'hello', protocol: 2, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', ...over });
 
 let engine: FakeEngine;
 let status: { conn: Connection[]; active: boolean[]; notices: string[]; setConnection(c: Connection): void; setActive(a: boolean): void; setNotice(m: string): void };
@@ -59,7 +59,7 @@ describe('tdBridge session', () => {
     expect(sock().url).toBe('ws://td/ws');
     expect(sock().binaryType).toBe('arraybuffer');
     sock().open();
-    expect(sock().json()).toEqual([{ t: 'ready', protocol: 1, client: 'panel', version: '0.1.0', token: 'tok-123' }]);
+    expect(sock().json()).toEqual([{ t: 'ready', protocol: 2, client: 'panel', version: '0.1.0', token: 'tok-123' }]);
   });
 
   it('becomes linked on hello and sends a full composite frame', () => {
@@ -96,7 +96,7 @@ describe('tdBridge session', () => {
   it('reports a protocol mismatch without linking', () => {
     start();
     sock().open();
-    sock().tell(hello({ protocol: 2 }));
+    sock().tell(hello({ protocol: 1 }));
     expect(at(status.conn, -1)).toBe('reconnecting');
     expect(status.notices[0]).toMatch(/mismatch/i);
   });
@@ -343,32 +343,269 @@ describe('tdBridge dirty tracking', () => {
   });
 });
 
-describe('tdBridge base frames', () => {
-  const pixels = (w: number, h: number, v: number) => new Uint8Array(w * h * 4).fill(v);
-  const bands = (rect: { x: number; y: number; w: number; h: number }, v: number, max?: number, docW = 64, docH = 48) =>
-    [...encodeBands({ type: FRAME_BASE, frameId: 1, docW, docH, rect, pixels: pixels(rect.w, rect.h, v), maxPayload: max })];
+/** Controllable fetch: every call stays pending until the test settles it. */
+class FetchMock {
+  calls: { url: string; signal: AbortSignal | undefined; settle: (r: Response | Error) => void }[] = [];
+  fn = ((url: string, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
+    const signal = init?.signal ?? undefined;
+    signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+    this.calls.push({ url, signal, settle: (r) => (r instanceof Error ? reject(r) : resolve(r)) });
+  })) as unknown as typeof fetch;
+}
+const flush = () => vi.advanceTimersByTimeAsync(0);
+const baseFrame = (docW: number, docH: number, v: number, frameId = 1) =>
+  encodeBands({ type: FRAME_BASE, frameId, docW, docH, rect: { x: 0, y: 0, w: docW, h: docH }, pixels: new Uint8Array(docW * docH * 4).fill(v), maxPayload: 1 << 30 }).next().value as Uint8Array;
+const ok = (bytes: Uint8Array) => new Response(bytes as BufferSource, { status: 200 });
+const notice = (frameId: number, w = 64, h = 48): TdMessage => ({ t: 'base', frameId, docW: w, docH: h, x: 0, y: 0, w, h });
 
-  it('writes every band and commits once on FRAME_END', () => {
-    start();
+describe('tdBridge base pull (HTTP)', () => {
+  let fm: FetchMock;
+  const startF = () => {
+    fm = new FetchMock();
+    engine = new FakeEngine(64, 48);
+    status = { conn: [], active: [], notices: [], setConnection(c) { this.conn.push(c); }, setActive(a) { this.active.push(a); }, setNotice(m) { this.notices.push(m); } };
+    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 'tok 1', fetch: fm.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false });
     connectActive();
-    const bs = bands({ x: 4, y: 2, w: 8, h: 6 }, 7, 8 * 4 * 2);
-    expect(bs.length).toBe(3);
-    bs.forEach((b) => sock().binary(b));
-    expect(engine.baseWrites.map((w) => w.rect)).toEqual([{ x: 4, y: 2, w: 8, h: 2 }, { x: 4, y: 4, w: 8, h: 2 }, { x: 4, y: 6, w: 8, h: 2 }]);
-    expect(engine.baseWrites.every((w) => w.len === 8 * 2 * 4)).toBe(true);
+  };
+
+  it('fetches /base on the ws host with token, client id and notice frame id', async () => {
+    startF();
+    sock().tell(notice(5));
+    await flush();
+    expect(fm.calls.map((c) => c.url)).toEqual(['http://td:9980/base?token=tok%201&client=c1&frameId=5']);
+  });
+
+  it('applies a fetched frame and commits once; header frameId may be newer than the notice', async () => {
+    startF();
+    sock().tell(notice(5));
+    await flush();
+    fm.calls[0].settle(ok(baseFrame(64, 48, 9, 8)));
+    await flush();
+    expect(engine.baseWrites).toEqual([{ rect: { x: 0, y: 0, w: 64, h: 48 }, len: 64 * 48 * 4 }]);
     expect(engine.commits).toBe(1);
   });
 
-  it('drops stale, malformed and composite-typed frames', () => {
-    start();
-    connectActive();
-    bands({ x: 0, y: 0, w: 4, h: 4 }, 1, undefined, 100, 100).forEach((b) => sock().binary(b));
-    sock().binary(new Uint8Array(10));
-    const bad = bands({ x: 0, y: 0, w: 4, h: 4 }, 1)[0].slice(0, 40);
-    sock().binary(bad);
-    [...encodeBands({ type: FRAME_COMPOSITE, frameId: 1, docW: 64, docH: 48, rect: { x: 0, y: 0, w: 2, h: 2 }, pixels: pixels(2, 2, 1) })].forEach((b) => sock().binary(b));
+  it('drops stale-size and malformed bodies', async () => {
+    startF();
+    sock().tell(notice(1));
+    await flush();
+    fm.calls[0].settle(ok(baseFrame(100, 100, 1)));
+    await flush();
+    sock().tell(notice(2));
+    await flush();
+    fm.calls[1].settle(ok(baseFrame(64, 48, 1).slice(0, 40)));
+    await flush();
+    sock().tell(notice(3));
+    await flush();
+    fm.calls[2].settle(ok(new Uint8Array(5)));
+    await flush();
     expect(engine.baseWrites.length).toBe(0);
     expect(engine.commits).toBe(0);
+  });
+
+  it('ignores 404 quietly (no retry, no notice, no fatal)', async () => {
+    startF();
+    sock().tell(notice(1));
+    await flush();
+    fm.calls[0].settle(new Response('', { status: 404 }));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(fm.calls.length).toBe(1);
+    expect(status.notices).toEqual([]);
+    expect(engine.baseWrites.length).toBe(0);
+  });
+
+  it('treats 403 like a token error: fatal message, no reconnecting', async () => {
+    startF();
+    const fatal: string[] = [];
+    (status as unknown as { setFatal: (m: string) => void }).setFatal = (m) => fatal.push(m);
+    sock().tell(notice(1));
+    await flush();
+    fm.calls[0].settle(new Response('', { status: 403 }));
+    await flush();
+    expect(fatal).toEqual([TOKEN_EXPIRED_MESSAGE]);
+    sock().close();
+    const n = FakeSocket.all.length;
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(FakeSocket.all.length).toBe(n);
+  });
+
+  it('retries a network error once after 500 ms, then waits (and later asks TD again)', async () => {
+    startF();
+    sock().tell(notice(1));
+    await flush();
+    fm.calls[0].settle(new TypeError('network'));
+    await vi.advanceTimersByTimeAsync(499);
+    expect(fm.calls.length).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fm.calls.length).toBe(2);
+    fm.calls[1].settle(new TypeError('network'));
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(fm.calls.length).toBe(2);
+    expect(sock().json().filter((m) => m.t === 'requestBase').length).toBe(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sock().json().filter((m) => m.t === 'requestBase').length).toBe(1);
+    expect(fm.calls.length).toBe(2);
+  });
+
+  it('a retry that succeeds applies the frame', async () => {
+    startF();
+    sock().tell(notice(1));
+    await flush();
+    fm.calls[0].settle(new TypeError('network'));
+    await vi.advanceTimersByTimeAsync(500);
+    fm.calls[1].settle(ok(baseFrame(64, 48, 3)));
+    await flush();
+    expect(engine.commits).toBe(1);
+  });
+
+  it('keeps one fetch in flight; notices arriving meanwhile cause exactly one more fetch with the newest id', async () => {
+    startF();
+    sock().tell(notice(1));
+    await flush();
+    sock().tell(notice(2));
+    sock().tell(notice(3));
+    await flush();
+    expect(fm.calls.length).toBe(1);
+    fm.calls[0].settle(ok(baseFrame(64, 48, 1)));
+    await flush();
+    expect(fm.calls.length).toBe(2);
+    expect(fm.calls[1].url).toContain('frameId=3');
+    fm.calls[1].settle(ok(baseFrame(64, 48, 2)));
+    await flush();
+    expect(fm.calls.length).toBe(2);
+    expect(engine.commits).toBe(2);
+  });
+
+  it('a docSize while fetching voids the in-flight result, even at an unchanged size, and fetches again (TD counted it as fetched)', async () => {
+    startF();
+    sock().tell(notice(1));
+    await flush();
+    sock().tell({ t: 'docSize', w: 64, h: 48, hasInput: true });
+    fm.calls[0].settle(ok(baseFrame(64, 48, 1)));
+    await flush();
+    expect(engine.commits).toBe(0);
+    expect(fm.calls.length).toBe(2); // re-fetch without waiting for a notice
+    fm.calls[1].settle(ok(baseFrame(64, 48, 2)));
+    await flush();
+    expect(engine.commits).toBe(1);
+    expect(fm.calls.length).toBe(2); // exactly one more, no loop
+  });
+
+  it('a discarded result followed by a 404 re-fetch just waits for the next notice', async () => {
+    startF();
+    sock().tell(notice(1));
+    await flush();
+    sock().tell({ t: 'docSize', w: 20, h: 10, hasInput: true });
+    fm.calls[0].settle(ok(baseFrame(64, 48, 1)));
+    await flush();
+    fm.calls[1].settle(new Response('', { status: 404 }));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(fm.calls.length).toBe(2);
+    sock().tell(notice(2, 20, 10));
+    await flush();
+    fm.calls[2].settle(ok(baseFrame(20, 10, 3)));
+    await flush();
+    expect(engine.commits).toBe(1);
+  });
+
+  it('aborts a hung fetch after 10 s and treats it as a network error (retry once, then requestBase)', async () => {
+    startF();
+    sock().tell(notice(1));
+    await flush();
+    expect(fm.calls[0].signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(9999);
+    expect(fm.calls[0].signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fm.calls[0].signal?.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(fm.calls.length).toBe(2);
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(fm.calls[1].signal?.aborted).toBe(true);
+    expect(sock().json().filter((m) => m.t === 'requestBase').length).toBe(0);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(sock().json().filter((m) => m.t === 'requestBase').length).toBe(1);
+    expect(fm.calls.length).toBe(2);
+    // the single-flight slot is free again
+    sock().tell(notice(2));
+    await flush();
+    expect(fm.calls.length).toBe(3);
+  });
+
+  it('a fetch that completes in time clears its timeout (no late abort)', async () => {
+    startF();
+    sock().tell(notice(1));
+    await flush();
+    fm.calls[0].settle(ok(baseFrame(64, 48, 1)));
+    await flush();
+    await vi.advanceTimersByTimeAsync(20000);
+    expect(fm.calls[0].signal?.aborted).toBe(false);
+  });
+
+  it('aborts the in-flight fetch on socket close and on dispose', async () => {
+    startF();
+    sock().tell(notice(1));
+    await flush();
+    sock().close();
+    expect(fm.calls[0].signal?.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(500);
+    sock().open();
+    sock().tell(hello());
+    sock().tell(notice(2));
+    await flush();
+    expect(fm.calls[1].signal?.aborted).toBe(false);
+    bridge.dispose();
+    expect(fm.calls[1].signal?.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(fm.calls.length).toBe(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('a docSize to a new size drops the old-size result and applies the new-size one', async () => {
+    startF();
+    sock().tell(notice(1));
+    await flush();
+    sock().tell({ t: 'docSize', w: 20, h: 10, hasInput: true });
+    sock().tell(notice(2, 20, 10));
+    fm.calls[0].settle(ok(baseFrame(64, 48, 1)));
+    await flush();
+    expect(engine.baseWrites.length).toBe(0);
+    fm.calls[1].settle(ok(baseFrame(20, 10, 4)));
+    await flush();
+    expect(engine.baseWrites).toEqual([{ rect: { x: 0, y: 0, w: 20, h: 10 }, len: 800 }]);
+  });
+
+  it('drops a result that arrives after the socket was lost or the bridge disposed', async () => {
+    startF();
+    sock().tell(notice(1));
+    await flush();
+    sock().close();
+    fm.calls[0].settle(ok(baseFrame(64, 48, 1)));
+    await flush();
+    expect(engine.commits).toBe(0);
+    vi.advanceTimersByTime(500);
+    sock().open();
+    sock().tell(hello());
+    sock().tell(notice(2));
+    await flush();
+    bridge.dispose();
+    fm.calls[1].settle(ok(baseFrame(64, 48, 1)));
+    await flush();
+    expect(engine.commits).toBe(0);
+  });
+
+  it('never acks and ignores binary WebSocket messages from TD', async () => {
+    startF();
+    const f = baseFrame(64, 48, 1);
+    sock().binary(f);
+    sock().tell(notice(1));
+    await flush();
+    expect(engine.baseWrites.length).toBe(0);
+    expect(sock().json().some((m) => (m as { t: string }).t === 'ack')).toBe(false);
+  });
+
+  it('derives the http origin from the ws url', () => {
+    expect(httpOrigin('ws://127.0.0.1:9980/ws')).toBe('http://127.0.0.1:9980');
+    expect(httpOrigin('wss://h.example/ws?x=1')).toBe('https://h.example');
   });
 });
 

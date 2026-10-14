@@ -17,3 +17,56 @@ html,body{margin:0;background:#1c1c1c}
 #app .lockbtn.on{opacity:1}
 #app ::-webkit-scrollbar{width:10px;height:10px}
 #app ::-webkit-scrollbar-thumb{background:#444;border-radius:5px;border:2px solid transparent;background-clip:padding-box}
+
+/* Tool rail: full size like the mockup, compacting on short windows */
+#app .rail{width:52px;flex:none;display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 0;background:#2b2b2b;border-right:1px solid #161616;overflow-y:auto}
+#app .rail .tb{width:44px;height:40px;flex:none}
+#app .rail-sep{width:28px;height:1px;background:#444;margin:4px 0;flex:none}
+#app .rail-chips{position:relative;width:40px;height:40px;flex:none;margin-top:8px}
+@media (max-height:859px){
+  #app .rail{gap:1px;padding:4px 0}
+  #app .rail .tb{height:34px}
+  #app .rail-sep{margin:2px 0}
+  #app .rail-chips{margin-top:4px}
+}
+@media (max-height:759px){
+  #app .rail{gap:0}
+  #app .rail .tb{height:28px}
+  #app .rail-chips{height:34px;width:38px}
+}
+
+/* Context bar: one row from 1180 px, shrinking and dropping low-priority controls */
+#app .ctx{min-height:42px;flex:none;display:flex;flex-wrap:wrap;align-items:center;gap:16px;padding:4px 12px;background:#303030;border-bottom:1px solid #1a1a1a}
+#app .ctx-tool{display:flex;align-items:center;gap:8px;min-width:150px}
+#app .ctx-name{font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#app .opts{display:flex;flex-wrap:wrap;align-items:center;gap:18px}
+#app .rw-xl{width:140px}
+#app .rw-lg{width:110px}
+#app .rw-sm{width:80px}
+@media (min-width:1180px){
+  #app .ctx{flex-wrap:nowrap;overflow:hidden}
+  #app .opts{flex-wrap:nowrap}
+}
+@media (max-width:1179px){
+  #app .opts{display:contents}
+}
+@media (max-width:1499px){
+  #app .ctx-tool{flex:0 1 150px;min-width:0}
+  #app .opts{gap:12px}
+  #app .rw-xl{width:100px}
+  #app .rw-lg{width:84px}
+  #app .rw-sm{width:56px}
+  #app .lowprio{display:none !important}
+}
+
+#app .topbar-left{display:flex;align-items:center;gap:2px;flex:1 1 0;min-width:0}
+#app .topbar-right{flex:1 1 0;display:flex;justify-content:flex-end;align-items:center;gap:4px}
+@media (max-width:1179px){
+  #app .topbar-left{flex:0 0 auto}
+  #app .topbar-right{flex:1 1 auto}
+  #app .rw-xl{width:80px}
+  #app .rw-lg{width:64px}
+  #app .rw-sm{width:44px}
+  #app .opts{gap:10px}
+  #app .ctx{gap:12px}
+}

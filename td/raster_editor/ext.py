@@ -12,6 +12,7 @@ import collections
 import functools
 import hmac
 import ipaddress
+import re
 import secrets
 import time
 import traceback
@@ -24,11 +25,12 @@ MODIFIER_KEYS = frozenset((
     "shift", "lshift", "rshift", "ctrl", "lctrl", "rctrl", "alt", "lalt", "ralt",
     "cmd", "lcmd", "rcmd", "meta", "win", "capslock",
 ))
-MAX_BYTES_PER_PUMP = 2 * 1024 * 1024  # across all clients; a 2 MB webSocketSendBinary costs ~5-10 ms in TD
 MAX_TEST_BODY = 64 * 1024
 MODULE_CHECK_S = 1.0
+LOOPBACK_ORIGIN = re.compile(r"^http://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$")
 LOOPBACK = ("127.0.0.1", "::1", "[::1]", "localhost")
 CONVERT_BUDGET_S = 0.004  # input -> wire conversion time per pump
+STALL_S = 10.0  # a client that has not fetched its last `base` notice for this long is 'stalled'
 STATUS_PERIOD_S = 0.25
 LOG_PER_SECOND = 20
 STAT_WINDOW = 300
@@ -47,32 +49,19 @@ def _guard(fn):
 
 
 class _Client:
-    __slots__ = ("id", "kind", "ready", "active", "seq")
+    __slots__ = ("id", "cid", "kind", "ready", "active", "seq", "outstanding", "sent_at", "stalled", "fetched")
 
     def __init__(self, cid):
-        self.id = cid
+        self.id = cid  # socket peer string, used for webSocketSend*
+        self.cid = secrets.token_hex(6)  # opaque id in `hello`, echoed by the client in GET /base
         self.kind = "unknown"
         self.ready = False
         self.active = False
         self.seq = 0
-
-
-class _Frame:
-    """A banded frame, encoded lazily once and shared by every client that receives it."""
-    __slots__ = ("_gen", "msgs", "buf")
-
-    def __init__(self, gen, buf):
-        self._gen = gen
-        self.msgs = []
-        self.buf = buf  # the wire image the bands are sliced from (must not be overwritten while sending)
-
-    def get(self, i):
-        while len(self.msgs) <= i:
-            m = next(self._gen, None)
-            if m is None:
-                return None
-            self.msgs.append(m)
-        return self.msgs[i]
+        self.outstanding = None  # frameId of the `base` notice sent but not yet fetched
+        self.sent_at = 0.0
+        self.stalled = False
+        self.fetched = None  # frameId of the newest frame this client has fetched
 
 
 def _median(xs):
@@ -85,6 +74,7 @@ class RasterEditorExt:
         self.o = ownerComp
         self._now = time.perf_counter
         self.pump_count = 0
+        self._frame_id = 0  # never reset (not even by Start): clients compare frame ids across restarts
         self._open_url = None  # test seam; defaults to TD's ui.viewFile
         self.test_result = None
         self._seen_errors = set()
@@ -92,7 +82,7 @@ class RasterEditorExt:
         self._started = False
         self._load_modules()
         self._reset_state()
-        self.stats = {k: collections.deque(maxlen=STAT_WINDOW) for k in ("pump", "paste", "cook", "convert", "send", "readback")}
+        self.stats = {k: collections.deque(maxlen=STAT_WINDOW) for k in ("pump", "paste", "cook", "convert", "publish", "readback")}
 
     # ------------------------------------------------------------------ setup / lifecycle
 
@@ -113,14 +103,12 @@ class RasterEditorExt:
         self.buffer = None  # uint8 [h, w, 4], TD order (bottom row first)
         self.dirty = False
         self.got_composite = False
-        self._base_wire = None
-        self._jobs = {}  # client id -> [frame being sent, next band index, queued next frame or None]
-        self._wire_bufs = [None, None]
-        self._wire_i = 0
+        self._wire_buf = None  # conversion scratch (reused); published frames are immutable bytes copies
+        self._base_msg = None  # newest BASE frame as one binary message (bytes), served by GET /base
+        self._base_fid = None
         self._issued_cooks = None
         self._move_pending = False
         self._module_check_at = 0.0
-        self._frame_id = 0
         self._input_cooks = None
         self._input_pending = False
         self._readback_issued = False
@@ -184,7 +172,6 @@ class RasterEditorExt:
             wr.par.active = 0
             self.clients.clear()
             self.active_id = None
-            self._jobs.clear()
             self.got_composite = False
             self._op("out_switch").par.index = 0  # passthrough while the editor is off
         self._status_at = 0.0
@@ -231,7 +218,6 @@ class RasterEditorExt:
             self._close_all_sockets()
             self.clients.clear()
             self.active_id = None
-            self._jobs.clear()
             ws = self._op("webserver")
             ws.par.port = self._p("Port")
             ws.par.restart.pulse()
@@ -248,8 +234,7 @@ class RasterEditorExt:
             # Buffer content was converted for the old setting: have the editor resend a full
             # composite (re-activation does that) and resend the input with the new setting.
             self._conv = None
-            self._base_wire = None
-            self._jobs.clear()
+            self._invalidate_base()
             self._readback_issued = False
             self._input_pending = self.has_input
             self._send_to_active(self.protocol.active(True))
@@ -320,6 +305,8 @@ class RasterEditorExt:
                 return self._reply(response, 413, "Payload Too Large", "too large")
             self.test_result = data.decode("utf-8", "replace") if isinstance(data, (bytes, bytearray)) else str(data)
             return self._reply(response, 204, "No Content")
+        if method == "GET" and path == "/base":
+            return self._serve_base(request, response)
         if method == "GET" and path in ("/", "/index.html"):
             html = self._op("ui_html").text
             if html:
@@ -340,7 +327,6 @@ class RasterEditorExt:
         c = self.clients.pop(client, None)
         if c is None:
             return
-        self._jobs.pop(client, None)
         if self.active_id == client:
             self.active_id = None
             ready = [x for x in self.clients.values() if x.ready]
@@ -366,7 +352,11 @@ class RasterEditorExt:
         elif t == "takeover":
             self._set_active(client)
         elif t == "requestBase":
-            self._queue_base([client])
+            # Re-announce the stored frame. A notice may be outstanding because the client's fetch
+            # failed (or it gave up): forget it, or the client would sit there until marked stalled.
+            c.fetched = None
+            c.outstanding = None
+            c.stalled = False
         elif t == "log":
             self._on_log(msg)
         # unknown message types are ignored (PROTOCOL.md)
@@ -425,9 +415,7 @@ class RasterEditorExt:
             c.active = True
             self.active_id = c.id
         self._send(c.id, P.hello(self.doc_w, self.doc_h, self.has_input,
-                                 self._p("Maxsendfps"), c.active))
-        if self.has_input:
-            self._queue_base([c.id])
+                                 self._p("Maxsendfps"), c.active, c.cid))
         self._status_at = 0.0
 
     def _demote_active(self):
@@ -504,7 +492,7 @@ class RasterEditorExt:
                 ("modules", lambda: self._check_modules(now)), ("reload", lambda: self._maybe_reload_panel(now)),
                 ("panel", self._keep_panel_cooking), ("mouse", self._flush_mouse),
                 ("doc", self._sync_doc_size), ("input", lambda: self._poll_input(now)),
-                ("send", self._flush_jobs), ("cook", self._cook_composite), ("switch", self._update_switch)):
+                ("notify", lambda: self._notify_clients(now)), ("cook", self._cook_composite), ("switch", self._update_switch)):
             try:
                 step()
             except Exception as e:  # noqa: BLE001
@@ -561,8 +549,7 @@ class RasterEditorExt:
         self.doc_w, self.doc_h, self.has_input = w, h, has_input
         self.got_composite = False
         self.dirty = True  # push the blank buffer so the Script TOP takes the new size
-        self._base_wire = None
-        self._jobs.clear()
+        self._invalidate_base()  # notices for the old size are void; clients refetch the new frame
         self._conv = None
         self._readback_issued = False
         self._input_pending = has_input
@@ -590,9 +577,6 @@ class RasterEditorExt:
         period = 1.0 / max(1, self._p("Maxinputfps"))
         if now - self._last_input_start < period:
             return
-        target = self._wire_bufs[self._wire_i ^ 1]
-        if target is not None and self._buf_in_use(target):
-            return  # an in-flight frame still reads from it; wait for the clients to finish
         # Two-step async readback: the first delayed call issues a GPU read, the next one
         # returns it (one frame latency, never a stall).
         t = self._now()
@@ -611,10 +595,9 @@ class RasterEditorExt:
         # since, another cycle is still owed.
         self._input_pending = top.totalCooks != self._issued_cooks
         self._last_input_start = now
-        self._wire_i ^= 1
-        out = self._wire_bufs[self._wire_i]
+        out = self._wire_buf
         if out is None or out.shape != arr.shape:
-            out = self._wire_bufs[self._wire_i] = np.empty(arr.shape, np.uint8)
+            out = self._wire_buf = np.empty(arr.shape, np.uint8)  # safe to reuse: publishing copies it
         self._conv = {"arr": arr, "out": out, "row": 0, "rows": 128}
         self._convert_some()
 
@@ -636,60 +619,85 @@ class RasterEditorExt:
                 break
         self.stats["convert"].append(self._now() - start)
         if c["row"] >= h:
-            self._base_wire = c["out"]
             self._conv = None
-            self._queue_base(self._ready_ids())
+            self._publish_base(c["out"])
 
-    def _queue_base(self, targets):
-        """Queue a banded BASE frame of the cached input for ``targets``. A frame already being
-        sent is always finished (so a client sees FRAME_END even when the input changes every
-        frame); only one newer frame is kept waiting behind it, the newest wins."""
-        if not self.has_input or not targets:
-            return
-        if self._base_wire is None:
-            self._input_pending = True
-            return
+    def _invalidate_base(self):
+        """The stored frame is no longer valid (resize, Premultiplied toggle): drop it and every
+        client's notice bookkeeping, so each client is notified again when the next one is ready.
+        `_frame_id` is deliberately never reset: fetched/outstanding comparisons rely on it."""
+        self._base_msg = None
+        self._base_fid = None
+        for c in self.clients.values():
+            c.outstanding = None
+            c.fetched = None
+            c.stalled = False
+
+    def _publish_base(self, wire):
+        """Store the converted input as the newest BASE frame: one immutable message that
+        `GET /base` serves from TD's HTTP thread (never touched again, so no aliasing). One copy."""
+        t = self._now()
         P = self.protocol
         self._frame_id = (self._frame_id + 1) & 0xFFFFFFFF
-        frame = _Frame(P.encode_frames(P.TYPE_BASE, self._frame_id, self.doc_w, self.doc_h,
-                                       (0, 0, self.doc_w, self.doc_h), self._base_wire), self._base_wire)
-        for cid in targets:
-            job = self._jobs.get(cid)
-            if job is None or job[1] == 0:
-                self._jobs.pop(cid, None)  # nothing sent yet: replace outright (and requeue)
-                self._jobs[cid] = [frame, 0, None]
-            else:
-                job[2] = frame
+        hdr = P.Header(P.TYPE_BASE, P.FLAG_FRAME_END, self._frame_id, self.doc_w, self.doc_h,
+                       0, 0, self.doc_w, self.doc_h)
+        self._base_msg = P.encode_message(hdr, wire)
+        self._base_fid = self._frame_id
+        self.stats["publish"].append(self._now() - t)
 
-    def _buf_in_use(self, buf):
-        return any(j[0].buf is buf or (j[2] is not None and j[2].buf is buf) for j in self._jobs.values())
-
-    def _flush_jobs(self):
-        """Send pending BASE bands, round-robin over clients, up to MAX_BYTES_PER_PUMP in total."""
-        ws = self._op("webserver")
-        budget = MAX_BYTES_PER_PUMP
-        self._sent_this_pump = False
-        t = self._now()
-        while self._jobs:
-            cid = next(iter(self._jobs))
-            job = self._jobs[cid]
-            frame, i = job[0], job[1]
-            msg = frame.get(i) if cid in self.clients else None
-            if msg is None:  # client gone, or its frame is complete
-                nxt = job[2]
-                del self._jobs[cid]
-                if nxt is not None and cid in self.clients:
-                    self._jobs[cid] = [nxt, 0, None]
+    def _notify_clients(self, now):
+        """Tell each client that a newer BASE frame can be fetched. At most one notice is
+        outstanding per client (sent, not yet fetched); a client that does not fetch within
+        STALL_S is stalled and gets no more notices until it does. Only tiny JSON is ever
+        written to a WebSocket, so a client that stops reading cannot block TD's cook thread."""
+        for c in self.clients.values():
+            if c.outstanding is not None and not c.stalled and now - c.sent_at > STALL_S:
+                c.stalled = True
+                self._status_at = 0.0
+                print(f"[raster_editor] client {c.id} has not fetched base frame {c.outstanding} for "
+                      f"{STALL_S:.0f}s: stalled, no more notices until it does")
+        if self._base_msg is None or not self.has_input:
+            return
+        msg = None
+        for c in self.clients.values():
+            if not c.ready or c.outstanding is not None or c.stalled or c.fetched == self._base_fid:
                 continue
-            if self._sent_this_pump and len(msg) > budget:
-                break  # always make progress, never exceed the budget by more than the first message
-            ws.webSocketSendBinary(cid, msg)
-            budget -= len(msg)
-            self._sent_this_pump = True
-            del self._jobs[cid]
-            self._jobs[cid] = [frame, i + 1, job[2]]  # to the back of the queue
-        if self._sent_this_pump:
-            self.stats["send"].append(self._now() - t)
+            if msg is None:
+                msg = self.protocol.base_notice(self._base_fid, self.doc_w, self.doc_h)
+            self._send(c.id, msg)
+            c.outstanding = self._base_fid
+            c.sent_at = now
+
+    def _serve_base(self, request, response):
+        """GET /base?token=T&client=<hello.clientId>[&frameId=N]: the newest BASE frame."""
+        pars = request.get("pars") or {}
+        if not self._token_ok(pars.get("token")):
+            return self._cors(request, self._reply(response, 403, "Forbidden", "bad token"))
+        c = next((x for x in self.clients.values() if x.cid == pars.get("client")), None)
+        if self._base_msg is None:
+            if c is not None:  # whatever it was told about is gone; it gets a new notice with the next frame
+                c.outstanding = None
+                c.fetched = None
+            return self._cors(request, self._reply(response, 404, "Not Found", "no base frame"))
+        if c is not None:
+            c.fetched = self._base_fid
+            c.outstanding = None
+            if c.stalled:
+                c.stalled = False
+                print(f"[raster_editor] client {c.id} resumed")
+                self._status_at = 0.0
+        response["Cache-Control"] = "no-store"
+        return self._cors(request, self._reply(response, 200, "OK", self._base_msg, "application/octet-stream"))
+
+    @staticmethod
+    def _cors(request, response):
+        """The page may come from a dev server on another loopback origin (Devurl workflow): allow
+        exactly that origin, nobody else. The token and loopback checks still apply."""
+        for k, v in request.items():
+            if str(k).lower() == "origin" and LOOPBACK_ORIGIN.match(str(v)):
+                response["Access-Control-Allow-Origin"] = str(v)
+                response["Vary"] = "Origin"
+        return response
 
     # ------------------------------------------------------------------ Script TOP
 
@@ -765,6 +773,9 @@ class RasterEditorExt:
                 text = f"{act.kind} active · {size} · {self._out_fps(now)} fps out"
                 if len(ready) > 1:
                     text += f" · {len(ready) - 1} standby"
+                stalled = sum(1 for c in ready if c.stalled)
+                if stalled:
+                    text += f" · {stalled} stalled"
         if self.last_error is not None and now - self.last_error[1] < 10.0:
             text += f" · ERROR {self.last_error[0]}"
         if text != self._status:

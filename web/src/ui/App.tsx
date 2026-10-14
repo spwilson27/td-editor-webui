@@ -9,7 +9,7 @@ import { Viewport } from './Viewport';
 
 export function App() {
   return (
-    <div style="position:relative;width:100%;height:100vh;min-height:720px;display:flex;flex-direction:column;background:#262626;color:#e3e3e3;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',sans-serif;font-size:12px;overflow:hidden">
+    <div style="position:relative;width:100%;height:100vh;display:flex;flex-direction:column;background:#262626;color:#e3e3e3;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',sans-serif;font-size:12px;overflow:hidden">
       <TopBar />
       <ContextBar />
       <div style="flex:1 1 auto;min-height:0;display:flex">

@@ -15,7 +15,7 @@ const hook = <T,>(page: Page, fn: string, ...args: unknown[]) =>
 test('connects, says ready as the panel client and shows the linked state', async ({ page }) => {
   await open(page);
   await td.waitFor(() => td.messages.length > 0);
-  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 1, client: 'panel', token: td.token });
+  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 2, client: 'panel', token: td.token });
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   expect((await hook<any>(page, 'state')).doc).toEqual({ w: 160, h: 90 });
 });
@@ -34,6 +34,70 @@ test('base frames from TD appear in the document and come back as a composite', 
   await td.waitFor(() => td.pixel(80, 45)[0] === 200);
   expect(td.pixel(0, 0)).toEqual([200, 30, 10, 255]);
   expect(td.pixel(159, 89)).toEqual([200, 30, 10, 255]);
+});
+
+test('a burst of BASE frames arrives via notices: one outstanding, newest wins, nothing lost at the end', async ({ page }) => {
+  await open(page);
+  await td.waitFor(() => td.frameEnds >= 1);
+  const shades = [10, 60, 110, 160, 210];
+  for (const v of shades) td.sendSolidBase(v, 0, 0);
+  await expect.poll(() => hook<number[]>(page, 'readPixel', 80, 45)).toEqual([210, 0, 0, 255]);
+  expect(td.noticesSent.length).toBe(td.fetches.length); // every notice fetched exactly once
+  expect(td.noticesSent.length).toBeLessThanOrEqual(shades.length);
+  expect(td.badFetches).toBe(0);
+  expect(td.fetches.every((f) => f.status === 200)).toBe(true);
+  expect(td.fetches.length).toBeLessThanOrEqual(shades.length);
+  await td.waitFor(() => td.pixel(80, 45)[0] === 210);
+
+  // and a later frame still flows after the burst
+  td.sendSolidBase(5, 6, 7);
+  await expect.poll(() => hook<number[]>(page, 'readPixel', 80, 45)).toEqual([5, 6, 7, 255]);
+});
+
+test('a frame stored before the page connected is announced on hello and fetched', async ({ page }) => {
+  td.sendSolidBase(33, 44, 55);
+  await open(page);
+  await expect.poll(() => hook<number[]>(page, 'readPixel', 10, 10)).toEqual([33, 44, 55, 255]);
+});
+
+test('404 from /base is ignored; the next notice delivers the frame', async ({ page }) => {
+  await open(page);
+  await td.waitFor(() => td.frameEnds >= 1);
+  td.baseStatus = 404;
+  td.sendSolidBase(1, 1, 1);
+  await td.waitFor(() => td.fetches.some((f) => f.status === 404));
+  await page.waitForTimeout(700); // no retry storm, no error shown
+  expect(td.fetches.filter((f) => f.status === 404).length).toBe(1);
+  await expect(page.locator('[data-status=fatal]')).toHaveCount(0);
+  await expect(page.locator('[data-status=notice]')).toHaveCount(0);
+  td.baseStatus = null;
+  td.sendSolidBase(70, 80, 90); // the "notice that follows"
+  await expect.poll(() => hook<number[]>(page, 'readPixel', 10, 10)).toEqual([70, 80, 90, 255]);
+  expect(td.noticesSent.length).toBe(td.fetches.length);
+});
+
+test('403 from /base is a token failure: fatal status message', async ({ page }) => {
+  await open(page);
+  await td.waitFor(() => td.frameEnds >= 1);
+  td.baseStatus = 403;
+  td.sendSolidBase(1, 1, 1);
+  await expect(page.locator('[data-status=fatal]')).toHaveText('Reopen from TouchDesigner — session expired');
+});
+
+test('a fetch result that arrives after docSize is dropped; the new-size frame wins', async ({ page }) => {
+  await open(page);
+  await td.waitFor(() => td.frameEnds >= 1);
+  td.baseDelayMs = 400;
+  td.sendSolidBase(200, 0, 0);
+  await td.waitFor(() => td.noticesSent.length === 1);
+  await page.waitForTimeout(100); // the page is now waiting on the slow response
+  td.resize(80, 60);
+  await expect.poll(async () => (await hook<any>(page, 'state')).doc).toEqual({ w: 80, h: 60 });
+  await page.waitForTimeout(500); // old (160x90) response lands and must be ignored
+  expect(await hook<number[]>(page, 'readPixel', 5, 5)).not.toEqual([200, 0, 0, 255]);
+  td.baseDelayMs = 0;
+  td.sendSolidBase(0, 200, 0);
+  await expect.poll(() => hook<number[]>(page, 'readPixel', 79, 59)).toEqual([0, 200, 0, 255]);
 });
 
 test('painting sends only dirty rects to TD', async ({ page }) => {
@@ -114,4 +178,27 @@ test('a missing or wrong token is rejected and the status bar says to reopen fro
   await page.goto(`/?test=1&ws=${encodeURIComponent(td.url)}`);
   await expect(page.locator('[data-status=fatal]')).toBeVisible();
   expect(td.messages[td.messages.length - 1]).toMatchObject({ t: 'ready', token: '' });
+});
+
+test('same-origin page served by TD fetches /base without any CORS headers or Origin', async ({ page }) => {
+  await page.goto(`http://127.0.0.1:${td.port}/?test=1&client=panel&token=${td.token}`);
+  await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
+  td.sendSolidBase(12, 34, 56);
+  await expect.poll(() => hook<number[]>(page, 'readPixel', 10, 10)).toEqual([12, 34, 56, 255]);
+  expect(td.fetches.length).toBeGreaterThan(0);
+  expect(td.fetches.every((f) => f.status === 200 && f.acao === undefined)).toBe(true);
+});
+
+test('cross-origin dev page: loopback origin is echoed, foreign origins get no CORS headers', async () => {
+  const get = async (origin: string) => {
+    const r = await fetch(`http://127.0.0.1:${td.port}/base?token=x&client=y&frameId=1`, { headers: { Origin: origin } }).catch(() => null);
+    return r;
+  };
+  expect(FakeTd.corsHeaders('http://127.0.0.1:4173')).toEqual({ 'Access-Control-Allow-Origin': 'http://127.0.0.1:4173', Vary: 'Origin' });
+  expect(FakeTd.corsHeaders('http://localhost:5173')['Access-Control-Allow-Origin']).toBe('http://localhost:5173');
+  expect(FakeTd.corsHeaders('https://evil.example')).toEqual({});
+  expect(FakeTd.corsHeaders('http://127.0.0.1.evil.example')).toEqual({});
+  expect(FakeTd.corsHeaders(undefined)).toEqual({});
+  const evil = await get('https://evil.example');
+  if (evil) expect(evil.headers.get('access-control-allow-origin')).toBeNull();
 });

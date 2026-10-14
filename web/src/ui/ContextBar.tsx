@@ -12,22 +12,22 @@ function RangeRow({ label, id, min, max, value, unit, w, span, onInput }: RangeP
   return (
     <div style="display:flex;align-items:center;gap:8px">
       <label for={id} style="color:#a8a8a8">{label}</label>
-      <input id={id} type="range" min={min} max={max} value={value} style={`width:${w}px`}
+      <input id={id} class={w >= 140 ? 'rw-xl' : w > 100 ? 'rw-lg' : 'rw-sm'} type="range" min={min} max={max} value={value} 
         onInput={(e) => onInput(Number((e.target as HTMLInputElement).value))} />
       <span data-value={id} style={`min-width:${span}px;${BOX}`}>{value}{unit}</span>
     </div>
   );
 }
 
-function Disabled({ children }: { children: ComponentChildren }) {
-  return <label title={NOT_IN_VERSION} style="display:flex;align-items:center;gap:6px;color:#707070">{children}</label>;
+function Disabled({ children, low }: { children: ComponentChildren; low?: boolean }) {
+  return <label class={low ? 'lowprio' : undefined} title={NOT_IN_VERSION} style="display:flex;align-items:center;gap:6px;color:#707070">{children}</label>;
 }
 
 function BrushOptions() {
   const b = store.brush.value, t = store.tool.value;
   const preset = BRUSHES.find((p) => p.id === store.brushPreset.value) || BRUSHES[0];
   return (
-    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:18px">
+    <div class="opts">
       <button aria-label="Brush presets" onClick={() => { store.colorTab.value = 'brushes'; }}
         style="display:flex;align-items:center;gap:8px;height:28px;padding:0 8px;border:1px solid #474747;border-radius:5px;background:#262626">
         <svg width="44" height="14" viewBox="0 0 44 14" aria-hidden="true"><path d="M2 10c8-8 14 4 22-2s14-4 18-2" fill="none" stroke="#e3e3e3" stroke-width="3" stroke-linecap="round" /></svg>
@@ -40,8 +40,8 @@ function BrushOptions() {
         <RangeRow label="Flow" id="bf" min={0} max={100} value={Math.round(b.flow * 100)} unit="%" w={80} span={36} onInput={(v) => store.setBrush({ flow: v / 100 })} />
         <RangeRow label="Hardness" id="bh" min={0} max={100} value={Math.round(b.hardness * 100)} unit="%" w={80} span={36} onInput={(v) => store.setBrush({ hardness: v / 100 })} />
       </>}
-      <Disabled><input type="checkbox" disabled style={CHK} />Wet edges</Disabled>
-      <Disabled><input type="checkbox" checked disabled style={CHK} />Protect alpha</Disabled>
+      <Disabled low><input type="checkbox" disabled style={CHK} />Wet edges</Disabled>
+      <Disabled low><input type="checkbox" checked disabled style={CHK} />Protect alpha</Disabled>
     </div>
   );
 }
@@ -49,7 +49,7 @@ function BrushOptions() {
 function SelectOptions() {
   const modes = ['New', 'Add', 'Subtract', 'Intersect'];
   return (
-    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:18px">
+    <div class="opts">
       <div role="group" aria-label="Selection mode" style="display:flex;gap:2px;padding:2px;background:#1f1f1f;border:1px solid #474747;border-radius:5px">
         {modes.map((m, i) => (
           <button key={m} aria-pressed={i === 0} aria-disabled={i !== 0} title={i === 0 ? undefined : NOT_IN_VERSION}
@@ -65,7 +65,7 @@ function SelectOptions() {
 
 function FillOptions() {
   return (
-    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:18px">
+    <div class="opts">
       <RangeRow label="Tolerance" id="ft" min={0} max={255} value={store.fillTolerance.value} unit="" w={140} span={36} onInput={(v) => { store.fillTolerance.value = v; }} />
       <Disabled><input type="checkbox" checked disabled style={CHK} />Contiguous</Disabled>
       <Disabled><input type="checkbox" disabled style={CHK} />All layers</Disabled>
@@ -80,7 +80,7 @@ function Readout() {
   const r = sel || { x: 0, y: 0, w: dw, h: dh };
   const v = (n: number) => <b style="color:#e3e3e3;font-weight:500">{n} px</b>;
   return (
-    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:14px;color:#a8a8a8">
+    <div class="opts" style="color:#a8a8a8">
       <span>X {v(r.x)}</span><span>Y {v(r.y)}</span><span>W {v(r.w)}</span><span>H {v(r.h)}</span>
       <Disabled><input type="checkbox" disabled style={CHK} />Snap</Disabled>
     </div>
@@ -91,10 +91,10 @@ export function ContextBar() {
   const id = store.tool.value;
   const info = toolInfo(id);
   return (
-    <div style="min-height:42px;flex:none;display:flex;flex-wrap:wrap;align-items:center;gap:16px;padding:4px 12px;background:#303030;border-bottom:1px solid #1a1a1a">
-      <div style="display:flex;align-items:center;gap:8px;min-width:150px">
+    <div class="ctx" data-context-bar>
+      <div class="ctx-tool">
         <Icon d={info.d} size={18} sw={1.7} stroke="#7fb2f0" />
-        <span data-context="name" style="font-weight:600">{info.name}</span>
+        <span data-context="name" class="ctx-name">{info.name}</span>
       </div>
       <div style="width:1px;height:22px;background:#474747" />
       {PAINT_TOOLS.has(id) ? <BrushOptions />

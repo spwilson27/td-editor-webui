@@ -23,9 +23,11 @@ export interface TdBridgeOptions {
   WebSocketCtor?: typeof WebSocket;
   forwardLogs?: boolean;
   now?: () => number;
+  fetch?: typeof fetch;
 }
 
 export const BACKPRESSURE_BYTES = 8 * 1024 * 1024;
+const FETCH_TIMEOUT_MS = 10000, FETCH_RETRY_MS = 500, REQUEST_BASE_MS = 2000;
 const BACKOFF_MIN = 500, BACKOFF_MAX = 5000, DEFAULT_FPS = 30;
 
 export function resolveWsUrl(search: string, loc: { protocol: string; host: string }): string {
@@ -39,6 +41,12 @@ export function resolveToken(search: string): string {
 }
 
 export const TOKEN_EXPIRED_MESSAGE = 'Reopen from TouchDesigner — session expired';
+
+/** The HTTP origin that serves /base: same host and port as the WebSocket (so `?ws=` overrides carry over). */
+export function httpOrigin(wsUrl: string): string {
+  const u = new URL(wsUrl);
+  return `${u.protocol === 'wss:' ? 'https:' : 'http:'}//${u.host}`;
+}
 
 export function resolveClient(search: string): 'panel' | 'external' {
   return new URLSearchParams(search).get('client') === 'panel' ? 'panel' : 'external';
@@ -55,6 +63,8 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   const client = opts.client ?? resolveClient(location.search);
   const token = opts.token ?? resolveToken(location.search);
   const WS = opts.WebSocketCtor ?? WebSocket;
+  const doFetch = opts.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
+  const httpBase = httpOrigin(url);
   const now = opts.now ?? (() => performance.now());
 
   let ws: WebSocket | null = null;
@@ -64,6 +74,14 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   let backoff = BACKOFF_MIN;
   let maxFps = DEFAULT_FPS;
   let frameId = 0;
+  let clientId = '';
+  let noticeId = 0;
+  let fetching = false;
+  let refetch = false; // a newer notice arrived while fetching: fetch again, newest wins
+  let docEpoch = 0; // bumped by docSize/reconnect: results fetched before are void
+  let fetchAbort: AbortController | null = null;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let requestTimer: ReturnType<typeof setTimeout> | null = null;
   let dirty: Rect | null = null;
   let lastSend = -Infinity;
   let sendTimer: ReturnType<typeof setTimeout> | null = null;
@@ -124,6 +142,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       case 'hello':
         if (m.protocol !== PROTOCOL_VERSION) { status.setNotice(`Protocol mismatch (TD ${m.protocol})`); return; }
         backoff = BACKOFF_MIN;
+        clientId = m.clientId;
         maxFps = m.maxSendFps > 0 ? m.maxSendFps : DEFAULT_FPS;
         if (m.doc.w !== engine.width || m.doc.h !== engine.height) engine.resize(m.doc.w, m.doc.h);
         status.setConnection('linked');
@@ -131,27 +150,70 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         setActive(m.active);
         break;
       case 'docSize':
+        docEpoch++;
         if (m.w !== engine.width || m.h !== engine.height) engine.resize(m.w, m.h);
+        break;
+      case 'base':
+        noticeId = m.frameId;
+        pullBase();
         break;
       case 'active':
         setActive(m.active);
         break;
       case 'error':
-        if (/token/i.test(m.msg)) {
-          rejected = true;
-          (status.setFatal ?? status.setNotice)(TOKEN_EXPIRED_MESSAGE);
-        } else status.setNotice(m.msg);
+        if (/token/i.test(m.msg)) rejectToken();
+        else status.setNotice(m.msg);
         break;
     }
   }
 
-  function onBinary(buf: ArrayBuffer) {
-    const r = decodeFrame(buf);
-    if (!r.ok) return;
-    const f = r.frame;
-    if (f.type !== FRAME_BASE || isStale(f, engine.width, engine.height)) return;
-    engine.writeBase({ x: f.x, y: f.y, w: f.w, h: f.h }, f.payload);
-    if (f.frameEnd) engine.commitBase();
+  function rejectToken() {
+    rejected = true;
+    (status.setFatal ?? status.setNotice)(TOKEN_EXPIRED_MESSAGE);
+  }
+
+  /** BASE frames are pulled over HTTP (never the WebSocket): one fetch in flight, a newer notice just triggers one more. */
+  function pullBase() {
+    if (fetching) { refetch = true; return; }
+    fetching = true;
+    void fetchBase(0).finally(() => {
+      fetching = false;
+      if (refetch && !disposed) { refetch = false; pullBase(); }
+    });
+  }
+
+  async function fetchBase(attempt: number): Promise<void> {
+    const sock = ws, epoch = docEpoch;
+    const q = `token=${encodeURIComponent(token)}&client=${encodeURIComponent(clientId)}&frameId=${noticeId}`;
+    const ctrl = new AbortController();
+    fetchAbort = ctrl;
+    const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const res = await doFetch(`${httpBase}/base?${q}`, { cache: 'no-store', signal: ctrl.signal });
+      if (res.status === 404) return; // nothing stored yet; a notice follows
+      if (res.status === 403) { rejectToken(); return; }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const buf = await res.arrayBuffer();
+      if (disposed || ws !== sock) return;
+      if (epoch !== docEpoch) { refetch = true; return; } // TD counted this frame as fetched and will not re-announce it
+
+      const r = decodeFrame(buf);
+      if (!r.ok || r.frame.type !== FRAME_BASE || isStale(r.frame, engine.width, engine.height)) return;
+      engine.writeBase({ x: r.frame.x, y: r.frame.y, w: r.frame.w, h: r.frame.h }, r.frame.payload);
+      if (r.frame.frameEnd) engine.commitBase();
+    } catch {
+      if (disposed || ws !== sock) return;
+      if (attempt === 0) {
+        await new Promise<void>((resolve) => { retryTimer = setTimeout(() => { retryTimer = null; resolve(); }, FETCH_RETRY_MS); });
+        if (!disposed && ws === sock) await fetchBase(1);
+      } else {
+        // Give up on this notice; ask TD to announce the stored frame again later.
+        requestTimer = setTimeout(() => { requestTimer = null; sendJson({ t: 'requestBase' }); }, REQUEST_BASE_MS);
+      }
+    } finally {
+      clearTimeout(timeout);
+      if (fetchAbort === ctrl) fetchAbort = null;
+    }
   }
 
   function scheduleReconnect() {
@@ -178,13 +240,14 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     sock.onmessage = (ev) => {
       if (ws !== sock) return;
       if (typeof ev.data === 'string') onJson(ev.data);
-      else if (ev.data instanceof ArrayBuffer) onBinary(ev.data);
     };
     sock.onclose = () => {
       if (ws !== sock) return;
       ws = null;
       active = false;
       dirty = null;
+      docEpoch++;
+      fetchAbort?.abort();
       if (sendTimer) { clearTimeout(sendTimer); sendTimer = null; }
       status.setConnection('reconnecting');
       status.setActive(true); // offline: keep editing locally, no standby overlay
@@ -207,6 +270,9 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       stopLogs();
       if (sendTimer) clearTimeout(sendTimer);
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      fetchAbort?.abort();
+      if (retryTimer) clearTimeout(retryTimer);
+      if (requestTimer) clearTimeout(requestTimer);
       const s = ws;
       ws = null;
       s?.close();

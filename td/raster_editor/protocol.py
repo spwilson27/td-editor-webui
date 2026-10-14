@@ -8,7 +8,7 @@ import json
 import struct
 from typing import Iterator, NamedTuple, Optional, Tuple
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAGIC = b"REF1"
 HEADER_SIZE = 24
 TYPE_BASE = 1  # TD -> web
@@ -156,9 +156,16 @@ def decode_json(text) -> dict:
     return msg
 
 
-def hello(doc_w: int, doc_h: int, has_input: bool, max_send_fps: float, active: bool) -> str:
+def hello(doc_w: int, doc_h: int, has_input: bool, max_send_fps: float, active: bool, client_id: str = "") -> str:
     return encode_json({"t": "hello", "protocol": PROTOCOL_VERSION, "doc": {"w": doc_w, "h": doc_h},
-                        "hasInput": bool(has_input), "maxSendFps": max_send_fps, "active": bool(active)})
+                        "hasInput": bool(has_input), "maxSendFps": max_send_fps, "active": bool(active),
+                        "clientId": client_id})
+
+
+def base_notice(frame_id: int, doc_w: int, doc_h: int) -> str:
+    """A BASE frame (whole document, one band) is ready: fetch it with GET /base (PROTOCOL.md §4)."""
+    return encode_json({"t": "base", "frameId": frame_id, "docW": doc_w, "docH": doc_h,
+                        "x": 0, "y": 0, "w": doc_w, "h": doc_h})
 
 
 def doc_size(w: int, h: int, has_input: bool) -> str:

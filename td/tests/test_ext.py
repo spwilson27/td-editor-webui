@@ -13,6 +13,8 @@ class Env:
     def __init__(self, tick=None, **pars):
         self.o = FakeOwner(**pars)
         self.clock = TickClock(tick) if tick else Clock()
+        self.fetch_skip = set()  # clients that never fetch
+        self.autofetch = True  # a well-behaved web client fetches every `base` notice
         self.x = E.RasterEditorExt(self.o)
         self.x._now = self.clock
         self.o.ext = self.x
@@ -20,13 +22,18 @@ class Env:
         self.opened = []
         self.x._open_url = self.opened.append
         self.s = self.o.server
+        self.fetched = {}  # socket id -> [(header, payload bytes)]
 
     def pump(self, n=1, dt=0.034):
         for _ in range(n):
             self.clock.advance(dt)
             self.x.Pump()
+            if self.autofetch:
+                for cid, c in list(self.x.clients.items()):
+                    if c.outstanding is not None and cid not in self.fetch_skip:
+                        self.fetch(cid)
 
-    def connect(self, kind="panel", protocol=1, ready=True, token=None):
+    def connect(self, kind="panel", protocol=P.PROTOCOL_VERSION, ready=True, token=None):
         self.n += 1
         cid = f"127.0.0.1:{5000 + self.n}"
         self.s.webSocketConnections.append(cid)
@@ -37,6 +44,14 @@ class Env:
 
     def send(self, cid, msg):
         self.x.OnWebSocketText(cid, json.dumps(msg))
+
+    def fetch(self, cid, token=None):
+        """GET /base as the web client behind socket `cid` would (its hello.clientId)."""
+        r = self.x.OnHTTPRequest(req(uri="/base", pars={"token": token or self.x.token, "client": self.x.clients[cid].cid}), {})
+        if r["statusCode"] == 200:
+            h, payload = P.decode_frame(r["data"])
+            self.fetched.setdefault(cid, []).append((h, bytes(payload)))
+        return r
 
     def composite(self, cid, rect, pixels, frame_id=1, dw=None, dh=None, end=True, max_payload=P.MAX_PAYLOAD):
         dw = dw or self.x.doc_w
@@ -62,13 +77,19 @@ class Env:
         return self.bases(cid)
 
     def bases(self, cid):
-        """Decoded BASE messages sent to cid, grouped by frame id -> list of (hdr, payload)."""
+        """BASE frames fetched by cid, grouped by frame id -> [(hdr, payload)] (one band each)."""
         out = {}
-        for c, data in self.s.binaries:
-            if c == cid:
-                h, p = P.decode_frame(data)
-                out.setdefault(h.frame_id, []).append((h, bytes(p)))
+        for h, p in self.fetched.get(cid, []):
+            out.setdefault(h.frame_id, []).append((h, p))
         return out
+
+    def notices(self, cid):
+        return self.s.messages(cid, "base")
+
+
+def wire_of(bands):
+    """Reassemble the wire image from fetched bands."""
+    return np.concatenate([np.frombuffer(p, np.uint8).reshape(h.h, h.w, 4) for h, p in bands])
 
 
 @pytest.fixture
@@ -84,9 +105,11 @@ def wire_img(w, h, seed=0, alpha=255):
 
 # ----------------------------------------------------------------------------- HTTP
 
-def req(method="GET", uri="/", data=b"", token=None, **extra):
+def req(method="GET", uri="/", data=b"", token=None, pars=None, **extra):
     r = {"method": method, "uri": uri, "data": data, "clientAddress": "127.0.0.1:5000", "Host": "127.0.0.1:9980",
-         "pars": {} if token is None else {"token": token}}
+         "pars": dict(pars or {})}
+    if token is not None:
+        r["pars"]["token"] = token
     r.update(extra)
     return r
 
@@ -121,7 +144,7 @@ def test_first_client_becomes_active_and_gets_hello(env):
     env.pump()
     a = env.connect("external")
     (hello,) = env.s.messages(a, "hello")
-    assert hello["protocol"] == 1 and hello["active"] is True and hello["hasInput"] is False
+    assert hello["protocol"] == 2 and hello["active"] is True and hello["hasInput"] is False
     assert hello["doc"] == {"w": 64, "h": 32} and hello["maxSendFps"] == 30
 
 
@@ -403,25 +426,7 @@ def test_input_is_sent_as_banded_base_frames_flipped_and_unpremultiplied(env):
     assert np.abs(wire.astype(int) - expect).max() <= 1
 
 
-def test_large_input_bands_split_under_2mb_and_sent_one_band_per_pump():
-    big = np.random.RandomState(1).rand(1080, 1920, 4).astype(np.float32)
-    env = Env(tick=0.002)  # every clock read costs 0.5 ms, so conversion hits its budget
-    env.o.inputs = [object()]
-    env.o.in1.set_image(big)
-    env.pump()
-    a = env.connect("panel")
-    counts, converts = [], []
-    for _ in range(80):
-        before, cv = len(env.s.binaries), len(env.x.stats["convert"])
-        env.pump()
-        counts.append(len(env.s.binaries) - before)
-        converts.append(len(env.x.stats["convert"]) - cv)
-    msgs = [P.decode_frame(d)[0] for c, d in env.s.binaries if c == a]
-    assert len(msgs) == 4 and msgs[-1].frame_end
-    assert all(h.payload_size <= P.MAX_PAYLOAD for h in msgs)
-    assert sum(h.h for h in msgs) == 1080
-    assert max(counts) <= 1  # one ~2 MB band per pump
-    assert sum(converts) >= 3  # the conversion was spread over several pumps (budget resume)
+
 
 
 def test_unchanged_input_is_not_resent(env):
@@ -487,7 +492,7 @@ def test_request_base_resends_cached_frame(env):
     env.run_until_bases(a)
     env.send(a, {"t": "requestBase"})
     env.pump(5)
-    assert len(env.bases(a)) == 2
+    assert len(env.fetched[a]) == 2 and len(env.notices(a)) == 2  # re-notified with the stored frame
 
 
 def test_request_base_without_input_is_noop(env):
@@ -495,17 +500,10 @@ def test_request_base_without_input_is_noop(env):
     a = env.connect("panel")
     env.send(a, {"t": "requestBase"})
     env.pump(5)
-    assert not env.s.binaries
+    assert not env.notices(a) and not env.s.binaries
 
 
-def test_frame_ids_increase_between_base_frames(env):
-    env.set_input(64, 32)
-    env.pump()
-    a = env.connect("panel")
-    env.run_until_bases(a)
-    env.send(a, {"t": "requestBase"})
-    env.pump(5)
-    assert sorted(env.bases(a)) == sorted(set(env.bases(a))) and len(env.bases(a)) == 2
+
 
 
 def test_input_resize_sends_docsize_then_new_base_and_drops_old_size_composites(env):
@@ -557,18 +555,7 @@ def test_doc_par_change_without_input_resizes(env):
     assert (env.x.doc_w, env.x.doc_h) == (10, 10)
 
 
-def test_old_size_readback_dropped_after_resize(env):
-    env.set_input(64, 32)
-    env.pump()
-    env.connect("panel")
-    env.pump(1)
-    env.set_input(16, 16, 4)
-    env.pump(40)
-    for c, d in env.s.binaries:
-        h, _ = P.decode_frame(d)
-        assert (h.doc_w, h.doc_h) in ((64, 32), (16, 16))
-    last = P.decode_frame(env.s.binaries[-1][1])[0]
-    assert (last.doc_w, last.doc_h) == (16, 16)
+
 
 
 # ----------------------------------------------------------------------------- mouse / keyboard
@@ -915,24 +902,7 @@ def test_host_header_lookup_is_case_insensitive(env):
     assert env.x.OnHTTPRequest(r, {})["statusCode"] == 403
 
 
-def test_byte_budget_is_shared_across_clients_round_robin():
-    env = Env()
-    big = np.random.RandomState(1).rand(1080, 1920, 4).astype(np.float32)
-    env.o.inputs = [object()]
-    env.o.in1.set_image(big)
-    env.pump()
-    a, b = env.connect("panel"), env.connect("external")
-    per_pump = []
-    for _ in range(120):
-        before = sum(len(d) for _, d in env.s.binaries)
-        env.pump()
-        per_pump.append(sum(len(d) for _, d in env.s.binaries) - before)
-    assert max(per_pump) <= E.MAX_BYTES_PER_PUMP + P.MAX_PAYLOAD + P.HEADER_SIZE  # at most one message over budget
-    for cid in (a, b):
-        frames_ = env.bases(cid)
-        assert len(frames_) == 1 and sum(h.h for h, _ in list(frames_.values())[0]) == 1080
-    order = [c for c, _ in env.s.binaries][:4]
-    assert order == [a, b, a, b]  # clients take turns
+
 
 
 @pytest.mark.parametrize("n_clients", [1, 3])
@@ -963,42 +933,10 @@ def test_every_client_keeps_receiving_complete_frames_under_continuous_input_cha
                 assert prev.frame_end
 
 
-def test_pending_frame_that_has_not_started_is_replaced_and_a_started_one_finishes():
-    env = Env()
-    env.o.par.Premultiplied.val = 0
-    big = np.random.RandomState(1).rand(1080, 1920, 4).astype(np.float32)
-    env.o.inputs = [object()]
-    env.o.in1.set_image(big)
-    env.pump()
-    a = env.connect("panel")
-    while len(env.s.binaries) < 1:
-        env.pump()
-    first = env.x._jobs[a][0]
-    env.x._queue_base([a])
-    env.x._queue_base([a])
-    job = env.x._jobs[a]
-    assert job[0] is first and job[2] is not None and job[2] is not first  # in flight kept, newest queued
-    env.pump(30)
-    fids = sorted(env.bases(a))
-    assert len(fids) == 2 and all(env.bases(a)[f][-1][0].frame_end for f in fids)
 
 
-def test_conversion_does_not_start_into_a_buffer_an_in_flight_job_reads():
-    env = Env()
-    env.o.par.Premultiplied.val = 0
-    env.o.par.Maxinputfps.val = 120
-    big = np.random.RandomState(1).rand(1080, 1920, 4).astype(np.float32)
-    env.o.inputs = [object()]
-    env.o.in1.set_image(big)
-    env.pump()
-    a = env.connect("panel")
-    for i in range(120):
-        env.o.in1.set_image(big * ((i % 7) / 7 + 0.1))
-        env.pump()
-        for job in env.x._jobs.values():
-            busy = {id(job[0].buf)} | ({id(job[2].buf)} if job[2] else set())
-            conv = env.x._conv
-            assert conv is None or id(conv["out"]) not in busy
+
+
 
 
 def test_premultiplied_toggle_mid_conversion_restarts_it():
@@ -1018,17 +956,7 @@ def test_premultiplied_toggle_mid_conversion_restarts_it():
     assert env.x._conv is None and env.x._input_pending
 
 
-def test_conversion_double_buffers_and_does_not_reallocate(env):
-    env.o.par.Maxinputfps.val = 120
-    env.set_input(64, 32, 1)
-    env.pump()
-    env.connect("panel")
-    seen = []
-    for i in range(6):
-        env.o.in1.set_image(np.random.RandomState(i).rand(32, 64, 4))
-        env.pump(8)
-        seen.append(id(env.x._base_wire))
-    assert len(set(seen)) == 2  # two buffers alternate
+
 
 
 def test_failed_buffer_allocation_does_not_commit_doc_size(env, monkeypatch):
@@ -1085,3 +1013,377 @@ def test_dev_module_reload_is_picked_up(env):
     env.o._ops["protocol"].module = new
     env.pump(3, dt=0.5)
     assert env.x.protocol is new
+
+
+# ----------------------------------------------------------------------------- flow control (ack)
+
+def _big_input(env, h=540, w=960):
+    env.o.par.Premultiplied.val = 0
+    env.o.par.Maxinputfps.val = 120
+    env.o.inputs = [object()]
+    env.o.in1.set_image(np.zeros((h, w, 4), np.float32))
+
+
+def _bytes_to(env, cid):
+    return sum(len(d) for c, d in env.s.binaries if c == cid)
+
+
+# ----------------------------------------------------------------------------- BASE delivery by HTTP pull (protocol v2)
+
+def test_base_notice_fields_and_single_band_whole_frame_fetch(env):
+    env.o.par.Premultiplied.val = 0
+    arr = env.set_input(64, 32, 3)
+    env.pump()
+    a = env.connect("panel")
+    env.pump(10)
+    (n,) = env.notices(a)
+    assert n == {"t": "base", "frameId": n["frameId"], "docW": 64, "docH": 32, "x": 0, "y": 0, "w": 64, "h": 32}
+    ((h, payload),) = env.fetched[a]
+    assert (h.type, h.frame_end, h.frame_id, h.x, h.y, h.w, h.h) == (P.TYPE_BASE, True, n["frameId"], 0, 0, 64, 32)
+    assert np.abs(wire_of([(h, payload)]).astype(int) - np.floor(arr[::-1] * 255 + 0.5)).max() <= 1
+    assert not env.s.binaries  # nothing but JSON ever goes down the WebSocket
+
+
+def test_full_hd_base_is_one_message_and_conversion_spreads_over_pumps():
+    env = Env(tick=0.002)
+    env.o.par.Maxinputfps.val = 120
+    env.o.inputs = [object()]
+    env.o.in1.set_image(np.random.RandomState(1).rand(1080, 1920, 4).astype(np.float32))
+    env.pump()
+    a = env.connect("panel")
+    converts = []
+    for _ in range(60):
+        n = len(env.x.stats["convert"])
+        env.pump()
+        converts.append(len(env.x.stats["convert"]) - n)
+    ((h, payload),) = env.fetched[a]
+    assert (h.w, h.h, h.frame_end) == (1920, 1080, True) and len(payload) == 1920 * 1080 * 4
+    assert sum(converts) >= 3  # budget resume: several pumps
+    assert len(env.x.stats["publish"]) == 1
+
+
+def test_one_notice_outstanding_until_fetched_and_the_newest_frame_is_served():
+    env = Env()
+    env.autofetch = False
+    env.o.par.Premultiplied.val = 0
+    env.o.par.Maxinputfps.val = 120
+    env.o.inputs = [object()]
+    env.o.in1.set_image(np.zeros((32, 64, 4), np.float32))
+    env.pump()
+    a = env.connect("panel")
+    for i in range(1, 60):
+        env.o.in1.set_image(np.full((32, 64, 4), i / 100.0, np.float32))
+        env.pump()
+    assert len(env.notices(a)) == 1  # frames keep changing, but only one notice is outstanding
+    first = env.notices(a)[0]["frameId"]
+    r = env.fetch(a)
+    (h, payload) = env.fetched[a][-1]
+    assert h.frame_id != first and h.frame_id == env.x._base_fid  # newest, not the notified one
+    assert r["data"] == env.x._base_msg
+    env.o.in1.set_image(np.full((32, 64, 4), 0.9, np.float32))
+    env.pump(10)
+    assert len(env.notices(a)) == 2  # a newer frame exists now: exactly one more notice
+
+
+def test_no_new_notice_when_nothing_changed_after_a_fetch(env):
+    env.set_input(64, 32)
+    env.pump()
+    a = env.connect("panel")
+    env.pump(40)
+    assert len(env.notices(a)) == 1 and len(env.fetched[a]) == 1
+
+
+def test_client_that_never_fetches_gets_one_notice_then_is_stalled_then_resumes(capsys):
+    env = Env()
+    env.o.par.Maxinputfps.val = 120
+    env.o.inputs = [object()]
+    env.o.in1.set_image(np.zeros((32, 64, 4), np.float32))
+    env.pump()
+    a, b = env.connect("panel"), env.connect("external")
+    env.fetch_skip = {a}
+    for i in range(1, 80):
+        env.o.in1.set_image(np.full((32, 64, 4), (i % 30) / 30.0, np.float32))
+        env.pump()
+    assert len(env.notices(a)) == 1 and len(env.notices(b)) >= 5
+    env.pump(3, dt=E.STALL_S / 2 + 0.1)
+    assert env.x.clients[a].stalled and "1 stalled" in env.o.par.Status.eval()
+    assert "stalled" in capsys.readouterr().out
+    env.o.in1.set_image(np.full((32, 64, 4), 0.5, np.float32))
+    env.pump(20)
+    assert len(env.notices(a)) == 1 and not env.s.closed  # still nothing, and never closed from the cook thread
+    env.fetch(a)  # it wakes up
+    assert not env.x.clients[a].stalled
+    env.pump(2)
+    assert "stalled" not in env.o.par.Status.eval()
+    env.o.in1.set_image(np.full((32, 64, 4), 0.25, np.float32))
+    env.pump(20)
+    assert len(env.notices(a)) == 2  # resumes with a fresh notice for the newest frame
+
+
+class BoundedSocketServer:
+    """Records every byte written to each client, like a kernel socket buffer nobody reads."""
+
+    def __init__(self, server):
+        self.written = {}
+        for name in ("webSocketSendText", "webSocketSendBinary"):
+            orig = getattr(server, name)
+
+            def wrap(client, data, _o=orig):
+                self.written[client] = self.written.get(client, 0) + len(data)
+                return _o(client, data)
+            setattr(server, name, wrap)
+
+
+def test_nothing_but_tiny_json_is_written_to_a_client_that_never_reads():
+    env = Env()
+    env.o.par.Maxinputfps.val = 120
+    sock = BoundedSocketServer(env.s)
+    env.o.inputs = [object()]
+    env.o.in1.set_image(np.zeros((540, 960, 4), np.float32))
+    env.pump()
+    a = env.connect("panel")
+    b = env.connect("external")
+    env.fetch_skip = {a, b}  # neither ever fetches, and neither reads its socket
+    for i in range(600):
+        env.o.in1.set_image(np.full((540, 960, 4), (i % 40) / 40.0, np.float32))
+        env.pump(dt=0.1)  # 60 s of simulated time: past the stall timeout
+    for cid in (a, b):
+        assert sock.written[cid] <= 16 * 1024, sock.written[cid]
+    assert not env.s.binaries
+
+
+def test_fetch_requires_token_and_loopback_and_a_stored_frame(env):
+    env.pump()
+    a = env.connect("panel")
+    assert env.fetch(a)["statusCode"] == 404  # no input, nothing stored
+    env.set_input(64, 32)
+    env.pump(10)
+    cid = env.x.clients[a].cid
+    for pars in ({"client": cid}, {"token": "", "client": cid}, {"token": "nope", "client": cid}):
+        assert env.x.OnHTTPRequest(req(uri="/base", pars=pars), {})["statusCode"] == 403
+    r = env.x.OnHTTPRequest(req(uri="/base", token=env.x.token, clientAddress="10.0.0.9:1"), {})
+    assert r["statusCode"] == 403
+    r = env.x.OnHTTPRequest(req(uri="/base", token=env.x.token, Host="evil.example"), {})
+    assert r["statusCode"] == 403
+    r = env.x.OnHTTPRequest(req(method="POST", uri="/base", token=env.x.token), {})
+    assert r["statusCode"] == 404
+
+
+def test_published_frames_are_immutable_snapshots(env):
+    import hashlib
+    env.o.par.Premultiplied.val = 0
+    env.o.par.Maxinputfps.val = 120
+    env.set_input(64, 32, 1)
+    env.pump()
+    env.connect("panel")
+    env.pump(10)
+    body = env.x.OnHTTPRequest(req(uri="/base", token=env.x.token), {})["data"]
+    digest = hashlib.sha256(body).hexdigest()
+    assert isinstance(body, bytes)
+    for i in range(10):  # later conversions reuse the scratch buffer; the served bytes must not change
+        env.o.in1.set_image(np.random.RandomState(50 + i).rand(32, 64, 4))
+        env.pump(6)
+    assert hashlib.sha256(body).hexdigest() == digest
+
+
+def test_resize_mid_conversion_voids_notices_and_serves_only_the_new_size():
+    env = Env(tick=0.002)
+    env.o.par.Maxinputfps.val = 120
+    env.o.par.Premultiplied.val = 0
+    env.o.inputs = [object()]
+    env.o.in1.set_image(np.random.RandomState(1).rand(540, 960, 4).astype(np.float32))
+    env.pump()
+    a = env.connect("panel")
+    env.fetch_skip = {a}
+    env.pump(40)
+    assert env.x.clients[a].outstanding is not None  # notice for the 960x540 frame, unfetched
+    env.o.in1.set_image(np.random.RandomState(3).rand(540, 960, 4).astype(np.float32))
+    for _ in range(30):  # start another conversion and resize in the middle of it
+        env.pump()
+        if env.x._conv is not None:
+            break
+    assert env.x._conv is not None
+    env.o.in1.set_image(np.random.RandomState(2).rand(40, 80, 4).astype(np.float32))
+    env.pump()
+    assert env.s.messages(a, "docSize")[-1] == {"t": "docSize", "w": 80, "h": 40, "hasInput": True}
+    assert env.x._conv is None and env.x.clients[a].outstanding is None
+    assert env.fetch(a)["statusCode"] == 404  # the old frame is gone, the new one is not ready yet
+    env.pump(30)
+    n = env.notices(a)[-1]
+    assert (n["docW"], n["docH"]) == (80, 40)
+    r = env.fetch(a)
+    assert r["statusCode"] == 200
+    h, _ = P.decode_frame(r["data"])
+    assert (h.doc_w, h.doc_h, h.w, h.h) == (80, 40, 80, 40)
+
+
+def test_reconnect_gets_a_notice_for_the_stored_frame_without_new_readback(env):
+    env.set_input(64, 32, 2)
+    env.pump()
+    a = env.connect("panel")
+    env.run_until_bases(a)
+    reads = env.o.in1.readbacks
+    env.x.OnWebSocketClose(a)
+    b = env.connect("panel")
+    env.pump(5)
+    assert env.o.in1.readbacks == reads
+    assert len(env.notices(b)) == 1 and len(env.fetched[b]) == 1
+    assert env.x.clients[b].cid and env.s.messages(b, "hello")[0]["clientId"] == env.x.clients[b].cid
+
+
+def test_frame_ids_wrap_around_u32_and_stay_consistent(env):
+    env.o.par.Maxinputfps.val = 120
+    env.set_input(64, 32)
+    env.pump()
+    env.x._frame_id = 0xFFFFFFFE
+    a = env.connect("panel")
+    for i in range(4):
+        env.o.in1.set_image(np.full((32, 64, 4), i / 10.0, np.float32))
+        env.pump(8)
+    ids = [n["frameId"] for n in env.notices(a)]
+    assert len(ids) >= 3 and 0 in ids or 1 in ids
+    assert ids == sorted(ids, key=lambda i: (i + 2) % 2 ** 32)  # increasing modulo 2**32
+    assert [h.frame_id for h, _ in env.fetched[a]] == ids and all(0 <= i < 2 ** 32 for i in ids)
+
+
+def test_unfetched_standby_and_active_clients_are_tracked_separately(env):
+    env.set_input(64, 32)
+    env.pump()
+    a, b = env.connect("panel"), env.connect("external")
+    env.fetch_skip = {b}
+    env.pump(10)
+    assert len(env.fetched[a]) == 1 and not env.fetched.get(b)
+    assert len(env.notices(b)) == 1
+    env.fetch(b)
+    assert env.x.clients[b].outstanding is None and env.x.clients[b].fetched == env.x._base_fid
+
+
+def test_fetch_with_unknown_client_id_still_serves_but_marks_nobody(env):
+    env.set_input(64, 32)
+    env.pump(1)
+    a = env.connect("panel")
+    env.fetch_skip = {a}
+    env.pump(10)
+    r = env.x.OnHTTPRequest(req(uri="/base", pars={"token": env.x.token, "client": "ghost"}), {})
+    assert r["statusCode"] == 200 and env.x.clients[a].outstanding is not None
+
+
+# ----------------------------------------------------------------------------- liveness regressions
+
+def test_request_base_renotifies_even_with_an_unfetched_notice_outstanding(env):
+    env.set_input(64, 32)
+    env.pump()
+    a = env.connect("panel")
+    env.fetch_skip = {a}  # the client's fetch "failed": it never fetched the notice
+    env.pump(10)
+    assert len(env.notices(a)) == 1 and env.x.clients[a].outstanding is not None
+    env.send(a, {"t": "requestBase"})
+    assert env.x.clients[a].outstanding is None and not env.x.clients[a].stalled
+    env.pump(3)
+    assert len(env.notices(a)) == 2  # re-announced, not stuck until stalled
+    env.fetch_skip = set()
+    env.pump(3)
+    assert len(env.fetched[a]) == 1
+
+
+def test_request_base_clears_a_stalled_flag(env):
+    env.set_input(64, 32)
+    env.pump()
+    a = env.connect("panel")
+    env.fetch_skip = {a}
+    env.pump(3)
+    env.pump(2, dt=E.STALL_S)
+    assert env.x.clients[a].stalled
+    env.send(a, {"t": "requestBase"})
+    env.pump(3)
+    assert not env.x.clients[a].stalled and len(env.notices(a)) == 2
+
+
+def test_404_on_base_clears_the_clients_outstanding_notice(env):
+    env.set_input(64, 32)
+    env.pump()
+    a = env.connect("panel")
+    env.fetch_skip = {a}
+    env.pump(10)
+    assert env.x.clients[a].outstanding is not None
+    env.x._base_msg = None  # frame vanished between notice and fetch
+    assert env.fetch(a)["statusCode"] == 404
+    assert env.x.clients[a].outstanding is None and env.x.clients[a].fetched is None
+
+
+def test_premultiplied_toggle_does_not_strand_clients_on_the_old_image(env):
+    env.o.par.Maxinputfps.val = 120
+    env.set_input(64, 32, 1)
+    env.pump()
+    a = env.connect("panel")
+    env.fetch_skip = {a}
+    env.pump(10)
+    assert env.x.clients[a].outstanding is not None
+    env.o.par.Premultiplied.val = 0
+    env.x.OnParChange(env.o.par.Premultiplied)
+    assert env.x.clients[a].outstanding is None and not env.x.clients[a].stalled
+    env.fetch_skip = set()
+    env.pump(30)
+    assert len(env.notices(a)) == 2 and len(env.fetched[a]) == 1  # a fresh notice for the re-converted frame
+
+
+def test_resize_clears_outstanding_and_stalled_for_every_client(env):
+    env.set_input(64, 32)
+    env.pump()
+    a, b = env.connect("panel"), env.connect("external")
+    env.fetch_skip = {a, b}
+    env.pump(3)
+    env.pump(2, dt=E.STALL_S)
+    assert env.x.clients[a].stalled
+    env.set_input(80, 40, 2)
+    env.pump()
+    assert all(c.outstanding is None and not c.stalled for c in env.x.clients.values())
+
+
+def test_cors_only_for_loopback_origins_and_tokens_still_required(env):
+    env.set_input(64, 32)
+    env.pump(10)
+    a = env.connect("panel")
+    env.pump(10)
+    cid = env.x.clients[a].cid
+
+    def get(origin=None, token=True, **kw):
+        r = req(uri="/base", pars={"token": env.x.token if token else "bad", "client": cid}, **kw)
+        if origin is not None:
+            r["Origin"] = origin
+        return env.x.OnHTTPRequest(r, {})
+
+    for origin in ("http://localhost:5173", "http://127.0.0.1:5173", "http://[::1]:5173", "http://localhost"):
+        r = get(origin)
+        assert r["statusCode"] == 200 and r["Access-Control-Allow-Origin"] == origin and r["Vary"] == "Origin"
+    for origin in ("https://localhost:5173", "http://evil.example", "http://localhost.evil.example", "null",
+                   "http://127.0.0.1.evil.example:80", None):
+        assert "Access-Control-Allow-Origin" not in get(origin)
+    r = get("http://localhost:5173", token=False)  # errors are readable by the page too, but never skip auth
+    assert r["statusCode"] == 403 and r["Access-Control-Allow-Origin"] == "http://localhost:5173"
+    assert get("http://localhost:5173", clientAddress="10.1.1.1:5")["statusCode"] == 403
+    env.x._base_msg = None
+    assert get("http://localhost:5173")["Access-Control-Allow-Origin"] == "http://localhost:5173"  # 404 too
+
+
+def test_frame_id_is_never_reset_by_invalidations_or_active_toggles(env):
+    env.o.par.Maxinputfps.val = 120
+    env.set_input(64, 32)
+    env.pump()
+    env.connect("panel")
+    env.pump(10)
+    seen = [env.x._frame_id]
+    for step in ("premult", "resize", "active"):
+        if step == "premult":
+            env.o.par.Premultiplied.val = 0
+            env.x.OnParChange(env.o.par.Premultiplied)
+        elif step == "resize":
+            env.set_input(80, 40, 2)
+        else:
+            env.o.par.Active.val = 0
+            env.x.OnParChange(env.o.par.Active)
+            env.o.par.Active.val = 1
+            env.x.OnParChange(env.o.par.Active)
+        env.pump(20)
+        seen.append(env.x._frame_id)
+    assert seen == sorted(seen) and seen[2] > seen[0] and seen[0] > 0  # monotonic across premult, resize and a restart

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  decodeFrame, decodeTdMessage, decodeWebMessage, encodeBands, encodeFrame, encodeMessage, isStale,
+  decodeFrame, decodeTdMessage, decodeWebMessage, encodeBands, encodeFrame, encodeMessage, isStale, PROTOCOL_VERSION,
   FRAME_BASE, FRAME_COMPOSITE, HEADER_BYTES, MAX_BAND_PAYLOAD, type FrameHeader,
 } from '../../src/bridge/codec';
 
@@ -139,10 +139,28 @@ describe('banding', () => {
   });
 });
 
+describe('protocol v2 messages', () => {
+  it('is protocol version 2', () => { expect(PROTOCOL_VERSION).toBe(2); });
+
+  it('decodes a base notice and rejects incomplete ones', () => {
+    const n = { t: 'base', frameId: 4000000000, docW: 1920, docH: 1080, x: 0, y: 0, w: 1920, h: 1080 } as const;
+    expect(decodeTdMessage(encodeMessage(n))).toEqual(n);
+    expect(decodeTdMessage('{"t":"base","frameId":1}')).toBeNull();
+    expect(decodeTdMessage('{"t":"base","frameId":"1","docW":1,"docH":1,"x":0,"y":0,"w":1,"h":1}')).toBeNull();
+  });
+
+  it('keeps clientId from hello (empty when absent) and no longer knows ack', () => {
+    const h = { t: 'hello', protocol: 2, doc: { w: 4, h: 4 }, hasInput: false, maxSendFps: 30, active: true };
+    expect(decodeTdMessage(JSON.stringify({ ...h, clientId: 'abc' }))).toEqual({ ...h, clientId: 'abc' });
+    expect(decodeTdMessage(JSON.stringify(h))).toEqual({ ...h, clientId: '' });
+    expect(decodeWebMessage('{"t":"ack","frameId":1}')).toBeNull();
+  });
+});
+
 describe('json messages', () => {
   it('web messages round trip', () => {
     const msgs = [
-      { t: 'ready', protocol: 1, client: 'panel', version: '0.1.0', token: 'abc' },
+      { t: 'ready', protocol: 2, client: 'panel', version: '0.1.0', token: 'abc' },
       { t: 'takeover' },
       { t: 'requestBase' },
       { t: 'log', level: 'warn', msg: 'x' },
@@ -151,7 +169,7 @@ describe('json messages', () => {
   });
 
   it('td messages round trip and strip unknown fields', () => {
-    const hello = { t: 'hello', protocol: 1, doc: { w: 1920, h: 1080 }, hasInput: true, maxSendFps: 30, active: false } as const;
+    const hello = { t: 'hello', protocol: 2, doc: { w: 1920, h: 1080 }, hasInput: true, maxSendFps: 30, active: false, clientId: 'c1' } as const;
     expect(decodeTdMessage(encodeMessage(hello))).toEqual(hello);
     expect(decodeTdMessage(JSON.stringify({ ...hello, extra: 1 }))).toEqual(hello);
     expect(decodeTdMessage('{"t":"docSize","w":4,"h":5,"hasInput":false}')).toEqual({ t: 'docSize', w: 4, h: 5, hasInput: false });

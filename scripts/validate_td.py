@@ -13,6 +13,7 @@ import argparse
 import base64
 import hashlib
 import http.client
+import select
 import json
 import os
 import socket
@@ -170,40 +171,91 @@ class WS:
             m = self._parse()
             if m is not None:
                 return m
-            left = end - time.time()
-            if left <= 0:
+            # select even with a zero timeout: recv(0) must still pick up bytes that are waiting
+            if not select.select([self.sock], [], [], max(0.0, end - time.time()))[0]:
                 return None
-            self.sock.settimeout(left)
-            try:
-                chunk = self.sock.recv(1 << 20)
-            except socket.timeout:
-                return None
+            chunk = self.sock.recv(1 << 20)
             if not chunk:
                 raise ConnectionError("closed")
             self.buf += chunk
 
     def close(self):
+        """Close handshake: send a close frame, keep reading so TD can finish writing, then drop."""
         try:
-            self.sock.close()
+            self.sock.sendall(bytes([0x88, 0x82]) + b"\0\0\0\0" + struct.pack(">H", 1000))
+            end = time.time() + 2
+            while time.time() < end:
+                try:
+                    if self.recv(0.2) is None and not self.buf:
+                        continue
+                except ConnectionError:
+                    break
         except OSError:
             pass
+        finally:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
 
 
 def ready_msg(client="external"):
     token = td("print(comp.ext.RasterEditorExt.token)").strip()
-    return json.dumps({"t": "ready", "protocol": 1, "client": client, "version": "validate", "token": token})
+    return json.dumps({"t": "ready", "protocol": 2, "client": client, "version": "validate", "token": token})
 
 
-def drain(ws, seconds):
-    """Collect (texts, binaries) for a while."""
-    texts, bins = [], []
-    end = time.time() + seconds
-    while time.time() < end:
-        m = ws.recv(0.2)
-        if m is None:
-            continue
-        (texts if isinstance(m, str) else bins).append(json.loads(m) if isinstance(m, str) else m)
-    return texts, bins
+def get_base(port, token, client_id, frame_id=0):
+    """GET /base (PROTOCOL.md section 4): the newest BASE frame message, or None on 404."""
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    c.request("GET", f"/base?token={token}&client={client_id}&frameId={frame_id}")
+    r = c.getresponse()
+    body = r.read()
+    c.close()
+    return body if r.status == 200 else None
+
+
+class Editor:
+    """A fake web client: WebSocket + the pull of every `base` notice, like the real bridge."""
+
+    def __init__(self, port, kind="external"):
+        self.port = port
+        self.ws = WS(port)
+        self.token = td("print(comp.ext.RasterEditorExt.token)").strip()
+        self.client_id = None
+        self.texts, self.bases, self.notices = [], [], 0
+        self.ws.send(json.dumps({"t": "ready", "protocol": 2, "client": kind, "version": "validate", "token": self.token}))
+
+    def poll(self, timeout=0.0):
+        """Handle everything that arrived; fetch frames for notices. Returns the messages handled."""
+        got = []
+        while True:
+            m = self.ws.recv(timeout)
+            timeout = 0.0
+            if m is None:
+                return got
+            if isinstance(m, bytes):
+                continue  # TD must never send binary down the WebSocket in protocol 2
+            msg = json.loads(m)
+            self.texts.append(msg)
+            got.append(msg)
+            if msg["t"] == "hello":
+                self.client_id = msg["clientId"]
+            elif msg["t"] == "base":
+                self.notices += 1
+                body = get_base(self.port, self.token, self.client_id, msg["frameId"])
+                if body is not None:
+                    self.bases.append(body)
+
+    def run(self, seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            self.poll(0.1)
+
+    def send(self, obj):
+        self.ws.send(json.dumps(obj))
+
+    def close(self):
+        self.ws.close()
 
 
 def assemble(bins, w, h):
@@ -326,17 +378,19 @@ def s5_input(args):
 
 def real_ui_input_roundtrip(args):
     got = wait_for(lambda: td_json("print(json.dumps(comp.op('out_switch').par.index.eval()))") == 1, 3)
+    # the editor first answers with a blank composite; the red base (banded, several frames) follows
+    wait_for(lambda: px_near(pixel(COMP + "/out1", 0.5, 0.5), (255, 0, 0, 255)), 5, 0.2)
     p = pixel(COMP + "/out1", 0.5, 0.5)
     ok = got and px_near(p, (255, 0, 0, 255))
     return bool(ok), f"switch index==1: {bool(got)}, centre={p}, status={status()!r}"
 
 
 def fake_client_input_roundtrip(args):
-    ws = WS(args.port)
+    ed = Editor(args.port)
     try:
-        ws.send(ready_msg())
-        ws.send(json.dumps({"t": "takeover"}))
-        texts, bins = drain(ws, 2.5)
+        ed.send({"t": "takeover"})
+        ed.run(2.5)
+        texts, bins = ed.texts, ed.bases
         hello = next((t for t in texts if t["t"] == "hello"), None)
         active = [t["active"] for t in texts if t["t"] == "active"]
         if not hello or hello["doc"] != {"w": IW, "h": IH} or not hello["hasInput"]:
@@ -344,12 +398,11 @@ def fake_client_input_roundtrip(args):
         if not active or active[-1] is not True:
             return False, f"takeover failed: {texts}"
         img, complete, ids = assemble(bins, IW, IH)
-        # one complete BASE frame (maybe repeated); red input, centre must be opaque red
         if not complete:
-            return False, f"BASE frame incomplete ({len(bins)} bands)"
+            return False, f"BASE frame incomplete ({len(bins)} fetched)"
         if not px_near(tuple(int(c) for c in img[IH // 2, IW // 2]), (255, 0, 0, 255), 1):
             return False, f"BASE centre pixel {img[IH // 2, IW // 2].tolist()}"
-        send_frame(ws, 1, (IW, IH), (0, 0, IW, IH), composite_image(IW, IH))
+        send_frame(ed.ws, 1, (IW, IH), (0, 0, IW, IH), composite_image(IW, IH))
         ok = wait_for(lambda: td_json("print(json.dumps(comp.op('out_switch').par.index.eval()))") == 1, 3)
         time.sleep(0.2)
         centre = pixel(COMP + "/out1", 0.5, 0.5)
@@ -359,10 +412,11 @@ def fake_client_input_roundtrip(args):
         want_t = (200 * 128 / 255, 100 * 128 / 255, 50 * 128 / 255, 128)
         good = (ok and px_near(centre, (0, 200, 0, 255)) and px_near(marker, (255, 0, 255, 255))
                 and px_near(below, (0, 200, 0, 255)) and px_near(trans, want_t, 3))
-        return bool(good), (f"BASE ok ({len(bins)} bands); out1 switch={bool(ok)} centre={centre} marker(top-left)={marker} "
-                            f"bottom-left={below} translucent={trans} want {[round(c, 1) for c in want_t]}")
+        return bool(good), (f"BASE fetched over HTTP ({len(bins)} frame(s), {len(bins[-1]) if bins else 0} bytes); out1 switch={bool(ok)} "
+                            f"centre={centre} marker(top-left)={marker} bottom-left={below} translucent={trans} "
+                            f"want {[round(c, 1) for c in want_t]}")
     finally:
-        ws.close()
+        ed.close()
 
 
 UI_JS_POST = ("fetch('/__test?token='+encodeURIComponent(new URLSearchParams(location.search).get('token')),"
@@ -470,12 +524,11 @@ def s10_perf(args):
     frames_sent, send_s = 0, 0.0
     if args.fake_client or args.skip_ui:
         driver = "fake client: 256x256 composite rects at ~60 Hz for 6 s while the 1080p input changes ~7x/s, then a full 1080p frame"
-        ws = WS(args.port)
+        ed = Editor(args.port)
         try:
-            ws.send(ready_msg())
-            ws.send(json.dumps({"t": "takeover"}))
-            texts, _ = drain(ws, 0.8)
-            hello = next(t for t in texts if t["t"] == "hello")
+            ed.send({"t": "takeover"})
+            ed.run(0.8)
+            hello = next(t for t in ed.texts if t["t"] == "hello")
             dw, dh = hello["doc"]["w"], hello["doc"]["h"]
             import numpy as np
             tile = np.random.RandomState(1).randint(0, 256, (256, 256, 4), dtype=np.uint8)
@@ -484,21 +537,21 @@ def s10_perf(args):
             while time.time() < end:
                 x = (n * 37) % max(1, dw - 256)
                 y = (n * 23) % max(1, dh - 256)
-                send_frame(ws, n, (dw, dh), (x, y, 256, 256), tile)
+                send_frame(ed.ws, n, (dw, dh), (x, y, 256, 256), tile)
                 if n % 8 == 0:
                     toggle_input(n // 8)
                 n += 1
-                while ws.recv(0) is not None:  # keep the socket drained (BASE frames keep arriving)
-                    pass
+                ed.poll(0)  # read notices, pull the frames
                 time.sleep(1 / 60)
             full = np.random.RandomState(2).randint(0, 256, (dh, dw, 4), dtype=np.uint8)
             t0 = time.time()
-            send_frame(ws, n, (dw, dh), (0, 0, dw, dh), full)
+            send_frame(ed.ws, n, (dw, dh), (0, 0, dw, dh), full)
             send_s = time.time() - t0
             frames_sent = n
-            drain(ws, 0.5)
+            ed.run(0.5)
+            driver += f"; {ed.notices} base notices, {len(ed.bases)} frames fetched"
         finally:
-            ws.close()
+            ed.close()
     else:
         driver = "mouse drag with the brush for ~6 s while the 1080p input changes"
         js("window.__editorTest.addLayer()")
@@ -513,18 +566,64 @@ def s10_perf(args):
             i += 1
             drag_doc(pts, perf=True)
     st = td_json("print(json.dumps(comp.GetStats()))")
-    p, q, c, cv, rb, sd = (st[k] for k in ("pump", "paste", "cook", "convert", "readback", "send"))
+    p, q, c, cv, rb, sd = (st[k] for k in ("pump", "paste", "cook", "convert", "readback", "publish"))
     checks = [("Pump worst <= 50 ms", p["max"] <= 50), ("256x256 band paste median <= 2 ms", q["median"] <= 2.0 or driver.startswith("mouse")),
               ("paste+upload median <= 4 ms", q["median"] + c["median"] <= 4.0),
               ("input readback worst <= 15 ms (DESIGN 6)", rb["max"] <= 15), ("convert slice worst <= 8 ms", cv["max"] <= 8),
-              ("send (one 2 MB band) worst <= 15 ms", sd["max"] <= 15)]
+              ("publish (8 MB copy) worst <= 15 ms", sd["max"] <= 15)]
     ok = all(v for _, v in checks)
     def f(d):
         return f"median {d['median']:.2f} worst {d['max']:.2f} (n={d['n']})"
     return ok, (f"driver: {driver}\n        Pump ms: {f(p)}\n        band paste ms: {f(q)} | composite cook/upload ms: {f(c)}"
-                f"\n        input readback ms: {f(rb)} | convert slice ms: {f(cv)} | band send ms: {f(sd)}"
+                f"\n        input readback ms: {f(rb)} | convert slice ms: {f(cv)} | publish ms: {f(sd)}"
                 + (f"\n        sent {frames_sent} tiles + full frame in {send_s * 1000:.0f} ms (client side)" if frames_sent else "")
                 + "\n        " + "; ".join(f"{'ok' if v else 'FAIL'}: {n}" for n, v in checks))
+
+
+def s11_stalled_client(args):
+    """Clients that stop reading must not freeze TD: (1) an HTTP client that GETs /base and never reads the
+    body, (2) a WebSocket client that never reads or fetches. Both then vanish with a RST. Run last."""
+    connect_input()
+    wait_for(lambda: out1_size() == [IW, IH], 3)
+    token = td("print(comp.ext.RasterEditorExt.token)").strip()
+    ed = Editor(args.port)  # a healthy client first, so a frame is stored and its notice flows
+    ed.run(1.5)
+    ws_stalled = WS(args.port)
+    ws_stalled.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    ws_stalled.send(ready_msg())
+    http_stalled = socket.socket()
+    http_stalled.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    http_stalled.connect(("127.0.0.1", args.port))
+    http_stalled.sendall(f"GET /base?token={token}&client=x HTTP/1.1\r\nHost: 127.0.0.1:{args.port}\r\n\r\n".encode())
+    worst = 0.0
+    for i in range(40):  # keep changing the 1080p input: nothing may block TD
+        toggle_input(i)
+        t0 = time.time()
+        td_json("print(json.dumps(1))")
+        worst = max(worst, time.time() - t0)
+        ed.poll(0)
+        time.sleep(0.05)
+    outstanding = td_json("print(json.dumps(sorted(1 for c in comp.ext.RasterEditorExt.clients.values() if c.outstanding is not None)))")
+    stalled = wait_for(lambda: (ed.poll(0) or True) and "stalled" in status(), 14, 0.5)
+    for sock in (ws_stalled.sock, http_stalled):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sock.close()  # abrupt reset with unread data
+    alive = worst < 2
+    for _ in range(12):
+        t0 = time.time()
+        try:
+            td_json("print(json.dumps(len(comp.ext.RasterEditorExt.clients)))")
+        except Exception as e:  # noqa: BLE001
+            ed.close()
+            return False, f"TD stopped responding after the abrupt close: {e} -> restart TD (kill, then open -a TouchDesigner)"
+        alive = alive and time.time() - t0 < 2
+        ed.poll(0)
+        time.sleep(0.25)
+    healthy = ed.notices >= 2  # the well-behaved client kept receiving notices throughout
+    ed.close()
+    ok = alive and bool(stalled) and healthy
+    return ok, (f"TD worst round trip while two clients hung and the input changed: {worst * 1000:.0f} ms; stalled in Status: {bool(stalled)}; "
+                f"responsive after resets: {alive}; healthy client got {ed.notices} notices; clients with an unfetched notice: {len(outstanding)}")
 
 
 def main():
@@ -549,6 +648,7 @@ def main():
             step(8, "hidden layer does not change output", lambda: s8_layer(args))
         step(9, "disconnect input: out1 back to Docw x Doch", lambda: s9_disconnect(args))
         step(10, "performance while streaming / dragging", lambda: s10_perf(args))
+        step(11, "stalled client (never reads or acks, then RST): bounded, TD stays responsive", lambda: s11_stalled_client(args))
     finally:
         try:
             restore = "\n".join(f"comp.par.{k} = {v!r}" for k, v in ORIG.items())

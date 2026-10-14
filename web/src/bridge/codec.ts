@@ -3,7 +3,7 @@
 export const MAGIC = [0x52, 0x45, 0x46, 0x31]; // "REF1"
 export const HEADER_BYTES = 24;
 export const MAX_BAND_PAYLOAD = 2 * 1024 * 1024;
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 export const FRAME_BASE = 1;
 export const FRAME_COMPOSITE = 2;
 export const FLAG_FRAME_END = 1;
@@ -123,7 +123,8 @@ export type WebMessage =
   | { t: 'log'; level: 'info' | 'warn' | 'error'; msg: string };
 
 export type TdMessage =
-  | { t: 'hello'; protocol: number; doc: { w: number; h: number }; hasInput: boolean; maxSendFps: number; active: boolean }
+  | { t: 'hello'; protocol: number; doc: { w: number; h: number }; hasInput: boolean; maxSendFps: number; active: boolean; clientId: string }
+  | { t: 'base'; frameId: number; docW: number; docH: number; x: number; y: number; w: number; h: number }
   | { t: 'docSize'; w: number; h: number; hasInput: boolean }
   | { t: 'active'; active: boolean }
   | { t: 'error'; msg: string };
@@ -154,7 +155,11 @@ export function decodeTdMessage(text: string): TdMessage | null {
   switch (o.t) {
     case 'hello':
       return isNum(o.protocol) && doc && isSize(doc.w) && isSize(doc.h) && isBool(o.hasInput) && isNum(o.maxSendFps) && isBool(o.active)
-        ? { t: 'hello', protocol: o.protocol, doc: { w: doc.w, h: doc.h }, hasInput: o.hasInput, maxSendFps: o.maxSendFps, active: o.active }
+        ? { t: 'hello', protocol: o.protocol, doc: { w: doc.w, h: doc.h }, hasInput: o.hasInput, maxSendFps: o.maxSendFps, active: o.active, clientId: isStr(o.clientId) ? o.clientId : '' }
+        : null;
+    case 'base':
+      return isNum(o.frameId) && isSize(o.docW) && isSize(o.docH) && isNum(o.x) && isNum(o.y) && isSize(o.w) && isSize(o.h)
+        ? { t: 'base', frameId: o.frameId, docW: o.docW, docH: o.docH, x: o.x, y: o.y, w: o.w, h: o.h }
         : null;
     case 'docSize':
       return isSize(o.w) && isSize(o.h) && isBool(o.hasInput) ? { t: 'docSize', w: o.w, h: o.h, hasInput: o.hasInput } : null;
