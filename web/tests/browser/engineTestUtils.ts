@@ -76,3 +76,25 @@ export function nextFrame(): Promise<void> {
 export function near(a: ArrayLike<number>, b: ArrayLike<number>, tol = 2): boolean {
   return a.length === b.length && Array.from(a).every((v, i) => Math.abs(v - b[i]) <= tol);
 }
+
+/** Grey value (r channel) of a mask slot at one pixel. */
+export function maskAt(e: Engine, slot: number, x: number, y: number): number {
+  return e.readSurface(slot, { x, y, w: 1, h: 1 })[0];
+}
+
+/** Straight RGBA of a surface slot at one pixel. */
+export function slotPx(e: Engine, slot: number, x: number, y: number): Px {
+  const d = e.readSurface(slot, { x, y, w: 1, h: 1 });
+  return [d[0], d[1], d[2], d[3]];
+}
+
+/** A pixel layer filled with a solid colour (whole document), made active. */
+export function solidLayer(e: Engine, css: string, name?: string): string {
+  const id = e.addPixelLayer(name);
+  drawRect(e, id, { x: 0, y: 0, w: e.width, h: e.height }, css);
+  return id;
+}
+
+export function slotOf(e: Engine, id: string): number {
+  return e.layers().find((l) => l.id === id)?.slot as number;
+}

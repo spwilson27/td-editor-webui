@@ -149,11 +149,9 @@ describe('LayersPanel settings and footer', () => {
     await settle();
     expect(engine.layers().some((l) => l.kind === 'group')).toBe(false);
 
-    for (const label of ['Add mask', 'New adjustment', 'Layer effects']) {
-      const b = q(`[aria-label="${label}"]`);
-      expect(b.getAttribute('aria-disabled')).toBe('true');
-      expect(b.title).toContain('Not in this version');
-    }
+    const fx = q('[aria-label="Layer effects"]');
+    expect(fx.getAttribute('aria-disabled')).toBe('true');
+    expect(fx.title).toContain('Not in this version');
   });
 
   it('does not delete the base layer', async () => {

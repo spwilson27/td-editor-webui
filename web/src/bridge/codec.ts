@@ -1,18 +1,23 @@
-// Pure encode/decode of docs/PROTOCOL.md. No sockets here.
+// Pure encode/decode of docs/PROTOCOL.md (version 3). No sockets here.
+import type { LayerSpec } from '../engine/types';
 
 export const MAGIC = [0x52, 0x45, 0x46, 0x31]; // "REF1"
 export const HEADER_BYTES = 24;
 export const MAX_BAND_PAYLOAD = 2 * 1024 * 1024;
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 export const FRAME_BASE = 1;
-export const FRAME_COMPOSITE = 2;
+export const FRAME_SURFACE = 3;
+export const FRAME_SURFACE_DUMP = 4;
+export const FRAME_VIEW = 5;
 export const FLAG_FRAME_END = 1;
 
-export type FrameType = typeof FRAME_BASE | typeof FRAME_COMPOSITE;
+export type FrameType = typeof FRAME_BASE | typeof FRAME_SURFACE | typeof FRAME_SURFACE_DUMP | typeof FRAME_VIEW;
+const VALID_TYPES: readonly number[] = [FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_VIEW];
 
 export interface FrameHeader {
   type: FrameType;
   frameEnd: boolean;
+  slot: number; // surface slot (SURFACE / SURFACE_DUMP); 0 otherwise
   frameId: number;
   docW: number;
   docH: number;
@@ -32,17 +37,17 @@ export type DecodedFrame = { ok: true; frame: Frame } | { ok: false; error: Fram
 const U16 = 0xffff;
 
 function checkHeader(h: FrameHeader): void {
-  const fields = [h.docW, h.docH, h.x, h.y, h.w, h.h];
+  const fields = [h.slot, h.docW, h.docH, h.x, h.y, h.w, h.h];
   if (!fields.every((n) => Number.isInteger(n) && n >= 0 && n <= U16)) throw new RangeError('frame field out of u16 range');
   if (h.w < 1 || h.h < 1 || h.x + h.w > h.docW || h.y + h.h > h.docH) throw new RangeError('frame rect outside document');
-  if (h.type !== FRAME_BASE && h.type !== FRAME_COMPOSITE) throw new RangeError('bad frame type');
+  if (!VALID_TYPES.includes(h.type)) throw new RangeError('bad frame type');
 }
 
 function writeHeader(view: DataView, bytes: Uint8Array, h: FrameHeader): void {
   bytes.set(MAGIC, 0);
   view.setUint8(4, h.type);
   view.setUint8(5, h.frameEnd ? FLAG_FRAME_END : 0);
-  view.setUint16(6, 0, true);
+  view.setUint16(6, h.slot, true);
   view.setUint32(8, h.frameId >>> 0, true);
   view.setUint16(12, h.docW, true);
   view.setUint16(14, h.docH, true);
@@ -64,6 +69,7 @@ export function encodeFrame(h: FrameHeader, payload: Uint8Array | Uint8ClampedAr
 
 export interface BandParams {
   type: FrameType;
+  slot?: number;
   frameId: number;
   docW: number;
   docH: number;
@@ -78,7 +84,7 @@ export function* encodeBands(p: BandParams): Generator<Uint8Array> {
   const rowBytes = rect.w * 4;
   const max = p.maxPayload ?? MAX_BAND_PAYLOAD;
   if (rowBytes > max) throw new RangeError('a single row exceeds the band size');
-  const base: FrameHeader = { type: p.type, frameEnd: false, frameId: p.frameId, docW: p.docW, docH: p.docH, x: rect.x, y: rect.y, w: rect.w, h: rect.h };
+  const base: FrameHeader = { type: p.type, frameEnd: false, slot: p.slot ?? 0, frameId: p.frameId, docW: p.docW, docH: p.docH, x: rect.x, y: rect.y, w: rect.w, h: rect.h };
   checkHeader(base);
   if (p.pixels.length !== rowBytes * rect.h) throw new RangeError('pixels length != w*h*4');
   const rows = Math.floor(max / rowBytes);
@@ -97,9 +103,9 @@ export function decodeFrame(data: ArrayBuffer | ArrayBufferView): DecodedFrame {
   if (MAGIC.some((m, i) => bytes[i] !== m)) return { ok: false, error: 'bad-magic' };
   const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const type = v.getUint8(4);
-  if (type !== FRAME_BASE && type !== FRAME_COMPOSITE) return { ok: false, error: 'bad-type' };
+  if (!VALID_TYPES.includes(type)) return { ok: false, error: 'bad-type' };
   const frame: Frame = {
-    type, frameEnd: (v.getUint8(5) & FLAG_FRAME_END) !== 0, frameId: v.getUint32(8, true),
+    type: type as FrameType, frameEnd: (v.getUint8(5) & FLAG_FRAME_END) !== 0, slot: v.getUint16(6, true), frameId: v.getUint32(8, true),
     docW: v.getUint16(12, true), docH: v.getUint16(14, true),
     x: v.getUint16(16, true), y: v.getUint16(18, true), w: v.getUint16(20, true), h: v.getUint16(22, true),
     payload: bytes.subarray(HEADER_BYTES),
@@ -116,15 +122,27 @@ export function isStale(f: FrameHeader, docW: number, docH: number): boolean {
 
 // ---- JSON messages ----
 
+export type ClientKind = 'panel' | 'external';
+export type ViewMode = 'local' | 'td';
+export type LogLevel = 'info' | 'warn' | 'error';
+
+export interface ViewRect { x: number; y: number; w: number; h: number }
+
 export type WebMessage =
-  | { t: 'ready'; protocol: number; client: 'panel' | 'external'; version: string; token: string }
+  | { t: 'ready'; protocol: number; client: ClientKind; version: string; token: string; fresh: boolean }
+  | { t: 'doc'; rev: number; layers: LayerSpec[] }
+  | { t: 'requestDoc' }
+  | { t: 'view'; mode: ViewMode; zoom: number; panX: number; panY: number; rect: ViewRect }
   | { t: 'takeover' }
   | { t: 'requestBase' }
-  | { t: 'log'; level: 'info' | 'warn' | 'error'; msg: string };
+  | { t: 'log'; level: LogLevel; msg: string };
 
 export type TdMessage =
-  | { t: 'hello'; protocol: number; doc: { w: number; h: number }; hasInput: boolean; maxSendFps: number; active: boolean; clientId: string }
+  | { t: 'hello'; protocol: number; doc: { w: number; h: number }; hasInput: boolean; maxSendFps: number; active: boolean; clientId: string; hasDocument: boolean; rev: number | null }
+  | { t: 'docState'; rev: number; layers: LayerSpec[]; docW: number; docH: number }
   | { t: 'base'; frameId: number; docW: number; docH: number; x: number; y: number; w: number; h: number }
+  | { t: 'view'; frameId: number; docW: number; docH: number; w: number; h: number; appliedFrameId: number }
+  | { t: 'applied'; frameId: number; tdFrame: number }
   | { t: 'docSize'; w: number; h: number; hasInput: boolean }
   | { t: 'active'; active: boolean }
   | { t: 'error'; msg: string };
@@ -147,6 +165,9 @@ function parseObject(text: string): Record<string, unknown> | null {
   }
 }
 
+const isLayers = (v: unknown): v is LayerSpec[] =>
+  Array.isArray(v) && v.every((l) => l !== null && typeof l === 'object' && isStr((l as LayerSpec).id) && isStr((l as LayerSpec).kind));
+
 /** Parse a TD → web message. Unknown types, unknown fields and malformed messages yield null / are dropped. */
 export function decodeTdMessage(text: string): TdMessage | null {
   const o = parseObject(text);
@@ -155,12 +176,25 @@ export function decodeTdMessage(text: string): TdMessage | null {
   switch (o.t) {
     case 'hello':
       return isNum(o.protocol) && doc && isSize(doc.w) && isSize(doc.h) && isBool(o.hasInput) && isNum(o.maxSendFps) && isBool(o.active)
-        ? { t: 'hello', protocol: o.protocol, doc: { w: doc.w, h: doc.h }, hasInput: o.hasInput, maxSendFps: o.maxSendFps, active: o.active, clientId: isStr(o.clientId) ? o.clientId : '' }
+        ? {
+          t: 'hello', protocol: o.protocol, doc: { w: doc.w, h: doc.h }, hasInput: o.hasInput, maxSendFps: o.maxSendFps, active: o.active,
+          clientId: isStr(o.clientId) ? o.clientId : '', hasDocument: o.hasDocument === true, rev: isNum(o.rev) ? o.rev : null,
+        }
+        : null;
+    case 'docState':
+      return isNum(o.rev) && isLayers(o.layers) && isSize(o.docW) && isSize(o.docH)
+        ? { t: 'docState', rev: o.rev, layers: o.layers, docW: o.docW, docH: o.docH }
         : null;
     case 'base':
       return isNum(o.frameId) && isSize(o.docW) && isSize(o.docH) && isNum(o.x) && isNum(o.y) && isSize(o.w) && isSize(o.h)
         ? { t: 'base', frameId: o.frameId, docW: o.docW, docH: o.docH, x: o.x, y: o.y, w: o.w, h: o.h }
         : null;
+    case 'view':
+      return isNum(o.frameId) && isSize(o.docW) && isSize(o.docH) && isSize(o.w) && isSize(o.h)
+        ? { t: 'view', frameId: o.frameId, docW: o.docW, docH: o.docH, w: o.w, h: o.h, appliedFrameId: isNum(o.appliedFrameId) ? o.appliedFrameId : -1 }
+        : null;
+    case 'applied':
+      return isNum(o.frameId) ? { t: 'applied', frameId: o.frameId, tdFrame: isNum(o.tdFrame) ? o.tdFrame : 0 } : null;
     case 'docSize':
       return isSize(o.w) && isSize(o.h) && isBool(o.hasInput) ? { t: 'docSize', w: o.w, h: o.h, hasInput: o.hasInput } : null;
     case 'active':
@@ -179,8 +213,18 @@ export function decodeWebMessage(text: string): WebMessage | null {
   switch (o.t) {
     case 'ready':
       return isNum(o.protocol) && (o.client === 'panel' || o.client === 'external') && isStr(o.version)
-        ? { t: 'ready', protocol: o.protocol, client: o.client, version: o.version, token: isStr(o.token) ? o.token : '' }
+        ? { t: 'ready', protocol: o.protocol, client: o.client, version: o.version, token: isStr(o.token) ? o.token : '', fresh: o.fresh === true }
         : null;
+    case 'doc':
+      return isNum(o.rev) && isLayers(o.layers) ? { t: 'doc', rev: o.rev, layers: o.layers } : null;
+    case 'requestDoc':
+      return { t: 'requestDoc' };
+    case 'view': {
+      const r = o.rect as Record<string, unknown> | undefined;
+      return (o.mode === 'local' || o.mode === 'td') && isNum(o.zoom) && isNum(o.panX) && isNum(o.panY) && r && isNum(r.x) && isNum(r.y) && isNum(r.w) && isNum(r.h)
+        ? { t: 'view', mode: o.mode, zoom: o.zoom, panX: o.panX, panY: o.panY, rect: { x: r.x, y: r.y, w: r.w, h: r.h } }
+        : null;
+    }
     case 'takeover':
       return { t: 'takeover' };
     case 'requestBase':

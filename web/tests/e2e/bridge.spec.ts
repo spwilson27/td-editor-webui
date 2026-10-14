@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 import { FakeTd } from './fakeTd';
+import type { LayerSpec } from '../../src/engine/types';
 
 let td: FakeTd;
 test.beforeEach(async () => { td = await FakeTd.start({ w: 160, h: 90 }); });
@@ -15,7 +16,7 @@ const hook = <T,>(page: Page, fn: string, ...args: unknown[]) =>
 test('connects, says ready as the panel client and shows the linked state', async ({ page }) => {
   await open(page);
   await td.waitFor(() => td.messages.length > 0);
-  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 2, client: 'panel', token: td.token });
+  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 3, client: 'panel', token: td.token, fresh: true });
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   expect((await hook<any>(page, 'state')).doc).toEqual({ w: 160, h: 90 });
 });
@@ -26,14 +27,14 @@ test('defaults to the external client', async ({ page }) => {
   expect(td.messages[0]).toMatchObject({ t: 'ready', client: 'external' });
 });
 
-test('base frames from TD appear in the document and come back as a composite', async ({ page }) => {
+test('base frames from TD appear in the document', async ({ page }) => {
   await open(page);
   await td.waitFor(() => td.frameEnds >= 1);
   td.sendSolidBase(200, 30, 10);
   await expect.poll(() => hook<number[]>(page, 'readPixel', 80, 45)).toEqual([200, 30, 10, 255]);
-  await td.waitFor(() => td.pixel(80, 45)[0] === 200);
-  expect(td.pixel(0, 0)).toEqual([200, 30, 10, 255]);
-  expect(td.pixel(159, 89)).toEqual([200, 30, 10, 255]);
+  expect(await hook<number[]>(page, 'readPixel', 0, 0)).toEqual([200, 30, 10, 255]);
+  expect(await hook<number[]>(page, 'readPixel', 159, 89)).toEqual([200, 30, 10, 255]);
+  expect(td.frames.every((f) => f.type === 3)).toBe(true); // only SURFACE tiles go to TD, never a composite
 });
 
 test('a burst of BASE frames arrives via notices: one outstanding, newest wins, nothing lost at the end', async ({ page }) => {
@@ -47,7 +48,6 @@ test('a burst of BASE frames arrives via notices: one outstanding, newest wins, 
   expect(td.badFetches).toBe(0);
   expect(td.fetches.every((f) => f.status === 200)).toBe(true);
   expect(td.fetches.length).toBeLessThanOrEqual(shades.length);
-  await td.waitFor(() => td.pixel(80, 45)[0] === 210);
 
   // and a later frame still flows after the burst
   td.sendSolidBase(5, 6, 7);
@@ -100,11 +100,14 @@ test('a fetch result that arrives after docSize is dropped; the new-size frame w
   await expect.poll(() => hook<number[]>(page, 'readPixel', 79, 59)).toEqual([0, 200, 0, 255]);
 });
 
-test('painting sends only dirty rects to TD', async ({ page }) => {
+test('painting sends only dirty SURFACE tiles of the painted layer to TD', async ({ page }) => {
   await open(page);
   td.sendSolidBase(10, 10, 200);
-  await td.waitFor(() => td.pixel(5, 5)[2] === 200);
+  await td.waitFor(() => td.doc !== null);
   await page.getByRole('button', { name: 'New pixel layer' }).click();
+  await td.waitFor(() => (td.doc?.layers.length ?? 0) >= 3);
+  const activeId = (await hook<any>(page, 'state')).activeLayer as string;
+  const slot = (await hook<any[]>(page, 'layers')).find((l) => l.id === activeId)!.slot as number;
   await hook(page, 'setPrimary', '#ffffff');
   await hook(page, 'setTool', 'pencil');
   await page.locator('#bw').fill('6');
@@ -115,11 +118,11 @@ test('painting sends only dirty rects to TD', async ({ page }) => {
   await page.mouse.down();
   await page.mouse.move(b.x, b.y, { steps: 6 });
   await page.mouse.up();
-  await td.waitFor(() => td.pixel(50, 40)[0] === 255);
+  await td.waitFor(() => td.surfacePixel(slot, 50, 40)[0] === 255);
   const sent = td.frames.slice(count);
   expect(sent.length).toBeGreaterThan(0);
-  expect(sent.every((f) => f.w * f.h < 160 * 90)).toBe(true);
-  expect(td.pixel(5, 80)).toEqual([10, 10, 200, 255]);
+  expect(sent.every((f) => f.slot === slot && f.w * f.h < 160 * 90)).toBe(true);
+  expect(td.surfacePixel(slot, 5, 80)).toEqual([0, 0, 0, 0]); // untouched pixels stay transparent
 });
 
 test('docSize from TD resizes the document', async ({ page }) => {
@@ -129,35 +132,45 @@ test('docSize from TD resizes the document', async ({ page }) => {
   await expect.poll(async () => (await hook<any>(page, 'state')).doc).toEqual({ w: 80, h: 60 });
   td.sendSolidBase(9, 9, 9);
   await expect.poll(() => hook<number[]>(page, 'readPixel', 79, 59)).toEqual([9, 9, 9, 255]);
-  await td.waitFor(() => td.pixel(79, 59)[0] === 9);
 });
 
-test('standby: overlay, Take over, then editing resumes with a full frame', async ({ page }) => {
-  td.close();
+const pxLayer = (id: string, slot: number, extra: Partial<LayerSpec> = {}): LayerSpec => ({
+  id, kind: 'pixel', parentId: null, name: id, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot, mask: null, adjustment: null, ...extra,
+});
+const baseLayer = (): LayerSpec => ({ ...pxLayer('base', 0), kind: 'base', slot: null, name: 'TD Input' });
+
+test('standby: overlay, Take over loads TD\'s document (nothing pushed), then editing resumes', async ({ page }) => {
+  await td.close();
   td = await FakeTd.start({ w: 160, h: 90, active: false });
+  td.seedDocument([baseLayer(), pxLayer('tdLayer', 7, { name: 'From TD' })], 3, { 7: [9, 8, 7, 255] });
   await open(page);
   await expect(page.getByText('Editing in another window')).toBeVisible();
   await page.waitForTimeout(300);
   expect(td.frames.length).toBe(0);
+  expect(td.docMessages).toBe(0);
   await page.getByRole('button', { name: 'Take over' }).click();
   await td.waitFor(() => td.messages.some((m) => m.t === 'takeover'));
   await expect(page.getByText('Editing in another window')).toBeHidden();
-  await td.waitFor(() => td.frameEnds >= 1);
-  expect(td.frames[0]).toMatchObject({ x: 0, y: 0, w: 160, h: 90 });
+  await expect(page.locator('[data-layer] [data-name]')).toHaveText(['From TD', 'TD Input']);
+  await td.waitFor(() => td.surfaceFetches.includes(7));
+  await expect.poll(() => hook<number[]>(page, 'readPixel', 3, 3)).toEqual([9, 8, 7, 255]); // surface pixels came from TD
+  expect(td.docMessages).toBe(0); // loading is not echoed back
+  expect(td.frames.length).toBe(0);
 
   td.setActive(false);
   await expect(page.getByText('Editing in another window')).toBeVisible();
 });
 
-test('reconnects after the socket drops and resends a full frame', async ({ page }) => {
+test('reconnects after the socket drops and re-pushes doc and full surfaces', async ({ page }) => {
   await open(page);
   await td.waitFor(() => td.frameEnds >= 1);
-  const ends = td.frameEnds;
+  const ends = td.frameEnds, docs = td.docMessages;
   td.dropClient();
   await expect(page.locator('[data-status=connection]')).toContainText('Reconnecting');
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked', { timeout: 8000 });
   expect(td.connections).toBe(2);
-  await td.waitFor(() => td.frameEnds > ends);
+  expect(td.messages.filter((m) => m.t === 'ready').map((m) => (m as { fresh: boolean }).fresh)).toEqual([true, false]);
+  await td.waitFor(() => td.frameEnds > ends && td.docMessages > docs);
   expect(td.frames[td.frames.length - 1]).toMatchObject({ x: 0, y: 0, w: 160, h: 90 });
 });
 

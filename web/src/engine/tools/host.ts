@@ -1,5 +1,5 @@
 import type { EngineEvent, Rect, RGBA, ToolContext, ToolPointer } from '../types';
-import type { Document, PixelLayer, StructureSnapshot } from '../model';
+import type { Document, EditTarget, PixelLayer, StructureSnapshot } from '../model';
 import type { Surface } from '../surface';
 import type { Patch } from '../tiles';
 
@@ -22,12 +22,18 @@ export interface Host {
   readonly scratch: Scratch;
   context(): ToolContext;
   emit(e: EngineEvent): void;
-  /** Active layer if it can be painted on; otherwise emits a notice and returns null. */
-  editableLayer(): PixelLayer | null;
+  /** What the paint tools edit now (pixels or mask of the active layer); otherwise emits a notice and returns null. */
+  editableLayer(): EditTarget | null;
+  /** Active pixel layer for the move tool; otherwise emits a notice and returns null. */
+  movableLayer(): PixelLayer | null;
   /** Document-space rect changed: recomposite and notify. */
   changed(r: Rect): void;
+  /** Pixels of `target` changed inside the document-space rect: recomposite and emit 'pixels' + 'surface'. */
+  paintChanged(target: EditTarget, docRect: Rect): void;
+  /** A layer offset changed (docSpec may differ): emits 'docspec' when it does. */
+  docMoved(): void;
   /** Record a pixel edit as layer-space patches holding old and new pixels. */
-  pushPatch(label: string, layer: PixelLayer, patches: Patch[]): void;
+  pushPatch(label: string, target: EditTarget, patches: Patch[]): void;
   /** Record a structural edit that was already applied since `before`. */
   commitStructure(label: string, before: StructureSnapshot, coalesceKey?: string, dirty?: Rect | null | false): void;
   sample(x: number, y: number): RGBA | null;

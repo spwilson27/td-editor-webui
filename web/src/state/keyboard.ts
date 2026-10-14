@@ -28,7 +28,7 @@ const toolKeys = new Map<string, ToolId[]>();
 for (const t of TOOLS) toolKeys.set(t.key.toLowerCase(), [...(toolKeys.get(t.key.toLowerCase()) || []), t.id]);
 
 export function onKeyDown(store: Store, e: KeyLike): void {
-  if (isTyping(e.target)) return;
+  if (isTyping(e.target) || store.loadingDoc.peek()) return; // locked while loading TD's document
   const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
   const mod = e.ctrlKey || e.metaKey;
   if (e.repeat && !mod && key !== '[' && key !== ']' && key !== ' ') return; // toggles must not retrigger

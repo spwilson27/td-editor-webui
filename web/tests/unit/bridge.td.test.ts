@@ -1,10 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  FRAME_BASE, FRAME_COMPOSITE, decodeFrame, decodeWebMessage, encodeBands, encodeMessage,
-  type Frame, type TdMessage,
+  FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_VIEW, decodeFrame, decodeWebMessage, encodeBands, encodeMessage,
+  type Frame, type TdMessage, type WebMessage,
 } from '../../src/bridge/codec';
-import { BACKPRESSURE_BYTES, installLogForwarding, httpOrigin, resolveClient, resolveToken, resolveWsUrl, TOKEN_EXPIRED_MESSAGE, startTdBridge, type Bridge, type Connection } from '../../src/bridge/tdBridge';
+import {
+  BACKPRESSURE_BYTES, SURFACE_FETCH_CONCURRENCY, installLogForwarding, httpOrigin, latencyStats, resolveClient, resolveToken, resolveWsUrl, TOKEN_EXPIRED_MESSAGE,
+  startTdBridge, type Bridge, type Connection, type LatencyStats, type ViewState,
+} from '../../src/bridge/tdBridge';
+import type { LayerSpec } from '../../src/engine/types';
 import { FakeEngine } from '../browser/fakeEngine';
+
+type Sent = { json: WebMessage } | { frame: Frame };
 
 class FakeSocket {
   static all: FakeSocket[] = [];
@@ -22,6 +28,15 @@ class FakeSocket {
   tell(m: TdMessage) { this.onmessage?.({ data: encodeMessage(m) }); }
   binary(u: Uint8Array) { this.onmessage?.({ data: u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength) }); }
   json() { return this.sent.filter((s): s is string => typeof s === 'string').map((s) => decodeWebMessage(s)!); }
+  /** Everything sent, in order. */
+  all(): Sent[] {
+    return this.sent.map((s) => {
+      if (typeof s === 'string') return { json: decodeWebMessage(s)! };
+      const r = decodeFrame(s);
+      if (!r.ok) throw new Error(r.error);
+      return { frame: r.frame };
+    });
+  }
   frames(): Frame[] {
     return this.sent.filter((s): s is Uint8Array => typeof s !== 'string').map((b) => {
       const r = decodeFrame(b);
@@ -31,50 +46,88 @@ class FakeSocket {
   }
 }
 
-const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({ t: 'hello', protocol: 2, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', ...over });
+const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({
+  t: 'hello', protocol: 3, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
+});
+
+interface TestStatus {
+  conn: Connection[]; active: boolean[]; notices: string[]; latency: LatencyStats[]; viewLatency: LatencyStats[];
+  loading: boolean[];
+  viewFrames: { w: number; h: number; first: number[]; age: number }[];
+  setConnection(c: Connection): void; setActive(a: boolean): void; setNotice(m: string): void;
+  setLoading(b: boolean): void;
+  setLatency(s: LatencyStats): void; setViewLatency(s: LatencyStats): void; setViewFrame(w: number, h: number, d: Uint8ClampedArray, age: number): void;
+}
+const makeStatus = (): TestStatus => ({
+  conn: [], active: [], notices: [], latency: [], viewLatency: [], viewFrames: [], loading: [],
+  setLoading(b) { this.loading.push(b); },
+  setConnection(c) { this.conn.push(c); }, setActive(a) { this.active.push(a); }, setNotice(m) { this.notices.push(m); },
+  setLatency(s) { this.latency.push(s); }, setViewLatency(s) { this.viewLatency.push(s); },
+  setViewFrame(w, h, d, age) { this.viewFrames.push({ w, h, first: Array.from(d.subarray(0, 4)), age }); },
+});
 
 let engine: FakeEngine;
-let status: { conn: Connection[]; active: boolean[]; notices: string[]; setConnection(c: Connection): void; setActive(a: boolean): void; setNotice(m: string): void };
+let status: TestStatus;
 let bridge: Bridge;
+let fm: FetchMock | null = null;
 const at = <T>(a: T[], i: number): T => a[a.length + i];
 const sock = () => FakeSocket.all[FakeSocket.all.length - 1];
+const raf = (cb: () => void) => setTimeout(cb, 16);
 
-function start(w = 64, h = 48) {
+function start(w = 64, h = 48, prep?: (e: FakeEngine) => void) {
   engine = new FakeEngine(w, h);
-  status = {
-    conn: [], active: [], notices: [],
-    setConnection(c) { this.conn.push(c); }, setActive(a) { this.active.push(a); }, setNotice(m) { this.notices.push(m); },
-  };
-  bridge = startTdBridge(engine, status, { url: 'ws://td/ws', client: 'panel', token: 'tok-123', WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false });
+  prep?.(engine);
+  status = makeStatus();
+  fm = new FetchMock();
+  bridge = startTdBridge(engine, status, {
+    url: 'ws://td:9980/ws', client: 'panel', token: 'tok-123', WebSocketCtor: FakeSocket as unknown as typeof WebSocket,
+    forwardLogs: false, fetch: fm.fn, raf,
+  });
 }
-function connectActive() { sock().open(); sock().tell(hello({ doc: { w: engine.width, h: engine.height } })); }
+function connectActive(over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}) { sock().open(); sock().tell(hello({ doc: { w: engine.width, h: engine.height }, ...over })); }
+const withLayer = (e: FakeEngine) => { e.addPixelLayer('Layer 1'); };
 
 beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(100000); FakeSocket.all = []; });
 afterEach(() => { bridge?.dispose(); vi.useRealTimers(); });
 
 describe('tdBridge session', () => {
-  it('sends ready with client and protocol after open', () => {
+  it('sends ready{protocol 3, fresh} after open', () => {
     start();
     expect(status.conn).toEqual(['reconnecting']);
-    expect(sock().url).toBe('ws://td/ws');
+    expect(sock().url).toBe('ws://td:9980/ws');
     expect(sock().binaryType).toBe('arraybuffer');
     sock().open();
-    expect(sock().json()).toEqual([{ t: 'ready', protocol: 2, client: 'panel', version: '0.1.0', token: 'tok-123' }]);
+    expect(sock().json()).toEqual([{ t: 'ready', protocol: 3, client: 'panel', version: '0.1.0', token: 'tok-123', fresh: true }]);
   });
 
-  it('becomes linked on hello and sends a full composite frame', () => {
-    start();
+  it('becomes linked on hello and pushes doc + every surface in full when TD has no document', () => {
+    start(64, 48, (e) => { withLayer(e); e.addMask('L1'); });
     connectActive();
     expect(at(status.conn, -1)).toBe('linked');
     expect(at(status.active, -1)).toBe(true);
     vi.advanceTimersByTime(100);
-    const [f] = sock().frames();
-    expect(f).toMatchObject({ type: FRAME_COMPOSITE, frameEnd: true, docW: 64, docH: 48, x: 0, y: 0, w: 64, h: 48 });
-    expect(Array.from(f.payload.subarray(0, 4))).toEqual([10, 20, 30, 255]);
+    const sent = sock().all();
+    expect('json' in sent[1] && sent[1].json).toMatchObject({ t: 'doc', rev: engine.docSpec().rev });
+    expect(('json' in sent[1] ? (sent[1].json as Extract<WebMessage, { t: 'doc' }>).layers : []).map((l) => l.id)).toEqual(['base', 'L1']);
+    const frames = sock().frames();
+    expect(frames.map((f) => f.slot).sort()).toEqual([1, 2]);
+    for (const f of frames) expect(f).toMatchObject({ type: FRAME_SURFACE, frameEnd: true, docW: 64, docH: 48, x: 0, y: 0, w: 64, h: 48 });
+    expect(new Set(frames.map((f) => f.frameId)).size).toBe(2); // one frameId per slot batch
+    expect(sock().json().some((m) => m.t === 'doc')).toBe(true);
+  });
+
+  it('never sends COMPOSITE (type 2) frames or composite reads', () => {
+    start(64, 48, withLayer);
+    connectActive();
+    engine.emit({ type: 'composite', rect: { x: 0, y: 0, w: 4, h: 4 } });
+    engine.emit({ type: 'pixels', rect: { x: 0, y: 0, w: 4, h: 4 } });
+    vi.advanceTimersByTime(300);
+    expect(sock().frames().every((f) => f.type === FRAME_SURFACE)).toBe(true);
+    expect(sock().sent.every((s) => typeof s === 'string' || s[4] !== 2)).toBe(true);
   });
 
   it('resizes the engine when hello or docSize disagree', () => {
-    start();
+    start(64, 48, withLayer);
     sock().open();
     sock().tell(hello({ doc: { w: 32, h: 16 } }));
     expect([engine.width, engine.height]).toEqual([32, 16]);
@@ -96,67 +149,454 @@ describe('tdBridge session', () => {
   it('reports a protocol mismatch without linking', () => {
     start();
     sock().open();
-    sock().tell(hello({ protocol: 1 }));
+    sock().tell(hello({ protocol: 2 }));
     expect(at(status.conn, -1)).toBe('reconnecting');
     expect(status.notices[0]).toMatch(/mismatch/i);
   });
 });
 
-describe('tdBridge outbound frames', () => {
-  it('coalesces dirty rects and sends at most maxSendFps', () => {
-    start();
+const spec = (over: Partial<LayerSpec> & { id: string }): LayerSpec => ({
+  kind: 'pixel', parentId: null, name: over.id, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot: null, mask: null, adjustment: null, ...over,
+});
+const tdLayers: LayerSpec[] = [
+  spec({ id: 'base', kind: 'base' }),
+  spec({ id: 'p1', slot: 1, mask: { slot: 2, enabled: true } }),
+  spec({ id: 'a1', kind: 'adjustment', adjustment: { type: 'invert' }, mask: { slot: 3, enabled: false } }),
+  spec({ id: 'p2', slot: 4 }), spec({ id: 'p3', slot: 5 }), spec({ id: 'p4', slot: 6 }),
+];
+const dump = (slot: number, w: number, h: number, v: number) =>
+  encodeBands({ type: FRAME_SURFACE_DUMP, slot, frameId: 1, docW: w, docH: h, rect: { x: 0, y: 0, w, h }, pixels: new Uint8Array(w * h * 4).fill(v), maxPayload: 1 << 30 }).next().value as Uint8Array;
+const flushP = () => vi.advanceTimersByTimeAsync(0);
+const okBytes = (b: Uint8Array) => new Response(b as BufferSource, { status: 200 });
+const docState = (rev = 7, layers = tdLayers): TdMessage => ({ t: 'docState', rev, layers, docW: 64, docH: 48 });
+
+describe('tdBridge document load', () => {
+  it('a fresh page loads TD\'s document: requestDoc, loadDocument, GET /surface per slot (<=4 at a time), commit, no echo', async () => {
+    start(64, 48, withLayer);
+    connectActive({ hasDocument: true, rev: 7 });
+    expect(sock().json()[0]).toMatchObject({ t: 'ready', fresh: true });
+    expect(sock().json().map((m) => m.t)).toEqual(['ready', 'requestDoc']);
+    expect(sock().sent.length).toBe(2); // no doc, no surfaces pushed
+    sock().tell(docState());
+    await flushP();
+    expect(engine.loaded).toHaveLength(1);
+    expect(engine.loaded[0]).toMatchObject({ rev: 7, width: 64, height: 48 });
+    expect(engine.loaded[0].layers.map((l) => l.id)).toEqual(tdLayers.map((l) => l.id));
+    // slots 1..6 -> 6 fetches, only 4 in flight
+    expect(SURFACE_FETCH_CONCURRENCY).toBe(4);
+    expect(fm!.calls.length).toBe(4);
+    expect(fm!.calls[0].url).toBe('http://td:9980/surface?token=tok-123&client=c1&slot=1');
+    fm!.calls[0].settle(okBytes(dump(1, 64, 48, 9)));
+    await flushP();
+    expect(fm!.calls.length).toBe(5);
+    for (let k = 1; k < 6; k++) { fm!.calls[k].settle(okBytes(dump([2, 3, 4, 5, 6][k - 1], 64, 48, 5))); await flushP(); }
+    expect(fm!.calls.map((c) => Number(new URL(c.url).searchParams.get('slot'))).sort()).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(engine.surfaceWrites.map((w) => w.slot).sort()).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(engine.surfaceCommits).toBe(1);
+    expect(engine.surfaceWrites[0]).toMatchObject({ rect: { x: 0, y: 0, w: 64, h: 48 }, len: 64 * 48 * 4 });
+    vi.advanceTimersByTime(500);
+    expect(sock().sent.length).toBe(2); // loading writes were not echoed back to TD
+    // editing afterwards works
+    engine.fillSurface(1, { x: 1, y: 1, w: 2, h: 2 }, [1, 2, 3, 255]);
+    vi.advanceTimersByTime(100);
+    expect(sock().frames()).toHaveLength(1);
+    expect(sock().frames()[0]).toMatchObject({ slot: 1, x: 1, y: 1, w: 2, h: 2 });
+  });
+
+  it('a reconnecting page (fresh=false) pushes its own document even when TD has one', async () => {
+    start(64, 48, withLayer);
+    connectActive({ hasDocument: true, rev: 3 }); // first connect: loads
+    sock().tell(docState(3, [tdLayers[0]]));
+    await flushP();
+    sock().close();
+    vi.advanceTimersByTime(500);
+    sock().open();
+    expect(sock().json()[0]).toMatchObject({ t: 'ready', fresh: false });
+    sock().tell(hello({ hasDocument: true, rev: 3 }));
+    vi.advanceTimersByTime(100);
+    const kinds = sock().json().map((m) => m.t);
+    expect(kinds).toContain('doc');
+    expect(kinds).not.toContain('requestDoc');
+  });
+
+  it('a page that pushed once is no longer fresh on reconnect', () => {
+    start(64, 48, withLayer);
+    connectActive();
+    sock().close();
+    vi.advanceTimersByTime(500);
+    sock().open();
+    expect(sock().json()[0]).toMatchObject({ t: 'ready', fresh: false });
+  });
+
+  it('retries a failed surface once, skips a 404 slot, and still commits', async () => {
+    start(64, 48, withLayer);
+    connectActive({ hasDocument: true, rev: 1 });
+    sock().tell(docState(1, tdLayers.slice(0, 2))); // slots 1, 2
+    await flushP();
+    fm!.calls[0].settle(new TypeError('net'));
+    fm!.calls[1].settle(new Response('', { status: 404 }));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(fm!.calls.length).toBe(3); // slot 1 retried
+    fm!.calls[2].settle(okBytes(dump(1, 64, 48, 2)));
+    await flushP();
+    expect(engine.surfaceWrites.map((w) => w.slot)).toEqual([1]);
+    expect(engine.surfaceCommits).toBe(1);
+  });
+
+  it('a surface fetch that hangs is aborted after 10 s', async () => {
+    start(64, 48, withLayer);
+    connectActive({ hasDocument: true, rev: 1 });
+    sock().tell(docState(1, [tdLayers[0], tdLayers[1]]));
+    await flushP();
+    expect(fm!.calls[0].signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(fm!.calls[0].signal?.aborted).toBe(true);
+  });
+
+  it('a stale-size surface body is dropped', async () => {
+    start(64, 48, withLayer);
+    connectActive({ hasDocument: true, rev: 1 });
+    sock().tell(docState(1, [tdLayers[0], spec({ id: 'p1', slot: 1 })]));
+    await flushP();
+    fm!.calls[0].settle(okBytes(dump(1, 10, 10, 1)));
+    await flushP();
+    expect(engine.surfaceWrites).toEqual([]);
+  });
+
+  it('takeover: a standby page loads TD\'s document when it becomes active', async () => {
+    start(64, 48, withLayer);
+    connectActive({ active: false, hasDocument: true, rev: 4 });
+    expect(sock().json().map((m) => m.t)).toEqual(['ready']);
+    engine.emit({ type: 'docspec' });
+    engine.fillSurface(1, { x: 0, y: 0, w: 2, h: 2 }, [1, 1, 1, 255]);
+    vi.advanceTimersByTime(300);
+    expect(sock().sent.length).toBe(1); // standby sends nothing
+    bridge.takeover();
+    expect(at(sock().json(), -1)).toEqual({ t: 'takeover' });
+    sock().tell({ t: 'active', active: true });
+    expect(at(sock().json(), -1)).toEqual({ t: 'requestDoc' });
+    sock().tell(docState(4, [tdLayers[0], tdLayers[1]]));
+    await flushP();
+    expect(engine.loaded).toHaveLength(1);
+    expect(fm!.calls.length).toBe(2);
+    fm!.calls[0].settle(okBytes(dump(1, 64, 48, 1)));
+    fm!.calls[1].settle(okBytes(dump(2, 64, 48, 1)));
+    await flushP();
+    expect(engine.surfaceCommits).toBe(1);
+    vi.advanceTimersByTime(300);
+    expect(sock().frames()).toEqual([]); // nothing echoed
+    expect(sock().json().filter((m) => m.t === 'doc')).toEqual([]);
+  });
+
+  it('NEVER overwrites TD\'s document when TD is slow: keeps asking with backoff, sends nothing, stays locked', async () => {
+    start(64, 48, withLayer);
+    connectActive({ hasDocument: true, rev: 4 });
+    expect(at(status.loading, -1)).toBe(true);
+    engine.setLayerProps('L1', { opacity: 0.5 }); // an edit while waiting is not pushed
+    engine.fillSurface(1, { x: 0, y: 0, w: 4, h: 4 }, [1, 2, 3, 255]);
+    await vi.advanceTimersByTimeAsync(60000);
+    const kinds = sock().json().map((m) => m.t);
+    expect(kinds).not.toContain('doc');
+    expect(sock().frames()).toEqual([]);
+    expect(kinds.filter((k) => k === 'requestDoc').length).toBeGreaterThanOrEqual(4);
+    expect(status.notices.some((n) => /Loading document from TouchDesigner/.test(n))).toBe(true);
+    expect(at(status.loading, -1)).toBe(true);
+    // TD finally answers (4 s+ late): the load completes and only then does the page become authoritative
+    sock().tell(docState(4, [tdLayers[0], tdLayers[1]]));
+    await flushP();
+    fm!.calls[0].settle(okBytes(dump(1, 64, 48, 1)));
+    fm!.calls[1].settle(okBytes(dump(2, 64, 48, 1)));
+    await flushP();
+    expect(at(status.loading, -1)).toBe(false);
+    expect(engine.loaded).toHaveLength(1);
+    expect(sock().json().some((m) => m.t === 'doc')).toBe(false);
+    expect(sock().frames()).toEqual([]);
+  });
+
+  it('a takeover where TD stores no document falls back to pushing, but only after a longer wait', async () => {
+    start(64, 48, withLayer);
+    connectActive({ active: false, hasDocument: false });
+    sock().tell({ t: 'active', active: true });
+    await vi.advanceTimersByTimeAsync(9000);
+    expect(sock().json().some((m) => m.t === 'doc')).toBe(false);
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(sock().json().some((m) => m.t === 'doc')).toBe(true);
+    expect(at(status.loading, -1)).toBe(false);
+    // a docState that arrives after the page pushed its own document is ignored (and logged)
+    sock().tell(docState(9, [tdLayers[0]]));
+    await flushP();
+    expect(engine.loaded).toEqual([]);
+    expect(sock().json().some((m) => m.t === 'log' && /ignored docState/.test(m.msg))).toBe(true);
+  });
+
+  it('a takeover where TD does have a document never falls back', async () => {
+    start(64, 48, withLayer);
+    connectActive({ active: false, hasDocument: true, rev: 2 });
+    sock().tell({ t: 'active', active: true });
+    await vi.advanceTimersByTimeAsync(120000);
+    expect(sock().json().some((m) => m.t === 'doc')).toBe(false);
+    expect(sock().frames()).toEqual([]);
+  });
+
+  describe('incomplete loads', () => {
+    const failFirstLoad = async () => {
+      start(64, 48, withLayer);
+      connectActive({ hasDocument: true, rev: 5 });
+      sock().tell(docState(5, [tdLayers[0], tdLayers[1], tdLayers[2]])); // slots 1, 2, 3
+      await flushP();
+      fm!.calls[0].settle(new Response('', { status: 500 })); // slot 1 fails (twice)
+      await vi.advanceTimersByTimeAsync(500);
+      fm!.calls.find((c, i) => i >= 3 && c.url.endsWith('slot=1'))!.settle(new Response('', { status: 500 }));
+      for (const c of fm!.calls) if (c.url.endsWith('slot=2') || c.url.endsWith('slot=3')) c.settle(okBytes(dump(2, 64, 48, 1)));
+      await flushP();
+    };
+
+    it('a 500 keeps the page non-authoritative, commits what loaded, and retries the load', async () => {
+      await failFirstLoad();
+      expect(engine.surfaceCommits).toBe(1);
+      expect(at(status.loading, -1)).toBe(true);
+      const requests = () => sock().json().filter((m) => m.t === 'requestDoc').length;
+      const before = requests();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(requests()).toBeGreaterThan(before);
+      engine.fillSurface(2, { x: 0, y: 0, w: 2, h: 2 }, [9, 9, 9, 255]);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(sock().json().some((m) => m.t === 'doc')).toBe(false);
+      expect(sock().frames()).toEqual([]);
+    });
+
+    it('docSize and resize after a failed load send no empty surfaces', async () => {
+      await failFirstLoad();
+      sock().tell({ t: 'docSize', w: 32, h: 24, hasInput: false });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(sock().frames()).toEqual([]);
+      expect(sock().json().some((m) => m.t === 'doc')).toBe(false);
+    });
+
+    it('a reconnect after a failed load asks for the document again instead of pushing (fresh stays true)', async () => {
+      await failFirstLoad();
+      sock().close();
+      await vi.advanceTimersByTimeAsync(500);
+      sock().open();
+      expect(sock().json()[0]).toMatchObject({ t: 'ready', fresh: true });
+      sock().tell(hello({ hasDocument: true, rev: 5 }));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(sock().json().map((m) => m.t)).toEqual(['ready', 'requestDoc']);
+      expect(sock().frames()).toEqual([]);
+    });
+
+    it('if TD has lost its document, a reconnect pushes but never the slot that failed to load', async () => {
+      await failFirstLoad();
+      sock().close();
+      await vi.advanceTimersByTimeAsync(500);
+      sock().open();
+      sock().tell(hello({ hasDocument: false }));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(sock().json().some((m) => m.t === 'doc')).toBe(true);
+      expect(sock().frames().map((f) => f.slot).sort()).toEqual([2, 3]);
+    });
+  });
+
+  it('a 404 for a slot means TD has no pixels there: the load completes and the page may edit', async () => {
+    start(64, 48, withLayer);
+    connectActive({ hasDocument: true, rev: 1 });
+    sock().tell(docState(1, tdLayers.slice(0, 2)));
+    await flushP();
+    fm!.calls[0].settle(new Response('', { status: 404 }));
+    fm!.calls[1].settle(new Response('', { status: 404 }));
+    await flushP();
+    expect(at(status.loading, -1)).toBe(false);
+    engine.fillSurface(1, { x: 0, y: 0, w: 2, h: 2 }, [5, 5, 5, 255]);
+    vi.advanceTimersByTime(100);
+    expect(sock().frames().map((f) => f.slot)).toEqual([1]);
+  });
+
+  it('a reconnect finding a newer TD rev reloads; the same rev pushes', async () => {
+    start(64, 48, withLayer);
+    connectActive({ hasDocument: true, rev: 3 });
+    sock().tell(docState(3, [tdLayers[0], tdLayers[1]]));
+    await flushP();
+    fm!.calls[0].settle(okBytes(dump(1, 64, 48, 1)));
+    fm!.calls[1].settle(okBytes(dump(2, 64, 48, 1)));
+    await flushP();
+    sock().close();
+    await vi.advanceTimersByTimeAsync(500);
+    sock().open();
+    sock().tell(hello({ hasDocument: true, rev: 8 })); // someone else edited
+    await vi.advanceTimersByTimeAsync(100);
+    expect(sock().json().map((m) => m.t)).toEqual(['ready', 'requestDoc']);
+    expect(sock().frames()).toEqual([]);
+
+    sock().close();
+    await vi.advanceTimersByTimeAsync(5000);
+    sock().open();
+    sock().tell(hello({ hasDocument: true, rev: 3 })); // incomplete reload -> still must load
+    expect(sock().json().map((m) => m.t)).toEqual(['ready', 'requestDoc']);
+  });
+
+  it('a reconnect with an unchanged TD rev pushes the page\'s own document', async () => {
+    start(64, 48, withLayer);
+    connectActive({ hasDocument: true, rev: 3 });
+    sock().tell(docState(3, [tdLayers[0], tdLayers[1]]));
+    await flushP();
+    fm!.calls[0].settle(okBytes(dump(1, 64, 48, 1)));
+    fm!.calls[1].settle(okBytes(dump(2, 64, 48, 1)));
+    await flushP();
+    sock().close();
+    await vi.advanceTimersByTimeAsync(500);
+    sock().open();
+    sock().tell(hello({ hasDocument: true, rev: 3 }));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(sock().json().some((m) => m.t === 'doc')).toBe(true);
+    expect(sock().json().some((m) => m.t === 'requestDoc')).toBe(false);
+  });
+
+  it('moving a layer (nonzero x/y) sends a doc message only, no SURFACE frames', () => {
+    start(64, 48, withLayer);
+    connectActive();
+    vi.advanceTimersByTime(200);
+    const frames = sock().frames().length, docs = sock().json().filter((m) => m.t === 'doc').length;
+    engine.rev++;
+    engine.emit({ type: 'docspec' });
+    vi.advanceTimersByTime(300);
+    expect(sock().json().filter((m) => m.t === 'doc').length).toBe(docs + 1);
+    expect(sock().frames().length).toBe(frames);
+  });
+
+  it('ignores docState on a standby page', async () => {
+    start(64, 48, withLayer);
+    connectActive({ active: false });
+    sock().tell(docState());
+    await flushP();
+    expect(engine.loaded).toEqual([]);
+  });
+});
+
+describe('tdBridge doc messages', () => {
+  it('coalesces docspec events to one doc message per animation frame, with the engine\'s layers', () => {
+    start(64, 48, withLayer);
+    connectActive();
+    vi.advanceTimersByTime(100);
+    const n = () => sock().json().filter((m) => m.t === 'doc').length;
+    const base = n();
+    engine.setLayerProps('L1', { opacity: 0.5 });
+    engine.setLayerProps('L1', { opacity: 0.4 });
+    engine.addAdjustment('blur');
+    expect(n()).toBe(base); // not yet: waits for the frame
+    vi.advanceTimersByTime(16);
+    expect(n()).toBe(base + 1);
+    const m = at(sock().json().filter((x) => x.t === 'doc'), -1) as Extract<WebMessage, { t: 'doc' }>;
+    expect(m.rev).toBe(engine.docSpec().rev);
+    expect(m.layers.map((l) => l.kind)).toEqual(['base', 'pixel', 'adjustment']);
+    vi.advanceTimersByTime(500);
+    expect(n()).toBe(base + 1);
+    engine.setLayerProps('L1', { opacity: 0.3 });
+    vi.advanceTimersByTime(16);
+    expect(n()).toBe(base + 2);
+  });
+
+  it('standby pages and loading pages send no doc', () => {
+    start(64, 48, withLayer);
+    connectActive({ active: false });
+    engine.setLayerProps('L1', { opacity: 0.2 });
+    vi.advanceTimersByTime(100);
+    expect(sock().json().some((m) => m.t === 'doc')).toBe(false);
+  });
+
+  it('a new layer\'s doc is sent before its first surface tiles even within the same frame', () => {
+    start(64, 48, withLayer);
+    connectActive();
+    vi.advanceTimersByTime(200);
+    const before = sock().sent.length;
+    const id = engine.addPixelLayer('Layer 2');
+    const slot = engine.layers().find((l) => l.id === id)!.slot!;
+    engine.fillSurface(slot, { x: 0, y: 0, w: 3, h: 3 }, [9, 9, 9, 255]);
+    vi.advanceTimersByTime(100);
+    const s = sock().all().slice(before);
+    const docIdx = s.findIndex((x) => 'json' in x && x.json.t === 'doc');
+    const frameIdx = s.findIndex((x) => 'frame' in x && x.frame.slot === slot);
+    expect(docIdx).toBeGreaterThanOrEqual(0);
+    expect(frameIdx).toBeGreaterThan(docIdx);
+  });
+});
+
+describe('tdBridge surface tiles', () => {
+  it('batches dirty rects per slot (one frameId per slot batch) and sends at most maxSendFps', () => {
+    start(64, 48, (e) => { withLayer(e); e.addPixelLayer('Layer 2'); });
     connectActive();
     vi.advanceTimersByTime(100);
     const base = sock().frames().length;
 
-    engine.emit({ type: 'composite', rect: { x: 2, y: 3, w: 4, h: 4 } });
+    engine.emit({ type: 'surface', slot: 1, rect: { x: 2, y: 3, w: 4, h: 4 } });
     vi.advanceTimersByTime(40);
     const afterFirst = sock().frames().length;
     expect(afterFirst).toBe(base + 1);
-    engine.emit({ type: 'composite', rect: { x: 10, y: 20, w: 5, h: 5 } });
-    engine.emit({ type: 'composite', rect: { x: 8, y: 18, w: 2, h: 2 } });
+    engine.emit({ type: 'surface', slot: 1, rect: { x: 10, y: 20, w: 5, h: 5 } });
+    engine.emit({ type: 'surface', slot: 1, rect: { x: 8, y: 18, w: 2, h: 2 } });
+    engine.emit({ type: 'surface', slot: 2, rect: { x: 0, y: 0, w: 1, h: 1 } });
     expect(sock().frames().length).toBe(afterFirst); // throttled
     vi.advanceTimersByTime(40);
-    const frames = sock().frames();
-    expect(frames.length).toBe(afterFirst + 1);
-    expect(at(frames, -1)).toMatchObject({ x: 8, y: 18, w: 7, h: 7 });
-    expect(at(frames, -1)!.frameId).toBe(at(frames, -2)!.frameId + 1);
+    const frames = sock().frames().slice(afterFirst);
+    expect(frames).toHaveLength(2);
+    expect(frames[0]).toMatchObject({ slot: 1, x: 8, y: 18, w: 7, h: 7, type: FRAME_SURFACE });
+    expect(frames[1]).toMatchObject({ slot: 2, x: 0, y: 0, w: 1, h: 1 });
+    expect(frames[1].frameId).toBe(frames[0].frameId + 1);
+  });
+
+  it('sends the pixels of the slot (readSurface), not a composite', () => {
+    start(64, 48, withLayer);
+    connectActive();
+    vi.advanceTimersByTime(100);
+    engine.fillSurface(1, { x: 4, y: 5, w: 2, h: 2 }, [11, 22, 33, 44]);
+    vi.advanceTimersByTime(100);
+    const f = at(sock().frames(), -1);
+    expect(f).toMatchObject({ slot: 1, x: 4, y: 5, w: 2, h: 2 });
+    expect(Array.from(f.payload.subarray(0, 4))).toEqual([11, 22, 33, 44]);
   });
 
   it('clips dirty rects to the document and skips empty ones', () => {
-    start();
+    start(64, 48, withLayer);
     connectActive();
     vi.advanceTimersByTime(100);
     const n = sock().frames().length;
-    engine.emit({ type: 'composite', rect: { x: 60, y: 44, w: 20, h: 20 } });
+    engine.emit({ type: 'surface', slot: 1, rect: { x: 60, y: 44, w: 20, h: 20 } });
     vi.advanceTimersByTime(100);
     expect(at(sock().frames(), -1)).toMatchObject({ x: 60, y: 44, w: 4, h: 4 });
-    engine.emit({ type: 'composite', rect: { x: 100, y: 100, w: 5, h: 5 } });
+    engine.emit({ type: 'surface', slot: 1, rect: { x: 100, y: 100, w: 5, h: 5 } });
     vi.advanceTimersByTime(100);
     expect(sock().frames().length).toBe(n + 1);
   });
 
-  it('splits large frames into bands of at most 2 MB, only the last ending the frame', () => {
-    start(1000, 1000);
+  it('rounds fractional dirty rects outward', () => {
+    start(64, 48, withLayer);
+    connectActive();
+    vi.advanceTimersByTime(100);
+    engine.emit({ type: 'surface', slot: 1, rect: { x: 2.4, y: 3.6, w: 2.2, h: 1.1 } });
+    vi.advanceTimersByTime(100);
+    expect(at(sock().frames(), -1)).toMatchObject({ x: 2, y: 3, w: 3, h: 2 });
+  });
+
+  it('splits large surface frames into bands of at most 2 MB, only the last ending the frame', () => {
+    start(1000, 1000, withLayer);
     connectActive();
     vi.advanceTimersByTime(100);
     const frames = sock().frames();
     expect(frames.length).toBe(Math.ceil(4_000_000 / (Math.floor(2097152 / 4000) * 4000)));
-    expect(frames.every((f) => f.payload.length <= 2 * 1024 * 1024)).toBe(true);
+    expect(frames.every((f) => f.payload.length <= 2 * 1024 * 1024 && f.slot === 1)).toBe(true);
     expect(frames.map((f) => f.frameEnd)).toEqual(frames.map((_, i) => i === frames.length - 1));
     expect(new Set(frames.map((f) => f.frameId)).size).toBe(1);
     expect(frames.reduce((a, f) => a + f.h, 0)).toBe(1000);
   });
 
   it('skips ticks while the socket is backed up and keeps accumulating', () => {
-    start();
+    start(64, 48, withLayer);
     connectActive();
     vi.advanceTimersByTime(100);
     const n = sock().frames().length;
     sock().bufferedAmount = BACKPRESSURE_BYTES + 1;
-    engine.emit({ type: 'composite', rect: { x: 0, y: 0, w: 2, h: 2 } });
+    engine.emit({ type: 'surface', slot: 1, rect: { x: 0, y: 0, w: 2, h: 2 } });
     vi.advanceTimersByTime(500);
-    engine.emit({ type: 'composite', rect: { x: 5, y: 5, w: 2, h: 2 } });
+    engine.emit({ type: 'surface', slot: 1, rect: { x: 5, y: 5, w: 2, h: 2 } });
     vi.advanceTimersByTime(500);
     expect(sock().frames().length).toBe(n);
     sock().bufferedAmount = 0;
@@ -165,30 +605,36 @@ describe('tdBridge outbound frames', () => {
     expect(at(sock().frames(), -1)).toMatchObject({ x: 0, y: 0, w: 7, h: 7 });
   });
 
-  it('sends nothing while on standby; full frame and takeover when taking over', () => {
-    start();
-    sock().open();
-    sock().tell(hello({ active: false }));
-    expect(at(status.active, -1)).toBe(false);
-    engine.emit({ type: 'composite', rect: { x: 0, y: 0, w: 4, h: 4 } });
+  it('sends nothing while on standby; doc + full surfaces after a takeover load', async () => {
+    start(64, 48, withLayer);
+    connectActive({ active: false });
+    engine.emit({ type: 'surface', slot: 1, rect: { x: 0, y: 0, w: 4, h: 4 } });
     vi.advanceTimersByTime(200);
     expect(sock().frames().length).toBe(0);
-
-    bridge.takeover();
-    expect(at(sock().json(), -1)).toEqual({ t: 'takeover' });
     sock().tell({ t: 'active', active: true });
-    vi.advanceTimersByTime(100);
-    expect(sock().frames()[0]).toMatchObject({ x: 0, y: 0, w: 64, h: 48 });
     sock().tell({ t: 'active', active: false });
-    engine.emit({ type: 'composite', rect: { x: 0, y: 0, w: 4, h: 4 } });
+    engine.emit({ type: 'surface', slot: 1, rect: { x: 0, y: 0, w: 4, h: 4 } });
     vi.advanceTimersByTime(200);
-    expect(sock().frames().length).toBe(1);
+    expect(sock().frames().length).toBe(0);
+  });
+
+  it('a docSize with tiles pending sends one full surface at the new size, never the stale rect', () => {
+    start(64, 48, withLayer);
+    connectActive();
+    vi.advanceTimersByTime(100);
+    const n = sock().frames().length;
+    engine.emit({ type: 'surface', slot: 1, rect: { x: 50, y: 40, w: 10, h: 6 } });
+    sock().tell({ t: 'docSize', w: 20, h: 10, hasInput: true });
+    vi.advanceTimersByTime(200);
+    const sent = sock().frames().slice(n);
+    expect(sent.length).toBe(1);
+    expect(sent[0]).toMatchObject({ docW: 20, docH: 10, x: 0, y: 0, w: 20, h: 10 });
   });
 });
 
 describe('tdBridge reconnect', () => {
-  it('backs off 0.5 s doubling up to 5 s, then resends a full frame', () => {
-    start();
+  it('backs off 0.5 s doubling up to 5 s, then re-pushes doc and surfaces', () => {
+    start(64, 48, withLayer);
     connectActive();
     vi.advanceTimersByTime(100);
     const delays: number[] = [];
@@ -206,8 +652,9 @@ describe('tdBridge reconnect', () => {
     sock().tell(hello());
     vi.advanceTimersByTime(100);
     expect(at(status.conn, -1)).toBe('linked');
-    expect(sock().json()[0]).toMatchObject({ t: 'ready' });
-    expect(sock().frames()[0]).toMatchObject({ w: 64, h: 48 });
+    expect(sock().json()[0]).toMatchObject({ t: 'ready', fresh: false });
+    expect(sock().json().some((m) => m.t === 'doc')).toBe(true);
+    expect(sock().frames()[0]).toMatchObject({ slot: 1, w: 64, h: 48 });
   });
 
   it('resets backoff only after a valid hello, so accept-then-close loops keep backing off', () => {
@@ -245,8 +692,8 @@ describe('tdBridge reconnect', () => {
     let fail = true;
     class Flaky extends FakeSocket { constructor(u: string) { if (fail) throw new Error('blocked'); super(u); } }
     engine = new FakeEngine(64, 48);
-    status = { conn: [], active: [], notices: [], setConnection(c) { this.conn.push(c); }, setActive(a) { this.active.push(a); }, setNotice(m) { this.notices.push(m); } };
-    bridge = startTdBridge(engine, status, { url: 'ws://td/ws', client: 'panel', token: 't', WebSocketCtor: Flaky as unknown as typeof WebSocket, forwardLogs: false });
+    status = makeStatus();
+    bridge = startTdBridge(engine, status, { url: 'ws://td/ws', client: 'panel', token: 't', WebSocketCtor: Flaky as unknown as typeof WebSocket, forwardLogs: false, raf });
     expect(FakeSocket.all.length).toBe(0);
     fail = false;
     vi.advanceTimersByTime(500);
@@ -254,12 +701,12 @@ describe('tdBridge reconnect', () => {
   });
 
   it('leaves no stray timers or listeners across many reconnects, and none after dispose', () => {
-    start();
+    start(64, 48, withLayer);
     const base = engine.listenerCount();
     for (let i = 0; i < 20; i++) {
       sock().open();
       sock().tell(hello());
-      engine.emit({ type: 'composite', rect: { x: 0, y: 0, w: 2, h: 2 } });
+      engine.emit({ type: 'surface', slot: 1, rect: { x: 0, y: 0, w: 2, h: 2 } });
       sock().close();
       vi.advanceTimersByTime(5000);
     }
@@ -297,49 +744,194 @@ describe('tdBridge reconnect', () => {
     expect(status.notices).toEqual(['Not connected to TouchDesigner']);
     expect(sock().sent.length).toBe(0);
   });
+
+  it('a socket drop during a document load abandons it and the next hello is not stuck loading', async () => {
+    start(64, 48, withLayer);
+    connectActive({ hasDocument: true, rev: 1 });
+    sock().tell(docState(1, [tdLayers[0], tdLayers[1]]));
+    await flushP();
+    sock().close();
+    expect(fm!.calls[0].signal?.aborted).toBe(true);
+    vi.advanceTimersByTime(500);
+    sock().open();
+    sock().tell(hello());
+    vi.advanceTimersByTime(100);
+    expect(sock().frames().length).toBeGreaterThan(0);
+  });
 });
 
-describe('tdBridge dirty tracking', () => {
-  it('rounds fractional dirty rects outward before encoding', () => {
-    start();
+describe('tdBridge latency', () => {
+  it('measures send -> applied per SURFACE frameId (rolling median / p95)', () => {
+    start(64, 48, withLayer);
     connectActive();
     vi.advanceTimersByTime(100);
-    engine.emit({ type: 'composite', rect: { x: 2.4, y: 3.6, w: 2.2, h: 1.1 } });
-    vi.advanceTimersByTime(100);
-    expect(at(sock().frames(), -1)).toMatchObject({ x: 2, y: 3, w: 3, h: 2 });
+    const ids: number[] = [];
+    for (const wait of [10, 20, 30, 40, 100]) {
+      engine.emit({ type: 'surface', slot: 1, rect: { x: 0, y: 0, w: 2, h: 2 } });
+      vi.advanceTimersByTime(40);
+      const id = at(sock().frames(), -1).frameId;
+      ids.push(id);
+      vi.advanceTimersByTime(wait);
+      sock().tell({ t: 'applied', frameId: id, tdFrame: 1 });
+    }
+    expect(status.latency).toHaveLength(5);
+    const last = at(status.latency, -1);
+    expect(last).toMatchObject({ n: 5, last: 140, median: 70, p95: 140 }); // 40 ms until read + wait
+    // unknown / repeated ids add nothing
+    sock().tell({ t: 'applied', frameId: ids[0], tdFrame: 2 });
+    sock().tell({ t: 'applied', frameId: 99999, tdFrame: 2 });
+    expect(status.latency).toHaveLength(5);
   });
 
-  it('a docSize with a composite pending sends one full frame at the new size, never the stale rect', () => {
+  it('latencyStats handles empty, single and unsorted samples', () => {
+    expect(latencyStats([])).toMatchObject({ n: 0, median: 0 });
+    expect(latencyStats([7])).toEqual({ n: 1, last: 7, median: 7, p95: 7 });
+    expect(latencyStats([30, 10, 20])).toMatchObject({ median: 20, last: 20 });
+  });
+});
+
+describe('tdBridge view messages', () => {
+  const view = (o: Partial<ViewState> = {}): ViewState => ({ mode: 'local', zoom: 1, panX: 10, panY: 20, rect: { x: 5, y: 6, w: 700, h: 500 }, ...o });
+
+  it('sends view at most once per animation frame with the latest state', () => {
     start();
     connectActive();
-    vi.advanceTimersByTime(100);
-    const n = sock().frames().length;
-    engine.emit({ type: 'composite', rect: { x: 50, y: 40, w: 10, h: 6 } });
-    sock().tell({ t: 'docSize', w: 20, h: 10, hasInput: true });
-    vi.advanceTimersByTime(200);
-    const sent = sock().frames().slice(n);
-    expect(sent.length).toBe(1);
-    expect(sent[0]).toMatchObject({ docW: 20, docH: 10, x: 0, y: 0, w: 20, h: 10 });
+    const n = () => sock().json().filter((m) => m.t === 'view').length;
+    bridge.setView(view());
+    bridge.setView(view({ zoom: 2 }));
+    bridge.setView(view({ zoom: 3, mode: 'td' }));
+    expect(n()).toBe(0);
+    vi.advanceTimersByTime(16);
+    expect(n()).toBe(1);
+    expect(at(sock().json(), -1)).toEqual({ t: 'view', mode: 'td', zoom: 3, panX: 10, panY: 20, rect: { x: 5, y: 6, w: 700, h: 500 } });
+    bridge.setView(view({ panX: 99 }));
+    vi.advanceTimersByTime(16);
+    expect(n()).toBe(2);
   });
 
-  it('standby discards pending dirty rects and docSize while standing by sends nothing', () => {
+  it('ignores an unmeasured viewport (w = h = 0)', () => {
     start();
     connectActive();
+    bridge.setView(view({ rect: { x: 0, y: 0, w: 0, h: 0 } }));
+    vi.advanceTimersByTime(50);
+    expect(sock().json().some((m) => m.t === 'view')).toBe(false);
+  });
+
+  it('re-sends the current view after a (re)connect hello', () => {
+    start();
+    connectActive();
+    bridge.setView(view({ mode: 'td' }));
+    vi.advanceTimersByTime(16);
+    sock().close();
+    vi.advanceTimersByTime(500);
+    sock().open();
+    sock().tell(hello());
+    expect(sock().json().filter((m) => m.t === 'view')).toHaveLength(1);
+  });
+
+  it('a view set while disconnected is sent on the next hello, nothing is sent offline', () => {
+    start();
+    bridge.setView(view());
+    vi.advanceTimersByTime(16);
+    expect(sock().sent.length).toBe(0);
+    connectActive();
+    expect(sock().json().filter((m) => m.t === 'view')).toHaveLength(1);
+  });
+});
+
+const viewBody = (w: number, h: number, v: number) =>
+  encodeBands({ type: FRAME_VIEW, frameId: 1, docW: w, docH: h, rect: { x: 0, y: 0, w, h }, pixels: new Uint8Array(w * h * 4).fill(v), maxPayload: 1 << 30 }).next().value as Uint8Array;
+const viewNotice = (frameId: number, applied = -1, w = 64, h = 48): TdMessage => ({ t: 'view', frameId, docW: w, docH: h, w, h, appliedFrameId: applied });
+
+describe('tdBridge view stream (external client)', () => {
+  it('fetches /view on a notice and hands the straight RGBA image to the status sink', async () => {
+    start();
+    connectActive();
+    sock().tell(viewNotice(3));
+    await flushP();
+    expect(fm!.calls.map((c) => c.url)).toEqual(['http://td:9980/view?token=tok-123&client=c1&frameId=3']);
+    vi.advanceTimersByTime(30);
+    fm!.calls[0].settle(okBytes(viewBody(64, 48, 77)));
+    await flushP();
+    expect(status.viewFrames).toEqual([{ w: 64, h: 48, first: [77, 77, 77, 77], age: 30 }]);
+    expect(engine.baseWrites).toEqual([]);
+  });
+
+  it('keeps one fetch in flight; newer notices cause exactly one more with the newest id', async () => {
+    start();
+    connectActive();
+    sock().tell(viewNotice(1));
+    await flushP();
+    sock().tell(viewNotice(2));
+    sock().tell(viewNotice(3));
+    await flushP();
+    expect(fm!.calls.length).toBe(1);
+    fm!.calls[0].settle(okBytes(viewBody(64, 48, 1)));
+    await flushP();
+    expect(fm!.calls.length).toBe(2);
+    expect(fm!.calls[1].url).toContain('frameId=3');
+    fm!.calls[1].settle(okBytes(viewBody(64, 48, 2)));
+    await flushP();
+    expect(fm!.calls.length).toBe(2);
+    expect(status.viewFrames).toHaveLength(2);
+  });
+
+  it('drops stale-size, wrong-type and malformed bodies; 404 is quiet', async () => {
+    start();
+    connectActive();
+    for (const [i, body] of [okBytes(viewBody(10, 10, 1)), okBytes(dump(0, 64, 48, 1)), okBytes(new Uint8Array(4)), new Response('', { status: 404 })].entries()) {
+      sock().tell(viewNotice(i + 1));
+      await flushP();
+      fm!.calls[i].settle(body);
+      await flushP();
+    }
+    expect(status.viewFrames).toEqual([]);
+    expect(status.notices).toEqual([]);
+  });
+
+  it('computes stroke -> view latency from appliedFrameId', async () => {
+    start(64, 48, withLayer);
+    connectActive();
     vi.advanceTimersByTime(100);
-    const n = sock().frames().length;
-    engine.emit({ type: 'composite', rect: { x: 1, y: 1, w: 3, h: 3 } });
-    sock().tell({ t: 'active', active: false });
-    vi.advanceTimersByTime(300);
-    expect(sock().frames().length).toBe(n);
-    sock().tell({ t: 'docSize', w: 30, h: 20, hasInput: false });
-    vi.advanceTimersByTime(300);
-    expect(sock().frames().length).toBe(n);
-    expect([engine.width, engine.height]).toEqual([30, 20]);
-    sock().tell({ t: 'active', active: true });
-    vi.advanceTimersByTime(100);
-    const sent = sock().frames().slice(n);
-    expect(sent.length).toBe(1);
-    expect(sent[0]).toMatchObject({ docW: 30, docH: 20, w: 30, h: 20 });
+    engine.emit({ type: 'surface', slot: 1, rect: { x: 0, y: 0, w: 2, h: 2 } });
+    vi.advanceTimersByTime(40);
+    const id = at(sock().frames(), -1).frameId;
+    vi.advanceTimersByTime(60);
+    sock().tell(viewNotice(1, id));
+    await flushP();
+    vi.advanceTimersByTime(10);
+    fm!.calls[0].settle(okBytes(viewBody(64, 48, 3)));
+    await flushP();
+    expect(status.viewLatency).toHaveLength(1);
+    expect(status.viewLatency[0].median).toBe(110);
+  });
+
+  it('a failed view fetch re-subscribes (view message) after 2 s so TD re-announces', async () => {
+    start();
+    connectActive();
+    bridge.setView({ mode: 'td', zoom: 1, panX: 0, panY: 0, rect: { x: 0, y: 0, w: 10, h: 10 } });
+    vi.advanceTimersByTime(16);
+    const n = () => sock().json().filter((m) => m.t === 'view').length;
+    const before = n();
+    sock().tell(viewNotice(1));
+    await flushP();
+    fm!.calls[0].settle(new TypeError('net'));
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(n()).toBe(before);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(n()).toBe(before + 1);
+  });
+
+  it('aborts the in-flight view fetch on socket close and ignores late results', async () => {
+    start();
+    connectActive();
+    sock().tell(viewNotice(1));
+    await flushP();
+    sock().close();
+    expect(fm!.calls[0].signal?.aborted).toBe(true);
+    fm!.calls[0].settle(okBytes(viewBody(64, 48, 1)));
+    await flushP();
+    expect(status.viewFrames).toEqual([]);
   });
 });
 
@@ -352,19 +944,19 @@ class FetchMock {
     this.calls.push({ url, signal, settle: (r) => (r instanceof Error ? reject(r) : resolve(r)) });
   })) as unknown as typeof fetch;
 }
-const flush = () => vi.advanceTimersByTimeAsync(0);
+const flush = flushP;
 const baseFrame = (docW: number, docH: number, v: number, frameId = 1) =>
   encodeBands({ type: FRAME_BASE, frameId, docW, docH, rect: { x: 0, y: 0, w: docW, h: docH }, pixels: new Uint8Array(docW * docH * 4).fill(v), maxPayload: 1 << 30 }).next().value as Uint8Array;
-const ok = (bytes: Uint8Array) => new Response(bytes as BufferSource, { status: 200 });
 const notice = (frameId: number, w = 64, h = 48): TdMessage => ({ t: 'base', frameId, docW: w, docH: h, x: 0, y: 0, w, h });
 
 describe('tdBridge base pull (HTTP)', () => {
   let fm: FetchMock;
+  const ok = okBytes;
   const startF = () => {
     fm = new FetchMock();
     engine = new FakeEngine(64, 48);
-    status = { conn: [], active: [], notices: [], setConnection(c) { this.conn.push(c); }, setActive(a) { this.active.push(a); }, setNotice(m) { this.notices.push(m); } };
-    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 'tok 1', fetch: fm.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false });
+    status = makeStatus();
+    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 'tok 1', fetch: fm.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
     connectActive();
   };
 

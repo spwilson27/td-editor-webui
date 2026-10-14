@@ -1,5 +1,6 @@
 import { computed, effect, signal } from '@preact/signals';
-import type { BrushSettings, EditorEngine, RGBA, ToolId } from '../engine/types';
+import type { AdjustmentSpec, AdjustmentType, BrushSettings, EditorEngine, RGBA, ToolId } from '../engine/types';
+import { NO_LATENCY, type LatencyStats } from '../bridge/tdBridge';
 import { hsvToRgb, parseHex, rgbToHsl, rgbToHsv, toHex, type Hsv, type Rgb } from './colour';
 import { BRUSHES, RECENT_DEFAULT, toolInfo } from './tools';
 import { fitView, screenToDoc, zoomAbout, clampZoom, type View } from './view';
@@ -27,7 +28,21 @@ export function createStore() {
   const fillTolerance = signal(32);
 
   const colorTab = signal<'color' | 'swatches' | 'brushes'>('color');
-  const layerTab = signal<'layers' | 'history'>('layers');
+  const layerTab = signal<'layers' | 'history' | 'adjust'>('layers');
+
+  // v2: view mode (Local preview vs TouchDesigner output), client kind, latency readouts
+  const viewMode = signal<'local' | 'td'>('local');
+  const clientKind = signal<'panel' | 'external'>('external');
+  const viewRect = signal({ x: 0, y: 0, w: 0, h: 0 });
+  const latency = signal<LatencyStats>(NO_LATENCY);
+  const viewLatency = signal<LatencyStats>(NO_LATENCY);
+  const viewAge = signal<number | null>(null);
+  const tdViewTick = signal(0);
+  const loadingDoc = signal(false);
+  const adjDraft = signal<{ id: string; spec: AdjustmentSpec } | null>(null);
+  let tdViewSource: HTMLCanvasElement | null = null;
+  let lastActiveId: string | null = null;
+  let adjFlush: number | null = null;
 
   const view = signal<View>({ zoom: 1, x: 0, y: 0 });
   const zoom = computed(() => view.value.zoom);
@@ -62,9 +77,15 @@ export function createStore() {
 
   const store = {
     tool, hsv, primary, secondary, alpha, recent, customSwatches, brush, brushPreset, fillTolerance,
-    colorTab, layerTab, view, zoom, spaceHeld, docSize, docName, connection, active, notice, fatal,
+    colorTab, layerTab, viewMode, clientKind, viewRect, latency, viewLatency, viewAge, tdViewTick, adjDraft, loadingDoc,
+    view, zoom, spaceHeld, docSize, docName, connection, active, notice, fatal,
     docVersion, historyVersion, selectionVersion, thumbTick,
     takeover: null as (() => void) | null,
+    /** TD view is only possible while linked to TouchDesigner. */
+    tdAvailable: computed(() => connection.value === 'linked'),
+    /** Panel client in TD view: the page leaves the document rect transparent so TD's overlay shows through. */
+    tdPanel: computed(() => viewMode.value === 'td' && clientKind.value === 'panel'),
+    tdViewSource: () => tdViewSource,
     /** Time of the last Space keydown (incl. auto-repeat); lets a missing keyup be detected. */
     spaceSeenAt: 0,
 
@@ -80,7 +101,18 @@ export function createStore() {
       docSize.value = { w: e.width, h: e.height };
       offEngine = e.on((ev) => {
         switch (ev.type) {
-          case 'structure': docVersion.value++; thumbTick.value++; break;
+          case 'structure': {
+            docVersion.value++; thumbTick.value++;
+            const id = e.activeLayerId();
+            if (id !== lastActiveId) {
+              lastActiveId = id;
+              const kind = e.layers().find((l) => l.id === id)?.kind;
+              if (kind === 'adjustment') layerTab.value = 'adjust';
+              else if (layerTab.peek() === 'adjust') layerTab.value = 'layers';
+            }
+            break;
+          }
+          case 'surface':
           case 'pixels':
             if (!thumbTimer) thumbTimer = setTimeout(() => { thumbTimer = null; thumbTick.value++; }, 250);
             break;
@@ -97,6 +129,8 @@ export function createStore() {
         }
       });
       e.setTool(tool.value);
+      e.setPreviewEnabled(viewMode.peek() === 'local');
+      lastActiveId = e.activeLayerId();
       stopContextSync = effect(() => {
         e.setToolContext({
           primary: toRgba(primary.value, alpha.value),
@@ -211,6 +245,53 @@ export function createStore() {
     },
     toDoc: (sx: number, sy: number) => screenToDoc(view.peek(), sx, sy),
 
+    // v2 view mode, masks, adjustments
+    setViewMode(m: 'local' | 'td') {
+      if (m === 'td' && connection.peek() !== 'linked') return;
+      viewMode.value = m;
+      engine?.setPreviewEnabled(m === 'local');
+    },
+    toggleViewMode: () => store.setViewMode(viewMode.peek() === 'local' ? 'td' : 'local'),
+    /** Image of TD's output for the external TD view (straight RGBA, document sized). */
+    setViewFrame(w: number, h: number, rgba: Uint8ClampedArray, ageMs: number) {
+      if (!tdViewSource) tdViewSource = document.createElement('canvas');
+      if (tdViewSource.width !== w || tdViewSource.height !== h) { tdViewSource.width = w; tdViewSource.height = h; }
+      tdViewSource.getContext('2d')!.putImageData(new ImageData(rgba as Uint8ClampedArray<ArrayBuffer>, w, h), 0, 0);
+      viewAge.value = Math.round(ageMs);
+      tdViewTick.value++;
+    },
+    setLoading: (b: boolean) => { loadingDoc.value = b; },
+    setLatency: (s: LatencyStats) => { latency.value = s; },
+    setViewLatency: (s: LatencyStats) => { viewLatency.value = s; },
+    addAdjustment: (type: AdjustmentType) => store.engine.addAdjustment(type),
+    activeLayer() {
+      const e = store.engine, id = e.activeLayerId();
+      return e.layers().find((l) => l.id === id);
+    },
+    canAddMask() {
+      const l = store.activeLayer();
+      return !!l && (l.kind === 'pixel' || l.kind === 'adjustment') && !l.mask;
+    },
+    addMask() {
+      const l = store.activeLayer();
+      if (l && store.canAddMask()) store.engine.addMask(l.id);
+    },
+    deleteMask() {
+      const l = store.activeLayer();
+      if (l?.mask) store.engine.deleteMask(l.id);
+    },
+    /** Live adjustment edits: latest spec wins, applied at most once per animation frame. */
+    editAdjustment(id: string, spec: AdjustmentSpec) {
+      adjDraft.value = { id, spec };
+      if (adjFlush !== null) return;
+      adjFlush = requestAnimationFrame(() => {
+        adjFlush = null;
+        const d = adjDraft.peek();
+        adjDraft.value = null;
+        if (d && engine) engine.setAdjustment(d.id, d.spec);
+      });
+    },
+
     // Document actions
     addLayer: () => store.engine.addPixelLayer(),
     addGroup: () => store.engine.addGroup(),
@@ -229,7 +310,10 @@ export function createStore() {
     },
 
     // Status
-    setConnection: (c: Connection) => { connection.value = c; },
+    setConnection: (c: Connection) => {
+      connection.value = c;
+      if (c !== 'linked' && viewMode.peek() === 'td') store.setViewMode('local'); // TD output is unavailable
+    },
     setActive: (a: boolean) => { active.value = a; },
     setNotice,
     setFatal: (msg: string) => { fatal.value = msg; },

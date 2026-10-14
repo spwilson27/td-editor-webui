@@ -32,7 +32,10 @@ export function Viewport() {
       if (!vw || !store.hasEngine()) return;
       const e = store.engine;
       setScale(mainCtx);
-      drawDocument(mainCtx, backdrop, vw, vh, store.view.peek(), e.width, e.height, e.compositeSource());
+      const td = store.viewMode.peek() === 'td';
+      // Local: the engine's preview. TD + panel: transparent document rect (TD draws underneath). TD + external: TD's image.
+      const source = !td ? e.compositeSource() : store.clientKind.peek() === 'external' ? store.tdViewSource() : null;
+      drawDocument(mainCtx, backdrop, vw, vh, store.view.peek(), e.width, e.height, source, td && store.clientKind.peek() === 'panel');
     };
     const paintOver = () => {
       overQueued = false;
@@ -51,6 +54,7 @@ export function Viewport() {
     const resize = () => {
       const r = el.getBoundingClientRect();
       vw = r.width; vh = r.height;
+      store.viewRect.value = { x: r.left, y: r.top, w: r.width, h: r.height };
       dpr = window.devicePixelRatio || 1;
       for (const c of [mainEl, overEl]) {
         c.width = Math.max(1, Math.round(vw * dpr));
@@ -77,7 +81,7 @@ export function Viewport() {
       if (ev.type === 'selection') queueOver();
     });
     const stopFx = effect(() => {
-      store.view.value; store.tool.value; store.brush.value; store.spaceHeld.value; store.selectionVersion.value;
+      store.view.value; store.viewMode.value; store.clientKind.value; store.tdViewTick.value; store.tool.value; store.brush.value; store.spaceHeld.value; store.selectionVersion.value;
       queueMain(); queueOver();
     });
     const ants = setInterval(() => { if (store.engine.selection()) { dash = (dash + 1) % 8; queueOver(); } }, 120);
@@ -101,7 +105,7 @@ export function Viewport() {
     const abort = () => { if (mode) finish(null); };
 
     const onDown = (e: PointerEvent) => {
-      if (activeId !== null || e.button === 2) return;
+      if (activeId !== null || e.button === 2 || store.loadingDoc.peek()) return;
       store.releaseStaleSpace();
       const p = local(e), tool = store.tool.peek();
       if (e.button === 1 || store.spaceHeld.peek() || tool === 'hand') {
@@ -177,8 +181,9 @@ export function Viewport() {
   }, []);
 
   const layer = 'position:absolute;left:0;top:0;width:100%;height:100%;display:block';
+  const clear = store.tdPanel.value;
   return (
-    <div ref={host} data-viewport style="flex:1 1 auto;min-height:0;position:relative;overflow:hidden;background:#1c1c1c;touch-action:none">
+    <div ref={host} data-viewport data-td-panel={clear} style={`flex:1 1 auto;min-height:0;position:relative;overflow:hidden;background:${clear ? 'transparent' : '#1c1c1c'};touch-action:none`}>
       <canvas ref={main} style={layer} />
       <canvas ref={over} style={layer + ';pointer-events:none'} />
     </div>

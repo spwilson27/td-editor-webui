@@ -404,7 +404,7 @@ describe('locked, hidden and unsupported cases', () => {
     expect(notices).toContain('Layer is hidden');
   });
 
-  it('painting on the locked base layer is refused; unlocking allows it', () => {
+  it('painting on the base layer is always refused, even after trying to unlock it', () => {
     e = newEngine(20, 20);
     e.setToolContext(brushCtx());
     const notices: string[] = [];
@@ -414,7 +414,8 @@ describe('locked, hidden and unsupported cases', () => {
     expect(notices).toEqual(['Layer is locked']);
     e.setLayerProps('base', { locked: false });
     stroke(e, 'brush', [[10, 10]]);
-    expect(px(e, 10, 10)).toEqual([0, 0, 0, 255]);
+    expect(px(e, 10, 10)).toEqual([0, 0, 0, 0]);
+    expect(e.layers()[0].locked).toBe(true);
   });
 
   it('painting with a group active is refused', () => {

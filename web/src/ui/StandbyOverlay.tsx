@@ -1,5 +1,15 @@
 import { store } from '../state/store';
 
+export function LoadingOverlay() {
+  if (!store.loadingDoc.value) return null;
+  return (
+    <div role="alert" aria-label="Loading document" data-loading-doc
+      style="position:fixed;inset:0;z-index:90;display:flex;align-items:center;justify-content:center;background:rgba(20,20,20,0.55)">
+      <div style="padding:18px 28px;background:#2b2b2b;border:1px solid #161616;border-radius:8px;box-shadow:0 12px 40px rgba(0,0,0,0.6);font-size:14px;font-weight:600">Loading document from TouchDesigner…</div>
+    </div>
+  );
+}
+
 export function StandbyOverlay() {
   if (store.active.value) return null;
   return (

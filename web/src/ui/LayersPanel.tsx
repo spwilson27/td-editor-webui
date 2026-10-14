@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
-import type { LayerInfo } from '../engine/types';
+import type { AdjustmentType, LayerInfo } from '../engine/types';
 import { computeDrop, dropZone, type DropZone } from '../state/layerDrop';
 import { capture } from './capture';
 import { store } from '../state/store';
@@ -11,26 +11,54 @@ const EYE_OFF = 'M3 3l18 18M10.6 5.1A10 10 0 0112 5c6 0 10 7 10 7a17 17 0 01-3 3
 const LOCK = 'M6 11h12v10H6zM8 11V7a4 4 0 018 0v4';
 const FOLDER = 'M3 6h7l2 2h9v11H3z';
 
-const FOOTER: { label: string; d: string; run?: () => void; off?: boolean }[] = [
-  { label: 'New pixel layer', d: 'M4 4h16v16H4zM12 8v8M8 12h8', run: () => store.addLayer() },
-  { label: 'New group', d: FOLDER, run: () => store.addGroup() },
-  { label: 'Add mask', d: 'M4 4h16v16H4zM12 8a4 4 0 100 8 4 4 0 000-8z' },
-  { label: 'New adjustment', d: 'M12 3a9 9 0 100 18V3z M12 3a9 9 0 010 18' },
-  { label: 'Layer effects', d: 'M5 19h4M7 17v4M12 3l2 5 5 2-5 2-2 5-2-5-5-2 5-2z' },
-  { label: 'Delete layer', d: 'M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13', run: () => store.deleteActive() },
+const ADJUST_ICON = 'M12 3a9 9 0 100 18V3z M12 3a9 9 0 010 18';
+const MASK_ICON = 'M4 4h16v16H4zM12 8a4 4 0 100 8 4 4 0 000-8z';
+
+const ADJUSTMENTS: { type: AdjustmentType; label: string }[] = [
+  { type: 'levels', label: 'Levels' },
+  { type: 'brightnessContrast', label: 'Brightness/Contrast' },
+  { type: 'hueSaturation', label: 'Hue/Saturation' },
+  { type: 'blur', label: 'Blur' },
+  { type: 'invert', label: 'Invert' },
+  { type: 'threshold', label: 'Threshold' },
 ];
+export const adjustmentLabel = (t: AdjustmentType) => ADJUSTMENTS.find((a) => a.type === t)?.label ?? t;
 
 function Thumb({ layer }: { layer: LayerInfo }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const tick = store.thumbTick.value;
   useEffect(() => {
-    if (layer.kind !== 'group' && ref.current) store.engine.drawThumbnail(layer.id, ref.current);
+    if (layer.kind !== 'group' && layer.kind !== 'adjustment' && ref.current) store.engine.drawThumbnail(layer.id, ref.current);
   }, [layer.id, layer.kind, tick]);
   const bg = 'background-color:#ffffff;background-image:repeating-conic-gradient(#cfcfcf 0 25%,#ffffff 0 50%);background-size:8px 8px';
+  if (layer.kind === 'adjustment') {
+    return <span aria-hidden="true" data-adjust-icon title={layer.adjustment ? adjustmentLabel(layer.adjustment.type) : 'Adjustment'} style="width:34px;height:24px;flex:none;border-radius:2px;box-shadow:0 0 0 1px #111111;background:#3a3a3a;display:flex;align-items:center;justify-content:center;color:#d4d4d4"><Icon d={ADJUST_ICON} size={14} sw={1.6} /></span>;
+  }
   if (layer.kind === 'group') {
     return <span aria-hidden="true" style="width:34px;height:24px;flex:none;border-radius:2px;box-shadow:0 0 0 1px #111111;background:#3a3a3a;display:flex;align-items:center;justify-content:center;color:#d4d4d4"><Icon d={FOLDER} size={14} sw={1.6} /></span>;
   }
   return <canvas ref={ref} width={68} height={48} aria-hidden="true" style={`width:34px;height:24px;flex:none;border-radius:2px;box-shadow:0 0 0 1px #111111;${bg}`} />;
+}
+
+function MaskThumb({ layer, target }: { layer: LayerInfo; target: boolean }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  const tick = store.thumbTick.value;
+  const mask = layer.mask!;
+  useEffect(() => { if (ref.current) store.engine.drawMaskThumbnail(layer.id, ref.current); }, [layer.id, mask.slot, tick]);
+  const e = store.engine;
+  return (
+    <button class="ib" data-nodrag data-act="mask" aria-label={`Mask of ${layer.name}`} aria-pressed={target} data-enabled={mask.enabled}
+      title="Click: paint on mask. Shift-click: disable/enable mask"
+      onClick={(ev) => { ev.stopPropagation(); if (ev.shiftKey) e.setMaskEnabled(layer.id, !mask.enabled); else e.setPaintTarget(layer.id, 'mask'); }}
+      style={`position:relative;width:34px;height:24px;flex:none;border-radius:2px;padding:0;box-shadow:0 0 0 ${target ? 2 : 1}px ${target ? '#7fb2f0' : '#111111'};background:#000000;overflow:hidden`}>
+      <canvas ref={ref} width={68} height={48} aria-hidden="true" style={`width:34px;height:24px;display:block;opacity:${mask.enabled ? 1 : 0.45}`} />
+      {!mask.enabled && (
+        <svg data-mask-off width="34" height="24" viewBox="0 0 34 24" aria-hidden="true" style="position:absolute;left:0;top:0">
+          <path d="M8 3l18 18M26 3L8 21" stroke="#e5483c" stroke-width="2" stroke-linecap="round" fill="none" />
+        </svg>
+      )}
+    </button>
+  );
 }
 
 function NameField({ layer, onDone }: { layer: LayerInfo; onDone: () => void }) {
@@ -50,8 +78,8 @@ function NameField({ layer, onDone }: { layer: LayerInfo; onDone: () => void }) 
 
 interface DragState { id: string; target: string | null; zone: DropZone }
 
-function LayerRow({ layer, layers, selected, editing, onEdit, drag }: {
-  layer: LayerInfo; layers: LayerInfo[]; selected: boolean; editing: boolean; onEdit: (id: string | null) => void; drag: DragState | null;
+function LayerRow({ layer, layers, selected, maskTarget, editing, onEdit, drag }: {
+  layer: LayerInfo; layers: LayerInfo[]; selected: boolean; maskTarget: boolean; editing: boolean; onEdit: (id: string | null) => void; drag: DragState | null;
 }) {
   const e = store.engine;
   const group = layer.kind === 'group';
@@ -85,7 +113,8 @@ function LayerRow({ layer, layers, selected, editing, onEdit, drag }: {
       <div data-act="sel" role="button" aria-pressed={selected} tabIndex={0} onClick={() => e.setActiveLayer(layer.id)}
         onDblClick={() => layer.kind !== 'base' && onEdit(layer.id)}
         style="flex:1 1 auto;min-width:0;height:40px;display:flex;align-items:center;gap:10px;text-align:left;cursor:default">
-        <Thumb layer={layer} />
+        <span data-act="thumb" onClick={() => { if (layer.mask) e.setPaintTarget(layer.id, 'pixels'); }} style="display:flex"><Thumb layer={layer} /></span>
+        {layer.mask && <MaskThumb layer={layer} target={selected && maskTarget} />}
         {editing
           ? <NameField layer={layer} onDone={() => onEdit(null)} />
           : <span data-name style="flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{layer.name}</span>}
@@ -110,7 +139,7 @@ function LayerSettings({ layer }: { layer: LayerInfo | undefined }) {
   };
   return (
     <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid #1f1f1f">
-      <select aria-label="Blend mode" disabled={!layer} value={layer?.blend || 'normal'} style="flex:1 1 auto"
+      <select aria-label="Blend mode" disabled={!layer || layer.kind === 'adjustment'} value={layer?.blend || 'normal'} style="flex:1 1 auto"
         onChange={(ev) => layer && e.setLayerProps(layer.id, { blend: (ev.target as HTMLSelectElement).value as LayerInfo['blend'] })}>
         {BLEND_MODES.map((b) => <option key={b} value={b} selected={layer?.blend === b}>{BLEND_LABELS[b]}</option>)}
       </select>
@@ -130,6 +159,7 @@ export function LayersPanel() {
   const layers = e.layers();
   const activeId = e.activeLayerId();
   const active = layers.find((l) => l.id === activeId);
+  const paint = e.paintTarget();
   const [editing, setEditing] = useState<string | null>(null);
   const [drag, setDrag] = useState<DragState | null>(null);
   const list = useRef<HTMLDivElement>(null);
@@ -183,22 +213,54 @@ export function LayersPanel() {
       <div ref={list} data-layer-list onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp}
         style="flex:1 1 auto;min-height:0;overflow-y:auto;padding:4px 0;user-select:none">
         {layers.map((l) => (
-          <LayerRow key={l.id} layer={l} layers={layers} selected={l.id === activeId} editing={editing === l.id}
+          <LayerRow key={l.id} layer={l} layers={layers} selected={l.id === activeId} maskTarget={paint.layerId === l.id && paint.target === 'mask'} editing={editing === l.id}
             onEdit={setEditing} drag={drag} />
         ))}
       </div>
-      <div style="height:36px;flex:none;display:flex;align-items:center;justify-content:space-around;border-top:1px solid #1f1f1f;background:#282828">
-        {FOOTER.map((b) => {
-          const enabled = b.run && (b.label !== 'Delete layer' || canDelete);
-          return (
-            <button key={b.label} class="ib" aria-label={b.label} aria-disabled={!enabled}
-              title={b.run ? b.label : `${b.label} — ${NOT_IN_VERSION}`}
-              onClick={() => enabled && b.run!()} style={`width:32px;height:30px;opacity:${enabled ? 1 : 0.4}`}>
-              <Icon d={b.d} sw={1.7} />
+      <Footer canDelete={canDelete} canMask={store.canAddMask()} />
+    </div>
+  );
+}
+
+function Footer({ canDelete, canMask }: { canDelete: boolean; canMask: boolean }) {
+  const [menu, setMenu] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!menu) return;
+    const away = (e: PointerEvent) => { if (!ref.current?.contains(e.target as Node)) setMenu(false); };
+    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') setMenu(false); };
+    window.addEventListener('pointerdown', away, true);
+    window.addEventListener('keydown', esc);
+    return () => { window.removeEventListener('pointerdown', away, true); window.removeEventListener('keydown', esc); };
+  }, [menu]);
+  const buttons: { label: string; d: string; run?: () => void; enabled: boolean; menu?: boolean }[] = [
+    { label: 'New pixel layer', d: 'M4 4h16v16H4zM12 8v8M8 12h8', run: () => store.addLayer(), enabled: true },
+    { label: 'New group', d: FOLDER, run: () => store.addGroup(), enabled: true },
+    { label: 'Add mask', d: MASK_ICON, run: () => store.addMask(), enabled: canMask },
+    { label: 'New adjustment', d: ADJUST_ICON, run: () => setMenu(!menu), enabled: true, menu: true },
+    { label: 'Layer effects', d: 'M5 19h4M7 17v4M12 3l2 5 5 2-5 2-2 5-2-5-5-2 5-2z', enabled: false },
+    { label: 'Delete layer', d: 'M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13', run: () => store.deleteActive(), enabled: canDelete },
+  ];
+  return (
+    <div ref={ref} style="position:relative;height:36px;flex:none;display:flex;align-items:center;justify-content:space-around;border-top:1px solid #1f1f1f;background:#282828">
+      {buttons.map((b) => (
+        <button key={b.label} class="ib" aria-label={b.label} aria-disabled={!b.enabled} aria-haspopup={b.menu ? 'menu' : undefined} aria-expanded={b.menu ? menu : undefined}
+          title={b.run ? (b.enabled ? b.label : `${b.label} — not available for this layer`) : `${b.label} — ${NOT_IN_VERSION}`}
+          onClick={() => b.enabled && b.run?.()} style={`width:32px;height:30px;opacity:${b.enabled ? 1 : 0.4}`}>
+          <Icon d={b.d} sw={1.7} />
+        </button>
+      ))}
+      {menu && (
+        <div role="menu" aria-label="New adjustment" style="position:absolute;left:50%;bottom:100%;z-index:50;min-width:190px;padding:4px;background:#2f2f2f;border:1px solid #161616;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,0.55)">
+          {ADJUSTMENTS.map((a) => (
+            <button key={a.type} role="menuitem" class="mi" data-adjustment={a.type}
+              onClick={() => { setMenu(false); store.addAdjustment(a.type); }}
+              style="display:flex;width:100%;box-sizing:border-box;align-items:center;height:26px;padding:0 10px;border-radius:4px;text-align:left;color:#e3e3e3">
+              {a.label}
             </button>
-          );
-        })}
-      </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

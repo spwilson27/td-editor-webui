@@ -1,5 +1,4 @@
 import type { Rect } from './types';
-import type { PixelLayer } from './model';
 import type { Surface } from './surface';
 
 export const TILE = 128;
@@ -18,7 +17,7 @@ export class TileBackup {
   private done = new Set<number>();
   private cols: number;
 
-  constructor(private layer: PixelLayer, private backup: Surface) {
+  constructor(private layer: { readonly surface: Surface }, private backup: Surface) {
     this.cols = Math.ceil(layer.surface.width / TILE);
   }
 

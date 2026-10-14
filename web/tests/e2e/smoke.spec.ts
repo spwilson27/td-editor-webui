@@ -272,6 +272,13 @@ for (const [w, h] of [[1280, 800], [1024, 700]] as const) {
       const box = (await page.locator('[data-rail]').getByLabel(label).boundingBox())!;
       expect(box.y + box.height).toBeLessThanOrEqual(rail.bottom + 0.5);
     }
+    const status = await page.locator('[data-status=connection]').evaluate((el) => {
+      const bar = el.parentElement!;
+      return { overflowX: bar.scrollWidth > bar.clientWidth + 1, right: el.getBoundingClientRect().right, view: document.documentElement.clientWidth };
+    });
+    expect(status.overflowX).toBe(false);
+    expect(status.right).toBeLessThanOrEqual(status.view);
+    await expect(page.locator('[data-view-mode=td]')).toBeVisible();
     await page.mouse.move(w / 2, h / 2);
     mkdirSync(REVIEW, { recursive: true });
     await page.screenshot({ path: resolve(REVIEW, `app-${w}x${h}.png`) });

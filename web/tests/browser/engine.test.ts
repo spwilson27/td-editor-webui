@@ -15,7 +15,7 @@ describe('layers', () => {
   it('starts with a locked base layer that is active', () => {
     e = newEngine(10, 10);
     expect(e.layers()).toEqual([
-      { id: 'base', name: 'TD Input', kind: 'base', visible: true, locked: true, opacity: 1, blend: 'normal', depth: 0, parentId: null },
+      { id: 'base', name: 'TD Input', kind: 'base', visible: true, locked: true, opacity: 1, blend: 'normal', depth: 0, parentId: null, slot: null, mask: null, adjustment: null },
     ]);
     expect(e.activeLayerId()).toBe('base');
   });
@@ -431,7 +431,7 @@ describe('events and lifecycle', () => {
     e = newEngine(4, 4);
     const ev = collect(e);
     e.addPixelLayer();
-    expect(ev.map((x) => x.type)).toEqual(['structure', 'history']);
+    expect(ev.map((x) => x.type)).toEqual(['structure', 'docspec', 'history']);
   });
 
   it('setActiveLayer ignores unknown ids and repeated ids', () => {

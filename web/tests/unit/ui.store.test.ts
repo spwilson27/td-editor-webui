@@ -171,3 +171,72 @@ describe('store: layers', () => {
     expect(engine.layers().some((l) => l.kind === 'base')).toBe(true);
   });
 });
+
+describe('store: v2 view mode, masks, adjustments', () => {
+  it('TD view needs a linked connection and toggles the engine preview', () => {
+    store.setViewMode('td');
+    expect(store.viewMode.value).toBe('local');
+    expect(store.tdAvailable.value).toBe(false);
+    store.setConnection('linked');
+    store.setViewMode('td');
+    expect(store.viewMode.value).toBe('td');
+    expect(engine.previewEnabled).toBe(false);
+    store.setViewMode('local');
+    expect(engine.previewEnabled).toBe(true);
+  });
+
+  it('falls back to Local when the connection drops while in TD view', () => {
+    store.setConnection('linked');
+    store.setViewMode('td');
+    store.setConnection('reconnecting');
+    expect(store.viewMode.value).toBe('local');
+    expect(engine.previewEnabled).toBe(true);
+  });
+
+  it('only a panel client in TD view is transparent', () => {
+    store.setConnection('linked');
+    store.setViewMode('td');
+    expect(store.tdPanel.value).toBe(false);
+    store.clientKind.value = 'panel';
+    expect(store.tdPanel.value).toBe(true);
+    store.setViewMode('local');
+    expect(store.tdPanel.value).toBe(false);
+  });
+
+  it('selects the Adjustment tab when an adjustment layer becomes active and leaves it otherwise', () => {
+    const adj = store.addAdjustment('blur');
+    expect(store.layerTab.value).toBe('adjust');
+    engine.setActiveLayer('base');
+    expect(store.layerTab.value).toBe('layers');
+    engine.setActiveLayer(adj);
+    expect(store.layerTab.value).toBe('adjust');
+    store.layerTab.value = 'history';
+    engine.emit({ type: 'structure' }); // same active layer: the user's tab choice stays
+    expect(store.layerTab.value).toBe('history');
+  });
+
+  it('adds a mask only to pixel and adjustment layers that have none', () => {
+    expect(store.canAddMask()).toBe(false); // base
+    store.addLayer();
+    expect(store.canAddMask()).toBe(true);
+    store.addMask();
+    expect(engine.calls.filter((c) => c.startsWith('addMask'))).toHaveLength(1);
+    expect(store.canAddMask()).toBe(false);
+    store.deleteMask();
+    expect(store.canAddMask()).toBe(true);
+    store.addGroup();
+    expect(store.canAddMask()).toBe(false);
+  });
+
+  it('coalesces live adjustment edits to the newest value per animation frame', () => {
+    vi.stubGlobal('requestAnimationFrame', (cb: () => void) => setTimeout(cb, 16) as unknown as number);
+    const id = store.addAdjustment('threshold');
+    for (const level of [0.1, 0.2, 0.3]) store.editAdjustment(id, { type: 'threshold', level });
+    expect(store.adjDraft.value).toEqual({ id, spec: { type: 'threshold', level: 0.3 } });
+    expect(engine.calls.filter((c) => c.startsWith('setAdjustment'))).toHaveLength(0);
+    vi.advanceTimersByTime(16);
+    expect(engine.calls.filter((c) => c.startsWith('setAdjustment'))).toEqual([`setAdjustment:${id}:{"type":"threshold","level":0.3}`]);
+    expect(store.adjDraft.value).toBeNull();
+    vi.unstubAllGlobals();
+  });
+});

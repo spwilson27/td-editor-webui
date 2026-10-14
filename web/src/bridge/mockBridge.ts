@@ -47,5 +47,5 @@ export function startMockBridge(engine: EditorEngine, status: BridgeStatus & { d
   if (status.docName) status.docName.value = 'landscape.png';
   status.setConnection('standalone');
   status.setActive(true);
-  return { takeover() {}, dispose() {} };
+  return { takeover() {}, dispose() {}, setView() {} };
 }

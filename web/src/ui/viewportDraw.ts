@@ -23,28 +23,30 @@ export class Backdrop {
   private key = '';
   builds = 0;
 
-  draw(ctx: CanvasRenderingContext2D, vw: number, vh: number, view: View, docW: number, docH: number): void {
+  draw(ctx: CanvasRenderingContext2D, vw: number, vh: number, view: View, docW: number, docH: number, hole = false): void {
     const t = ctx.getTransform();
-    const key = [vw, vh, view.zoom, view.x, view.y, docW, docH, ctx.canvas.width, ctx.canvas.height].join(',');
+    const key = [vw, vh, view.zoom, view.x, view.y, docW, docH, ctx.canvas.width, ctx.canvas.height, hole].join(',');
     if (!this.canvas || key !== this.key) {
       const c = this.canvas ?? document.createElement('canvas');
       c.width = ctx.canvas.width;
       c.height = ctx.canvas.height;
       const b = c.getContext('2d')!;
       b.setTransform(t);
-      paintBackdrop(b, vw, vh, view, docW, docH);
+      paintBackdrop(b, vw, vh, view, docW, docH, hole);
       this.canvas = c;
       this.key = key;
       this.builds++;
     }
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height); // a transparent hole must not keep the last frame
     ctx.drawImage(this.canvas, 0, 0);
     ctx.restore();
   }
 }
 
-function paintBackdrop(ctx: CanvasRenderingContext2D, vw: number, vh: number, view: View, docW: number, docH: number): void {
+/** `hole`: TD-view in the panel. Surround and shadow are drawn, the document rect stays fully transparent. */
+function paintBackdrop(ctx: CanvasRenderingContext2D, vw: number, vh: number, view: View, docW: number, docH: number, hole: boolean): void {
   ctx.fillStyle = '#1c1c1c';
   ctx.fillRect(0, 0, vw, vh);
   const { zoom: z, x, y } = view;
@@ -60,6 +62,10 @@ function paintBackdrop(ctx: CanvasRenderingContext2D, vw: number, vh: number, vi
 
   const x0 = Math.max(0, x), y0 = Math.max(0, y), x1 = Math.min(vw, x + w), y1 = Math.min(vh, y + h);
   if (x1 <= x0 || y1 <= y0) return;
+  if (hole) {
+    ctx.clearRect(x0, y0, x1 - x0, y1 - y0);
+    return;
+  }
   ctx.save();
   ctx.beginPath();
   ctx.rect(x0, y0, x1 - x0, y1 - y0);
@@ -71,9 +77,9 @@ function paintBackdrop(ctx: CanvasRenderingContext2D, vw: number, vh: number, vi
 }
 
 /** Draws the cached backdrop, then the composite. `ctx` is already scaled to CSS px. */
-export function drawDocument(ctx: CanvasRenderingContext2D, backdrop: Backdrop, vw: number, vh: number, view: View, docW: number, docH: number, source: CanvasImageSource | null): void {
-  backdrop.draw(ctx, vw, vh, view, docW, docH);
-  if (!source) return;
+export function drawDocument(ctx: CanvasRenderingContext2D, backdrop: Backdrop, vw: number, vh: number, view: View, docW: number, docH: number, source: CanvasImageSource | null, hole = false): void {
+  backdrop.draw(ctx, vw, vh, view, docW, docH, hole);
+  if (!source || hole) return;
   const { zoom: z, x, y } = view;
   const x0 = Math.max(0, x), y0 = Math.max(0, y), x1 = Math.min(vw, x + docW * z), y1 = Math.min(vh, y + docH * z);
   if (x1 <= x0 || y1 <= y0) return;

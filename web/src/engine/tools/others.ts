@@ -1,7 +1,8 @@
 import type { Rect, ToolPointer } from '../types';
 import { fromPoints, intersect, isEmpty, translate, union } from '../rect';
 import { cropData, floodFill, paintMasked } from '../floodFill';
-import type { StructureSnapshot, PixelLayer } from '../model';
+import type { EditTarget, StructureSnapshot, PixelLayer } from '../model';
+import { luminance } from '../adjustments';
 import { commitPatches, editableRegion, restoreAndDraw } from './paint';
 import { cancelRaf, raf } from '../compositor';
 import { TileBackup } from '../tiles';
@@ -30,9 +31,7 @@ export class MoveTool implements Tool {
   constructor(private host: Host) {}
 
   down(p: ToolPointer): void {
-    const l = this.host.doc.active();
-    if (l && l.kind === 'group') return this.host.emit({ type: 'notice', message: 'Select a pixel layer to move' });
-    this.layer = this.host.editableLayer();
+    this.layer = this.host.movableLayer();
     if (!this.layer) return;
     this.before = this.host.doc.snapshot();
     this.sx = p.x;
@@ -51,6 +50,7 @@ export class MoveTool implements Tool {
     l.x = nx;
     l.y = ny;
     this.host.changed(union(old, translate(old, nx - old.x, ny - old.y)) as Rect);
+    this.host.docMoved();
   }
 
   up(p: ToolPointer): void {
@@ -92,23 +92,47 @@ export class FillTool implements Tool {
     const lay = intersect({ x: 0, y: 0, w: layer.surface.width, h: layer.surface.height }, translate(this.host.doc.selection ?? { x: 0, y: 0, w: this.host.doc.width, h: this.host.doc.height }, -layer.x, -layer.y)) as Rect;
     const ctx = this.host.context();
     const img = layer.surface.ctx.getImageData(lay.x, lay.y, lay.w, lay.h);
-    const res = floodFill(img.data, lay.w, lay.h, Math.floor(p.x) - layer.x - lay.x, Math.floor(p.y) - layer.y - lay.y, ctx.fillTolerance);
+    // Masks flood on their value (alpha) only; the colour channels of the alpha-stored mask are meaningless.
+    const probe = layer.isMask ? maskProbe(img.data) : img.data;
+    const res = floodFill(probe, lay.w, lay.h, Math.floor(p.x) - layer.x - lay.x, Math.floor(p.y) - layer.y - lay.y, ctx.fillTolerance);
     if (!res) return;
     const before = cropData(img.data, lay.w, res.rect);
     const after = before.slice();
-    paintMasked(after, lay.w, res.rect, res.mask, ctx.primary);
+    if (layer.isMask) paintMaskValue(after, lay.w, res.rect, res.mask, luminance(ctx.primary.r, ctx.primary.g, ctx.primary.b), ctx.primary.a / 255);
+    else paintMasked(after, lay.w, res.rect, res.mask, ctx.primary);
     const r = { x: lay.x + res.rect.x, y: lay.y + res.rect.y, w: res.rect.w, h: res.rect.h };
     const afterImg = new ImageData(after, r.w, r.h);
     layer.surface.ctx.putImageData(afterImg, r.x, r.y);
-    this.host.changed(translate(r, layer.x, layer.y));
+    this.host.paintChanged(layer, translate(r, layer.x, layer.y));
     this.host.pushPatch('Fill', layer, [{ rect: r, before: new ImageData(before, r.w, r.h), after: afterImg }]);
   }
   move(): void {}
   up(): void {}
 }
 
+/** Greyscale probe of an alpha-stored mask: every channel = mask value. */
+function maskProbe(data: Uint8ClampedArray): Uint8ClampedArray {
+  const out = new Uint8ClampedArray(data.length);
+  for (let i = 0; i < data.length; i += 4) out.fill(data[i + 3], i, i + 4);
+  return out;
+}
+
+/** Set the mask value (lerp towards `value` by `amount`) wherever `mask` is set; `crop` is rgb=255/alpha storage. */
+function paintMaskValue(crop: Uint8ClampedArray, w: number, rect: Rect, mask: Uint8Array, value: number, amount: number): void {
+  for (let y = 0; y < rect.h; y++) {
+    for (let x = 0; x < rect.w; x++) {
+      if (!mask[(rect.y + y) * w + rect.x + x]) continue;
+      const i = (y * rect.w + x) * 4;
+      crop[i] = 255;
+      crop[i + 1] = 255;
+      crop[i + 2] = 255;
+      crop[i + 3] = Math.round(crop[i + 3] * (1 - amount) + value * amount);
+    }
+  }
+}
+
 export class GradientTool implements Tool {
-  private layer: PixelLayer | null = null;
+  private layer: EditTarget | null = null;
   private tb: TileBackup | null = null;
   private sx = 0;
   private sy = 0;
@@ -165,12 +189,19 @@ export class GradientTool implements Tool {
       if (p.x === this.sx && p.y === this.sy) return; // zero-length drag paints nothing
       const c = layer.surface.ctx;
       const g = c.createLinearGradient(this.sx - layer.x, this.sy - layer.y, p.x - layer.x, p.y - layer.y);
-      g.addColorStop(0, `rgba(${a.r},${a.g},${a.b},${a.a / 255})`);
-      g.addColorStop(1, `rgba(${b.r},${b.g},${b.b},${b.a / 255})`);
+      if (layer.isMask) {
+        // Mask value from colour luminance, replacing the old mask under the gradient (stored as white with alpha).
+        g.addColorStop(0, `rgba(255,255,255,${luminance(a.r, a.g, a.b) / 255})`);
+        g.addColorStop(1, `rgba(255,255,255,${luminance(b.r, b.g, b.b) / 255})`);
+        c.clearRect(lr.x, lr.y, lr.w, lr.h);
+      } else {
+        g.addColorStop(0, `rgba(${a.r},${a.g},${a.b},${a.a / 255})`);
+        g.addColorStop(1, `rgba(${b.r},${b.g},${b.b},${b.a / 255})`);
+      }
       c.fillStyle = g;
       c.fillRect(lr.x, lr.y, lr.w, lr.h);
     });
     this.drew = true;
-    this.host.changed(area);
+    this.host.paintChanged(layer, area);
   }
 }

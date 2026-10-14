@@ -4,7 +4,7 @@ import { MODES } from '../state/tools';
 import { formatZoom } from '../state/view';
 import { Icon, NOT_IN_VERSION } from './Icon';
 
-type Item = 'sep' | { label: string; hint?: string; run?: (s: Store) => void };
+type Item = 'sep' | { label: string; hint?: string; run?: (s: Store) => void; checked?: (s: Store) => boolean; enabled?: (s: Store) => boolean };
 interface MenuDef { label: string; items: Item[] }
 
 const off = (label: string, hint?: string): Item => ({ label, hint });
@@ -15,11 +15,13 @@ const MENUS: MenuDef[] = [
   { label: 'Edit', items: [{ label: 'Undo', hint: 'Ctrl+Z', run: (s) => s.undo() }, { label: 'Redo', hint: 'Ctrl+Shift+Z', run: (s) => s.redo() },
     'sep', off('Cut', 'Ctrl+X'), off('Copy', 'Ctrl+C'), off('Paste', 'Ctrl+V')] },
   { label: 'Document', items: [off('Resize document…'), off('Resize canvas…'), off('Rotate…')] },
-  { label: 'Layer', items: [off('Duplicate'), off('Merge down'), off('Layer properties…')] },
+  { label: 'Layer', items: [off('Duplicate'), off('Merge down'), off('Layer properties…'), 'sep', { label: 'Add mask', run: (s) => s.addMask(), enabled: (s) => s.canAddMask() }, { label: 'Delete mask', run: (s) => s.deleteMask(), enabled: (s) => !!s.activeLayer()?.mask }] },
   { label: 'Select', items: [off('Select all', 'Ctrl+A'), { label: 'Deselect', hint: 'Ctrl+D', run: (s) => s.deselect() }, off('Invert selection')] },
   { label: 'Filters', items: [off('Blur…'), off('Sharpen…'), off('Noise…')] },
   { label: 'View', items: [{ label: 'Zoom in', hint: '+', run: (s) => s.zoomStep(1) }, { label: 'Zoom out', hint: '-', run: (s) => s.zoomStep(-1) },
-    { label: 'Fit', hint: '0', run: (s) => s.fit() }, { label: '100%', hint: '1', run: (s) => s.zoomTo(1) }] },
+    { label: 'Fit', hint: '0', run: (s) => s.fit() }, { label: '100%', hint: '1', run: (s) => s.zoomTo(1) }, 'sep',
+    { label: 'Local view', run: (s) => s.setViewMode('local'), checked: (s) => s.viewMode.value === 'local' },
+    { label: 'TouchDesigner view', run: (s) => s.setViewMode('td'), checked: (s) => s.viewMode.value === 'td', enabled: (s) => s.tdAvailable.value }] },
   { label: 'Window', items: [off('Reset layout'), off('Show rulers')] },
 ];
 
@@ -47,16 +49,19 @@ function MenuBar() {
             style="padding:5px 8px;border-radius:4px">{m.label}</button>
           {open === i && (
             <div role="menu" style="position:absolute;left:0;top:100%;z-index:50;min-width:210px;padding:4px;background:#2f2f2f;border:1px solid #161616;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,0.55)">
-              {m.items.map((it, k) => it === 'sep'
-                ? <div key={k} style="height:1px;background:#444;margin:4px 2px" />
-                : (
-                  <button key={it.label} role="menuitem" class="mi" aria-disabled={!it.run} title={it.run ? undefined : NOT_IN_VERSION}
-                    onClick={() => { if (!it.run) return; setOpen(-1); it.run(store); }}
-                    style={`display:flex;width:100%;box-sizing:border-box;align-items:center;gap:24px;height:26px;padding:0 10px;border-radius:4px;text-align:left;color:${it.run ? '#e3e3e3' : '#707070'}`}>
-                    <span style="flex:1 1 auto">{it.label}</span>
+              {m.items.map((it, k) => {
+                if (it === 'sep') return <div key={k} style="height:1px;background:#444;margin:4px 2px" />;
+                const usable = !!it.run && (!it.enabled || it.enabled(store));
+                const check = it.checked?.(store);
+                return (
+                  <button key={it.label} role="menuitem" class="mi" aria-disabled={!usable} aria-checked={check} title={it.run ? undefined : NOT_IN_VERSION}
+                    onClick={() => { if (!usable) return; setOpen(-1); it.run!(store); }}
+                    style={`display:flex;width:100%;box-sizing:border-box;align-items:center;gap:24px;height:26px;padding:0 10px;border-radius:4px;text-align:left;color:${usable ? '#e3e3e3' : '#707070'}`}>
+                    <span style="flex:1 1 auto">{check ? '✓ ' : ''}{it.label}</span>
                     {it.hint && <span style="color:#8f8f8f;font-size:11px">{it.hint}</span>}
                   </button>
-                ))}
+                );
+              })}
             </div>
           )}
         </div>

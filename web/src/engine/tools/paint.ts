@@ -1,5 +1,6 @@
 import type { Rect, ToolPointer } from '../types';
-import type { PixelLayer } from '../model';
+import type { EditTarget } from '../model';
+import { luminance } from '../adjustments';
 import { clipToSize, intersect, union } from '../rect';
 import type { Host, Tool } from './host';
 import { TileBackup } from '../tiles';
@@ -7,7 +8,7 @@ import { TileBackup } from '../tiles';
 export type PaintMode = 'brush' | 'pencil' | 'eraser';
 
 /** Restore the pre-edit pixels in `r` (layer space), then run `draw` clipped to the selection. */
-export function restoreAndDraw(host: Host, layer: PixelLayer, tb: TileBackup, r: Rect, draw: () => void): void {
+export function restoreAndDraw(host: Host, layer: EditTarget, tb: TileBackup, r: Rect, draw: () => void): void {
   tb.restore(r);
   const c = layer.surface.ctx;
   c.save();
@@ -22,21 +23,21 @@ export function restoreAndDraw(host: Host, layer: PixelLayer, tb: TileBackup, r:
 }
 
 /** Region of the document an edit to `layer` can touch: layer ∩ document ∩ selection, in document space. */
-export function editableRegion(host: Host, layer: PixelLayer, r: Rect): Rect | null {
+export function editableRegion(host: Host, layer: EditTarget, r: Rect): Rect | null {
   const lay = intersect({ x: layer.x, y: layer.y, w: layer.surface.width, h: layer.surface.height }, { x: 0, y: 0, w: host.doc.width, h: host.doc.height });
   let out = lay && intersect(r, lay);
   if (out && host.doc.selection) out = intersect(out, host.doc.selection);
   return out;
 }
 
-export function commitPatches(host: Host, layer: PixelLayer, tb: TileBackup, label: string): void {
+export function commitPatches(host: Host, layer: EditTarget, tb: TileBackup, label: string): void {
   const patches = tb.patches();
   if (patches.length) host.pushPatch(label, layer, patches);
 }
 
 /** Brush / pencil / eraser: dabs go to a stroke buffer, which is merged over the pre-stroke layer at stroke opacity. */
 export class StrokeTool implements Tool {
-  private layer: PixelLayer | null = null;
+  private layer: EditTarget | null = null;
   private lx = 0;
   private ly = 0;
   private toNext = 0; // distance until the next dab
@@ -99,6 +100,7 @@ export class StrokeTool implements Tool {
   }
 
   private color(): string {
+    if (this.layer?.isMask) return 'rgb(255,255,255)'; // coverage only: the mask value is applied at merge time
     const { r, g, b } = this.mode === 'eraser' ? { r: 0, g: 0, b: 0 } : this.host.context().primary;
     return `rgb(${r},${g},${b})`;
   }
@@ -184,10 +186,26 @@ export class StrokeTool implements Tool {
     const ly = r.y - layer.y;
     restoreAndDraw(this.host, layer, this.tb as TileBackup, { x: lx, y: ly, w: r.w, h: r.h }, () => {
       const c = layer.surface.ctx;
+      const stroke = this.host.scratch.stroke.canvas as CanvasImageSource;
+      if (layer.isMask) {
+        // mask = lerp(mask, value, coverage * opacity), stored as alpha: scale the old alpha down, add value * coverage.
+        const a = brush.opacity * primary.a / 255;
+        const value = this.mode === 'eraser' ? 0 : luminance(primary.r, primary.g, primary.b) / 255;
+        const amount = this.mode === 'eraser' ? brush.opacity : a;
+        c.globalAlpha = amount;
+        c.globalCompositeOperation = 'destination-out';
+        c.drawImage(stroke, r.x, r.y, r.w, r.h, lx, ly, r.w, r.h);
+        if (value > 0) {
+          c.globalAlpha = amount * value;
+          c.globalCompositeOperation = 'lighter';
+          c.drawImage(stroke, r.x, r.y, r.w, r.h, lx, ly, r.w, r.h);
+        }
+        return;
+      }
       c.globalAlpha = brush.opacity * (this.mode === 'eraser' ? 1 : primary.a / 255);
       c.globalCompositeOperation = this.mode === 'eraser' ? 'destination-out' : 'source-over';
-      c.drawImage(this.host.scratch.stroke.canvas as CanvasImageSource, r.x, r.y, r.w, r.h, lx, ly, r.w, r.h);
+      c.drawImage(stroke, r.x, r.y, r.w, r.h, lx, ly, r.w, r.h);
     });
-    this.host.changed(r);
+    this.host.paintChanged(layer, r);
   }
 }

@@ -1,11 +1,22 @@
 import type {
-  BlendMode, EditorEngine, EngineEvent, HistoryEntry, LayerInfo, Rect, ToolContext, ToolId, ToolPointer,
+  AdjustmentSpec, AdjustmentType, BlendMode, DocSpec, EditorEngine, EngineEvent, HistoryEntry, LayerInfo, LayerSpec, PaintTarget, Rect,
+  ToolContext, ToolId, ToolPointer,
 } from '../../src/engine/types';
 
 interface FakeLayer {
-  id: string; name: string; kind: 'pixel' | 'group' | 'base'; visible: boolean; locked: boolean;
+  id: string; name: string; kind: 'pixel' | 'group' | 'base' | 'adjustment'; visible: boolean; locked: boolean;
   opacity: number; blend: BlendMode; expanded: boolean; parent: string | null; colour: string;
+  slot: number | null; mask: { slot: number; enabled: boolean } | null; adjustment: AdjustmentSpec | null;
 }
+
+export const DEFAULT_ADJUSTMENTS: Record<AdjustmentType, AdjustmentSpec> = {
+  levels: { type: 'levels', inLow: 0, inHigh: 1, gamma: 1, outLow: 0, outHigh: 1 },
+  brightnessContrast: { type: 'brightnessContrast', brightness: 0, contrast: 0 },
+  hueSaturation: { type: 'hueSaturation', hue: 0, saturation: 1, value: 1 },
+  blur: { type: 'blur', radius: 8 },
+  invert: { type: 'invert' },
+  threshold: { type: 'threshold', level: 0.5 },
+};
 
 /** Minimal in-memory EditorEngine for UI tests. Records calls; paints dabs into a lazily created canvas. */
 export class FakeEngine implements EditorEngine {
@@ -16,6 +27,14 @@ export class FakeEngine implements EditorEngine {
   tool: ToolId = 'brush';
   context: ToolContext | null = null;
   baseWrites: { rect: Rect; len: number }[] = [];
+  surfaceWrites: { slot: number; rect: Rect; len: number }[] = [];
+  surfaceCommits = 0;
+  loaded: DocSpec[] = [];
+  previewEnabled = true;
+  rev = 0;
+  target: { layerId: string | null; target: PaintTarget } = { layerId: null, target: 'pixels' };
+  surfaces = new Map<number, Uint8ClampedArray>();
+  private nextSlot = 1;
   commits = 0;
   private listeners = new Set<(e: EngineEvent) => void>();
   private store: FakeLayer[];
@@ -29,7 +48,7 @@ export class FakeEngine implements EditorEngine {
   constructor(width = 64, height = 48) {
     this.width = width;
     this.height = height;
-    this.store = [{ id: 'base', name: 'TD Input', kind: 'base', visible: true, locked: true, opacity: 1, blend: 'normal', expanded: false, parent: null, colour: '#9cc3e4' }];
+    this.store = [{ id: 'base', name: 'TD Input', kind: 'base', visible: true, locked: true, opacity: 1, blend: 'normal', expanded: false, parent: null, colour: '#9cc3e4', slot: null, mask: null, adjustment: null }];
     this.active = 'base';
   }
 
@@ -55,21 +74,120 @@ export class FakeEngine implements EditorEngine {
     return this.order().map((l) => ({
       id: l.id, name: l.name, kind: l.kind, visible: l.visible, locked: l.locked, opacity: l.opacity, blend: l.blend,
       depth: this.depth(l), expanded: l.kind === 'group' ? l.expanded : undefined, parentId: l.parent,
+      slot: l.slot, mask: l.mask ? { ...l.mask } : null, adjustment: l.adjustment,
     }));
   }
   activeLayerId() { return this.active; }
   setActiveLayer(id: string) { this.active = id; this.calls.push(`setActive:${id}`); this.emit({ type: 'structure' }); }
 
-  private add(kind: 'pixel' | 'group', name: string): string {
+  private add(kind: 'pixel' | 'group' | 'adjustment', name: string, adjustment: AdjustmentSpec | null = null): string {
     const id = `L${this.nextId++}`;
     const above = this.store.find((l) => l.id === this.active)!;
     const idx = this.store.indexOf(above) + 1;
-    this.store.splice(idx, 0, { id, name, kind, visible: true, locked: false, opacity: 1, blend: 'normal', expanded: true, parent: above.parent, colour: '#' + ((this.nextId * 5000011) & 0xffffff).toString(16).padStart(6, '0') });
+    const slot = kind === 'pixel' ? this.nextSlot++ : null;
+    this.store.splice(idx, 0, { id, name, kind, visible: true, locked: false, opacity: 1, blend: 'normal', expanded: true, parent: above.parent, colour: '#' + ((this.nextId * 5000011) & 0xffffff).toString(16).padStart(6, '0'), slot, mask: null, adjustment });
     this.active = id;
-    this.push(kind === 'group' ? 'New group' : 'New pixel layer');
-    this.emit({ type: 'structure' });
+    this.push(kind === 'group' ? 'New group' : kind === 'adjustment' ? 'New adjustment' : 'New pixel layer');
+    this.changed();
     return id;
   }
+  /** structure + docspec, like the real engine for any stack change */
+  changed() { this.rev++; this.emit({ type: 'structure' }); this.emit({ type: 'docspec' }); }
+  addAdjustment(type: AdjustmentType) { this.calls.push(`addAdjustment:${type}`); return this.add('adjustment', type[0].toUpperCase() + type.slice(1), DEFAULT_ADJUSTMENTS[type]); }
+  setAdjustment(id: string, spec: AdjustmentSpec) {
+    this.store.find((x) => x.id === id)!.adjustment = spec;
+    this.calls.push(`setAdjustment:${id}:${JSON.stringify(spec)}`);
+    this.changed();
+  }
+  addMask(layerId: string) {
+    const l = this.store.find((x) => x.id === layerId)!;
+    const slot = this.nextSlot++;
+    l.mask = { slot, enabled: true };
+    this.calls.push(`addMask:${layerId}`);
+    this.push('Add mask');
+    this.changed();
+    return slot;
+  }
+  deleteMask(layerId: string) {
+    this.store.find((x) => x.id === layerId)!.mask = null;
+    this.calls.push(`deleteMask:${layerId}`);
+    this.changed();
+  }
+  setMaskEnabled(layerId: string, enabled: boolean) {
+    const l = this.store.find((x) => x.id === layerId)!;
+    if (l.mask) l.mask.enabled = enabled;
+    this.calls.push(`maskEnabled:${layerId}:${enabled}`);
+    this.changed();
+  }
+  setPaintTarget(layerId: string, target: PaintTarget) {
+    this.active = layerId;
+    this.target = { layerId, target };
+    this.calls.push(`paintTarget:${layerId}:${target}`);
+    this.changed();
+  }
+  paintTarget() { return this.target; }
+  drawMaskThumbnail(id: string, target: HTMLCanvasElement) {
+    const c = target.getContext('2d')!;
+    c.fillStyle = '#dddddd';
+    c.fillRect(0, 0, target.width, target.height);
+    this.calls.push(`maskThumb:${id}`);
+  }
+  docSpec(): DocSpec {
+    const layers: LayerSpec[] = [];
+    const walk = (parent: string | null) => {
+      for (const l of this.store.filter((x) => x.parent === parent)) {
+        layers.push({
+          id: l.id, kind: l.kind, parentId: l.parent, name: l.name, visible: l.visible, opacity: l.opacity, blend: l.blend,
+          x: 0, y: 0, slot: l.slot, mask: l.mask ? { ...l.mask } : null, adjustment: l.adjustment,
+        });
+        if (l.kind === 'group') walk(l.id);
+      }
+    };
+    walk(null);
+    return { rev: this.rev, width: this.width, height: this.height, layers };
+  }
+  surfaceSlots() { return this.store.flatMap((l) => [...(l.slot !== null ? [l.slot] : []), ...(l.mask ? [l.mask.slot] : [])]); }
+  /** Fills a slot with a deterministic pattern so tests can compare the bytes sent. */
+  fillSurface(slot: number, rect: Rect, rgba: [number, number, number, number]) {
+    const buf = this.surfaceBuf(slot);
+    for (let y = rect.y; y < rect.y + rect.h; y++) for (let x = rect.x; x < rect.x + rect.w; x++) buf.set(rgba, (y * this.width + x) * 4);
+    this.emit({ type: 'surface', slot, rect });
+  }
+  private surfaceBuf(slot: number) {
+    let b = this.surfaces.get(slot);
+    if (!b || b.length !== this.width * this.height * 4) { b = new Uint8ClampedArray(this.width * this.height * 4); this.surfaces.set(slot, b); }
+    return b;
+  }
+  readSurface(slot: number, rect: Rect, out?: Uint8ClampedArray) {
+    const n = rect.w * rect.h * 4, buf = out ?? new Uint8ClampedArray(n), src = this.surfaceBuf(slot);
+    for (let row = 0; row < rect.h; row++) buf.set(src.subarray(((rect.y + row) * this.width + rect.x) * 4, ((rect.y + row) * this.width + rect.x + rect.w) * 4), row * rect.w * 4);
+    return buf;
+  }
+  loadDocument(spec: DocSpec) {
+    this.loaded.push(spec);
+    this.width = spec.width; this.height = spec.height; this.canvas = null;
+    this.surfaces.clear();
+    const kids = new Map<string, FakeLayer>();
+    this.store = spec.layers.map((l) => {
+      const f: FakeLayer = { id: l.id, name: l.name, kind: l.kind as FakeLayer['kind'], visible: l.visible, locked: l.kind === 'base', opacity: l.opacity, blend: l.blend, expanded: true, parent: l.parentId, colour: '#778899', slot: l.slot, mask: l.mask ? { ...l.mask } : null, adjustment: l.adjustment };
+      kids.set(l.id, f);
+      return f;
+    });
+    this.nextSlot = Math.max(0, ...this.surfaceSlots()) + 1;
+    this.active = this.store[this.store.length - 1]?.id ?? 'base';
+    this.rev = spec.rev;
+    this.entries = []; this.index = -1;
+    this.calls.push('loadDocument');
+    this.emit({ type: 'structure' }); this.emit({ type: 'docspec' }); this.emit({ type: 'history' });
+  }
+  writeSurface(slot: number, rect: Rect, rgba: Uint8Array | Uint8ClampedArray) {
+    this.surfaceWrites.push({ slot, rect, len: rgba.length });
+    const buf = this.surfaceBuf(slot);
+    for (let row = 0; row < rect.h; row++) buf.set(rgba.subarray(row * rect.w * 4, (row + 1) * rect.w * 4), ((rect.y + row) * this.width + rect.x) * 4);
+    this.emit({ type: 'surface', slot, rect });
+  }
+  commitSurfaces() { this.surfaceCommits++; }
+  setPreviewEnabled(enabled: boolean) { this.previewEnabled = enabled; this.calls.push(`preview:${enabled}`); }
   addPixelLayer(name = `Layer ${this.nextId}`) { return this.add('pixel', name); }
   addGroup(name = `Group ${this.nextId}`) { return this.add('group', name); }
   deleteLayer(id: string) {
@@ -79,7 +197,7 @@ export class FakeEngine implements EditorEngine {
     if (this.active === id) this.active = this.store[this.store.length - 1].id;
     this.calls.push(`delete:${id}`);
     this.push('Delete layer');
-    this.emit({ type: 'structure' });
+    this.changed();
   }
   moveLayer(id: string, parent: string | null, index: number) {
     this.calls.push(`move:${id}:${parent}:${index}`);
@@ -92,12 +210,12 @@ export class FakeEngine implements EditorEngine {
     const at = before ? this.store.indexOf(before) + 1 : sibs.length ? this.store.indexOf(sibs[0]) : this.store.length;
     this.store.splice(at, 0, l);
     this.push('Move layer');
-    this.emit({ type: 'structure' });
+    this.changed();
   }
   setLayerProps(id: string, props: Partial<Pick<LayerInfo, 'name' | 'visible' | 'locked' | 'opacity' | 'blend' | 'expanded'>>) {
     Object.assign(this.store.find((x) => x.id === id)!, props);
     this.calls.push(`props:${id}:${JSON.stringify(props)}`);
-    this.emit({ type: 'structure' });
+    this.changed();
   }
   flattenToNewLayer() { return this.add('pixel', 'Flattened'); }
 

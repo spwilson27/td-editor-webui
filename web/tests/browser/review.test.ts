@@ -152,10 +152,10 @@ describe('group thumbnail cache', () => {
     const l = e.addPixelLayer();
     e.moveLayer(l, g, 0);
     drawRect(e, l, { x: 0, y: 0, w: 50, h: 50 }, '#f00');
-    const comp = (e as unknown as { compositor: { renderIsolated: (g: unknown) => unknown } }).compositor;
+    const comp = (e as unknown as { compositor: { renderIsolated: (g: unknown, k: number) => unknown } }).compositor;
     const orig = comp.renderIsolated.bind(comp);
     let calls = 0;
-    comp.renderIsolated = (grp) => { calls++; return orig(grp); };
+    comp.renderIsolated = (grp, k) => { calls++; return orig(grp, k); };
     const t = document.createElement('canvas');
     t.width = t.height = 20;
     e.drawThumbnail(g, t);
