@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Raster editor — Paint workspace</title>
+<style>
+body{margin:0;background:#1c1c1c}
+a{color:#7fb2f0}a:hover{color:#a9cbf5}
+button{font:inherit;color:inherit;border:0;background:none;cursor:pointer;padding:0}
+.ib{display:inline-flex;align-items:center;justify-content:center;border-radius:5px}
+.ib:hover{background:#3a3a3a}
+.menu:hover{background:#3a3a3a}
+.row:hover{background:#353535}
+.sw:hover{outline:2px solid #e8e8e8;outline-offset:1px}
+input[type=range]{accent-color:#4a8fe0;height:14px;margin:0}
+select{font:inherit;color:#e3e3e3;background:#1f1f1f;border:1px solid #474747;border-radius:4px;padding:2px 6px;height:24px}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+(function () {
+var TOOLS = [
+  { id: 'move', name: 'Move Tool', key: 'V', hint: 'Drag to move the selected layer. Shift constrains to axis.', d: 'M12 3v18M3 12h18M12 3l-3 3M12 3l3 3M12 21l-3-3M12 21l3-3M3 12l3-3M3 12l3 3M21 12l-3-3M21 12l-3 3' },
+  { id: 'marquee', name: 'Rectangular Marquee', key: 'M', sep: true, hint: 'Drag to select. Shift adds, Alt subtracts.', d: 'M4 4h3M10 4h4M17 4h3v3M20 10v4M20 17v3h-3M14 20h-4M7 20H4v-3M4 14v-4M4 7V4' },
+  { id: 'lasso', name: 'Freehand Selection', key: 'L', hint: 'Drag to draw a freehand selection. Release to close.', d: 'M12 4c5 0 8 2.5 8 5.5S16.5 15 12 15 4 12.5 4 9.5 7 4 12 4zM7 14c-1 2 0 4 2 4s2 2 1 3' },
+  { id: 'wand', name: 'Flood Select', key: 'W', hint: 'Click to select similar colours. Drag to change tolerance.', d: 'M4 20L15 9M14 3v2M20 9h-2M18.5 4.5L17 6M9.5 4.5l1 1M18.5 13.5l-1-1' },
+  { id: 'crop', name: 'Crop Tool', key: 'C', hint: 'Drag handles to crop. Enter to apply.', d: 'M6 2v16h16M2 6h16v16' },
+  { id: 'brush', name: 'Paint Brush', key: 'B', sep: true, hint: 'Drag to paint. Shift-click draws a straight line. Alt picks a colour. [ ] resize.', d: 'M18 3l3 3-9 9-3-3 9-9zM9 12c-3 0-5 2-5 5 0 1.5-1 3-2 3 4 1 9 0 9-5' },
+  { id: 'pencil', name: 'Pixel Tool', key: 'N', hint: 'Drag to paint hard-edged pixels.', d: 'M16 3l5 5L8 21H3v-5L16 3zM13 6l5 5' },
+  { id: 'eraser', name: 'Erase Brush', key: 'E', hint: 'Drag to erase to transparency.', d: 'M15 4l5 5-10 10H6l-3-3L15 4zM9 10l5 5M10 20h11' },
+  { id: 'fill', name: 'Flood Fill', key: 'G', hint: 'Click to fill similar colours with the primary colour.', d: 'M5 11l7-7 8 8-7 7a2 2 0 01-3 0l-5-5a2 2 0 010-3zM5 12h15M20 16c0 1.5 1 2.5 1 3.5a1 1 0 01-2 0c0-1 1-2 1-3.5' },
+  { id: 'gradient', name: 'Gradient Tool', key: 'G', hint: 'Drag to draw a gradient from primary to secondary.', d: 'M4 4h16v16H4zM8 16l8-8' },
+  { id: 'clone', name: 'Clone Brush', key: 'S', hint: 'Alt-click to set the source, then drag to paint.', d: 'M9 3h6v5l-1 3h4v4H6v-4h4L9 8zM5 21h14' },
+  { id: 'smudge', name: 'Smudge Brush', key: 'R', hint: 'Drag to push and blend pixels.', d: 'M9 11V5a2 2 0 014 0v6M13 10a2 2 0 014 0v2M17 12a2 2 0 014 0v3a6 6 0 01-6 6h-2a6 6 0 01-5-3l-3-5a2 2 0 013-2l2 2' },
+  { id: 'text', name: 'Text Tool', key: 'T', sep: true, hint: 'Click to place text. Text is rasterised on commit.', d: 'M5 5h14M12 5v14M9 19h6' },
+  { id: 'shape', name: 'Shape Tool', key: 'U', hint: 'Drag to draw a filled shape on the active layer.', d: 'M4 4h9v9H4zM11 16a5 5 0 1010 0 5 5 0 10-10 0' },
+  { id: 'picker', name: 'Colour Picker', key: 'I', hint: 'Click to sample a colour into the primary swatch.', d: 'M14 4l6 6M17 7L7 17l-3 1 1-3L15 5' },
+  { id: 'hand', name: 'View Tool', key: 'H', sep: true, hint: 'Drag to pan. Hold Space with any tool.', d: 'M8 13V5a1.5 1.5 0 013 0v6M11 10V3.5a1.5 1.5 0 013 0V10M14 10V5a1.5 1.5 0 013 0v6M17 9a1.5 1.5 0 013 0v5a7 7 0 01-7 7h-1a7 7 0 01-6-3l-3-5a1.5 1.5 0 012.5-1.5L8 14' },
+  { id: 'zoom', name: 'Zoom Tool', key: 'Z', hint: 'Click to zoom in, Alt-click to zoom out.', d: 'M10 3a7 7 0 100 14 7 7 0 000-14zM15 15l6 6M7 10h6M10 7v6' }
+];
+var BRUSH_TOOLS = { brush: 1, pencil: 1, eraser: 1, clone: 1, smudge: 1 };
+var SELECT_TOOLS = { marquee: 1, lasso: 1, wand: 1 };
+var MODES = [
+  { id: 'paint', label: 'Paint', d: 'M18 3l3 3-9 9-3-3 9-9zM9 12c-3 0-5 2-5 5 0 1.5-1 3-2 3 4 1 9 0 9-5' },
+  { id: 'adjust', label: 'Adjust', d: 'M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0M14 4v4M8 10v4M16 16v4' },
+  { id: 'export', label: 'Output', d: 'M12 3v12M7 10l5 5 5-5M4 19h16' }
+];
+var LAYERS = [
+  { id: 'fg', name: 'Foreground', group: true, children: ['tree', 'grass'] },
+  { id: 'tree', name: 'Tree', parent: 'fg', thumb: '#2f6b3a', blend: 'Normal' },
+  { id: 'grass', name: 'Grass', parent: 'fg', thumb: '#2f5a2c', blend: 'Normal' },
+  { id: 'grade', name: 'Warm grade', adj: true, thumb: '#ff9a3c', blend: 'Soft Light' },
+  { id: 'sun', name: 'Sun', thumb: '#f4c04e', blend: 'Normal' },
+  { id: 'hills', name: 'Hills', thumb: '#4b7843', blend: 'Normal' },
+  { id: 'sky', name: 'Sky', thumb: '#9cc3e4', blend: 'Normal' },
+  { id: 'bg', name: 'Background', thumb: '#f4efe6', blend: 'Normal', locked: true }
+];
+var PALETTE = ['#1b1b1b','#3a3a3a','#6b6b6b','#9e9e9e','#cfcfcf','#ffffff','#f4efe6','#e8d9b5',
+  '#7a2e1f','#b4472c','#e2683c','#f0955a','#f4c04e','#f7dc8a','#c9b458','#8a7a2e',
+  '#1f3d2a','#2f6b3a','#4b7843','#6c9a5c','#9cc08a','#3d9a8f','#2a6f7a','#1d4a5e',
+  '#1f2d5c','#3d6fb4','#6f9bd6','#9cc3e4','#5b3f8c','#8b6cc0','#b85c8c','#e39ab8'];
+var BRUSHES = [
+  { id: 'round', name: 'Round — soft', size: '64', sw: 6, op: 0.55 },
+  { id: 'hard', name: 'Round — hard', size: '24', sw: 4, op: 1 },
+  { id: 'ink', name: 'Ink pen', size: '8', sw: 2, op: 1 },
+  { id: 'chalk', name: 'Dry chalk', size: '48', sw: 7, op: 0.4 },
+  { id: 'gouache', name: 'Gouache', size: '96', sw: 9, op: 0.8 },
+  { id: 'airbrush', name: 'Airbrush', size: '200', sw: 12, op: 0.25 }
+];
+var HISTORY = ['Open landscape.png', 'New pixel layer', 'Paint Brush', 'Paint Brush', 'Flood Fill', 'Layer opacity', 'Paint Brush'];
+
+function hexToRgb(h) { h = h.replace('#', ''); return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)]; }
+function analyse(hex) {
+  var c = hexToRgb(hex), r = c[0] / 255, g = c[1] / 255, b = c[2] / 255;
+  var mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn, h = 0;
+  if (d) { if (mx === r) h = ((g - b) / d) % 6; else if (mx === g) h = (b - r) / d + 2; else h = (r - g) / d + 4; h *= 60; if (h < 0) h += 360; }
+  var l = (mx + mn) / 2, sl = d ? d / (1 - Math.abs(2 * l - 1)) : 0, sv = mx ? d / mx : 0;
+  return { h: h, sl: sl, l: l, sv: sv, v: mx };
+}
+
+var ACCENT = '#3d6fb4';
+var state = {
+  tool: 'brush', mode: 'paint', colorTab: 'color', layerTab: 'layers',
+  primary: '#e2683c', secondary: '#ffffff', alpha: 100,
+  width: 64, opacity: 100, flow: 72, hardness: 40, brush: 'round',
+  sel: 'hills', hidden: {}, open: { fg: true },
+  recent: ['#e2683c', '#f4c04e', '#2f6b3a', '#9cc3e4', '#4b7843', '#3d6fb4', '#f4efe6', '#1b1b1b', '#b85c8c', '#6c9a5c', '#ffffff', '#7a2e1f']
+};
+function setPrimary(hex) {
+  var rec = [hex].concat(state.recent.filter(function (x) { return x !== hex; })).slice(0, 12);
+  state.primary = hex; state.recent = rec;
+}
+function find(list, fn) { for (var i = 0; i < list.length; i++) if (fn(list[i])) return list[i]; return undefined; }
+function each(list, fn) { return list.map(fn).join(''); }
+
+function tabs(list, key) {
+  return list.map(function (t) {
+    var on = state[key] === t[0];
+    return { id: t[0], label: t[1], on: on, fg: on ? '#ffffff' : '#a8a8a8', bg: on ? '#2b2b2b' : 'transparent', line: on ? ACCENT : 'transparent' };
+  });
+}
+function svg(w, d, sw, extra) {
+  return '<svg width="' + w + '" height="' + w + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="' + sw + '" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"' + (extra || '') + '><path d="' + d + '"></path></svg>';
+}
+var BOX = 'padding: 3px 6px; background: #1f1f1f; border: 1px solid #474747; border-radius: 4px; text-align: right';
+
+function vals() {
+  var s = state, accent = ACCENT;
+  var tool = find(TOOLS, function (t) { return t.id === s.tool; }) || TOOLS[0];
+  var c = analyse(s.primary), hue = Math.round(c.h);
+  var rad = c.h * Math.PI / 180;
+  var hsl = 'hsl(' + hue + ',' + Math.round(c.sl * 100) + '%,';
+  var sliders = [
+    { k: 'H', v: hue + '°', pos: (c.h / 360 * 100) + '%', track: 'linear-gradient(to right,#ff0000,#ffff00,#00ff00,#00ffff,#0000ff,#ff00ff,#ff0000)' },
+    { k: 'S', v: Math.round(c.sl * 100) + '%', pos: (c.sl * 100) + '%', track: 'linear-gradient(to right,hsl(' + hue + ',0%,' + Math.round(c.l * 100) + '%),hsl(' + hue + ',100%,' + Math.round(c.l * 100) + '%))' },
+    { k: 'L', v: Math.round(c.l * 100) + '%', pos: (c.l * 100) + '%', track: 'linear-gradient(to right,#000000,' + hsl + '50%),#ffffff)' },
+    { k: 'A', v: s.alpha + '%', pos: s.alpha + '%', track: 'linear-gradient(to right,rgba(0,0,0,0),' + s.primary + ')' }
+  ];
+  var flat = [];
+  LAYERS.forEach(function (L) {
+    if (L.parent && !s.open[L.parent]) return;
+    var on = L.id === s.sel, vis = !s.hidden[L.id];
+    var parentHidden = L.parent && s.hidden[L.parent];
+    var thumb = L.group
+      ? 'linear-gradient(135deg,#2f6b3a 0 50%,#2f5a2c 50% 100%), none'
+      : L.adj
+        ? 'linear-gradient(to right,#2a2a2a,' + L.thumb + '), none'
+        : 'linear-gradient(' + L.thumb + ',' + L.thumb + '), repeating-conic-gradient(#cfcfcf 0 25%,#ffffff 0 50%)';
+    flat.push({
+      id: L.id, name: L.name, isGroup: !!L.group, open: !!s.open[L.id], chev: s.open[L.id] ? '90deg' : '0deg',
+      openLabel: (s.open[L.id] ? 'Collapse ' : 'Expand ') + L.name,
+      indent: L.parent ? '22px' : (L.group ? '4px' : '20px'),
+      selected: on, visible: vis, hidden: !vis, locked: !!L.locked,
+      visLabel: (vis ? 'Hide ' : 'Show ') + L.name,
+      eyeOp: parentHidden ? 0.4 : 1,
+      bg: on ? accent : 'transparent', fg: on ? '#ffffff' : (vis && !parentHidden ? '#e3e3e3' : '#8f8f8f'),
+      meta: L.group ? 'Group' : L.adj ? 'Adjustment' : (L.id === 'sun' ? '90%' : ''),
+      metaFg: on ? '#e6eefa' : '#a8a8a8',
+      thumb: thumb
+    });
+  });
+  var show = {}; LAYERS.forEach(function (L) { show[L.id] = !s.hidden[L.id]; });
+  var sel = find(LAYERS, function (L) { return L.id === s.sel; }) || LAYERS[5];
+  return {
+    tools: TOOLS.map(function (t) {
+      var on = t.id === s.tool;
+      return { id: t.id, d: t.d, sep: !!t.sep, on: on, label: t.name + ' (' + t.key + ')', bg: on ? accent : 'transparent', fg: on ? '#ffffff' : '#d4d4d4' };
+    }),
+    modes: MODES.map(function (m) {
+      var on = m.id === s.mode;
+      return { id: m.id, label: m.label, d: m.d, on: on, bg: on ? '#3f3f3f' : 'transparent', fg: on ? '#ffffff' : '#b5b5b5' };
+    }),
+    toolName: tool.name, toolD: tool.d, hint: tool.hint,
+    ctxBrush: !!BRUSH_TOOLS[s.tool], ctxSelect: !!SELECT_TOOLS[s.tool], ctxOther: !BRUSH_TOOLS[s.tool] && !SELECT_TOOLS[s.tool],
+    brushName: (find(BRUSHES, function (b) { return b.id === s.brush; }) || BRUSHES[0]).name,
+    width: s.width, opacity: s.opacity, flow: s.flow, hardness: s.hardness,
+    cursor: Math.max(4, Math.round(s.width * 0.667)) + 'px',
+    primary: s.primary, secondary: s.secondary, primaryLabel: s.primary.toUpperCase(),
+    colorTabs: tabs([['color', 'Colour'], ['swatches', 'Swatches'], ['brushes', 'Brushes']], 'colorTab'),
+    tabColor: s.colorTab === 'color', tabSwatches: s.colorTab === 'swatches', tabBrushes: s.colorTab === 'brushes',
+    hueColor: 'hsl(' + hue + ',100%,50%)',
+    ringX: (90 + 81 * Math.sin(rad)) + 'px', ringY: (90 - 81 * Math.cos(rad)) + 'px',
+    svX: (44 + c.sv * 92) + 'px', svY: (44 + (1 - c.v) * 92) + 'px',
+    sliders: sliders,
+    recent: s.recent,
+    palette: PALETTE,
+    brushes: BRUSHES.map(function (b) {
+      var on = b.id === s.brush;
+      return { id: b.id, name: b.name, size: b.size + ' px', sw: b.sw, op: b.op, on: on, bg: on ? '#383838' : 'transparent' };
+    }),
+    layerTabs: tabs([['layers', 'Layers'], ['history', 'History']], 'layerTab'),
+    tabLayers: s.layerTab === 'layers', tabHistory: s.layerTab === 'history',
+    layers: flat, show: show, showFg: show.fg,
+    op: { sky: 1, sun: 0.9, hills: 1, grade: 0.55, grass: 1, tree: 1 },
+    selName: sel.name, selBlend: sel.blend || 'Pass-through', selOpacity: sel.id === 'sun' ? '90%' : '100%',
+    history: HISTORY.map(function (h, i) {
+      var cur = i === HISTORY.length - 1;
+      return { label: h, fg: cur ? '#ffffff' : '#cfcfcf', bg: cur ? '#383838' : 'transparent', dot: cur ? accent : '#5a5a5a' };
+    })
+  };
+}
+
+function rangeRow(label, id, min, max, val, key, w, spanW, unit) {
+  return '<div style="display: flex; align-items: center; gap: 8px">' +
+    '<label for="' + id + '" style="color: #a8a8a8">' + label + '</label>' +
+    '<input id="' + id + '" type="range" min="' + min + '" max="' + max + '" value="' + val + '" data-range="' + key + '" style="width: ' + w + 'px">' +
+    '<span data-rv="' + key + '" style="min-width: ' + spanW + 'px; ' + BOX + '">' + val + unit + '</span></div>';
+}
+var CHK = 'accent-color: #4a8fe0; margin: 0';
+
+function html() {
+  var v = vals(), o = [];
+  o.push('<div style="width: 100%; height: 100vh; min-height: 720px; display: flex; flex-direction: column; background: #262626; color: #e3e3e3; font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', \'Helvetica Neue\', sans-serif; font-size: 12px; overflow: hidden">');
+  // top bar
+  o.push('<div style="height: 38px; flex: none; display: flex; align-items: center; gap: 12px; padding: 0 10px; background: #2b2b2b; border-bottom: 1px solid #161616">');
+  o.push('<div style="display: flex; align-items: center; gap: 2px; flex: 1 1 0; min-width: 0; overflow: hidden">');
+  o.push('<div aria-hidden="true" style="width: 22px; height: 22px; margin-right: 8px; border-radius: 6px; background: #4a8fe0; display: flex; align-items: center; justify-content: center"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 3l3 3-9 9-3-3 9-9zM9 12c-3 0-5 2-5 5 0 1.5-1 3-2 3 4 1 9 0 9-5"></path></svg></div>');
+  ['File', 'Edit', 'Document', 'Layer', 'Select', 'Filters', 'View', 'Window'].forEach(function (m) {
+    o.push('<button class="menu" style="padding: 5px 8px; border-radius: 4px">' + m + '</button>');
+  });
+  o.push('</div>');
+  o.push('<div role="group" aria-label="Workspace" style="display: flex; gap: 2px; padding: 2px; background: #1f1f1f; border-radius: 7px; border: 1px solid #3a3a3a">');
+  v.modes.forEach(function (m) {
+    o.push('<button data-a="mode" data-v="' + m.id + '" aria-pressed="' + m.on + '" style="display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 12px; border-radius: 5px; background: ' + m.bg + '; color: ' + m.fg + '">' + svg(14, m.d, 1.8) + '<span>' + m.label + '</span></button>');
+  });
+  o.push('</div>');
+  o.push('<div style="flex: 1 1 0; display: flex; justify-content: flex-end; align-items: center; gap: 4px">');
+  o.push('<button class="ib" aria-label="Undo" title="Undo (Ctrl+Z)" style="width: 30px; height: 30px">' + svg(16, 'M9 14L4 9l5-5M4 9h11a5 5 0 010 10h-3', 1.8) + '</button>');
+  o.push('<button class="ib" aria-label="Redo" title="Redo (Ctrl+Shift+Z)" style="width: 30px; height: 30px">' + svg(16, 'M15 14l5-5-5-5M20 9H9a5 5 0 000 10h3', 1.8) + '</button>');
+  o.push('<div style="width: 1px; height: 18px; background: #444; margin: 0 6px"></div>');
+  o.push('<label for="zoomSel" style="color: #a8a8a8">Zoom</label>');
+  o.push('<select id="zoomSel"><option>25%</option><option>50%</option><option selected="selected">66.7%</option><option>100%</option><option>200%</option><option>Fit</option></select>');
+  o.push('</div></div>');
+  // context toolbar
+  o.push('<div style="min-height: 42px; flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 4px 12px; background: #303030; border-bottom: 1px solid #1a1a1a">');
+  o.push('<div style="display: flex; align-items: center; gap: 8px; min-width: 150px"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#7fb2f0" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="' + v.toolD + '"></path></svg><span style="font-weight: 600">' + v.toolName + '</span></div>');
+  o.push('<div style="width: 1px; height: 22px; background: #474747"></div>');
+  if (v.ctxBrush) {
+    o.push('<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 18px">');
+    o.push('<button style="display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px; border: 1px solid #474747; border-radius: 5px; background: #262626"><svg width="44" height="14" viewBox="0 0 44 14" aria-hidden="true"><path d="M2 10c8-8 14 4 22-2s14-4 18-2" fill="none" stroke="#e3e3e3" stroke-width="3" stroke-linecap="round"></path></svg><span>' + v.brushName + '</span><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></button>');
+    o.push(rangeRow('Width', 'bw', 1, 300, v.width, 'width', 110, 46, ' px'));
+    o.push(rangeRow('Opacity', 'bo', 0, 100, v.opacity, 'opacity', 80, 36, '%'));
+    o.push(rangeRow('Flow', 'bf', 0, 100, v.flow, 'flow', 80, 36, '%'));
+    o.push(rangeRow('Hardness', 'bh', 0, 100, v.hardness, 'hardness', 80, 36, '%'));
+    o.push('<label style="display: flex; align-items: center; gap: 6px; color: #cfcfcf"><input type="checkbox" style="' + CHK + '">Wet edges</label>');
+    o.push('<label style="display: flex; align-items: center; gap: 6px; color: #cfcfcf"><input type="checkbox" checked="checked" style="' + CHK + '">Protect alpha</label>');
+    o.push('</div>');
+  }
+  if (v.ctxSelect) {
+    o.push('<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 18px">');
+    o.push('<div role="group" aria-label="Selection mode" style="display: flex; gap: 2px; padding: 2px; background: #1f1f1f; border: 1px solid #474747; border-radius: 5px"><button style="height: 22px; padding: 0 10px; border-radius: 3px; background: #3d6fb4; color: #ffffff">New</button><button style="height: 22px; padding: 0 10px; border-radius: 3px">Add</button><button style="height: 22px; padding: 0 10px; border-radius: 3px">Subtract</button><button style="height: 22px; padding: 0 10px; border-radius: 3px">Intersect</button></div>');
+    o.push('<div style="display: flex; align-items: center; gap: 8px"><label for="sf" style="color: #a8a8a8">Feather</label><span id="sf" style="min-width: 40px; ' + BOX + '">0 px</span></div>');
+    o.push('<label style="display: flex; align-items: center; gap: 6px; color: #cfcfcf"><input type="checkbox" checked="checked" style="' + CHK + '">Antialias</label>');
+    o.push('<button style="height: 26px; padding: 0 12px; border: 1px solid #474747; border-radius: 5px; background: #262626">Refine…</button>');
+    o.push('</div>');
+  }
+  if (v.ctxOther) {
+    var b = '<b style="color: #e3e3e3; font-weight: 500">';
+    o.push('<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 14px; color: #a8a8a8"><span>X ' + b + '412 px</b></span><span>Y ' + b + '268 px</b></span><span>W ' + b + '1920 px</b></span><span>H ' + b + '1080 px</b></span><label style="display: flex; align-items: center; gap: 6px; color: #cfcfcf"><input type="checkbox" checked="checked" style="' + CHK + '">Snap</label></div>');
+  }
+  o.push('</div>');
+  // body
+  o.push('<div style="flex: 1 1 auto; min-height: 0; display: flex">');
+  // tool rail
+  o.push('<div style="width: 52px; flex: none; display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 6px 0; background: #2b2b2b; border-right: 1px solid #161616; overflow-y: auto">');
+  v.tools.forEach(function (t) {
+    if (t.sep) o.push('<div style="width: 28px; height: 1px; background: #444; margin: 4px 0"></div>');
+    o.push('<button class="ib" data-a="tool" data-v="' + t.id + '" aria-label="' + t.label + '" title="' + t.label + '" aria-pressed="' + t.on + '" style="width: 44px; height: 40px; flex: none; background: ' + t.bg + '; color: ' + t.fg + '">' + svg(20, t.d, 1.6) + '</button>');
+  });
+  o.push('<div style="flex: 1 1 auto"></div>');
+  o.push('<div style="position: relative; width: 40px; height: 40px; flex: none; margin-top: 8px"><button aria-label="Secondary colour" data-a="swap" style="position: absolute; right: 0; bottom: 0; width: 24px; height: 24px; border-radius: 50%; border: 2px solid #1a1a1a; box-shadow: 0 0 0 1px #5a5a5a; background: ' + v.secondary + '"></button><button aria-label="Primary colour" style="position: absolute; left: 0; top: 0; width: 26px; height: 26px; border-radius: 50%; border: 2px solid #1a1a1a; box-shadow: 0 0 0 1px #8a8a8a; background: ' + v.primary + '"></button></div>');
+  o.push('</div>');
+  // canvas column
+  o.push('<div style="flex: 999 1 480px; min-width: 0; display: flex; flex-direction: column; background: #1c1c1c">');
+  o.push('<div style="height: 30px; flex: none; display: flex; align-items: flex-end; gap: 2px; padding: 0 8px; background: #242424; border-bottom: 1px solid #161616">');
+  o.push('<div style="height: 26px; display: flex; align-items: center; gap: 8px; padding: 0 10px; background: #1c1c1c; border: 1px solid #161616; border-bottom: 0; border-radius: 5px 5px 0 0"><span>landscape.png</span><span style="color: #9a9a9a">1920 × 1080 · RGBA/8 · 66.7%</span><button class="ib" aria-label="Close document" style="width: 18px; height: 18px"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"></path></svg></button></div>');
+  o.push('<div style="height: 26px; display: flex; align-items: center; gap: 8px; padding: 0 10px; color: #9a9a9a"><span>texture_02.png</span></div>');
+  o.push('</div>');
+  o.push('<div style="flex: 1 1 auto; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 32px; overflow: auto">');
+  o.push('<div style="position: relative; width: 640px; height: 360px; flex: none; overflow: hidden; box-shadow: 0 8px 28px rgba(0,0,0,0.55); background-color: #ffffff; background-image: repeating-conic-gradient(#cfcfcf 0 25%, #ffffff 0 50%); background-size: 16px 16px">');
+  var sh = v.show, op = v.op;
+  if (sh.bg) o.push('<div style="position: absolute; inset: 0; background: #f4efe6"></div>');
+  if (sh.sky) o.push('<div style="position: absolute; inset: 0; background: #9cc3e4; opacity: ' + op.sky + '"></div>');
+  if (sh.sun) o.push('<div style="position: absolute; left: 448px; top: 52px; width: 84px; height: 84px; border-radius: 50%; background: #f4c04e; opacity: ' + op.sun + '"></div>');
+  if (sh.hills) o.push('<div style="position: absolute; inset: 0; opacity: ' + op.hills + '"><div style="position: absolute; left: -90px; top: 200px; width: 520px; height: 300px; border-radius: 50%; background: #6c9a5c"></div><div style="position: absolute; left: 240px; top: 230px; width: 560px; height: 300px; border-radius: 50%; background: #4b7843"></div></div>');
+  if (sh.grade) o.push('<div style="position: absolute; inset: 0; background: #ff9a3c; mix-blend-mode: soft-light; opacity: ' + op.grade + '"></div>');
+  if (v.showFg) {
+    o.push('<div style="position: absolute; inset: 0">');
+    if (sh.grass) o.push('<div style="position: absolute; left: 0; right: 0; bottom: 0; height: 44px; background: #2f5a2c; opacity: ' + op.grass + '"></div>');
+    if (sh.tree) o.push('<div style="position: absolute; inset: 0; opacity: ' + op.tree + '"><div style="position: absolute; left: 140px; top: 200px; width: 14px; height: 120px; background: #5a3d2b"></div><div style="position: absolute; left: 94px; top: 130px; width: 106px; height: 106px; border-radius: 50%; background: #2f6b3a"></div></div>');
+    o.push('</div>');
+  }
+  if (v.ctxSelect) o.push('<div style="position: absolute; left: 230px; top: 120px; width: 220px; height: 150px; outline: 1px dashed #ffffff; box-shadow: 0 0 0 1px #000000"></div>');
+  if (v.ctxBrush) o.push('<div data-cursor="1" style="position: absolute; left: 340px; top: 170px; width: ' + v.cursor + '; height: ' + v.cursor + '; transform: translate(-50%, -50%); border-radius: 50%; border: 1px solid #ffffff; box-shadow: 0 0 0 1px rgba(0,0,0,0.6)"></div>');
+  o.push('</div></div></div>');
+  // studio
+  o.push('<div style="flex: 1 1 290px; max-width: 320px; min-width: 260px; display: flex; flex-direction: column; background: #2b2b2b; border-left: 1px solid #161616; overflow: hidden">');
+  o.push('<div style="flex: none; border-bottom: 1px solid #161616">');
+  o.push('<div role="tablist" aria-label="Colour panels" style="display: flex; height: 30px; background: #262626; border-bottom: 1px solid #1a1a1a">');
+  v.colorTabs.forEach(function (t) {
+    o.push('<button role="tab" data-a="ctab" data-v="' + t.id + '" aria-selected="' + t.on + '" style="padding: 0 14px; color: ' + t.fg + '; background: ' + t.bg + '; box-shadow: inset 0 -2px 0 ' + t.line + '">' + t.label + '</button>');
+  });
+  o.push('</div>');
+  if (v.tabColor) {
+    o.push('<div style="display: flex; flex-direction: column; gap: 12px; padding: 12px">');
+    o.push('<div style="display: flex; align-items: center; gap: 12px">');
+    o.push('<div style="position: relative; width: 44px; height: 40px; flex: none"><button aria-label="Secondary colour" data-a="swap" style="position: absolute; right: 0; bottom: 0; width: 26px; height: 26px; border-radius: 50%; border: 2px solid #1a1a1a; box-shadow: 0 0 0 1px #5a5a5a; background: ' + v.secondary + '"></button><button aria-label="Primary colour" style="position: absolute; left: 0; top: 0; width: 30px; height: 30px; border-radius: 50%; border: 2px solid #1a1a1a; box-shadow: 0 0 0 1px #8a8a8a; background: ' + v.primary + '"></button></div>');
+    o.push('<button class="ib" data-a="swap" aria-label="Swap primary and secondary" title="Swap (X)" style="width: 28px; height: 28px">' + svg(16, 'M7 4L3 8l4 4M3 8h14M17 20l4-4-4-4M21 16H7', 1.8) + '</button>');
+    o.push('<div style="flex: 1 1 auto"></div>');
+    o.push('<label for="hex" style="color: #a8a8a8">Hex</label>');
+    o.push('<input id="hex" value="' + v.primaryLabel + '" readonly="readonly" style="width: 74px; height: 24px; box-sizing: border-box; padding: 0 6px; font: inherit; font-family: ui-monospace, Menlo, monospace; color: #e3e3e3; background: #1f1f1f; border: 1px solid #474747; border-radius: 4px">');
+    o.push('</div>');
+    o.push('<div style="position: relative; width: 180px; height: 180px; align-self: center">');
+    o.push('<div style="position: absolute; inset: 0; border-radius: 50%; background: conic-gradient(from 0deg, #ff0000, #ffff00, #00ff00, #00ffff, #0000ff, #ff00ff, #ff0000)"></div>');
+    o.push('<div style="position: absolute; inset: 18px; border-radius: 50%; background: #2b2b2b"></div>');
+    o.push('<div style="position: absolute; left: 44px; top: 44px; width: 92px; height: 92px; border-radius: 3px; background-color: ' + v.hueColor + '; background-image: linear-gradient(to top, #000000, rgba(0,0,0,0)), linear-gradient(to right, #ffffff, rgba(255,255,255,0))"></div>');
+    o.push('<div style="position: absolute; left: ' + v.ringX + '; top: ' + v.ringY + '; width: 14px; height: 14px; transform: translate(-50%, -50%); border-radius: 50%; border: 2px solid #ffffff; box-shadow: 0 0 0 1px #000000"></div>');
+    o.push('<div style="position: absolute; left: ' + v.svX + '; top: ' + v.svY + '; width: 10px; height: 10px; transform: translate(-50%, -50%); border-radius: 50%; border: 2px solid #ffffff; box-shadow: 0 0 0 1px #000000"></div>');
+    o.push('</div>');
+    o.push('<div style="display: flex; flex-direction: column; gap: 8px">');
+    v.sliders.forEach(function (s) {
+      o.push('<div style="display: grid; grid-template-columns: 14px minmax(0, 1fr) 44px; align-items: center; gap: 8px"><span style="color: #a8a8a8; font-weight: 600">' + s.k + '</span><div style="position: relative; height: 10px; border-radius: 5px; background-color: #ffffff; background-image: repeating-conic-gradient(#bdbdbd 0 25%, #ffffff 0 50%); background-size: 8px 8px"><div style="position: absolute; inset: 0; border-radius: 5px; background: ' + s.track + '"></div><div style="position: absolute; top: 50%; left: ' + s.pos + '; width: 12px; height: 12px; transform: translate(-50%, -50%); border-radius: 50%; background: #ffffff; box-shadow: 0 0 0 1px #000000, 0 1px 3px rgba(0,0,0,0.5)"></div></div><span style="padding: 2px 4px; text-align: right; background: #1f1f1f; border: 1px solid #474747; border-radius: 4px">' + s.v + '</span></div>');
+    });
+    o.push('</div>');
+    o.push('<div style="display: flex; flex-direction: column; gap: 6px"><span style="color: #a8a8a8">Recent</span><div style="display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 4px">');
+    v.recent.forEach(function (h) {
+      o.push('<button class="sw" data-a="color" data-v="' + h + '" aria-label="Use ' + h + '" title="' + h + '" style="aspect-ratio: 1; border-radius: 3px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.12); background: ' + h + '"></button>');
+    });
+    o.push('</div></div></div>');
+  }
+  if (v.tabSwatches) {
+    o.push('<div style="display: flex; flex-direction: column; gap: 10px; padding: 12px"><select aria-label="Palette"><option>Landscape palette</option><option>Greys</option><option>Document colours</option></select><div style="display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 5px">');
+    v.palette.forEach(function (h) {
+      o.push('<button class="sw" data-a="color" data-v="' + h + '" aria-label="Use ' + h + '" title="' + h + '" style="aspect-ratio: 1; border-radius: 4px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.12); background: ' + h + '"></button>');
+    });
+    o.push('</div><button style="align-self: flex-start; display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 10px; border: 1px solid #474747; border-radius: 5px; background: #262626"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>Add current colour</button></div>');
+  }
+  if (v.tabBrushes) {
+    o.push('<div style="display: flex; flex-direction: column; padding: 6px 0">');
+    v.brushes.forEach(function (b) {
+      o.push('<button class="row" data-a="brush" data-v="' + b.id + '" aria-pressed="' + b.on + '" style="display: flex; align-items: center; gap: 12px; height: 44px; padding: 0 12px; text-align: left; background: ' + b.bg + '"><svg width="96" height="24" viewBox="0 0 96 24" aria-hidden="true"><path d="M4 16c14-14 26 6 44-2s26-8 44-4" fill="none" stroke="#e3e3e3" stroke-width="' + b.sw + '" stroke-linecap="round" opacity="' + b.op + '"></path></svg><span style="flex: 1 1 auto">' + b.name + '</span><span style="color: #a8a8a8">' + b.size + '</span></button>');
+    });
+    o.push('</div>');
+  }
+  o.push('</div>');
+  // layers panel
+  o.push('<div style="flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column">');
+  o.push('<div role="tablist" aria-label="Layer panels" style="display: flex; height: 30px; flex: none; background: #262626; border-bottom: 1px solid #1a1a1a">');
+  v.layerTabs.forEach(function (t) {
+    o.push('<button role="tab" data-a="ltab" data-v="' + t.id + '" aria-selected="' + t.on + '" style="padding: 0 14px; color: ' + t.fg + '; background: ' + t.bg + '; box-shadow: inset 0 -2px 0 ' + t.line + '">' + t.label + '</button>');
+  });
+  o.push('</div>');
+  if (v.tabLayers) {
+    o.push('<div style="flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column">');
+    o.push('<div style="display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid #1f1f1f"><select aria-label="Blend mode" style="flex: 1 1 auto"><option>' + v.selBlend + '</option><option>Normal</option><option>Multiply</option><option>Screen</option><option>Overlay</option><option>Soft Light</option></select><label for="lop" style="color: #a8a8a8">Opacity</label><span id="lop" style="min-width: 38px; padding: 3px 6px; text-align: right; background: #1f1f1f; border: 1px solid #474747; border-radius: 4px">' + v.selOpacity + '</span></div>');
+    o.push('<div style="flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 0">');
+    var EYE = 'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12zM12 9a3 3 0 100 6 3 3 0 000-6z';
+    var EYE_OFF = 'M3 3l18 18M10.6 5.1A10 10 0 0112 5c6 0 10 7 10 7a17 17 0 01-3 3.7M6.6 6.6C3.9 8.4 2 12 2 12s4 7 10 7a9.6 9.6 0 005.4-1.6';
+    v.layers.forEach(function (l) {
+      o.push('<div class="row" style="display: flex; align-items: center; gap: 6px; height: 40px; padding-right: 8px; padding-left: ' + l.indent + '; background: ' + l.bg + '; color: ' + l.fg + '">');
+      o.push('<button class="ib" data-a="vis" data-v="' + l.id + '" aria-label="' + l.visLabel + '" aria-pressed="' + l.visible + '" style="width: 26px; height: 26px; flex: none; opacity: ' + l.eyeOp + '">' + (l.visible ? svg(16, EYE, 1.8) : '') + (l.hidden ? svg(16, EYE_OFF, 1.8) : '') + '</button>');
+      if (l.isGroup) o.push('<button class="ib" data-a="open" data-v="' + l.id + '" aria-label="' + l.openLabel + '" aria-expanded="' + l.open + '" style="width: 16px; height: 26px; flex: none">' + svg(10, 'M9 6l6 6-6 6', 2.6, ' style="transform: rotate(' + l.chev + ')"') + '</button>');
+      o.push('<button data-a="sel" data-v="' + l.id + '" aria-pressed="' + l.selected + '" style="flex: 1 1 auto; min-width: 0; height: 40px; display: flex; align-items: center; gap: 10px; text-align: left"><span aria-hidden="true" style="width: 34px; height: 24px; flex: none; border-radius: 2px; box-shadow: 0 0 0 1px #111111; background-color: #ffffff; background-image: ' + l.thumb + '; background-size: 100% 100%, 8px 8px"></span><span style="flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">' + l.name + '</span><span style="flex: none; font-size: 11px; color: ' + l.metaFg + '">' + l.meta + '</span></button>');
+      if (l.locked) o.push('<svg role="img" aria-label="Locked" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 11h12v10H6zM8 11V7a4 4 0 018 0v4"></path></svg>');
+      o.push('</div>');
+    });
+    o.push('</div>');
+    o.push('<div style="height: 36px; flex: none; display: flex; align-items: center; justify-content: space-around; border-top: 1px solid #1f1f1f; background: #282828">');
+    [['New pixel layer', 'M4 4h16v16H4zM12 8v8M8 12h8'], ['New group', 'M3 6h7l2 2h9v11H3z'], ['Add mask', 'M4 4h16v16H4zM12 8a4 4 0 100 8 4 4 0 000-8z'], ['New adjustment', 'M12 3a9 9 0 100 18V3z M12 3a9 9 0 010 18'], ['Layer effects', 'M5 19h4M7 17v4M12 3l2 5 5 2-5 2-2 5-2-5-5-2 5-2z'], ['Delete layer', 'M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13']].forEach(function (b) {
+      o.push('<button class="ib" aria-label="' + b[0] + '" title="' + b[0] + '" style="width: 32px; height: 30px">' + svg(16, b[1], 1.7) + '</button>');
+    });
+    o.push('</div></div>');
+  }
+  if (v.tabHistory) {
+    o.push('<div style="flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 0">');
+    v.history.forEach(function (h) {
+      o.push('<div style="display: flex; align-items: center; gap: 10px; height: 30px; padding: 0 12px; color: ' + h.fg + '; background: ' + h.bg + '"><span style="width: 6px; height: 6px; border-radius: 50%; background: ' + h.dot + '"></span><span>' + h.label + '</span></div>');
+    });
+    o.push('</div>');
+  }
+  o.push('</div></div></div>');
+  // status bar
+  o.push('<div style="height: 26px; flex: none; display: flex; align-items: center; gap: 16px; padding: 0 12px; background: #2b2b2b; border-top: 1px solid #161616; color: #b5b5b5"><span style="flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">' + v.hint + '</span><span>Layer: <b style="color: #e3e3e3; font-weight: 500">' + v.selName + '</b></span><span>GPU · 60 fps</span><span style="display: flex; align-items: center; gap: 6px"><span aria-hidden="true" style="width: 7px; height: 7px; border-radius: 50%; background: #5cc27a"></span>TouchDesigner linked</span></div>');
+  o.push('</div>');
+  return o.join('');
+}
+
+var root = document.getElementById('app');
+function render() { root.innerHTML = html(); }
+
+root.addEventListener('click', function (e) {
+  var el = e.target;
+  while (el && el !== root && !(el.getAttribute && el.getAttribute('data-a'))) el = el.parentNode;
+  if (!el || el === root) return;
+  var a = el.getAttribute('data-a'), v = el.getAttribute('data-v');
+  if (a === 'tool') state.tool = v;
+  else if (a === 'mode') state.mode = v;
+  else if (a === 'ctab') state.colorTab = v;
+  else if (a === 'ltab') state.layerTab = v;
+  else if (a === 'swap') { var p = state.primary; state.primary = state.secondary; state.secondary = p; }
+  else if (a === 'color') setPrimary(v);
+  else if (a === 'brush') { var b = find(BRUSHES, function (x) { return x.id === v; }); state.brush = b.id; state.width = +b.size; }
+  else if (a === 'vis') { var h = {}; for (var k in state.hidden) h[k] = state.hidden[k]; h[v] = !h[v]; state.hidden = h; }
+  else if (a === 'open') { var op = {}; for (var k2 in state.open) op[k2] = state.open[k2]; op[v] = !op[v]; state.open = op; }
+  else if (a === 'sel') state.sel = v;
+  else return;
+  render();
+});
+
+root.addEventListener('input', function (e) {
+  var t = e.target, key = t.getAttribute && t.getAttribute('data-range');
+  if (!key) return;
+  state[key] = +t.value;
+  var span = root.querySelector('[data-rv="' + key + '"]');
+  if (span) span.textContent = state[key] + (key === 'width' ? ' px' : '%');
+  if (key === 'width') {
+    var cur = root.querySelector('[data-cursor]');
+    if (cur) { var px = Math.max(4, Math.round(state.width * 0.667)) + 'px'; cur.style.width = px; cur.style.height = px; }
+  }
+});
+
+render();
+})();
+</script>
+</body>
+</html>

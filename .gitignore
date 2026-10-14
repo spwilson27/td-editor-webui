@@ -1,0 +1,4 @@
+.venv
+dist/validate
+__pycache__
+.DS_Store
