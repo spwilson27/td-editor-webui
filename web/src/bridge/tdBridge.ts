@@ -95,7 +95,14 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   const doFetch = opts.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   const httpBase = httpOrigin(url);
   const now = opts.now ?? (() => performance.now());
-  const raf: (cb: () => void) => unknown = opts.raf ?? (typeof requestAnimationFrame === 'function' ? (cb) => requestAnimationFrame(cb) : (cb) => setTimeout(cb, 16));
+  const rawRaf: (cb: () => void) => unknown = opts.raf ?? (typeof requestAnimationFrame === 'function' ? (cb) => requestAnimationFrame(cb) : (cb) => setTimeout(cb, 16));
+  /** Next frame, but never later than 50 ms: rAF is throttled or paused in hidden / offscreen pages. Runs cb once. */
+  const raf = (cb: () => void) => {
+    let done = false;
+    const run = () => { if (done) return; done = true; clearTimeout(t); cb(); };
+    const t = setTimeout(run, 50);
+    rawRaf(run);
+  };
 
   let ws: WebSocket | null = null;
   let disposed = false;
@@ -335,11 +342,11 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
           authoritative = true;
           tdRev = m.rev;
           endLoadState();
-          if (viewState) sendView();
         } else if (loadPending && !disposed) {
           armLoadRetry(); // stay non-authoritative; ask TD again
           status.setNotice('Loading document from TouchDesigner… (retrying)');
         }
+        if (viewState) sendView(); // the viewport state must reach TD whatever the load outcome
       }
     }
   }
@@ -591,7 +598,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       viewQueued = true;
       raf(() => {
         viewQueued = false;
-        if (!disposed && viewDirty && !loading) sendView();
+        if (!disposed && viewDirty) sendView();
       });
     },
     dispose() {

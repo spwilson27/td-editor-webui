@@ -205,6 +205,9 @@ test('editing is locked while the document loads (tools do not paint, keys are i
   td.docStateDelayMs = 2500;
   await open(page);
   await expect(page.locator('[data-loading-doc]')).toBeVisible();
+  expect((await hook<any>(page, 'loadState')).loadingDoc).toBe(true);
+  await hook(page, 'setViewMode', 'td'); // switching view mid-load still reaches TD (the overlay blocks the mouse)
+  await td.waitFor(() => td.lastView?.mode === 'td');
   await page.keyboard.press('e');
   expect((await hook<any>(page, 'state')).tool).toBe('brush');
   await page.waitForTimeout(100);

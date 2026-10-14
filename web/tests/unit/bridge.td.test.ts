@@ -809,6 +809,47 @@ describe('tdBridge view messages', () => {
     expect(n()).toBe(2);
   });
 
+  it('sends view while a document load is pending and after a failed load', async () => {
+    start(64, 48, withLayer);
+    connectActive({ hasDocument: true, rev: 1 });
+    bridge.setView(view({ mode: 'td' }));
+    vi.advanceTimersByTime(60);
+    expect(sock().json().filter((m) => m.t === 'view')).toHaveLength(1); // still waiting for docState
+    sock().tell(docState(1, [tdLayers[0], tdLayers[1]]));
+    await flushP();
+    bridge.setView(view({ mode: 'td', zoom: 4 })); // mid-load
+    vi.advanceTimersByTime(60);
+    expect(sock().json().filter((m) => m.t === 'view')).toHaveLength(2);
+    fm!.calls[0].settle(new Response('', { status: 500 }));
+    fm!.calls[1].settle(new Response('', { status: 500 }));
+    await vi.advanceTimersByTimeAsync(600);
+    fm!.calls[2].settle(new Response('', { status: 500 }));
+    fm!.calls[3].settle(new Response('', { status: 500 }));
+    await flushP();
+    expect(sock().json().filter((m) => m.t === 'view').length).toBeGreaterThanOrEqual(3); // re-sent when the load ended (failed)
+  });
+
+  it('does not stall when requestAnimationFrame never fires (hidden page)', () => {
+    engine = new FakeEngine(64, 48);
+    engine.addPixelLayer('Layer 1');
+    status = makeStatus();
+    fm = new FetchMock();
+    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 't', WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, fetch: fm.fn, raf: () => {} });
+    connectActive();
+    bridge.setView(view());
+    bridge.setView(view({ zoom: 2 }));
+    vi.advanceTimersByTime(60);
+    expect(sock().json().filter((m) => m.t === 'view')).toHaveLength(1);
+    bridge.setView(view({ zoom: 3 }));
+    vi.advanceTimersByTime(60);
+    expect(sock().json().filter((m) => m.t === 'view')).toHaveLength(2);
+    const docs = () => sock().json().filter((m) => m.t === 'doc').length;
+    const n = docs();
+    engine.setLayerProps('L1', { opacity: 0.5 });
+    vi.advanceTimersByTime(60);
+    expect(docs()).toBe(n + 1);
+  });
+
   it('ignores an unmeasured viewport (w = h = 0)', () => {
     start();
     connectActive();
