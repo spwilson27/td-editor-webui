@@ -1,4 +1,10 @@
 .venv
-dist/validate
 __pycache__
 .DS_Store
+# Ship the built component and UI (overrides a global dist/ ignore)
+!dist/
+dist/*
+!dist/raster_editor.tox
+!dist/ui/
+dist/ui/*
+!dist/ui/index.html
