@@ -3,20 +3,23 @@
 // surface / adjusted result, premultiplied), 2 = mask (optional, .r).
 // Uniforms (GLSL TOP "Vectors" page):
 //   uParams  vec4  x = uMode (BlendMode index, web/src/engine/types.ts: normal=0 ... luminosity=15)
-//                  y = uOpacity (0..1)   z = uHasMask (0/1)   w = uAdjust (0..3)
+//                  y = uOpacity (0..1)   z = uHasMask (0/1)   w = uAdjust (0..6)
 //   uOffset  vec2  layer x,y in document pixels, top-left origin (applied to inputs 1 and 2)
 // uAdjust = 0: W3C Compositing and Blending L1 "source-over with blend mode" (== Canvas 2D
 //   globalCompositeOperation + globalAlpha), premultiplied in / out.
 // uAdjust = 1: out = mix(below, adjusted, opacity * mask)   (adjusted = premultiplied RGBA, input 1).
-// uAdjust = 2: as 1, but input 1 holds STRAIGHT rgb computed from the unpremultiplied below (its alpha is
-//   ignored): adjusted = vec4(clamp(rgb, 0, 1) * below.a, below.a).  Used by levels, brightness/contrast,
-//   invert and threshold, which are non-linear in colour and must not see premultiplied values.
-// uAdjust = 3: out = straight (unpremultiplied) copy of input 0, rgb / a (helper node in front of the
-//   native Level / Threshold TOPs).
+// uAdjust = 2..6: colour adjustments computed here on the STRAIGHT colour of input 0 (no helper passes):
+//   adjusted rgb = clamp(f(rgb), 0, 1), alpha from below, out = mix(below, adjusted * a, opacity * mask)
+//   2 levels      uA = (inLow, inHigh, gamma, outLow), uB.x = outHigh
+//   3 bright/contr uA = (brightness, contrast)         4 invert
+//   5 threshold   uA.x = level (Rec.709 luma >= level -> white else black)
+//   6 hue/sat/val uA = (hue deg, saturation, value)   true HSV edit
 // All inputs are fetched with texelFetch, so there is no filtering and no resampling.
 
 uniform vec4 uParams;
 uniform vec2 uOffset;
+uniform vec4 uA;      // adjustment parameters (uAdjust 2..6)
+uniform vec4 uB;
 
 out vec4 fragColor;
 
@@ -88,6 +91,45 @@ vec3 blendFn(int mode, vec3 cb, vec3 cs) {
     return cs;
 }
 
+vec3 rgb2hsv(vec3 c) {
+    float mx = max(max(c.r, c.g), c.b), mn = min(min(c.r, c.g), c.b), d = mx - mn;
+    float h = 0.0;
+    if (d > 0.0) {
+        if (mx == c.r) h = mod((c.g - c.b) / d, 6.0);
+        else if (mx == c.g) h = (c.b - c.r) / d + 2.0;
+        else h = (c.r - c.g) / d + 4.0;
+    }
+    return vec3(h * 60.0, mx > 0.0 ? d / mx : 0.0, mx);
+}
+
+vec3 hsv2rgb(vec3 c) {
+    float h6 = mod(c.x, 360.0) / 60.0;
+    float i = floor(h6), f = h6 - i;
+    float p = c.z * (1.0 - c.y), q = c.z * (1.0 - c.y * f), t = c.z * (1.0 - c.y * (1.0 - f));
+    int k = int(i) % 6;
+    if (k == 0) return vec3(c.z, t, p);
+    if (k == 1) return vec3(q, c.z, p);
+    if (k == 2) return vec3(p, c.z, t);
+    if (k == 3) return vec3(p, q, c.z);
+    if (k == 4) return vec3(t, p, c.z);
+    return vec3(c.z, p, q);
+}
+
+vec3 adjustFn(int k, vec3 c) {
+    if (k == 2) {
+        vec3 t = clamp((c - uA.x) / (uA.y - uA.x), 0.0, 1.0);
+        return uA.w + (uB.x - uA.w) * pow(t, vec3(1.0 / uA.z));
+    }
+    if (k == 3) {
+        vec3 c1 = clamp(c * (1.0 + uA.x), 0.0, 1.0);
+        return (c1 - 0.5) * (1.0 + uA.y) + 0.5;
+    }
+    if (k == 4) return 1.0 - c;
+    if (k == 5) return vec3(dot(c, vec3(0.2126, 0.7152, 0.0722)) >= uA.x ? 1.0 : 0.0);
+    vec3 h = rgb2hsv(c);
+    return hsv2rgb(vec3(h.x + uA.x, min(1.0, h.y * uA.y), h.z * uA.z));
+}
+
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     vec4 below = texelFetch(sTD2DInputs[0], p, 0);
@@ -108,17 +150,13 @@ void main() {
             ivec2 mp = ivec2(d.x, mSize.y - 1 - d.y);
             m = (d.x < mSize.x && d.y < mSize.y) ? texelFetch(sTD2DInputs[2], mp, 0).r : 0.0;
         }
-    } else if (uParams.w > 0.5) {
-        // adjustment inputs are doc sized and aligned; outside = unchanged
-        src = below;
     }
 
     vec4 res;
-    if (uParams.w > 2.5) {
-        res = vec4(below.a > 0.0 ? below.rgb / below.a : vec3(0.0), below.a);
-    } else if (uParams.w > 1.5) {
-        vec4 adj = vec4(clamp(src.rgb, 0.0, 1.0) * below.a, below.a);
-        res = mix(below, adj, opacity * m);
+    if (uParams.w > 1.5) {
+        vec3 c = below.a > 0.0 ? below.rgb / below.a : vec3(0.0);
+        vec3 o = clamp(adjustFn(int(uParams.w + 0.5), c), 0.0, 1.0);
+        res = mix(below, vec4(o * below.a, below.a), opacity * m);
     } else if (uParams.w > 0.5) {
         res = mix(below, src, opacity * m);
     } else {

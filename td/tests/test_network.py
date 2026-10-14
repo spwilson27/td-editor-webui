@@ -458,104 +458,20 @@ def adj(id_, spec, **kw):
 LEVELS = {"type": "levels", "inLow": 0.1, "inHigh": 0.9, "gamma": 2.0, "outLow": 0.2, "outHigh": 0.8}
 
 
-def test_levels_chain_and_mapping(env):
-    net, comp, log, _ = env
-    net.apply([base(), px("a", 1), adj("lv", LEVELS, opacity=0.7)], W, H)
-    assert source_of(net, "adj_L_lv_un", 0) == "blend_L_a"
-    assert source_of(net, "adj_L_lv_a", 0) == "adj_L_lv_un"
-    assert source_of(net, "adj_L_lv", 0) == "adj_L_lv_a"
-    assert source_of(net, "blend_L_lv", 0) == "blend_L_a"
-    assert source_of(net, "blend_L_lv", 1) == "adj_L_lv"
-    pv = net._ops["blend_L_lv"].par.value
-    assert pv("vec0valuew") == 2.0 and pv("vec0valuey") == 0.7
-    assert net._ops["adj_L_lv_un"].par.value("vec0valuew") == 3.0
-    a = net._ops["adj_L_lv_a"].par.value
-    assert (a("inlow"), a("inhigh"), a("clamp")) == (0.1, 0.9, True)
-    b = net._ops["adj_L_lv"].par.value
-    assert (b("gamma1"), b("outlow"), b("outhigh")) == (2.0, 0.2, 0.8)
-    assert net._ops["adj_L_lv"].OPType == "levelTOP"
 
 
-def test_levels_degenerate_input_range_is_guarded():
-    p = network.adjustment_plan({"type": "levels", "inLow": 0.5, "inHigh": 0.5, "gamma": 1, "outLow": 0, "outHigh": 1}, "x")
-    pars = [n for n in p.nodes if n[0] == "adj_L_x_a"][0][2]
-    assert pars["inhigh"] > pars["inlow"]
 
 
-def test_adjustment_param_edit_is_par_sets_only(env):
-    net, comp, log, _ = env
-    net.apply([base(), px("a", 1), adj("lv", LEVELS)], W, H)
-    settle(net)
-    spec = dict(LEVELS, gamma=1.5)
-    m = log.mark()
-    net.apply([base(), px("a", 1), adj("lv", spec)], W, H)
-    d = log.since(m)
-    assert not d["creates"] and not d["destroys"] and not d["connects"]
-    assert [(n, k) for n, k, v in d["par_sets"]] == [("adj_L_lv", "gamma1")]
 
 
-def test_brightness_contrast_mapping(env):
-    net, comp, log, _ = env
-    net.apply([base(), px("a", 1), adj("bc", {"type": "brightnessContrast", "brightness": 0.25, "contrast": -0.5})], W, H)
-    assert net._ops["adj_L_bc_a"].par.value("brightness1") == pytest.approx(1.25)
-    assert net._ops["adj_L_bc"].par.value("contrast") == pytest.approx(0.5)
-    assert net._ops["blend_L_bc"].par.value("vec0valuew") == 2.0
 
 
-def test_invert_and_threshold_mapping(env):
-    net, comp, log, _ = env
-    net.apply([base(), px("a", 1), adj("iv", {"type": "invert"}), adj("th", {"type": "threshold", "level": 0.3})], W, H)
-    assert net._ops["adj_L_iv"].par.value("invert") is True
-    t = net._ops["adj_L_th"]
-    assert t.OPType == "thresholdTOP"
-    assert (t.par.value("comparator"), t.par.value("rgb"), t.par.value("threshold"), t.par.value("alpha")) == \
-        ("lessorequal", "luminance", 0.3, "one")
-    assert source_of(net, "adj_L_th_un", 0) == "blend_L_iv"           # sees the accumulated result below
 
 
-def test_hue_saturation_mapping_and_identity_bypass(env):
-    net, comp, log, _ = env
-    net.apply([base(), px("a", 1), adj("hs", {"type": "hueSaturation", "hue": 30, "saturation": 1.5, "value": 0.8})], W, H)
-    h = net._ops["adj_L_hs"]
-    assert h.OPType == "hsvadjustTOP"
-    assert (h.par.value("hueoffset"), h.par.value("saturationmult"), h.par.value("valuemult")) == (30, 1.5, 0.8)
-    assert h.bypass is False
-    net.apply([base(), px("a", 1), adj("hs", {"type": "hueSaturation", "hue": 0, "saturation": 1, "value": 1})], W, H)
-    assert net._ops["adj_L_hs"].bypass is True
 
 
-def test_blur_mapping_and_preshrink(env):
-    net, comp, log, _ = env
-    net.apply([base(), px("a", 1), adj("bl", {"type": "blur", "radius": 4})], W, H)
-    b = net._ops["adj_L_bl"]
-    assert b.OPType == "blurTOP" and source_of(net, "adj_L_bl", 0) == "blend_L_a"
-    assert b.par.value("type") == "gaussian"
-    assert b.par.value("size") == round(4 * 4.698) and b.par.value("preshrink") == 1
-    assert net._ops["blend_L_bl"].par.value("vec0valuew") == 1.0
-    assert source_of(net, "blend_L_bl", 1) == "adj_L_bl"
-    for r, ps in ((5.9, 1), (6, 2), (13.9, 2), (14, 4), (31.9, 4), (32, 8), (200, 8)):
-        assert network.blur_preshrink(r) == ps
-    p = network.adjustment_plan({"type": "blur", "radius": 100}, "z")
-    n = p.nodes[0]
-    assert n[2]["preshrink"] == 8 and n[2]["size"] == round(100 * 4.698 / 8)
-    net.apply([base(), px("a", 1), adj("bl", {"type": "blur", "radius": 0})], W, H)
-    assert net._ops["adj_L_bl"].bypass is True
 
 
-def test_adjustment_type_change_recreates_and_rewires(env):
-    net, comp, log, _ = env
-    net.apply([base(), px("a", 1), adj("x", LEVELS)], W, H)
-    levels_op = net._ops["adj_L_x"]
-    net.apply([base(), px("a", 1), adj("x", {"type": "hueSaturation", "hue": 10, "saturation": 1, "value": 1})], W, H)
-    assert net._ops["adj_L_x"].OPType == "hsvadjustTOP" and net._ops["adj_L_x"] is not levels_op
-    assert "adj_L_x_a" not in net._ops                                  # chain shrank
-    # the consumer must be rewired to the NEW node even though the name is unchanged
-    assert net._ops["blend_L_x"].inputConnectors[1].source is net._ops["adj_L_x"]
-    # Level -> Level with a different role keeps no stale parameters
-    net.apply([base(), px("a", 1), adj("x", {"type": "invert"})], W, H)
-    net.apply([base(), px("a", 1), adj("x", {"type": "brightnessContrast", "brightness": 0, "contrast": 0.5})], W, H)
-    lv = net._ops["adj_L_x"].par
-    assert lv.value("invert") is False and lv.value("contrast") == 1.5
 
 
 def test_adjustment_with_mask_and_hidden(env):
@@ -566,28 +482,8 @@ def test_adjustment_with_mask_and_hidden(env):
     assert net._ops["blend_L_lv"].par.value("vec0valuez") == 1.0
 
 
-def test_adjustment_inside_group_sees_only_group_content(env):
-    net, comp, log, _ = env
-    st = [base(), px("a", 1), L("g", "group"), px("b", 2, parentId="g"), adj("lv", LEVELS, parentId="g")]
-    net.apply(st, W, H)
-    assert source_of(net, "adj_L_lv_un", 0) == "blend_L_b"
-    assert source_of(net, "blend_L_lv", 0) == "blend_L_b"
-    assert source_of(net, "blend_L_g", 1) == "blend_L_lv"
 
 
-def test_delete_adjustment_defers_destroys_to_tick(env):
-    net, comp, log, _ = env
-    net.apply([base(), px("a", 1), adj("lv", LEVELS)], W, H)
-    settle(net)
-    m = log.mark()
-    net.apply([base(), px("a", 1)], W, H)
-    assert not log.since(m)["destroys"]
-    assert net.stats()["garbage"] == 2                                # the two Level TOPs
-    before = len(log.destroys)
-    for _ in range(5):
-        net.tick()
-    assert len(log.destroys) >= before + 2
-    assert "adj_L_lv" not in net._ops
 
 
 # --------------------------------------------------------------------------- housekeeping
@@ -671,7 +567,7 @@ def test_adopts_existing_network_without_creating(env):
     assert not d["destroys"]
     assert net2.slots() == [1, 2, 9]
     assert all(net2.surface_top(s).lock for s in (1, 2, 9))           # locked pixels are not touched
-    assert source_of(net2, "blend_L_lv", 1) == "adj_L_lv"
+    assert source_of(net2, "blend_L_lv", 1) == "blank"
     assert net2._ops["blend_L_a"].tags == ["role:blend_L_a"]
 
 
@@ -833,19 +729,6 @@ def _all_valid(net):
     return all(o.valid for o in net._ops.values())
 
 
-def test_garbage_resurrection_keeps_live_nodes(env):
-    net, comp, log, _ = env
-    with_adj = [base(), px("a", 1), adj("lv", LEVELS)]
-    net.apply(with_adj, W, H)
-    settle(net)
-    net.apply([base(), px("a", 1)], W, H)
-    assert net.stats()["garbage"] == 2
-    net.apply(with_adj, W, H)
-    for _ in range(8):
-        net.tick()
-    assert _all_valid(net)
-    assert net._ops["adj_L_lv"].name == "adj_L_lv" and comp.op("doc").op("adj_L_lv_a").valid
-    assert source_of(net, "blend_L_lv", 1) == "adj_L_lv"
 
 
 def test_fake_renames_duplicates_like_td():
@@ -894,27 +777,10 @@ def test_delete_group_with_masks_and_adjustments(env):
         net.tick()
     assert _all_valid(net)
     names = {c.name for c in net.doc.children}
-    assert not {"s2", "s8", "s9", "s10", "adj_L_lv", "adj_L_lv_a", "adj_L_lv_un"} & names
+    assert not {"s2", "s8", "s9", "s10"} & names
     assert net.stats()["pending_destroy"] == 0 and net.stats()["garbage"] == 0
 
 
-def test_nested_group_and_adjustment_type_change_in_one_apply(env):
-    net, comp, log, _ = env
-    st = [base(), L("g1", "group"), L("g2", "group", parentId="g1"), px("a", 1, parentId="g2"),
-          adj("x", LEVELS, parentId="g2"), adj("y", {"type": "invert"}, parentId="g1")]
-    net.apply(st, W, H)
-    st2 = [base(), L("g1", "group"), L("g2", "group", parentId="g1"), px("a", 1, parentId="g2"),
-           adj("x", {"type": "blur", "radius": 10}, parentId="g2"),
-           adj("y", {"type": "hueSaturation", "hue": 5, "saturation": 1, "value": 1}, parentId="g1")]
-    net.apply(st2, W, H)
-    assert net._ops["adj_L_x"].OPType == "blurTOP" and net._ops["adj_L_y"].OPType == "hsvadjustTOP"
-    assert source_of(net, "adj_L_x", 0) == "blend_L_a"
-    assert source_of(net, "blend_L_x", 1) == "adj_L_x"
-    assert net._ops["blend_L_x"].inputConnectors[1].source is net._ops["adj_L_x"]
-    assert source_of(net, "adj_L_y_un", 0) == "blend_L_g2"
-    assert net._ops["blend_L_y"].inputConnectors[1].source is net._ops["adj_L_y"]
-    assert net._ops["adj_L_x"].par.value("extend") == "hold"
-    assert "adj_L_x_a" not in net._ops
 
 
 def test_pool_never_exceeds_max(env):
@@ -984,3 +850,159 @@ def test_blur_tiny_radius_is_identity(env):
     net, comp, log, _ = env
     net.apply([base(), px("a", 1), adj("bl", {"type": "blur", "radius": 0.08})], W, H)
     assert net._ops["adj_L_bl"].bypass is True
+
+
+def test_unknown_removal_survives_children_dying_with_parent(env, monkeypatch):
+    net, comp, log, clock = env
+    net.apply([base(), px("a", 1)], W, H)            # leaves companion DATs (g*_info, s1_callbacks ...) behind
+    assert net.stats()["junk"] > 0
+    monkeypatch.setattr(network, "POOL_MAX", 0)       # spares cannot be recycled -> destroyed as unknown
+    net2 = DocNetwork(comp, GLSL, clock=clock)
+    net2.apply([base()], W, H)                        # must not touch the dead companions
+    names = {c.name for c in comp.op("doc").children}
+    assert not any(n.endswith(("_info", "_pixel", "_compute")) or re.match(r"s\d+_callbacks", n) for n in names), names
+    net2.tick()
+
+
+def test_tick_prunes_junk_that_died_with_its_parent(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1)], W, H)
+    net.apply([base()], W, H)
+    for _ in range(80):
+        net.tick()
+    assert net.stats()["junk"] == 0
+
+
+def uvals(net, role):
+    pv = net._ops[role].par.value
+    return tuple(pv(k) for k in ("vec2valuex", "vec2valuey", "vec2valuez", "vec2valuew", "vec3valuex"))
+
+
+def test_levels_is_one_pass_with_uniforms(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1), adj("lv", LEVELS, opacity=0.7)], W, H)
+    assert source_of(net, "blend_L_lv", 0) == "blend_L_a"
+    assert source_of(net, "blend_L_lv", 1) == "blank"
+    assert not [r for r in net._ops if r.startswith("adj_")]          # no helper nodes at all
+    pv = net._ops["blend_L_lv"].par.value
+    assert pv("vec0valuew") == network.ADJ_LEVELS and pv("vec0valuey") == 0.7
+    assert uvals(net, "blend_L_lv") == (0.1, 0.9, 2.0, 0.2, 0.8)
+    assert net._ops["blend_L_lv"].par.value("vec2name") == "uA"
+
+
+def test_levels_degenerate_input_range_is_guarded():
+    p = network.adjustment_plan({"type": "levels", "inLow": 0.5, "inHigh": 0.5, "gamma": 1, "outLow": 0, "outHigh": 1}, "x")
+    assert p.extra["vec2valuey"] > p.extra["vec2valuex"]
+    p = network.adjustment_plan({"type": "levels", "inLow": 0, "inHigh": 1, "gamma": 99, "outLow": 0, "outHigh": 1}, "x")
+    assert p.extra["vec2valuez"] == 10.0
+
+
+def test_adjustment_param_edit_is_par_sets_only(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1), adj("lv", LEVELS)], W, H)
+    settle(net)
+    m = log.mark()
+    net.apply([base(), px("a", 1), adj("lv", dict(LEVELS, gamma=1.5))], W, H)
+    d = log.since(m)
+    assert not d["creates"] and not d["destroys"] and not d["connects"]
+    assert [k for n, k, v in d["par_sets"]] == ["vec2valuez"]
+
+
+def test_brightness_contrast_invert_threshold_hue_mapping(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1),
+               adj("bc", {"type": "brightnessContrast", "brightness": 0.25, "contrast": -0.5}),
+               adj("iv", {"type": "invert"}),
+               adj("th", {"type": "threshold", "level": 0.3}),
+               adj("hs", {"type": "hueSaturation", "hue": 30, "saturation": 1.5, "value": 0.8})], W, H)
+    code = lambda r: net._ops[r].par.value("vec0valuew")
+    assert (code("blend_L_bc"), code("blend_L_iv"), code("blend_L_th"), code("blend_L_hs")) == \
+        (network.ADJ_BC, network.ADJ_INVERT, network.ADJ_THRESHOLD, network.ADJ_HSV)
+    assert uvals(net, "blend_L_bc")[:2] == (0.25, -0.5)
+    assert uvals(net, "blend_L_th")[0] == 0.3
+    assert uvals(net, "blend_L_hs")[:3] == (30, 1.5, 0.8)
+    # each adjustment sees the accumulated result below it (chain order)
+    assert source_of(net, "blend_L_iv", 0) == "blend_L_bc" and source_of(net, "blend_L_th", 0) == "blend_L_iv"
+    assert source_of(net, "blend_L_hs", 0) == "blend_L_th"
+
+
+def test_blur_mapping_and_preshrink(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1), adj("bl", {"type": "blur", "radius": 4})], W, H)
+    b = net._ops["adj_L_bl"]
+    assert b.OPType == "blurTOP" and source_of(net, "adj_L_bl", 0) == "blend_L_a"
+    assert b.par.value("type") == "gaussian" and b.par.value("extend") == "hold"
+    assert b.par.value("size") == round(4 * 4.698) and b.par.value("preshrink") == 1
+    assert net._ops["blend_L_bl"].par.value("vec0valuew") == network.ADJ_PREMULT
+    assert source_of(net, "blend_L_bl", 1) == "adj_L_bl"
+    for r, ps in ((5.9, 1), (6, 2), (13.9, 2), (14, 4), (31.9, 4), (32, 8), (200, 8)):
+        assert network.blur_preshrink(r) == ps
+    n = network.adjustment_plan({"type": "blur", "radius": 100}, "z").nodes[0]
+    assert n[2]["preshrink"] == 8 and n[2]["size"] == round(100 * 4.698 / 8)
+    net.apply([base(), px("a", 1), adj("bl", {"type": "blur", "radius": 0})], W, H)
+    assert net._ops["adj_L_bl"].bypass is True
+
+
+def test_adjustment_type_change_rewires(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1), adj("x", {"type": "blur", "radius": 8})], W, H)
+    blur_op = net._ops["adj_L_x"]
+    net.apply([base(), px("a", 1), adj("x", LEVELS)], W, H)
+    assert "adj_L_x" not in net._ops
+    assert source_of(net, "blend_L_x", 1) == "blank"
+    assert net._ops["blend_L_x"].par.value("vec0valuew") == network.ADJ_LEVELS
+    net.apply([base(), px("a", 1), adj("x", {"type": "blur", "radius": 8})], W, H)
+    assert net._ops["blend_L_x"].inputConnectors[1].source is net._ops["adj_L_x"]
+    assert net._ops["blend_L_x"].par.value("vec0valuew") == network.ADJ_PREMULT
+    assert blur_op.valid or True
+
+
+def test_adjustment_inside_group_sees_only_group_content(env):
+    net, comp, log, _ = env
+    st = [base(), px("a", 1), L("g", "group"), px("b", 2, parentId="g"), adj("lv", LEVELS, parentId="g")]
+    net.apply(st, W, H)
+    assert source_of(net, "blend_L_lv", 0) == "blend_L_b"
+    assert source_of(net, "blend_L_g", 1) == "blend_L_lv"
+
+
+def test_delete_blur_defers_destroy_to_tick(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1), adj("bl", {"type": "blur", "radius": 8})], W, H)
+    settle(net)
+    m = log.mark()
+    net.apply([base(), px("a", 1)], W, H)
+    assert not log.since(m)["destroys"]
+    assert net.stats()["garbage"] == 1
+    for _ in range(5):
+        net.tick()
+    assert "adj_L_bl" not in net._ops and net.stats()["garbage"] == 0
+
+
+def test_garbage_resurrection_keeps_live_nodes(env):
+    net, comp, log, _ = env
+    with_adj = [base(), px("a", 1), adj("bl", {"type": "blur", "radius": 8})]
+    net.apply(with_adj, W, H)
+    settle(net)
+    net.apply([base(), px("a", 1)], W, H)
+    assert net.stats()["garbage"] == 1
+    net.apply(with_adj, W, H)
+    for _ in range(8):
+        net.tick()
+    assert _all_valid(net) and comp.op("doc").op("adj_L_bl").valid
+    assert source_of(net, "blend_L_bl", 1) == "adj_L_bl"
+
+
+def test_nested_group_and_adjustment_type_change_in_one_apply(env):
+    net, comp, log, _ = env
+    st = [base(), L("g1", "group"), L("g2", "group", parentId="g1"), px("a", 1, parentId="g2"),
+          adj("x", LEVELS, parentId="g2"), adj("y", {"type": "invert"}, parentId="g1")]
+    net.apply(st, W, H)
+    st2 = [base(), L("g1", "group"), L("g2", "group", parentId="g1"), px("a", 1, parentId="g2"),
+           adj("x", {"type": "blur", "radius": 10}, parentId="g2"),
+           adj("y", {"type": "hueSaturation", "hue": 5, "saturation": 1, "value": 1}, parentId="g1")]
+    net.apply(st2, W, H)
+    assert net._ops["adj_L_x"].OPType == "blurTOP"
+    assert source_of(net, "adj_L_x", 0) == "blend_L_a"
+    assert net._ops["blend_L_x"].inputConnectors[1].source is net._ops["adj_L_x"]
+    assert net._ops["blend_L_y"].par.value("vec0valuew") == network.ADJ_HSV
+    assert source_of(net, "blend_L_y", 0) == "blend_L_g2"

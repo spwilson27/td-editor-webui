@@ -11,52 +11,50 @@ Network shape (all names inside ``doc``)::
     blank (constantTOP, transparent, doc size)      base_src (selectTOP: ../in1 or blank)
     s<slot>        scriptTOP  surface pixels (callbacks DAT surface_callbacks -> OnSurfaceCook)
     g<N>           glslTOP    blend.glsl nodes: role in tag/comment ``blend_<id>`` (inputs 0 below, 1 source,
-                              2 mask; always 3 wired) or ``adj_<id>_un`` (unpremultiply helper).  They are
+                              2 mask; always 3 wired).  They are
                               NOT named after the layer: creating or renaming a GLSL TOP costs ~4.5 ms, so a
                               pool of spare nodes is made in tick() and handed out / taken back by apply().
-    adj_<id>[_a]   native adjustment TOPs (Level / HSV Adjust / Blur / Threshold, see below)
+    adj_L_<id>     Blur TOP of a blur adjustment (the only native adjustment node)
     out            nullTOP    result (input = last root blend)
     blend_glsl, surface_callbacks   text DATs (shader, Script TOP callbacks)
 
 Chain order is bottom -> top inside each parent; a group is an isolated chain that starts at ``blank``
 and whose result is the *source* of ``blend_<groupId>``.
 
-Adjustment mapping (AdjustmentSpec -> TOPs)  --  KEEP IN SYNC WITH THE WEB PREVIEW
-===================================================================================
-All formulas are on STRAIGHT (unpremultiplied) sRGB values c in [0,1] unless stated; the working
-image is premultiplied, so adjustments that are non-linear in colour are bracketed by an unpremultiply
-node (``adj_<id>_un``, blend.glsl mode 3) and finally merged with the alpha of the image below
-(blend.glsl ``uAdjust = 2``).  Final result of every adjustment layer:
+Adjustment mapping (AdjustmentSpec -> blend.glsl / TOPs)  --  KEEP IN SYNC WITH THE WEB PREVIEW
+=========================================================================================
+All formulas are on STRAIGHT (unpremultiplied) sRGB values c in [0,1].  Levels, brightness/contrast,
+invert, threshold and hue/saturation are computed INSIDE the ``blend_<id>`` pass (blend.glsl uAdjust 2..6,
+parameters in uniforms uA / uB): one full-screen pass per adjustment, no helper nodes.  The shader
+unpremultiplies the image below, applies f, clamps to [0,1], premultiplies with the alpha of the image below.
+Final result of every adjustment layer:
 
     out = mix(below, adjusted, opacity * mask)            (premultiplied RGBA, per channel)
 
-levels            nodes: _un -> _a (Level) -> adj (Level)            uAdjust = 2
-                    t   = clamp((c - inLow) / (inHigh - inLow), 0, 1)           _a.inlow/inhigh, clamp
-                    out = outLow + (outHigh - outLow) * t ** (1 / gamma)         adj.gamma1=gamma, outlow/outhigh
-                  (gamma > 1 brightens mid-tones; alpha untouched; inHigh is kept >= inLow + 1e-4)
-brightnessContrast nodes: _un -> _a (Level) -> adj (Level)           uAdjust = 2
-                    c1  = clamp(c * (1 + brightness), 0, 1)                     _a.brightness1 = 1 + brightness
-                    out = clamp((c1 - 0.5) * (1 + contrast) + 0.5, 0, 1)        adj.contrast = 1 + contrast
-                  (== CSS ``brightness(1+b) contrast(1+k)``; brightness is a MULTIPLY, contrast pivots at 0.5)
-hueSaturation     nodes: _un -> adj (HSV Adjust TOP)                 uAdjust = 2
-                    true HSV edit on straight colour: V = max(R,G,B), S = (V - min) / V, H in degrees;
+levels            uAdjust 2   uA = (inLow, inHigh, gamma, outLow), uB.x = outHigh
+                    t   = clamp((c - inLow) / (inHigh - inLow), 0, 1)
+                    out = outLow + (outHigh - outLow) * t ** (1 / gamma)       (gamma > 1 brightens mid-tones)
+                    inHigh is kept >= inLow + 1e-4, gamma in 0.1..10
+brightnessContrast uAdjust 3  uA = (brightness, contrast)
+                    c1  = clamp(c * (1 + brightness), 0, 1)
+                    out = clamp((c1 - 0.5) * (1 + contrast) + 0.5, 0, 1)
+hueSaturation     uAdjust 6   uA = (hue, saturation, value)
+                    true HSV edit: V = max(R,G,B), S = (V - min) / V, H in degrees;
                     H' = H + hue (+ = CSS hue-rotate direction: red -> green -> blue), S' = min(1, S * saturation),
-                    V' = V * value, back to RGB, then each channel is clamped to [0,1] by the blend shader
-                    (value > 1 saturates channels, hue is not kept).  hueoffset/saturationmult/valuemult are
-                    set 1:1 (hueoffset is in DEGREES).  Identity (0, 1, 1) -> node bypassed.
-blur              node: adj (Blur TOP, gaussian)                      uAdjust = 1
+                    V' = V * value, back to RGB, each channel clamped (value > 1 saturates channels).
+invert            uAdjust 4   out = 1 - c
+threshold         uAdjust 5   uA.x = level;  out = white if lum(c) >= level else black, alpha preserved,
+                    lum = Rec.709 0.2126 R + 0.7152 G + 0.0722 B
+blur              uAdjust 1   one extra node ``adj_L_<id>`` = Blur TOP (gaussian) on the premultiplied image
                     size = round(radius * 4.698 / preshrink), preshrink = 1 (r<6), 2 (<14), 4 (<32), 8
                     -> gaussian with standard deviation sigma = radius px (measured 100.06 for size 470 and
-                    200.4 for 940 at preshrink 1), applied to premultiplied RGBA.  Pixels outside the document
-                    repeat the edge pixels (Blur TOP extend 'hold'); radius < 0.1 -> node bypassed (size 1 would blur with sigma ~0.2 px, not r).
-invert            nodes: _un -> adj (Level invert=1)                 uAdjust = 2      out = 1 - c
-threshold         nodes: _un -> adj (Threshold TOP)                  uAdjust = 2
-                    out = white if lum(c) >= level else black, alpha preserved, lum = Rec.709
-                    0.2126 R + 0.7152 G + 0.0722 B  (the Threshold TOP 'luminance' weights, measured:
-                    NOT Rec.601 0.299/0.587/0.114).  comparator 'lessorequal' = level <= lum.
+                    200.4 for 940 at preshrink 1), premultiplied RGBA, pixels outside the document repeat the
+                    edge pixels (extend 'hold').  radius < 0.1 -> node bypassed.
+(Version 1 used native Level / HSV Adjust / Threshold TOPs behind an unpremultiply helper pass: 3-4 passes per
+adjustment.  Same maths, folded into the shader to cut GPU passes and cooks.)
 
 Blend uniforms (GLSL TOP Vectors page): ``uParams`` vec4 = (BlendMode index, opacity, hasMask,
-uAdjust 0..3) and ``uOffset`` vec2 = (x, y).  See blend.glsl.
+uAdjust 0..6) and ``uOffset`` vec2 = (x, y).  See blend.glsl.
 
 Persistence (verified): a LOCKED Script TOP keeps its pixels in COMP.save()/loadTox (and so in a saved .toe).
 Locking resets the locked image, so ``freeze()`` does ``top.lock = True`` and then calls ``comp.OnSurfaceCook(top)``
@@ -160,12 +158,6 @@ def view_uniforms(view, panel_w, panel_h, doc_w, doc_h):
     return (ox, oy, zoom, 1.0 if zoom < 1.0 else 0.0, x0, y0, max(x0, x1), max(y0, y1))
 
 
-LEVEL_DEFAULTS = {
-    "invert": False, "brightness1": 1.0, "gamma1": 1.0, "contrast": 1.0, "inlow": 0.0, "inhigh": 1.0,
-    "outlow": 0.0, "outhigh": 1.0, "clamp": True,
-}
-
-
 def blur_preshrink(radius):
     """Blur TOP pre-shrink (box downsample before the 1-D passes); the cost is linear in the filter size, so
     large radii run on a 2x/4x/8x smaller image (sigma >= ~3.5 shrunk px; measured error vs a true gaussian
@@ -173,69 +165,53 @@ def blur_preshrink(radius):
     return 1 if radius < 6 else 2 if radius < 14 else 4 if radius < 32 else 8
 
 
-def _level(**kw):
-    """Complete Level TOP parameter set (a node can change role between applies)."""
-    d = dict(LEVEL_DEFAULTS)
-    d.update(kw)
-    return d
-
-
 class Plan:
-    """Nodes of one adjustment layer (besides ``blend_<id>``).
+    """How one adjustment layer is built.
 
-    ``nodes``: ordered ``(name, optype, pars, bypass, inputs, kind)``; inputs are node names or the tokens
-    ``$acc`` (accumulated image below) / ``$prev`` (previous node of the list).  ``src`` = node feeding
-    blend input 1 (``$last`` = last node), ``adjust`` = blend.glsl uAdjust."""
+    ``nodes``: extra operators (only blur has one), ordered ``(name, optype, pars, bypass, inputs, kind)``;
+    inputs are node names or the tokens ``$acc`` (accumulated image below) / ``$prev``.  ``src`` = node
+    feeding blend input 1 (``$last`` = last node, otherwise a name such as ``blank``), ``adjust`` =
+    blend.glsl uAdjust, ``extra`` = uA / uB uniform values of the blend node."""
 
-    def __init__(self, nodes, adjust, src="$last"):
-        self.nodes, self.adjust, self.src = nodes, adjust, src
+    def __init__(self, nodes, adjust, src="$last", extra=None):
+        self.nodes, self.adjust, self.src, self.extra = nodes, adjust, src, extra or {}
+
+
+# blend.glsl uAdjust codes
+ADJ_BLEND, ADJ_PREMULT, ADJ_LEVELS, ADJ_BC, ADJ_INVERT, ADJ_THRESHOLD, ADJ_HSV = range(7)
+
+
+def _ab(a=0.0, b=0.0, c=0.0, d=0.0, e=0.0):
+    return {"vec2valuex": float(a), "vec2valuey": float(b), "vec2valuez": float(c), "vec2valuew": float(d),
+            "vec3valuex": float(e)}
 
 
 def adjustment_plan(adj, sid, doc_w=0, doc_h=0):
     """AdjustmentSpec -> :class:`Plan`.  Documented at the top of this module."""
     t = adj.get("type")
     base = "adj_L_" + sid
-    un = (base + "_un", "glslTOP", {}, False, ["$acc", "blank", "blank"], "un")
     if t == "levels":
         lo = float(adj.get("inLow", 0.0))
         hi = max(float(adj.get("inHigh", 1.0)), lo + 1e-4)
         gamma = min(10.0, max(0.1, float(adj.get("gamma", 1.0))))
-        return Plan([
-            un,
-            (base + "_a", "levelTOP", _level(inlow=lo, inhigh=hi), False, ["$prev"], "level"),
-            (base, "levelTOP", _level(
-                gamma1=gamma, outlow=float(adj.get("outLow", 0.0)), outhigh=float(adj.get("outHigh", 1.0))),
-             False, ["$prev"], "level"),
-        ], 2)
+        return Plan([], ADJ_LEVELS, "blank", _ab(lo, hi, gamma, float(adj.get("outLow", 0.0)), float(adj.get("outHigh", 1.0))))
     if t == "brightnessContrast":
-        b = float(adj.get("brightness", 0.0))
-        k = float(adj.get("contrast", 0.0))
-        return Plan([
-            un,
-            (base + "_a", "levelTOP", _level(brightness1=1.0 + b), False, ["$prev"], "level"),
-            (base, "levelTOP", _level(contrast=1.0 + k), False, ["$prev"], "level"),
-        ], 2)
+        return Plan([], ADJ_BC, "blank", _ab(float(adj.get("brightness", 0.0)), float(adj.get("contrast", 0.0))))
     if t == "invert":
-        return Plan([un, (base, "levelTOP", _level(invert=True), False, ["$prev"], "level")], 2)
+        return Plan([], ADJ_INVERT, "blank", _ab())
     if t == "threshold":
-        return Plan([un, (base, "thresholdTOP", {
-            "comparator": "lessorequal", "rgb": "luminance", "alpha": "one",
-            "threshold": float(adj.get("level", 0.5))}, False, ["$prev"], "threshold")], 2)
+        return Plan([], ADJ_THRESHOLD, "blank", _ab(float(adj.get("level", 0.5))))
     if t == "hueSaturation":
-        hue = float(adj.get("hue", 0.0))
-        sat = float(adj.get("saturation", 1.0))
-        val = float(adj.get("value", 1.0))
-        ident = hue == 0.0 and sat == 1.0 and val == 1.0
-        return Plan([un, (base, "hsvadjustTOP", {
-            "hueoffset": hue, "saturationmult": sat, "valuemult": val}, ident, ["$prev"], "hsv")], 2)
+        return Plan([], ADJ_HSV, "blank", _ab(float(adj.get("hue", 0.0)), float(adj.get("saturation", 1.0)),
+                                              float(adj.get("value", 1.0))))
     if t == "blur":
         r = max(0.0, float(adj.get("radius", 0.0)))
         ps = blur_preshrink(r)
         return Plan([(base, "blurTOP", {
             "type": "gaussian", "extend": "hold", "preshrink": ps,
-            "size": max(1, int(round(r * BLUR_SIZE_PER_RADIUS / ps)))}, r < 0.1, ["$acc"], "blur")], 1)
+            "size": max(1, int(round(r * BLUR_SIZE_PER_RADIUS / ps)))}, r < 0.1, ["$acc"], "blur")], ADJ_PREMULT)
     # unknown type: identity
-    return Plan([(base, "nullTOP", {}, False, ["$acc"], "null")], 1)
+    return Plan([(base, "nullTOP", {}, False, ["$acc"], "null")], ADJ_PREMULT)
 
 
 class _Node:
@@ -317,6 +293,7 @@ class DocNetwork:
         if self._garbage:
             self._collect_garbage(1)
             return
+        self._prune()
         if self._junk:
             self._destroy_op(self._junk.pop())
             return
@@ -502,6 +479,7 @@ class DocNetwork:
         def walk(kids, acc, depth):
             bx = depth * 700
             for l in kids:
+                extra = {}
                 sid = self._alloc_name(l["id"])
                 kind = l.get("kind")
                 y = -row[0] * 160
@@ -532,13 +510,12 @@ class DocNetwork:
                 elif kind == "adjustment":
                     plan = adjustment_plan(l.get("adjustment") or {}, sid, doc_w, doc_h)
                     adjust = plan.adjust
+                    extra = plan.extra
                     prev = None
                     ax = bx - 350
                     for name, optype, pars, byp, ins, nk in plan.nodes:
                         npars = dict(pars)
-                        if nk == "un":
-                            npars.update(blend_pars(0, 1.0, False, 3, 0, 0, FMT))
-                        elif optype not in ("nullTOP", "constantTOP"):
+                        if optype not in ("nullTOP", "constantTOP"):
                             npars["format"] = FMT
                         ins = [acc if i == "$acc" else prev if i == "$prev" else i for i in ins]
                         add(_Node(name, optype, npars, ins, bypass=byp, pos=(ax, y)))
@@ -549,8 +526,9 @@ class DocNetwork:
                     continue
                 # sTD2DInputs[] is sized by the number of wired inputs: always wire all three
                 inputs = [acc, src, mask_name or "blank"]
-                add(_Node(bname, "glslTOP", blend_pars(mode, opacity, mask_name is not None, adjust, ox, oy),
-                          inputs, bypass=not visible, pos=(bx, y)))
+                bp = blend_pars(mode, opacity, mask_name is not None, adjust, ox, oy)
+                bp.update(extra)
+                add(_Node(bname, "glslTOP", bp, inputs, bypass=not visible, pos=(bx, y)))
                 acc = bname
             return acc
 
@@ -620,12 +598,19 @@ class DocNetwork:
                 if t.startswith(ROLE_PREFIX):
                     self._adopt[t[len(ROLE_PREFIX):]] = ch
 
+    def _prune(self):
+        """Destroying a node can take its companion DATs with it: forget operators that are gone."""
+        self._junk = [j for j in self._junk if j.valid]
+        self._garbage = [(g, c) for g, c in self._garbage if g.valid]
+        self._pool = [(g, c) for g, c in self._pool if g.valid]
+
     def _remove_unknown(self):
+        self._prune()
         known = {op.name for op in self._ops.values()} | set(RESERVED) \
             | {p[0].name for p in self._pool} | {g.name for g, _ in self._garbage} | {j.name for j in self._junk}
         leftovers = {o.path for o in self._adopt.values()}      # tagged glsl nodes whose role is gone
         for child in list(self.doc.children):
-            if child.name in known:
+            if not child.valid or child.name in known:      # may have died with a destroyed parent node
                 continue
             spare = child.OPType == "glslTOP" and not child.tags and _SPARE_NAME.match(child.name)
             if (child.path in leftovers or spare) and len(self._pool) < POOL_MAX:
@@ -637,8 +622,7 @@ class DocNetwork:
                 self._pool.append((child, {"type": "glslTOP", "pars": {}, "inputs": [], "bypass": False, "pos": None}))
                 continue
             self._unknown_names.append(child.name)
-            child.destroy()
-            self._counters["destroyed"] += 1
+            self._destroy_op(child)
             self._counters["unknown"] += 1
         self._adopt = {}
 
@@ -679,7 +663,8 @@ class DocNetwork:
         self._note_companions(op)
         cache = {"type": "glslTOP", "pars": {}, "inputs": [], "bypass": False, "pos": None}
         self._set_pars_raw(op, cache, {
-            "pixeldat": "blend_glsl", "format": FMT_BLEND, "vec0name": "uParams", "vec1name": "uOffset"})
+            "pixeldat": "blend_glsl", "format": FMT_BLEND, "vec0name": "uParams", "vec1name": "uOffset",
+            "vec2name": "uA", "vec3name": "uB"})
         return (op, cache)
 
     def _note_companions(self, op):
@@ -699,7 +684,8 @@ class DocNetwork:
             op = existing
             # resurrection: the node may be waiting in the garbage / junk lists (dropped, then re-added
             # before tick() collected it); it must not be destroyed while live
-            self._garbage = [(g, c) for g, c in self._garbage if g is not existing and g.path != existing.path]
+            self._prune()
+            self._garbage = [(g, c) for g, c in self._garbage if g.path != existing.path]
             self._junk = [j for j in self._junk if j.path != existing.path]
             self._cache[name] = {"type": spec.optype, "pars": {}, "inputs": None, "bypass": None, "pos": None}
         else:

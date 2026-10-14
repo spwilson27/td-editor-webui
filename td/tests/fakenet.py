@@ -107,6 +107,8 @@ class FakeOp:
     # -- identity
     @property
     def name(self):
+        if not self.valid:
+            raise RuntimeError("Invalid OP object")
         return self._name
 
     @name.setter
@@ -156,6 +158,11 @@ class FakeOp:
         assert self.valid, "destroy of an invalid op " + self._name
         self.valid = False
         self._log.destroys.append(self._name)
+        # like TD, destroying a GLSL / Script TOP also takes its auto-created companion DATs with it
+        for suf in COMPANIONS.get(self.OPType, ()):
+            comp = self.parent_op.op(self._name + suf) if self.parent_op is not None else None
+            if comp is not None:
+                comp.valid = False
         # downstream connectors that pointed here are cut, like TD
         root = self.parent_op
         if root is not None:
