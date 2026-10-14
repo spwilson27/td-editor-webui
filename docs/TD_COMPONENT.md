@@ -177,3 +177,37 @@ Why BASE frames are pulled over HTTP (measured)
   per published frame), so the HTTP thread can never see a half-rewritten buffer. Remaining risk: tiny JSON writes
   (`hello`, `docSize`, `active`, `base` notices; capped to one notice per client) cannot fill a socket buffer
   unless a client is dead for a very long time.
+
+
+## 6. Protocol v3 / document network (supersedes the COMPOSITE parts above)
+
+- **Removed:** `composite` Script TOP, COMPOSITE path, single output buffer. `out_switch`: input 0 = `in1`, input 1 =
+  `doc_out` (a Select TOP on `doc/out`; wires cannot enter a child COMP). Index 1 once a stack was applied (a default
+  base-only stack is applied at start), 0 while `Active` is off or the network failed.
+- **New operators:** `network` (DocNetwork, network.py), `blend_glsl`, `doc_state` (text DAT, JSON `{rev, layers, docW,
+  docH}`), `view_pack` + `view_pack_glsl` (GPU unpremultiply/flip/scale to exact 0..255 float32 for the VIEW stream: the CPU
+  only casts, 2.4 ms instead of ~27 ms at 1080p), `doc` (generated network, preserved across rebuilds). The COMP has
+  parent shortcut `RasterEditor` (`doc/surface_callbacks` call `parent.RasterEditor.OnSurfaceCook(scriptOp)`).
+- **New parameters:** `Maxviewfps` (30), `Viewmode` (read-only mirror of the active client's mode), `Savetox` pulse.
+- **Surfaces:** `surfaces[slot]` uint8 `[h, w, 4]` TD order, premultiplied (masks grey, a=255), allocated from `doc`
+  messages and docSize (anchored top-left). A slot new to a `doc` always starts zeroed. Removed slots keep their buffer
+  5 s. SURFACE tiles paste in place; on FRAME_END the slot is marked dirty; Pump force-cooks each dirty slot once
+  (`OnSurfaceCook` copies the buffer on EVERY cook) and then sends `applied` (<= 1 per TD frame and client).
+- **HTTP:** `GET /surface?slot=` (SURFACE_DUMP, straight alpha), `GET /view` (subscribed external clients only),
+  same auth/CORS/notice/stall rules as `/base`. `view` notices carry `appliedFrameId` (-1 = none yet), the newest SURFACE
+  frameId uploaded before the readback was issued.
+- **Readback pipeline** (base and view, `_Pipe`): one `numpyArray(delayed=True)` call per frame both returns the previous
+  read and issues the next (1 frame per pump when the source changes), leaky-bucket rate limit.
+- **Persistence:** Execute DAT `onProjectPreSave/PostSave` -> `Freeze()/Thaw()`; `Start()` -> `Restore()` (stored
+  stack -> network -> `read_locked()` -> buffers -> `thaw()`; finished by the first successful network apply, uploads are
+  held until then). `SaveTox(path)` freezes around `comp.save`. `build_component.py` rebuilds in place, keeping `doc` and
+  `doc_state` (Freeze first), and exports `dist/raster_editor.tox` from a clean throw-away build.
+- **View messages:** panel client -> `DocNetwork.set_view` + COMP background `./panel_view`
+  (back to `./webrender` for `local` or panel disconnect). The Web Render TOP's `transparent` is permanently on (toggling it
+  reloads the page and drops the WebSocket); the page paints an opaque background in Local mode; external client `mode: td` -> VIEW stream.
+- A rebuild with `Active` toggled off/on or a restart keeps pixels (buffers carried over when nothing was locked).
+- **Restore safety:** while a restore is pending (the network's first apply failed) the locked images are the only copy:
+  `Freeze/Thaw` leave them alone, `SaveTox` is refused, tiles / docs / requestDocs are held and replayed (a few ms per pump) and
+  `/surface` answers 503. A client that overflows the 64 MB hold queue gets an `error` and, after the restore, `active:false`
+  then `active:true` (the page reloads TD's document). Surface uploads are round robin and budgeted (~4 ms/pump); a dirty
+  slot without a Script TOP is dropped after 3 s. `Freeze` first re-encodes slots still waiting for a `Premultiplied` toggle.

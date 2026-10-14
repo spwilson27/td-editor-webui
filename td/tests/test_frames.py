@@ -203,3 +203,66 @@ def test_scratch_reused_and_resized():
 def test_premultiply_u8_helper_matches_reference():
     x = rnd(5, 5, 8)
     assert (F.premultiply_u8(x) == ref_premul(x)).all()
+
+
+# ---- v3 helpers: surface reallocation, locked-TOP readback, premultiplication toggle
+
+def test_resize_buffer_anchors_top_left_in_td_order():
+    old = np.arange(4 * 6 * 4, dtype=np.uint8).reshape(4, 6, 4)  # 6x4 document, TD order (row 0 = bottom)
+    big = F.resize_buffer(old, 10, 7)
+    assert big.shape == (7, 10, 4)
+    # wire row 0 (top) is TD row h-1 in both; wire (x, y) is unchanged for the overlap
+    for y in range(4):
+        assert (big[7 - 1 - y, :6] == old[4 - 1 - y]).all()
+    assert not big[:3].any() and not big[:, 6:].any()
+    small = F.resize_buffer(old, 3, 2)
+    for y in range(2):
+        assert (small[2 - 1 - y] == old[4 - 1 - y, :3]).all()
+
+
+def test_resize_buffer_from_none_and_same_size():
+    assert not F.resize_buffer(None, 5, 3).any()
+    old = np.random.RandomState(0).randint(0, 255, (3, 5, 4), dtype=np.uint8)
+    same = F.resize_buffer(old, 5, 3)
+    assert same is not old and (same == old).all()
+
+
+def test_from_float_rounds_clips_and_resizes():
+    arr = np.zeros((2, 3, 4), np.float32)
+    arr[0, 0] = (0.5, 1.0, 0.2, 1.0)
+    arr[1, 2] = (1.2, -0.3, 0.0, 0.5)
+    out = F.from_float(arr, 3, 2)
+    assert out[0, 0].tolist() == [128, 255, 51, 255] and out[1, 2].tolist() == [255, 0, 0, 128]
+    assert F.from_float(arr, 4, 3).shape == (3, 4, 4)
+
+
+def test_from_float_roundtrips_uint8_exactly():
+    u8 = np.random.RandomState(4).randint(0, 256, (5, 7, 4), dtype=np.uint8)
+    assert (F.from_float(u8.astype(np.float32) / 255.0, 7, 5) == u8).all()
+
+
+def test_convert_premultiplication_toggles_in_place():
+    wire = np.random.RandomState(5).randint(0, 256, (6, 6, 4), dtype=np.uint8)
+    wire[..., 3] = 255
+    buf = wire.copy()
+    F.convert_premultiplication(buf, True)
+    assert (buf == wire).all()  # opaque: unchanged
+    wire[..., 3] = 128
+    buf = wire.copy()
+    F.convert_premultiplication(buf, True)
+    assert (buf == F.premultiply_u8(wire)).all()
+    F.convert_premultiplication(buf, False)
+    assert np.abs(buf.astype(int) - wire).max() <= 2 and (buf[..., 3] == 128).all()
+
+
+def test_masks_fill_white_in_the_new_area():
+    old = np.zeros((2, 3, 4), np.uint8)
+    old[..., 3] = 255   # black mask
+    big = F.resize_buffer(old, 5, 4, white=True)
+    assert (big[2:, :3] == old).all() and (big[:2] == 255).all() and (big[:, 3:] == 255).all()
+    assert (F.alloc_buffer(2, 2, white=True) == 255).all() and not F.alloc_buffer(2, 2).any()
+    assert (F.resize_buffer(None, 3, 2, white=True) == 255).all()
+    arr = np.zeros((2, 3, 4), np.float32)
+    arr[..., 3] = 1.0
+    out = F.from_float(arr, 4, 3, white=True)
+    assert (out[1:, :3] == (0, 0, 0, 255)).all() and (out[0] == 255).all() and (out[:, 3] == 255).all()

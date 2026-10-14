@@ -9,6 +9,7 @@
       "size": 104,
       "header": {
         "type": 1,
+        "slot": 0,
         "flags": 1,
         "frameEnd": true,
         "frameId": 1,
@@ -22,13 +23,14 @@
       "payloadSha256": "f029f014ccd21bcc30bdb1780e02b56211c93c4054cb1ce8245b2c00e81369bf"
     },
     {
-      "name": "composite_band0",
-      "file": "composite_band0.bin",
-      "frame": "composite_multiband",
+      "name": "surface_band0",
+      "file": "surface_band0.bin",
+      "frame": "surface_multiband",
       "valid": true,
       "size": 56,
       "header": {
-        "type": 2,
+        "type": 3,
+        "slot": 5,
         "flags": 0,
         "frameEnd": false,
         "frameId": 7,
@@ -42,13 +44,14 @@
       "payloadSha256": "e555fbce8123cdc53063f11e6d9f0ddc9635eb4813b53b96dd2444617ba31fe4"
     },
     {
-      "name": "composite_band1",
-      "file": "composite_band1.bin",
-      "frame": "composite_multiband",
+      "name": "surface_band1",
+      "file": "surface_band1.bin",
+      "frame": "surface_multiband",
       "valid": true,
       "size": 56,
       "header": {
-        "type": 2,
+        "type": 3,
+        "slot": 5,
         "flags": 0,
         "frameEnd": false,
         "frameId": 7,
@@ -62,13 +65,14 @@
       "payloadSha256": "7d7c51e380ecfcc4d57524f59d759f1992ee23de4040276d87044a557e8a443c"
     },
     {
-      "name": "composite_band2",
-      "file": "composite_band2.bin",
-      "frame": "composite_multiband",
+      "name": "surface_band2",
+      "file": "surface_band2.bin",
+      "frame": "surface_multiband",
       "valid": true,
       "size": 56,
       "header": {
-        "type": 2,
+        "type": 3,
+        "slot": 5,
         "flags": 1,
         "frameEnd": true,
         "frameId": 7,
@@ -82,13 +86,14 @@
       "payloadSha256": "02700915b2153c86b12b88243e2f8eb49f8b97d48c50e6d9a0d87a84c0776af9"
     },
     {
-      "name": "composite_no_end",
-      "file": "composite_no_end.bin",
-      "frame": "composite_no_end",
+      "name": "surface_no_end",
+      "file": "surface_no_end.bin",
+      "frame": "surface_no_end",
       "valid": true,
       "size": 36,
       "header": {
-        "type": 2,
+        "type": 3,
+        "slot": 300,
         "flags": 0,
         "frameEnd": false,
         "frameId": 4294967295,
@@ -102,13 +107,56 @@
       "payloadSha256": "9bc3becda296380e21a36440faba609ba8762cdc75e903bfa9f3ef6ab917aa08"
     },
     {
+      "name": "surface_dump",
+      "file": "surface_dump.bin",
+      "frame": "surface_dump",
+      "valid": true,
+      "size": 104,
+      "header": {
+        "type": 4,
+        "slot": 9,
+        "flags": 1,
+        "frameEnd": true,
+        "frameId": 3,
+        "docW": 5,
+        "docH": 4,
+        "x": 0,
+        "y": 0,
+        "w": 5,
+        "h": 4
+      },
+      "payloadSha256": "f029f014ccd21bcc30bdb1780e02b56211c93c4054cb1ce8245b2c00e81369bf"
+    },
+    {
+      "name": "view_small",
+      "file": "view_small.bin",
+      "frame": "view_small",
+      "valid": true,
+      "size": 104,
+      "header": {
+        "type": 5,
+        "slot": 0,
+        "flags": 1,
+        "frameEnd": true,
+        "frameId": 12,
+        "docW": 5,
+        "docH": 4,
+        "x": 0,
+        "y": 0,
+        "w": 5,
+        "h": 4
+      },
+      "payloadSha256": "f029f014ccd21bcc30bdb1780e02b56211c93c4054cb1ce8245b2c00e81369bf"
+    },
+    {
       "name": "stale_docsize",
       "file": "stale_docsize.bin",
       "frame": "stale_docsize",
       "valid": true,
       "size": 40,
       "header": {
-        "type": 2,
+        "type": 3,
+        "slot": 5,
         "flags": 1,
         "frameEnd": true,
         "frameId": 11,
@@ -125,6 +173,36 @@
         "h": 7
       },
       "note": "decodes fine; a receiver whose document is currentDoc must drop it"
+    },
+    {
+      "name": "wrong_slot",
+      "file": "wrong_slot.bin",
+      "frame": "wrong_slot",
+      "valid": true,
+      "size": 40,
+      "header": {
+        "type": 3,
+        "slot": 999,
+        "flags": 1,
+        "frameEnd": true,
+        "frameId": 13,
+        "docW": 6,
+        "docH": 7,
+        "x": 0,
+        "y": 0,
+        "w": 2,
+        "h": 2
+      },
+      "payloadSha256": "d8277da61fa6efe246f000edbdcf54fca9874e52d3701daa1700ed8cfca69601",
+      "currentDoc": {
+        "w": 6,
+        "h": 7
+      },
+      "knownSlots": [
+        5,
+        9
+      ],
+      "note": "decodes fine; a receiver that does not know the slot must drop it"
     },
     {
       "name": "invalid_bad_magic",
@@ -157,6 +235,14 @@
       "valid": false,
       "size": 40,
       "error": "unknown type"
+    },
+    {
+      "name": "invalid_type_2",
+      "file": "invalid_type_2.bin",
+      "frame": "invalid",
+      "valid": false,
+      "size": 40,
+      "error": "type 2 (v1/v2 COMPOSITE) is invalid in v3"
     },
     {
       "name": "invalid_zero_size_rect",

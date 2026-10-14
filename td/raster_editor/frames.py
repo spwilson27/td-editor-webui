@@ -10,8 +10,11 @@ import numpy as np
 CHANNELS = 4
 
 
-def alloc_buffer(w: int, h: int) -> np.ndarray:
-    """Persistent TD-order output buffer (transparent black)."""
+def alloc_buffer(w: int, h: int, white: bool = False) -> np.ndarray:
+    """Persistent TD-order surface buffer: transparent black, or opaque white for mask surfaces (the engine's
+    masks start fully visible)."""
+    if white:
+        return np.full((h, w, CHANNELS), 255, np.uint8)
     return np.zeros((h, w, CHANNELS), np.uint8)
 
 
@@ -69,6 +72,14 @@ class WireConverter:
         self.convert_rows(arr, out, 0, arr.shape[0], unpremultiply)
         return out
 
+    @staticmethod
+    def copy_rows(arr: np.ndarray, out: np.ndarray, y0: int, y1: int) -> None:
+        """Rows [y0, y1) of a GPU-packed readback (float32 holding exact 0..255 integers, already in wire order
+        and unpremultiplied by the ``view_pack`` shader) -> uint8: one truncating cast, ~2.5 ms for 1080p."""
+        if not (0 <= y0 <= y1 <= arr.shape[0]) or out.shape != arr.shape:
+            raise ValueError(f"row range {y0}:{y1} / shape {out.shape} vs {arr.shape}")
+        np.copyto(out[y0:y1], arr[y0:y1], casting="unsafe")
+
     def convert_rows(self, arr: np.ndarray, out: np.ndarray, y0: int, y1: int, unpremultiply: bool = True) -> None:
         """Fill wire rows [y0, y1) of ``out`` (uint8, same shape as ``arr``)."""
         h = arr.shape[0]
@@ -118,3 +129,31 @@ def _unpremultiply_u8_inplace(rgba: np.ndarray) -> None:
     np.minimum(rgb, 255, out=rgb)
     rgb[(a == 0).repeat(3, axis=2)] = 0
     rgba[..., :3] = rgb
+
+
+def resize_buffer(old, w: int, h: int, white: bool = False) -> np.ndarray:
+    """New TD-order buffer of w x h with ``old`` copied in, anchored at the document's top-left (wire
+    coordinates stay valid). TD order keeps the top rows last. The new area is transparent black, or opaque
+    white for masks (``white``). With no ``old`` the buffer is entirely the fill."""
+    out = alloc_buffer(w, h, white)
+    if old is None:
+        return out
+    oh, ow = old.shape[:2]
+    cw, ch = min(ow, w), min(oh, h)
+    out[h - ch: h, :cw] = old[oh - ch: oh, :cw]
+    return out
+
+
+def from_float(arr: np.ndarray, w: int, h: int, white: bool = False) -> np.ndarray:
+    """float32 (h', w', 4) TD-order TOP readback (0..1) -> uint8 buffer of w x h, anchored top-left."""
+    arr = _check(arr)
+    u8 = np.clip(arr * np.float32(255.0) + np.float32(0.5), 0, 255).astype(np.uint8)
+    return resize_buffer(u8, w, h, white)
+
+
+def convert_premultiplication(buf: np.ndarray, to_premultiplied: bool) -> None:
+    """Re-encode a whole TD-order buffer in place when the ``Premultiplied`` setting flips."""
+    if to_premultiplied:
+        buf[...] = premultiply_u8(buf)
+    else:
+        _unpremultiply_u8_inplace(buf)

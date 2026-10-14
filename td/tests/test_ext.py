@@ -10,19 +10,28 @@ from faketd import Clock, FakeOwner, TickClock
 
 
 class Env:
-    def __init__(self, tick=None, **pars):
+    def __init__(self, tick=None, like=None, **pars):
         self.o = FakeOwner(**pars)
+        if like is not None:  # a reloaded file: same doc_state DAT and Script TOPs, fresh extension
+            self.o.doc_state = like.o.doc_state
+            self.o._ops["doc_state"] = like.o.doc_state
+            self.o.net = like.o.net
+            self.o.net.rebind(lambda: self.o.ext)
         self.clock = TickClock(tick) if tick else Clock()
         self.fetch_skip = set()  # clients that never fetch
-        self.autofetch = True  # a well-behaved web client fetches every `base` notice
+        self.autofetch = True  # a well-behaved web client fetches every `base` / `view` notice
         self.x = E.RasterEditorExt(self.o)
         self.x._now = self.clock
         self.o.ext = self.x
         self.n = 0
         self.opened = []
         self.x._open_url = self.opened.append
+        self.renamed = []
+        self.x._replace = lambda a, b: self.renamed.append((a, b))
         self.s = self.o.server
         self.fetched = {}  # socket id -> [(header, payload bytes)]
+        self.view_frames = {}
+        self.autofetch_view = True
 
     def pump(self, n=1, dt=0.034):
         for _ in range(n):
@@ -30,16 +39,19 @@ class Env:
             self.x.Pump()
             if self.autofetch:
                 for cid, c in list(self.x.clients.items()):
-                    if c.outstanding is not None and cid not in self.fetch_skip:
+                    if c.base.outstanding is not None and cid not in self.fetch_skip:
                         self.fetch(cid)
+                    if c.view.outstanding is not None and cid not in self.fetch_skip and self.autofetch_view:
+                        self.fetch_view(cid)
 
-    def connect(self, kind="panel", protocol=P.PROTOCOL_VERSION, ready=True, token=None):
+    def connect(self, kind="panel", protocol=P.PROTOCOL_VERSION, ready=True, token=None, fresh=False):
         self.n += 1
         cid = f"127.0.0.1:{5000 + self.n}"
         self.s.webSocketConnections.append(cid)
         self.x.OnWebSocketOpen(cid, "/ws?client=" + kind)
         if ready:
-            self.send(cid, {"t": "ready", "protocol": protocol, "client": kind, "version": "t", "token": token or self.x.token})
+            self.send(cid, {"t": "ready", "protocol": protocol, "client": kind, "version": "t", "token": token or self.x.token,
+                             "fresh": fresh})
         return cid
 
     def send(self, cid, msg):
@@ -53,15 +65,42 @@ class Env:
             self.fetched.setdefault(cid, []).append((h, bytes(payload)))
         return r
 
-    def composite(self, cid, rect, pixels, frame_id=1, dw=None, dh=None, end=True, max_payload=P.MAX_PAYLOAD):
+    def surface(self, cid, slot, rect, pixels, frame_id=1, dw=None, dh=None, end=True, max_payload=P.MAX_PAYLOAD):
+        """Send one SURFACE frame (bands) for `slot` from client `cid`."""
         dw = dw or self.x.doc_w
         dh = dh or self.x.doc_h
-        msgs = list(P.encode_frames(P.TYPE_COMPOSITE, frame_id, dw, dh, rect, pixels, max_payload))
+        msgs = list(P.encode_frames(P.TYPE_SURFACE, frame_id, dw, dh, rect, pixels, max_payload, slot=slot))
         if not end:
             msgs = msgs[:-1]
         for m in msgs:
             self.x.OnWebSocketBinary(cid, m)
         return msgs
+
+    def doc(self, cid, layers, rev=1):
+        self.send(cid, {"t": "doc", "rev": rev, "layers": layers})
+
+    def get(self, uri, **pars):
+        pars = dict(pars)
+        pars.setdefault("token", self.x.token)
+        return self.x.OnHTTPRequest(req(uri=uri, pars={k: str(v) for k, v in pars.items()}), {})
+
+    def dump(self, cid, slot):
+        """GET /surface as the client behind `cid`: (header, straight wire pixels) or None on 404."""
+        r = self.get("/surface", client=self.x.clients[cid].cid, slot=slot)
+        if r["statusCode"] != 200:
+            return None
+        h, payload = P.decode_frame(r["data"])
+        return h, np.frombuffer(payload, np.uint8).reshape(h.h, h.w, 4).copy()
+
+    def fetch_view(self, cid):
+        r = self.get("/view", client=self.x.clients[cid].cid)
+        if r["statusCode"] == 200:
+            h, payload = P.decode_frame(r["data"])
+            self.view_frames.setdefault(cid, []).append((h, bytes(payload)))
+        return r
+
+    def top(self, slot):
+        return self.o.net.tops[slot]
 
     def set_input(self, w, h, seed=0, alpha=None):
         arr = np.random.RandomState(seed).rand(h, w, 4).astype(np.float32)
@@ -101,6 +140,16 @@ def wire_img(w, h, seed=0, alpha=255):
     a = np.random.RandomState(seed).randint(0, 256, (h, w, 4), dtype=np.uint8)
     a[..., 3] = alpha
     return a
+
+
+def L(id, kind="pixel", slot=None, mask=None, **kw):
+    d = {"id": id, "kind": kind, "parentId": None, "name": id, "visible": True, "opacity": 1, "blend": "normal",
+         "x": 0, "y": 0, "slot": slot, "mask": mask, "adjustment": None}
+    d.update(kw)
+    return d
+
+
+DOC = [L("base", "base"), L("p1", slot=1), L("p2", slot=2, mask={"slot": 3, "enabled": True})]
 
 
 # ----------------------------------------------------------------------------- HTTP
@@ -144,8 +193,9 @@ def test_first_client_becomes_active_and_gets_hello(env):
     env.pump()
     a = env.connect("external")
     (hello,) = env.s.messages(a, "hello")
-    assert hello["protocol"] == 2 and hello["active"] is True and hello["hasInput"] is False
+    assert hello["protocol"] == 3 and hello["active"] is True and hello["hasInput"] is False
     assert hello["doc"] == {"w": 64, "h": 32} and hello["maxSendFps"] == 30
+    assert hello["hasDocument"] is False and hello["rev"] is None
 
 
 def test_second_client_is_standby(env):
@@ -191,19 +241,6 @@ def test_takeover_by_active_resends_active_true(env):
     a = env.connect("panel")
     env.send(a, {"t": "takeover"})
     assert env.s.messages(a, "active")[-1]["active"] is True and env.x.active_id == a
-
-
-def test_composite_from_standby_is_ignored_then_accepted_after_takeover(env):
-    env.pump()
-    a = env.connect("panel")
-    b = env.connect("external")
-    img = wire_img(64, 32, 1)
-    env.composite(b, (0, 0, 64, 32), img)
-    assert not env.x.dirty and not env.x.got_composite
-    env.send(b, {"t": "takeover"})
-    env.composite(b, (0, 0, 64, 32), img)
-    assert env.x.got_composite
-    env.composite(a, (0, 0, 64, 32), img)  # a is standby now: ignored (no state change)
 
 
 def test_close_active_promotes_most_recent_remaining(env):
@@ -258,8 +295,9 @@ def test_messages_before_ready_are_ignored(env):
     a = env.connect("panel", ready=False)
     env.send(a, {"t": "takeover"})
     assert env.x.active_id is None
-    env.composite(a, (0, 0, 64, 32), wire_img(64, 32))
-    assert not env.x.got_composite
+    env.surface(a, 1, (0, 0, 64, 32), wire_img(64, 32))
+    env.doc(a, DOC)
+    assert env.x.doc_layers is None and not env.o.net.applies[1:]
 
 
 def test_log_messages_rate_limited(env, capsys):
@@ -288,65 +326,111 @@ def test_reconnect_gets_hello_and_full_base_again(env):
     assert len(env.bases(b)) == 1  # cached wire frame resent without a new readback
 
 
-# ----------------------------------------------------------------------------- composite path
+# ----------------------------------------------------------------------------- surfaces (protocol v3)
 
-def test_composite_flows_into_td_order_premultiplied_buffer_and_script_top(env):
+def test_tile_flows_into_td_order_premultiplied_buffer_and_script_top(env):
     env.pump()
     a = env.connect("panel")
+    env.doc(a, DOC)
     img = wire_img(64, 32, 2, alpha=255)
     img[0, 0] = (10, 20, 30, 255)
     img[31, 63] = (1, 2, 3, 128)
-    env.composite(a, (0, 0, 64, 32), img)
-    assert env.x.dirty
+    env.surface(a, 1, (0, 0, 64, 32), img)
+    assert 1 in env.x._dirty
     env.pump()
-    up = env.o.composite.uploaded
+    up = env.top(1).uploaded
     assert up is not None and up.shape == (32, 64, 4) and up.dtype == np.uint8
     assert up[31, 0].tolist() == [10, 20, 30, 255]  # wire top-left -> TD top row (last)
     assert up[0, 63].tolist() == [1, 1, 2, 128]  # premultiplied: round(c * 128 / 255)
-    assert not env.x.dirty
+    assert not env.x._dirty
     assert env.o.switch.par.index.eval() == 1
 
 
-def test_premultiplied_off_keeps_straight(env):
+def test_premultiplied_off_keeps_straight():
     e = Env(Premultiplied=0)
     e.pump()
     a = e.connect("panel")
+    e.doc(a, DOC)
     img = wire_img(64, 32, 4, alpha=100)
-    e.composite(a, (0, 0, 64, 32), img)
+    e.surface(a, 1, (0, 0, 64, 32), img)
     e.pump()
-    assert (e.o.composite.uploaded == img[::-1]).all()
+    assert (e.top(1).uploaded == img[::-1]).all()
 
 
-def test_band_without_frame_end_is_not_published(env):
+def test_mask_surface_is_grey_and_unchanged_by_premultiplication(env):
     env.pump()
     a = env.connect("panel")
-    img = wire_img(64, 32, 5)
-    env.composite(a, (0, 0, 64, 32), img, max_payload=64 * 4 * 8, end=False)  # 3 of 4 bands
+    env.doc(a, DOC)
+    grey = np.zeros((32, 64, 4), np.uint8)
+    grey[..., :3] = np.arange(64, dtype=np.uint8)[None, :, None] * 4
+    grey[..., 3] = 255
+    env.surface(a, 3, (0, 0, 64, 32), grey)
     env.pump()
-    assert not env.x.got_composite and env.o.composite.cooks == 1  # only the initial blank push
-    # pixels were written already
-    assert env.x.buffer[env.x.doc_h - 1].any()
+    assert (env.top(3).uploaded == grey[::-1]).all()
 
 
-def test_multiband_frame_publishes_once_at_end(env):
+def test_each_slot_has_its_own_buffer(env):
     env.pump()
     a = env.connect("panel")
+    env.doc(a, DOC)
+    env.pump()
+    env.pump()
+    n2, n3 = len(env.top(2).uploads), len(env.top(3).uploads)
+    env.surface(a, 1, (0, 0, 64, 32), wire_img(64, 32, 1))
+    env.pump()
+    assert len(env.top(2).uploads) == n2 and len(env.top(3).uploads) == n3  # clean slots are not cooked
+    assert env.x.surfaces[1] is not env.x.surfaces[2] and not env.x.surfaces[2].any()
+
+
+def test_band_without_frame_end_is_not_uploaded(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC)
+    env.pump()
+    n = env.top(1).cooks
+    env.surface(a, 1, (0, 0, 64, 32), wire_img(64, 32, 5), max_payload=64 * 4 * 8, end=False)  # 3 of 4 bands
+    env.pump()
+    assert env.top(1).cooks == n and not env.x._dirty
+    assert env.x.surfaces[1][env.x.doc_h - 1].any()  # pixels were written already, just not published
+    assert env.x.clients[a].fid_pending is None and not env.s.messages(a, "applied")
+
+
+def test_multiband_frame_uploads_once_at_end(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC)
+    env.pump()
     img = wire_img(64, 32, 6, alpha=255)
-    cooks = env.o.composite.cooks
-    env.composite(a, (0, 0, 64, 32), img, max_payload=64 * 4 * 8)
+    n = len(env.top(1).uploads)
+    env.surface(a, 1, (0, 0, 64, 32), img, max_payload=64 * 4 * 8)
     env.pump()
-    assert env.o.composite.cooks == cooks + 1  # coalesced: one cook for four bands
-    assert (env.o.composite.uploaded == img[::-1]).all()
+    assert len(env.top(1).uploads) == n + 1  # coalesced: one upload for four bands
+    assert (env.top(1).uploaded == img[::-1]).all()
 
 
-def test_partial_rect_composite_only_touches_rect(env):
+def test_many_frames_and_tiles_in_one_td_frame_upload_each_dirty_slot_once(env):
     env.pump()
     a = env.connect("panel")
-    env.composite(a, (0, 0, 64, 32), wire_img(64, 32, 1, 255))
-    before = env.x.buffer.copy()
-    patch = wire_img(10, 6, 2, 255)
-    env.composite(a, (20, 5, 10, 6), patch, frame_id=2)
-    changed = (env.x.buffer != before).any(axis=2)
+    env.doc(a, DOC)
+    env.pump()
+    n1, n2 = len(env.top(1).uploads), len(env.top(2).uploads)
+    for i in range(10):
+        env.surface(a, 1, (i, 0, 4, 4), wire_img(4, 4, i), frame_id=i)
+        env.surface(a, 2, (0, i, 4, 4), wire_img(4, 4, i + 50), frame_id=100 + i)
+    env.pump()
+    assert len(env.top(1).uploads) == n1 + 1 and len(env.top(2).uploads) == n2 + 1
+    env.pump(3)
+    assert len(env.top(1).uploads) == n1 + 1  # nothing dirty any more: no further uploads
+
+
+def test_partial_rect_tile_only_touches_rect(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC)
+    env.surface(a, 1, (0, 0, 64, 32), wire_img(64, 32, 1, 255))
+    before = env.x.surfaces[1].copy()
+    env.surface(a, 1, (20, 5, 10, 6), wire_img(10, 6, 2, 255), frame_id=2)
+    changed = (env.x.surfaces[1] != before).any(axis=2)
     ys, xs = np.nonzero(changed)
     assert xs.min() >= 20 and xs.max() < 30 and ys.min() >= 32 - 11 and ys.max() < 32 - 5
 
@@ -354,15 +438,35 @@ def test_partial_rect_composite_only_touches_rect(env):
 def test_wrong_doc_size_dropped_silently(env, capsys):
     env.pump()
     a = env.connect("panel")
-    env.composite(a, (0, 0, 32, 16), wire_img(32, 16), dw=32, dh=16)
-    assert not env.x.got_composite and not env.x.dirty
+    env.doc(a, DOC)
+    env.pump()
+    env.surface(a, 1, (0, 0, 32, 16), wire_img(32, 16), dw=32, dh=16)
+    assert not env.x._dirty and not env.x.surfaces[1].any()
     assert capsys.readouterr().out == ""
+
+
+def test_unknown_slot_dropped_silently(env, capsys):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC)
+    env.pump()
+    env.surface(a, 999, (0, 0, 64, 32), wire_img(64, 32))
+    assert not env.x._dirty and 999 not in env.x.surfaces and capsys.readouterr().out == ""
+
+
+def test_tile_before_any_doc_is_dropped(env):
+    env.pump()
+    a = env.connect("panel")
+    env.surface(a, 1, (0, 0, 64, 32), wire_img(64, 32))
+    assert not env.x._dirty and not env.x.surfaces
 
 
 def test_invalid_frames_dropped_and_logged_once_per_frame_id(env, capsys):
     env.pump()
     a = env.connect("panel")
-    good = P.encode_message(P.Header(P.TYPE_COMPOSITE, 1, 7, 64, 32, 0, 0, 2, 2), bytes(16))
+    env.doc(a, DOC)
+    env.pump()
+    good = P.encode_message(P.Header(P.TYPE_SURFACE, 1, 7, 64, 32, 0, 0, 2, 2, 1), bytes(16))
     bad = good[:-1]
     for _ in range(3):
         env.x.OnWebSocketBinary(a, bad)
@@ -370,44 +474,376 @@ def test_invalid_frames_dropped_and_logged_once_per_frame_id(env, capsys):
     assert out.count("dropped invalid frame") == 1
     env.x.OnWebSocketBinary(a, b"junk" * 10)
     env.x.OnWebSocketBinary(a, b"x")
-    assert not env.x.got_composite
+    assert not env.x._dirty
     env.pump()
     assert "ERROR invalid frame" in env.o.par.Status.eval()
 
 
-def test_base_type_frame_from_web_is_ignored(env):
+def test_type_2_composite_and_other_types_are_ignored(env, capsys):
     env.pump()
     a = env.connect("panel")
-    m = P.encode_message(P.Header(P.TYPE_BASE, 1, 1, 64, 32, 0, 0, 64, 32), bytes(64 * 32 * 4))
-    env.x.OnWebSocketBinary(a, m)
-    assert not env.x.got_composite
+    env.doc(a, DOC)
+    env.pump()
+    old = bytearray(P.encode_message(P.Header(P.TYPE_SURFACE, 1, 1, 64, 32, 0, 0, 64, 32, 1), bytes(64 * 32 * 4)))
+    old[4] = 2  # v1/v2 COMPOSITE
+    env.x.OnWebSocketBinary(a, bytes(old))
+    assert "dropped invalid frame" in capsys.readouterr().out
+    for typ in (P.TYPE_BASE, P.TYPE_VIEW, P.TYPE_SURFACE_DUMP):
+        env.x.OnWebSocketBinary(a, P.encode_message(P.Header(typ, 1, 1, 64, 32, 0, 0, 64, 32, 1), bytes(64 * 32 * 4)))
+    assert not env.x._dirty and not env.x.surfaces[1].any()
 
 
-def test_out_switch_passthrough_until_composite_when_input_present(env):
+def test_tiles_from_standby_are_ignored_then_accepted_after_takeover(env):
+    env.pump()
+    a = env.connect("panel")
+    b = env.connect("external")
+    env.doc(a, DOC)
+    env.pump()
+    img = wire_img(64, 32, 1)
+    env.surface(b, 1, (0, 0, 64, 32), img)
+    assert not env.x._dirty
+    env.send(b, {"t": "takeover"})
+    env.surface(b, 1, (0, 0, 64, 32), img)
+    assert 1 in env.x._dirty
+    env.x._dirty.clear()
+    env.surface(a, 1, (0, 0, 64, 32), img)  # a is standby now: ignored
+    assert not env.x._dirty
+
+
+def test_applied_once_per_td_frame_and_only_when_changed(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC)
+    env.pump()
+    env.surface(a, 1, (0, 0, 8, 8), wire_img(8, 8), frame_id=41)
+    env.surface(a, 1, (8, 8, 8, 8), wire_img(8, 8), frame_id=42)
+    env.surface(a, 2, (0, 0, 8, 8), wire_img(8, 8), frame_id=43)
+    assert not env.s.messages(a, "applied")  # nothing is reported before the upload
+    env.pump()
+    got = env.s.messages(a, "applied")
+    assert [m["frameId"] for m in got] == [43] and all(isinstance(m["tdFrame"], int) for m in got)
+    env.pump(5)
+    assert len(env.s.messages(a, "applied")) == 1  # unchanged: not repeated
+    env.surface(a, 1, (0, 0, 8, 8), wire_img(8, 8), frame_id=44)
+    env.pump()
+    assert [m["frameId"] for m in env.s.messages(a, "applied")] == [43, 44]
+
+
+def test_applied_is_reported_to_the_client_that_sent_the_tiles_only(env):
+    env.pump()
+    a = env.connect("panel")
+    b = env.connect("external")
+    env.doc(a, DOC)
+    env.surface(a, 1, (0, 0, 8, 8), wire_img(8, 8), frame_id=9)
+    env.pump()
+    assert env.s.messages(a, "applied") and not env.s.messages(b, "applied")
+
+
+def test_applied_waits_while_a_surface_top_does_not_exist_yet(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC)
+    env.surface(a, 1, (0, 0, 8, 8), wire_img(8, 8), frame_id=9)
+    top = env.o.net.tops.pop(1)  # the network has not created the Script TOP yet
+    env.pump()
+    assert not env.s.messages(a, "applied") and 1 in env.x._dirty
+    env.o.net.tops[1] = top
+    env.pump()
+    assert [m["frameId"] for m in env.s.messages(a, "applied")] == [9]
+
+
+def test_out_switch_selects_the_network_once_a_stack_was_applied(env):
     env.set_input(64, 32)
     env.pump()
-    a = env.connect("panel")
-    assert env.o.switch.par.index.eval() == 0
-    env.composite(a, (0, 0, 64, 32), wire_img(64, 32))
+    assert env.o.switch.par.index.eval() == 1  # default document: base layer passthrough inside the network
+    env.o.net_module.module.DocNetwork = lambda comp, glsl: (_ for _ in ()).throw(RuntimeError("x"))
+    env.x.Start()
+    env.pump()
+    assert env.o.switch.par.index.eval() == 0  # no network: input passthrough
+
+
+def test_no_input_output_is_the_network_at_doc_size(env):
     env.pump()
     assert env.o.switch.par.index.eval() == 1
+    layers, w, h = env.o.net.applies[-1]
+    assert (w, h) == (64, 32) and [l["kind"] for l in layers] == ["base"]
 
 
-def test_no_input_output_is_composite_buffer_at_doc_size(env):
-    env.pump()
-    assert env.o.switch.par.index.eval() == 1
-    assert env.o.composite.uploaded.shape == (32, 64, 4)
+def test_network_failure_keeps_passthrough_and_reports(env, capsys):
+    env.o.net_module.module.DocNetwork = lambda comp, glsl: (_ for _ in ()).throw(RuntimeError("no network"))
+    env.x.Start()
+    env.pump(3)
+    assert env.x.network is None and env.o.switch.par.index.eval() == 0
+    assert "network: RuntimeError: no network" in capsys.readouterr().out
+    a = env.connect("panel")
+    env.doc(a, DOC)  # still stored, still served
+    assert env.x.doc_layers == DOC
 
 
-def test_disconnect_keeps_last_composite(env):
+def test_disconnect_keeps_document_and_buffers(env):
     env.pump()
     a = env.connect("panel")
+    env.doc(a, DOC)
     img = wire_img(64, 32, 8, 255)
-    env.composite(a, (0, 0, 64, 32), img)
+    env.surface(a, 1, (0, 0, 64, 32), img)
     env.pump()
     env.x.OnWebSocketClose(a)
     env.pump(3)
-    assert (env.o.composite.uploaded == img[::-1]).all() and env.o.switch.par.index.eval() == 1
+    assert (env.top(1).uploaded == img[::-1]).all() and env.o.switch.par.index.eval() == 1
+    assert env.x.doc_layers == DOC
+
+
+# ----------------------------------------------------------------------------- doc messages
+
+def test_doc_is_applied_to_the_network_and_stored_in_doc_state(env):
+    env.pump()
+    a = env.connect("panel")
+    n = len(env.o.net.applies)
+    env.doc(a, DOC, rev=5)
+    assert len(env.o.net.applies) == n + 1 and env.o.net.applies[-1] == (DOC, 64, 32)
+    assert env.o.net.slots() == [1, 2, 3] and set(env.x.surfaces) == {1, 2, 3}
+    assert all(s.shape == (32, 64, 4) for s in env.x.surfaces.values())
+    assert env.o.doc_state.text == ""  # written once per pump, not per message
+    env.pump()
+    stored = json.loads(env.o.doc_state.text)
+    assert stored == {"rev": 5, "layers": DOC}
+
+
+def test_doc_state_written_once_per_pump_with_the_newest_doc(env):
+    env.pump()
+    a = env.connect("panel")
+    writes = []
+
+    class Spy:
+        @property
+        def text(self):
+            return ""
+
+        @text.setter
+        def text(self, v):
+            writes.append(v)
+    env.o._ops["doc_state"] = Spy()
+    for r in range(1, 6):
+        env.doc(a, DOC, rev=r)
+    env.pump()
+    assert len(writes) == 1 and json.loads(writes[0])["rev"] == 5
+
+
+def test_identical_stack_with_new_rev_does_not_reapply_but_updates_rev(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC, rev=1)
+    n = len(env.o.net.applies)
+    env.doc(a, DOC, rev=2)
+    assert len(env.o.net.applies) == n and env.x.doc_rev == 2
+
+
+def test_doc_from_standby_is_ignored(env):
+    env.pump()
+    a = env.connect("panel")
+    b = env.connect("external")
+    env.doc(b, DOC)
+    assert env.x.doc_layers is None
+    env.doc(a, DOC)
+    assert env.x.doc_layers == DOC
+
+
+def test_bad_doc_replies_error_and_changes_nothing(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC, rev=1)
+    env.send(a, {"t": "doc", "rev": 2, "layers": [{"id": 3}]})
+    assert env.s.messages(a, "error") and env.x.doc_rev == 1 and env.x.doc_layers == DOC
+
+
+def test_duplicate_slots_rejected_without_state_change(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC, rev=1)
+    dup = DOC[:2] + [dict(DOC[2], slot=1)]
+    env.doc(a, dup, rev=2)
+    assert env.x.doc_rev == 1 and env.s.messages(a, "error")
+
+
+def test_failed_network_apply_keeps_previous_document(env, capsys):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC, rev=1)
+    env.o.net.raise_on_apply = True
+    env.doc(a, DOC[:2], rev=2)
+    assert env.x.doc_rev == 1 and env.x.doc_layers == DOC
+    assert "apply failed" in capsys.readouterr().out
+
+
+def test_new_script_tops_are_uploaded_even_without_tiles(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC)
+    env.pump()
+    assert all(env.top(s).uploads for s in (1, 2, 3))  # blank buffers pushed so the TOPs have the doc size
+    assert env.top(1).uploaded.shape == (32, 64, 4)
+
+
+def test_removed_slot_is_freed_at_once_and_a_reappearing_slot_starts_blank_masks_white(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC, rev=1)
+    env.surface(a, 2, (0, 0, 64, 32), wire_img(64, 32, 3, 255))
+    assert (env.x.surfaces[3] == 255).all()   # a fresh mask is white (fully visible)
+    env.doc(a, DOC[:2], rev=2)  # layer with slot 2 (and mask 3) deleted
+    assert env.dump(a, 2) is None and 3 not in env.x._slot_set
+    assert 2 not in env.x.surfaces and 3 not in env.x.surfaces
+    env.surface(a, 2, (0, 0, 8, 8), wire_img(8, 8), frame_id=9)  # dropped: not in the doc any more
+    env.doc(a, DOC, rev=3)  # undo of the delete: blank / white, the engine resends pixels itself
+    assert not env.x.surfaces[2].any() and (env.x.surfaces[3] == 255).all()
+    env.pump()
+    assert not env.top(2).uploaded.any() and (env.top(3).uploaded == 255).all()
+
+
+def test_slot_kept_across_docs_keeps_its_pixels(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC, rev=1)
+    img = wire_img(64, 32, 3, 255)
+    env.surface(a, 1, (0, 0, 64, 32), img)
+    env.doc(a, DOC[:2] + [L("p3", slot=7)], rev=2)
+    assert (env.x.surfaces[1][::-1] == img).all()
+
+
+def test_reconnecting_client_resends_everything_over_the_existing_document(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC, rev=4)
+    env.surface(a, 1, (0, 0, 64, 32), wire_img(64, 32, 1, 255))
+    env.pump()
+    env.x.OnWebSocketClose(a)
+    b = env.connect("panel")  # reconnecting page: fresh=false, authoritative
+    (hello,) = env.s.messages(b, "hello")
+    assert hello["hasDocument"] is True and hello["rev"] == 4
+    new = wire_img(64, 32, 9, 255)
+    env.doc(b, DOC, rev=7)
+    env.surface(b, 1, (0, 0, 64, 32), new)
+    env.pump()
+    assert env.x.doc_rev == 7 and (env.top(1).uploaded == new[::-1]).all()
+
+
+# ----------------------------------------------------------------------------- fresh load / requestDoc / GET /surface
+
+def test_hello_reports_stored_document(env):
+    env.pump()
+    a = env.connect("panel", fresh=True)
+    assert env.s.messages(a, "hello")[0]["hasDocument"] is False
+    env.doc(a, DOC, rev=12)
+    b = env.connect("external", fresh=True)
+    h = env.s.messages(b, "hello")[0]
+    assert h["hasDocument"] is True and h["rev"] == 12 and env.x.clients[b].fresh
+
+
+def test_fresh_load_flow_request_doc_then_surface_per_slot(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC, rev=3)
+    imgs = {s: wire_img(64, 32, s, 255) for s in (1, 2)}
+    for s, im in imgs.items():
+        env.surface(a, s, (0, 0, 64, 32), im)
+    env.pump()
+    b = env.connect("external", fresh=True)
+    assert env.s.messages(b, "hello")[0]["hasDocument"] is True
+    env.send(b, {"t": "requestDoc"})
+    (st,) = env.s.messages(b, "docState")
+    assert st == {"t": "docState", "rev": 3, "layers": DOC, "docW": 64, "docH": 32}
+    for s, im in imgs.items():
+        h, got = env.dump(b, s)
+        assert (h.type, h.slot, h.frame_end, (h.x, h.y, h.w, h.h)) == (P.TYPE_SURFACE_DUMP, s, True, (0, 0, 64, 32))
+        assert (h.doc_w, h.doc_h) == (64, 32)
+        assert (got == im).all()  # opaque pixels survive the premultiplied round trip exactly
+
+
+def test_request_doc_without_document_sends_nothing(env):
+    env.pump()
+    a = env.connect("panel")
+    env.send(a, {"t": "requestDoc"})
+    assert not env.s.messages(a, "docState")
+
+
+def test_surface_dump_is_straight_alpha_and_masks_stay_grey(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC)
+    img = wire_img(64, 32, 5, alpha=255)
+    img[3, 4] = (200, 100, 50, 128)
+    env.surface(a, 1, (0, 0, 64, 32), img)
+    grey = np.zeros((32, 64, 4), np.uint8)
+    grey[..., :3] = 77
+    grey[..., 3] = 255
+    env.surface(a, 3, (0, 0, 64, 32), grey)
+    env.pump()
+    _, got = env.dump(a, 1)
+    assert np.abs(got[3, 4].astype(int) - (200, 100, 50, 128)).max() <= 2  # straight again
+    assert (got[0, 0] == img[0, 0]).all()
+    _, g = env.dump(a, 3)
+    assert (g == grey).all()
+
+
+def test_surface_dump_with_premultiplied_off_is_the_buffer_flipped():
+    e = Env(Premultiplied=0)
+    e.pump()
+    a = e.connect("panel")
+    e.doc(a, DOC)
+    img = wire_img(64, 32, 6, alpha=90)
+    e.surface(a, 1, (0, 0, 64, 32), img)
+    assert (e.dump(a, 1)[1] == img).all()
+
+
+def test_surface_endpoint_auth_unknown_slot_and_cors(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC)
+    ok = dict(client=env.x.clients[a].cid)
+    assert env.get("/surface", slot=1, **ok)["statusCode"] == 200
+    assert env.x.OnHTTPRequest(req(uri="/surface", pars={"slot": "1"}), {})["statusCode"] == 403  # no token
+    assert env.get("/surface", token="bad", slot=1, **ok)["statusCode"] == 403
+    for slot in ("999", "x", "-1", ""):
+        assert env.get("/surface", slot=slot, **ok)["statusCode"] == 404
+    assert env.x.OnHTTPRequest(req(uri="/surface", pars={"token": env.x.token}), {})["statusCode"] == 404  # no slot
+    r = env.x.OnHTTPRequest(req(uri="/surface", pars={"token": env.x.token, "slot": "1"}, clientAddress="10.0.0.2:1"), {})
+    assert r["statusCode"] == 403
+    r = env.x.OnHTTPRequest(req(uri="/surface", pars={"token": env.x.token, "slot": "1"}, Host="evil.example"), {})
+    assert r["statusCode"] == 403
+    r = env.x.OnHTTPRequest(req(uri="/surface", pars={"token": env.x.token, "slot": "1"}, Origin="http://localhost:5173"), {})
+    assert r["Access-Control-Allow-Origin"] == "http://localhost:5173" and r["Vary"] == "Origin"
+    r = env.x.OnHTTPRequest(req(uri="/surface", pars={"token": env.x.token, "slot": "1"}, Origin="http://evil.example"), {})
+    assert "Access-Control-Allow-Origin" not in r
+    assert r["Cache-Control"] == "no-store" and r["content-type"] == "application/octet-stream"
+
+
+def test_surface_endpoint_is_a_snapshot_not_a_view_of_the_live_buffer(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC)
+    env.surface(a, 1, (0, 0, 64, 32), wire_img(64, 32, 1, 255))
+    r = env.get("/surface", client=env.x.clients[a].cid, slot=1)
+    before = bytes(r["data"])
+    env.surface(a, 1, (0, 0, 64, 32), wire_img(64, 32, 2, 255), frame_id=2)
+    assert bytes(r["data"]) == before
+
+
+# ----------------------------------------------------------------------------- takeover
+
+def test_takeover_new_active_loads_tds_document_and_old_active_is_standby(env):
+    env.pump()
+    a = env.connect("panel")
+    b = env.connect("external", fresh=True)
+    env.doc(a, DOC, rev=2)
+    im = wire_img(64, 32, 4, 255)
+    env.surface(a, 1, (0, 0, 64, 32), im)
+    env.send(b, {"t": "takeover"})
+    assert env.s.messages(b, "active")[-1]["active"] is True and env.s.messages(a, "active")[-1]["active"] is False
+    env.send(b, {"t": "requestDoc"})  # what the new active editor does first
+    assert env.s.messages(b, "docState")[0]["rev"] == 2
+    assert (env.dump(b, 1)[1] == im).all()
+    env.doc(a, DOC[:2], rev=3)  # the old active can no longer edit
+    assert env.x.doc_rev == 2
 
 
 # ----------------------------------------------------------------------------- input / base path
@@ -452,7 +888,7 @@ def test_changed_input_resent_and_rate_limited(env):
         env.o.in1.set_image(np.random.RandomState(100 + i).rand(32, 64, 4))
         env.pump()
     got = len(env.bases(a)) - start
-    assert 5 <= got <= 21  # ~2 s * 10 fps, plus slack for the 2-step readback
+    assert 5 <= got <= 23  # ~2 s * 10 fps, plus slack for the pipelined readback and one frame of burst
     # trailing edge: the final image is eventually delivered
     last = np.random.RandomState(999).rand(32, 64, 4).astype(np.float32)
     env.o.in1.set_image(last)
@@ -506,26 +942,47 @@ def test_request_base_without_input_is_noop(env):
 
 
 
-def test_input_resize_sends_docsize_then_new_base_and_drops_old_size_composites(env):
+def test_input_resize_sends_docsize_then_new_base_and_reallocates_surfaces_top_left(env):
     env.set_input(64, 32)
     env.pump()
     a = env.connect("panel")
+    env.doc(a, DOC)
     env.run_until_bases(a)
-    env.composite(a, (0, 0, 64, 32), wire_img(64, 32))
-    assert env.x.got_composite
+    img = wire_img(64, 32, 3, 255)
+    env.surface(a, 1, (0, 0, 64, 32), img)
     env.set_input(80, 40, 2)
     env.pump()
     (ds,) = env.s.messages(a, "docSize")
     assert ds == {"t": "docSize", "w": 80, "h": 40, "hasInput": True}
-    assert env.x.buffer.shape == (40, 80, 4) and not env.x.got_composite
-    assert env.o.switch.par.index.eval() == 0  # passthrough until the editor answers
-    env.composite(a, (0, 0, 64, 32), wire_img(64, 32), dw=64, dh=32)  # in-flight stale composite
-    assert not env.x.got_composite
+    assert all(b.shape == (40, 80, 4) for b in env.x.surfaces.values())
+    # anchored top-left: wire pixel (x, y) is unchanged, the new area is transparent
+    new = env.dump(a, 1)[1]
+    assert (new[:32, :64] == img).all() and not new[32:].any() and not new[:, 64:].any()
+    assert env.o.net.applies[-1][1:] == (80, 40)  # network told the new size
+    env.surface(a, 1, (0, 0, 64, 32), wire_img(64, 32), dw=64, dh=32)  # in-flight stale tile
+    assert (env.dump(a, 1)[1] == new).all()
     env.pump(30)
     last = list(env.bases(a).values())[-1]
     assert (last[0][0].doc_w, last[0][0].doc_h) == (80, 40)
-    # the buffer was re-uploaded at the new size
-    assert env.o.composite.uploaded.shape == (40, 80, 4)
+    assert env.top(1).uploaded.shape == (40, 80, 4)  # re-uploaded at the new size
+
+
+def test_shrinking_the_document_crops_surfaces_top_left(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC)
+    img = wire_img(64, 32, 3, 255)
+    env.surface(a, 1, (0, 0, 64, 32), img)
+    env.o.par.Docw.val, env.o.par.Doch.val = 40, 20
+    env.pump()
+    assert (env.dump(a, 1)[1] == img[:20, :40]).all()
+
+
+def test_doc_size_change_with_no_surfaces_and_no_document_is_fine(env):
+    env.pump()
+    env.o.par.Docw.val = 100
+    env.pump()
+    assert env.x.doc_w == 100 and not env.x.surfaces
 
 
 def test_input_disconnect_returns_to_doc_par_size(env):
@@ -537,7 +994,7 @@ def test_input_disconnect_returns_to_doc_par_size(env):
     env.pump()
     assert (env.x.doc_w, env.x.doc_h, env.x.has_input) == (64, 32, False)
     assert env.s.messages(a, "docSize")[-1] == {"t": "docSize", "w": 64, "h": 32, "hasInput": False}
-    assert env.o.composite.uploaded.shape == (32, 64, 4)
+    assert env.o.net.applies[-1][1:] == (64, 32)
     assert env.o.switch.par.index.eval() == 1
 
 
@@ -703,16 +1160,24 @@ def test_pulses(env):
     assert env.opened == [f"http://127.0.0.1:9980/?client=external&token={env.x.token}"]
 
 
-def test_premultiplied_toggle_asks_active_editor_for_full_composite(env):
+def test_premultiplied_toggle_reencodes_surfaces_and_resends_input(env):
     env.set_input(64, 32)
     env.pump()
     a = env.connect("panel")
+    env.doc(a, DOC)
+    img = wire_img(64, 32, 4, alpha=255)
+    env.surface(a, 1, (0, 0, 64, 32), img)
+    env.surface(a, 2, (0, 0, 64, 32), wire_img(64, 32, 5, alpha=128), frame_id=2)
     env.run_until_bases(a)
+    straight = env.dump(a, 2)[1]
+    n = len(env.top(2).uploads)
     env.o.par.Premultiplied.val = 0
     env.x.OnParChange(env.o.par.Premultiplied)
-    assert env.s.messages(a, "active")[-1]["active"] is True
     env.pump(10)
     assert len(env.bases(a)) == 2  # input resent unpremultiplied
+    assert len(env.top(2).uploads) == n + 1  # re-uploaded in the new encoding
+    assert (env.x.surfaces[1] == img[::-1]).all()
+    assert np.abs(env.dump(a, 2)[1].astype(int) - straight).max() <= 2  # wire content unchanged (8-bit loss)
 
 
 def test_webrender_forced_to_cook_only_when_nothing_pulls_it(env):
@@ -732,28 +1197,33 @@ def test_status_strings(env):
     a = env.connect("panel")
     env.pump(10)
     s = env.o.par.Status.eval()
-    assert s.startswith("panel active · 64×32 · 0 fps out")
+    assert s.startswith("panel active · 64×32 · 0 tiles/s in")
     env.connect("external")
-    env.composite(a, (0, 0, 64, 32), wire_img(64, 32))
+    env.doc(a, DOC, rev=7)
+    env.surface(a, 1, (0, 0, 64, 32), wire_img(64, 32))
     env.clock.advance(0.3)
     env.pump()
     s = env.o.par.Status.eval()
-    assert "1 fps out" in s and "1 standby" in s
+    assert "1 tiles/s in" in s and "1 standby" in s and "doc r7 3 surfaces" in s
 
 
 def test_exceptions_are_contained_and_reported_once(env, capsys):
     env.pump()
     a = env.connect("panel")
-    env.composite(a, (0, 0, 64, 32), wire_img(64, 32))
-    env.o.composite.raise_on_cook = True
-    for _ in range(5):
+    env.doc(a, DOC)
+    env.pump()
+    env.o.net.out = None  # sabotage a different step first
+    env.top(1).raise_on_cook = True
+    for i in range(5):
+        env.surface(a, 1, (0, 0, 8, 8), wire_img(8, 8), frame_id=i)
         env.pump()  # must not raise
     out = capsys.readouterr().out
-    assert out.count("Pump/cook: RuntimeError: boom") == 1
-    assert "ERROR Pump/cook: RuntimeError: boom" in env.o.par.Status.eval()
-    env.o.composite.raise_on_cook = False
+    assert out.count("cook s1: RuntimeError: boom") == 1
+    assert "ERROR cook s1: RuntimeError: boom" in env.o.par.Status.eval()
+    env.top(1).raise_on_cook = False
+    env.surface(a, 1, (0, 0, 8, 8), wire_img(8, 8), frame_id=9)
     env.pump()
-    assert env.x.dirty is False
+    assert not env.x._dirty
 
 
 def test_callback_exceptions_do_not_escape(env, capsys):
@@ -768,10 +1238,11 @@ def test_callback_exceptions_do_not_escape(env, capsys):
 def test_stats_collected(env):
     env.pump(5)
     a = env.connect("panel")
-    env.composite(a, (0, 0, 64, 32), wire_img(64, 32))
+    env.doc(a, DOC)
+    env.surface(a, 1, (0, 0, 64, 32), wire_img(64, 32))
     env.pump()
     st = env.x.GetStats()
-    assert st["pump"]["n"] >= 6 and st["paste"]["n"] == 1 and st["cook"]["n"] >= 1
+    assert st["pump"]["n"] >= 6 and st["paste"]["n"] == 1 and st["cook"]["n"] >= 1 and st["apply"]["n"] >= 1
 
 
 # ----------------------------------------------------------------------------- review fixes
@@ -817,16 +1288,20 @@ def test_readback_shape_mismatch_is_dropped(env):
     assert len(env.bases(a)) == 1
 
 
-def test_active_off_switches_to_passthrough_and_forgets_composite(env):
+def test_active_off_switches_to_passthrough_and_keeps_the_document(env):
     env.set_input(64, 32)
     env.pump()
     a = env.connect("panel")
-    env.composite(a, (0, 0, 64, 32), wire_img(64, 32))
+    env.doc(a, DOC)
     env.pump()
     assert env.o.switch.par.index.eval() == 1
     env.o.par.Active.val = 0
     env.x.OnParChange(env.o.par.Active)
-    assert env.o.switch.par.index.eval() == 0 and not env.x.got_composite
+    assert env.o.switch.par.index.eval() == 0
+    env.o.par.Active.val = 1
+    env.x.OnParChange(env.o.par.Active)  # Start: the document comes back from doc_state
+    env.pump()
+    assert env.x.doc_layers == DOC and env.o.switch.par.index.eval() == 1
 
 
 def test_non_loopback_peers_rejected(env):
@@ -948,12 +1423,12 @@ def test_premultiplied_toggle_mid_conversion_restarts_it():
     env.connect("panel")
     for _ in range(20):
         env.pump()
-        if env.x._conv is not None:
+        if env.x.base.conv is not None:
             break
-    assert env.x._conv is not None
+    assert env.x.base.conv is not None
     env.o.par.Premultiplied.val = 0
     env.x.OnParChange(env.o.par.Premultiplied)
-    assert env.x._conv is None and env.x._input_pending
+    assert env.x.base.conv is None and env.x.base.pending
 
 
 
@@ -962,10 +1437,11 @@ def test_premultiplied_toggle_mid_conversion_restarts_it():
 def test_failed_buffer_allocation_does_not_commit_doc_size(env, monkeypatch):
     env.pump()
     a = env.connect("panel")
+    env.doc(a, DOC)
     env.o.par.Docw.val = 200
-    monkeypatch.setattr(env.x.frames, "alloc_buffer", lambda w, h: (_ for _ in ()).throw(MemoryError("no")))
+    monkeypatch.setattr(env.x.frames, "resize_buffer", lambda old, w, h: (_ for _ in ()).throw(MemoryError("no")))
     env.pump()
-    assert (env.x.doc_w, env.x.doc_h) == (64, 32) and env.x.buffer.shape == (32, 64, 4)
+    assert (env.x.doc_w, env.x.doc_h) == (64, 32) and env.x.surfaces[1].shape == (32, 64, 4)
     assert not env.s.messages(a, "docSize")
     monkeypatch.undo()
     env.pump()
@@ -975,11 +1451,13 @@ def test_failed_buffer_allocation_does_not_commit_doc_size(env, monkeypatch):
 def test_one_failing_pump_step_does_not_skip_the_rest(env):
     env.pump()
     a = env.connect("panel")
-    env.composite(a, (0, 0, 64, 32), wire_img(64, 32))
-    env.o.composite.raise_on_cook = True
-    env.o.inputs = []
+    env.doc(a, DOC)
     env.pump()
-    assert env.o.switch.par.index.eval() == 1  # the switch step still ran
+    env.surface(a, 1, (0, 0, 8, 8), wire_img(8, 8))
+    env.top(1).raise_on_cook = True
+    env.o.switch.par.index.val = 0
+    env.pump()
+    assert env.o.switch.par.index.eval() == 1  # the switch step still ran after the failing upload
 
 
 def test_pointer_moves_coalesce_into_one_call_per_frame(env):
@@ -1078,8 +1556,8 @@ def test_one_notice_outstanding_until_fetched_and_the_newest_frame_is_served():
     first = env.notices(a)[0]["frameId"]
     r = env.fetch(a)
     (h, payload) = env.fetched[a][-1]
-    assert h.frame_id != first and h.frame_id == env.x._base_fid  # newest, not the notified one
-    assert r["data"] == env.x._base_msg
+    assert h.frame_id != first and h.frame_id == env.x.base.fid  # newest, not the notified one
+    assert r["data"] == env.x.base.msg
     env.o.in1.set_image(np.full((32, 64, 4), 0.9, np.float32))
     env.pump(10)
     assert len(env.notices(a)) == 2  # a newer frame exists now: exactly one more notice
@@ -1106,13 +1584,13 @@ def test_client_that_never_fetches_gets_one_notice_then_is_stalled_then_resumes(
         env.pump()
     assert len(env.notices(a)) == 1 and len(env.notices(b)) >= 5
     env.pump(3, dt=E.STALL_S / 2 + 0.1)
-    assert env.x.clients[a].stalled and "1 stalled" in env.o.par.Status.eval()
+    assert env.x.clients[a].base.stalled and "1 stalled" in env.o.par.Status.eval()
     assert "stalled" in capsys.readouterr().out
     env.o.in1.set_image(np.full((32, 64, 4), 0.5, np.float32))
     env.pump(20)
     assert len(env.notices(a)) == 1 and not env.s.closed  # still nothing, and never closed from the cook thread
     env.fetch(a)  # it wakes up
-    assert not env.x.clients[a].stalled
+    assert not env.x.clients[a].base.stalled
     env.pump(2)
     assert "stalled" not in env.o.par.Status.eval()
     env.o.in1.set_image(np.full((32, 64, 4), 0.25, np.float32))
@@ -1196,17 +1674,17 @@ def test_resize_mid_conversion_voids_notices_and_serves_only_the_new_size():
     a = env.connect("panel")
     env.fetch_skip = {a}
     env.pump(40)
-    assert env.x.clients[a].outstanding is not None  # notice for the 960x540 frame, unfetched
+    assert env.x.clients[a].base.outstanding is not None  # notice for the 960x540 frame, unfetched
     env.o.in1.set_image(np.random.RandomState(3).rand(540, 960, 4).astype(np.float32))
     for _ in range(30):  # start another conversion and resize in the middle of it
         env.pump()
-        if env.x._conv is not None:
+        if env.x.base.conv is not None:
             break
-    assert env.x._conv is not None
+    assert env.x.base.conv is not None
     env.o.in1.set_image(np.random.RandomState(2).rand(40, 80, 4).astype(np.float32))
     env.pump()
     assert env.s.messages(a, "docSize")[-1] == {"t": "docSize", "w": 80, "h": 40, "hasInput": True}
-    assert env.x._conv is None and env.x.clients[a].outstanding is None
+    assert env.x.base.conv is None and env.x.clients[a].base.outstanding is None
     assert env.fetch(a)["statusCode"] == 404  # the old frame is gone, the new one is not ready yet
     env.pump(30)
     n = env.notices(a)[-1]
@@ -1235,7 +1713,7 @@ def test_frame_ids_wrap_around_u32_and_stay_consistent(env):
     env.o.par.Maxinputfps.val = 120
     env.set_input(64, 32)
     env.pump()
-    env.x._frame_id = 0xFFFFFFFE
+    env.x.base.frame_id = 0xFFFFFFFE
     a = env.connect("panel")
     for i in range(4):
         env.o.in1.set_image(np.full((32, 64, 4), i / 10.0, np.float32))
@@ -1255,7 +1733,7 @@ def test_unfetched_standby_and_active_clients_are_tracked_separately(env):
     assert len(env.fetched[a]) == 1 and not env.fetched.get(b)
     assert len(env.notices(b)) == 1
     env.fetch(b)
-    assert env.x.clients[b].outstanding is None and env.x.clients[b].fetched == env.x._base_fid
+    assert env.x.clients[b].base.outstanding is None and env.x.clients[b].base.fetched == env.x.base.fid
 
 
 def test_fetch_with_unknown_client_id_still_serves_but_marks_nobody(env):
@@ -1265,7 +1743,7 @@ def test_fetch_with_unknown_client_id_still_serves_but_marks_nobody(env):
     env.fetch_skip = {a}
     env.pump(10)
     r = env.x.OnHTTPRequest(req(uri="/base", pars={"token": env.x.token, "client": "ghost"}), {})
-    assert r["statusCode"] == 200 and env.x.clients[a].outstanding is not None
+    assert r["statusCode"] == 200 and env.x.clients[a].base.outstanding is not None
 
 
 # ----------------------------------------------------------------------------- liveness regressions
@@ -1276,9 +1754,9 @@ def test_request_base_renotifies_even_with_an_unfetched_notice_outstanding(env):
     a = env.connect("panel")
     env.fetch_skip = {a}  # the client's fetch "failed": it never fetched the notice
     env.pump(10)
-    assert len(env.notices(a)) == 1 and env.x.clients[a].outstanding is not None
+    assert len(env.notices(a)) == 1 and env.x.clients[a].base.outstanding is not None
     env.send(a, {"t": "requestBase"})
-    assert env.x.clients[a].outstanding is None and not env.x.clients[a].stalled
+    assert env.x.clients[a].base.outstanding is None and not env.x.clients[a].base.stalled
     env.pump(3)
     assert len(env.notices(a)) == 2  # re-announced, not stuck until stalled
     env.fetch_skip = set()
@@ -1293,10 +1771,10 @@ def test_request_base_clears_a_stalled_flag(env):
     env.fetch_skip = {a}
     env.pump(3)
     env.pump(2, dt=E.STALL_S)
-    assert env.x.clients[a].stalled
+    assert env.x.clients[a].base.stalled
     env.send(a, {"t": "requestBase"})
     env.pump(3)
-    assert not env.x.clients[a].stalled and len(env.notices(a)) == 2
+    assert not env.x.clients[a].base.stalled and len(env.notices(a)) == 2
 
 
 def test_404_on_base_clears_the_clients_outstanding_notice(env):
@@ -1305,10 +1783,10 @@ def test_404_on_base_clears_the_clients_outstanding_notice(env):
     a = env.connect("panel")
     env.fetch_skip = {a}
     env.pump(10)
-    assert env.x.clients[a].outstanding is not None
-    env.x._base_msg = None  # frame vanished between notice and fetch
+    assert env.x.clients[a].base.outstanding is not None
+    env.x.base.msg = None  # frame vanished between notice and fetch
     assert env.fetch(a)["statusCode"] == 404
-    assert env.x.clients[a].outstanding is None and env.x.clients[a].fetched is None
+    assert env.x.clients[a].base.outstanding is None and env.x.clients[a].base.fetched is None
 
 
 def test_premultiplied_toggle_does_not_strand_clients_on_the_old_image(env):
@@ -1318,10 +1796,10 @@ def test_premultiplied_toggle_does_not_strand_clients_on_the_old_image(env):
     a = env.connect("panel")
     env.fetch_skip = {a}
     env.pump(10)
-    assert env.x.clients[a].outstanding is not None
+    assert env.x.clients[a].base.outstanding is not None
     env.o.par.Premultiplied.val = 0
     env.x.OnParChange(env.o.par.Premultiplied)
-    assert env.x.clients[a].outstanding is None and not env.x.clients[a].stalled
+    assert env.x.clients[a].base.outstanding is None and not env.x.clients[a].base.stalled
     env.fetch_skip = set()
     env.pump(30)
     assert len(env.notices(a)) == 2 and len(env.fetched[a]) == 1  # a fresh notice for the re-converted frame
@@ -1334,10 +1812,10 @@ def test_resize_clears_outstanding_and_stalled_for_every_client(env):
     env.fetch_skip = {a, b}
     env.pump(3)
     env.pump(2, dt=E.STALL_S)
-    assert env.x.clients[a].stalled
+    assert env.x.clients[a].base.stalled
     env.set_input(80, 40, 2)
     env.pump()
-    assert all(c.outstanding is None and not c.stalled for c in env.x.clients.values())
+    assert all(c.base.outstanding is None and not c.base.stalled for c in env.x.clients.values())
 
 
 def test_cors_only_for_loopback_origins_and_tokens_still_required(env):
@@ -1362,7 +1840,7 @@ def test_cors_only_for_loopback_origins_and_tokens_still_required(env):
     r = get("http://localhost:5173", token=False)  # errors are readable by the page too, but never skip auth
     assert r["statusCode"] == 403 and r["Access-Control-Allow-Origin"] == "http://localhost:5173"
     assert get("http://localhost:5173", clientAddress="10.1.1.1:5")["statusCode"] == 403
-    env.x._base_msg = None
+    env.x.base.msg = None
     assert get("http://localhost:5173")["Access-Control-Allow-Origin"] == "http://localhost:5173"  # 404 too
 
 
@@ -1372,7 +1850,7 @@ def test_frame_id_is_never_reset_by_invalidations_or_active_toggles(env):
     env.pump()
     env.connect("panel")
     env.pump(10)
-    seen = [env.x._frame_id]
+    seen = [env.x.base.frame_id]
     for step in ("premult", "resize", "active"):
         if step == "premult":
             env.o.par.Premultiplied.val = 0
@@ -1385,5 +1863,1023 @@ def test_frame_id_is_never_reset_by_invalidations_or_active_toggles(env):
             env.o.par.Active.val = 1
             env.x.OnParChange(env.o.par.Active)
         env.pump(20)
-        seen.append(env.x._frame_id)
+        seen.append(env.x.base.frame_id)
     assert seen == sorted(seen) and seen[2] > seen[0] and seen[0] > 0  # monotonic across premult, resize and a restart
+
+
+# ----------------------------------------------------------------------------- view messages
+
+VIEW_RECT = {"x": 10, "y": 20, "w": 800, "h": 600}
+
+
+def vmsg(mode="td", zoom=2.0, pan_x=5.0, pan_y=-3.0, rect=None):
+    return {"t": "view", "mode": mode, "zoom": zoom, "panX": pan_x, "panY": pan_y, "rect": dict(rect or VIEW_RECT)}
+
+
+def set_output(env, seed=0, w=64, h=32, alpha=None):
+    arr = np.random.RandomState(seed).rand(h, w, 4).astype(np.float32)
+    if alpha is not None:
+        arr[..., 3] = alpha
+    env.o.net.out.set_image(arr)
+    return arr
+
+
+def test_panel_view_td_drives_overlay_and_background_switch(env):
+    env.pump()
+    p = env.connect("panel")
+    net = env.o.net
+    n = len(net.views)
+    env.send(p, vmsg("td"))
+    assert net.views[n:] == [({"mode": "td", "zoom": 2.0, "panX": 5.0, "panY": -3.0, "rect": VIEW_RECT}, 1280, 800)]
+    assert env.o.par.top.eval() == "./panel_view"
+    env.send(p, vmsg("td"))  # unchanged: nothing is rebuilt
+    assert len(net.views) == n + 1
+    env.send(p, vmsg("td", zoom=3.0))
+    assert len(net.views) == n + 2 and net.views[-1][0]["zoom"] == 3.0
+    env.send(p, vmsg("local"))
+    assert net.views[-1][0] is None
+    assert env.o.par.top.eval() == "./webrender"
+    assert env.o.par.Viewmode.eval() == "local"
+
+
+def test_panel_view_follows_panel_resize_and_doc_size(env):
+    env.pump()
+    p = env.connect("panel")
+    env.send(p, vmsg("td"))
+    n = len(env.o.net.views)
+    env.o.par.w.val, env.o.par.h.val = 1000, 700
+    env.pump()
+    assert env.o.net.views[n:] == [(env.o.net.views[-1][0], 1000, 700)] and env.o.net.views[-1][0] is not None
+    env.o.par.Docw.val = 100
+    env.pump()
+    assert len(env.o.net.views) == n + 2  # doc size change re-lays out the overlay
+
+
+def test_panel_disconnect_returns_background_to_webrender(env):
+    env.pump()
+    p = env.connect("panel")
+    env.send(p, vmsg("td"))
+    env.x.OnWebSocketClose(p)
+    assert env.o.net.views[-1][0] is None and env.o.par.top.eval() == "./webrender"
+
+
+def test_active_off_returns_background_to_webrender(env):
+    env.pump()
+    p = env.connect("panel")
+    env.send(p, vmsg("td"))
+    env.o.par.Active.val = 0
+    env.x.OnParChange(env.o.par.Active)
+    assert env.o.par.top.eval() == "./webrender"
+
+
+def test_panel_view_does_not_start_the_external_stream(env):
+    env.pump()
+    p = env.connect("panel")
+    env.send(p, vmsg("td"))
+    set_output(env)
+    env.pump(10)
+    assert not env.s.messages(p, "view") and env.o.net.out.readbacks == 0
+
+
+def test_external_view_message_does_not_touch_the_panel_overlay(env):
+    env.pump()
+    env.connect("panel")
+    e = env.connect("external")
+    n = len(env.o.net.views)
+    env.send(e, vmsg("td"))
+    assert len(env.o.net.views) == n and env.o.par.top.eval() == "./webrender"
+
+
+def test_bad_view_message_replies_error(env):
+    env.pump()
+    p = env.connect("panel")
+    env.send(p, {"t": "view", "mode": "td", "zoom": "x"})
+    assert env.s.messages(p, "error") and not any(v is not None for v, _, _ in env.o.net.views)
+
+
+def test_viewmode_mirrors_the_active_clients_choice(env):
+    env.pump()
+    p = env.connect("panel")
+    e = env.connect("external")
+    env.send(e, vmsg("td"))
+    assert env.o.par.Viewmode.eval() == "local"  # panel is active
+    env.send(p, vmsg("td"))
+    assert env.o.par.Viewmode.eval() == "td"
+    env.send(e, {"t": "takeover"})
+    assert env.o.par.Viewmode.eval() == "td"
+    env.send(e, vmsg("local"))
+    assert env.o.par.Viewmode.eval() == "local"
+    env.x.OnWebSocketClose(e)
+    assert env.o.par.Viewmode.eval() == "td"  # panel is active again
+
+
+# ----------------------------------------------------------------------------- VIEW stream (external, mode td)
+
+def test_no_view_stream_without_subscribers(env):
+    env.pump()
+    env.connect("external")
+    set_output(env)
+    env.pump(10)
+    assert env.o.net.out.readbacks == 0 and not env.x.out.msg
+
+
+def test_view_stream_notice_and_get_view_return_the_output_flipped_and_unpremultiplied():
+    env = Env(Premultiplied=0)
+    env.pump()
+    e = env.connect("external")
+    arr = set_output(env, 3, alpha=1.0)
+    env.send(e, vmsg("td"))
+    env.pump(10)
+    (n,) = env.s.messages(e, "view")
+    assert n == {"t": "view", "frameId": n["frameId"], "docW": 64, "docH": 32, "w": 64, "h": 32, "appliedFrameId": -1}
+    ((h, payload),) = env.view_frames[e]
+    assert (h.type, h.slot, h.frame_end, h.frame_id, (h.x, h.y, h.w, h.h)) == (P.TYPE_VIEW, 0, True, n["frameId"], (0, 0, 64, 32))
+    got = np.frombuffer(payload, np.uint8).reshape(32, 64, 4)
+    assert np.abs(got.astype(int) - np.floor(arr[::-1] * 255 + 0.5)).max() <= 1
+    assert not env.s.binaries  # never binary on the WebSocket
+    assert not env.fetched.get(e)  # and no BASE traffic without an input
+
+
+def test_view_stream_uses_the_budgeted_pipeline_with_delayed_readback(env):
+    env.pump()
+    e = env.connect("external")
+    set_output(env)
+    env.send(e, vmsg("td"))
+    env.pump(6)
+    assert env.o.net.out.readbacks >= 2
+    st = env.x.GetStats()
+    assert st["vreadback"]["n"] >= 2 and st["vconvert"]["n"] >= 1 and st["vpublish"]["n"] == 1
+
+
+def test_view_not_resent_while_output_unchanged_and_resent_when_it_changes(env):
+    env.pump()
+    e = env.connect("external")
+    set_output(env, 1)
+    env.send(e, vmsg("td"))
+    env.pump(20)
+    assert len(env.s.messages(e, "view")) == 1
+    set_output(env, 2)
+    env.pump(20)
+    assert len(env.s.messages(e, "view")) == 2
+
+
+def test_view_rate_limited_by_maxviewfps(env):
+    env.o.par.Maxviewfps.val = 10
+    env.pump()
+    e = env.connect("external")
+    set_output(env, 0)
+    env.send(e, vmsg("td"))
+    env.pump(5)
+    start = len(env.s.messages(e, "view"))
+    for i in range(60):  # 2.04 s, output changes every pump
+        set_output(env, 100 + i)
+        env.pump()
+    got = len(env.s.messages(e, "view")) - start
+    assert 5 <= got <= 23
+    last = set_output(env, 999)  # trailing edge is never lost
+    env.pump(30)
+    h, payload = env.view_frames[e][-1]
+    env.o.par.Premultiplied.val = 1
+    assert h.frame_id == env.x.out.fid
+
+
+def test_view_and_base_are_independent_streams():
+    env = Env(Premultiplied=0)
+    env.set_input(64, 32, 1)
+    env.pump()
+    e = env.connect("external")
+    set_output(env, 2)
+    env.send(e, vmsg("td"))
+    env.pump(20)
+    assert len(env.s.messages(e, "base")) == 1 and len(env.s.messages(e, "view")) == 1
+    b = env.bases(e)
+    assert next(iter(b.values()))[0][0].type == P.TYPE_BASE
+    assert env.view_frames[e][0][0].type == P.TYPE_VIEW
+    # frame ids are per stream
+    assert env.x.base.frame_id >= 1 and env.x.out.frame_id >= 1
+
+
+def test_get_view_requires_subscription_token_and_loopback(env):
+    env.pump()
+    e = env.connect("external")
+    set_output(env)
+    cid = env.x.clients[e].cid
+    assert env.get("/view", client=cid)["statusCode"] == 404  # not subscribed
+    env.send(e, vmsg("td"))
+    assert env.get("/view", client=cid)["statusCode"] == 404  # subscribed, nothing converted yet
+    env.pump(10)
+    assert env.get("/view", client=cid)["statusCode"] == 200
+    assert env.get("/view", client="nobody")["statusCode"] == 404
+    assert env.get("/view", token="nope", client=cid)["statusCode"] == 403
+    assert env.x.OnHTTPRequest(req(uri="/view", pars={"client": cid}), {})["statusCode"] == 403
+    r = env.x.OnHTTPRequest(req(uri="/view", token=env.x.token, pars={"client": cid}, clientAddress="10.0.0.9:1"), {})
+    assert r["statusCode"] == 403
+    r = env.x.OnHTTPRequest(req(uri="/view", pars={"token": env.x.token, "client": cid}, Host="evil.example"), {})
+    assert r["statusCode"] == 403
+    r = env.x.OnHTTPRequest(req(uri="/view", pars={"token": env.x.token, "client": cid}, Origin="http://localhost:5173"), {})
+    assert r["Access-Control-Allow-Origin"] == "http://localhost:5173" and r["Vary"] == "Origin"
+    r = env.x.OnHTTPRequest(req(uri="/view", pars={"token": env.x.token, "client": cid}, Origin="http://evil.example"), {})
+    assert "Access-Control-Allow-Origin" not in r and r["Cache-Control"] == "no-store"
+
+
+def test_panel_client_cannot_fetch_the_view_stream(env):
+    env.pump()
+    p = env.connect("panel")
+    e = env.connect("external")
+    set_output(env)
+    env.send(e, vmsg("td"))
+    env.send(p, vmsg("td"))
+    env.pump(10)
+    assert env.x.out.msg is not None
+    assert env.get("/view", client=env.x.clients[p].cid)["statusCode"] == 404
+
+
+def test_one_view_notice_outstanding_and_newest_frame_served():
+    env = Env()
+    env.autofetch_view = False
+    env.o.par.Premultiplied.val = 0
+    env.o.par.Maxviewfps.val = 120
+    env.pump()
+    e = env.connect("external")
+    env.send(e, vmsg("td"))
+    for i in range(40):
+        set_output(env, i)
+        env.pump()
+    assert len(env.s.messages(e, "view")) == 1
+    first = env.s.messages(e, "view")[0]["frameId"]
+    env.fetch_view(e)
+    h, _ = env.view_frames[e][-1]
+    assert h.frame_id != first and h.frame_id == env.x.out.fid
+    set_output(env, 99)
+    env.pump(10)
+    assert len(env.s.messages(e, "view")) == 2
+
+
+def test_view_stall_after_10s_then_resumes_on_fetch(capsys):
+    env = Env()
+    env.autofetch_view = False
+    env.o.par.Maxviewfps.val = 120
+    env.pump()
+    e = env.connect("external")
+    env.send(e, vmsg("td"))
+    set_output(env, 0)
+    env.pump(10)
+    assert len(env.s.messages(e, "view")) == 1
+    env.pump(3, dt=E.STALL_S / 2 + 0.1)
+    assert env.x.clients[e].view.stalled and "1 stalled" in env.o.par.Status.eval()
+    assert "view frame" in capsys.readouterr().out
+    set_output(env, 1)
+    env.pump(20)
+    assert len(env.s.messages(e, "view")) == 1 and not env.s.closed
+    env.fetch_view(e)
+    assert not env.x.clients[e].view.stalled
+    set_output(env, 2)
+    env.pump(20)
+    assert len(env.s.messages(e, "view")) == 2
+
+
+def test_view_stall_is_independent_of_the_base_stream():
+    env = Env()
+    env.autofetch_view = False
+    env.set_input(64, 32)
+    env.o.par.Maxviewfps.val = 120
+    env.pump()
+    e = env.connect("external")
+    env.send(e, vmsg("td"))
+    set_output(env)
+    env.pump(10)
+    env.pump(3, dt=E.STALL_S / 2 + 0.1)
+    c = env.x.clients[e]
+    assert c.view.stalled and not c.base.stalled
+
+
+def test_new_td_mode_message_clears_stall_and_reannounces():
+    env = Env()
+    env.autofetch_view = False
+    env.pump()
+    e = env.connect("external")
+    env.send(e, vmsg("td"))
+    set_output(env)
+    env.pump(10)
+    env.pump(3, dt=E.STALL_S / 2 + 0.1)
+    assert env.x.clients[e].view.stalled
+    env.send(e, vmsg("td", zoom=4.0))  # zoom/pan changes while subscribed do not re-announce
+    assert env.x.clients[e].view.stalled
+    env.send(e, vmsg("local"))
+    env.send(e, vmsg("td"))
+    assert not env.x.clients[e].view.stalled and env.x.clients[e].view.outstanding is None
+    env.pump(5)
+    assert len(env.s.messages(e, "view")) == 2  # same stored frame, announced again
+
+
+def test_leaving_td_mode_stops_the_stream_and_drops_the_frame(env):
+    env.pump()
+    e = env.connect("external")
+    set_output(env)
+    env.send(e, vmsg("td"))
+    env.pump(10)
+    assert env.x.out.msg is not None
+    env.send(e, vmsg("local"))
+    env.pump(2)
+    assert env.x.out.msg is None
+    n = env.o.net.out.readbacks
+    set_output(env, 5)
+    env.pump(10)
+    assert env.o.net.out.readbacks == n
+    assert env.get("/view", client=env.x.clients[e].cid)["statusCode"] == 404
+
+
+def test_closing_the_only_subscriber_stops_the_stream(env):
+    env.pump()
+    e = env.connect("external")
+    set_output(env)
+    env.send(e, vmsg("td"))
+    env.pump(10)
+    env.x.OnWebSocketClose(e)
+    env.pump(2)
+    assert env.x.out.msg is None
+
+
+def test_second_subscriber_gets_the_stored_frame_without_a_new_readback(env):
+    env.pump()
+    e1 = env.connect("external")
+    set_output(env)
+    env.send(e1, vmsg("td"))
+    env.pump(10)
+    n = env.o.net.out.readbacks
+    e2 = env.connect("external")
+    env.send(e2, vmsg("td"))
+    env.pump(5)
+    assert len(env.s.messages(e2, "view")) == 1 and env.o.net.out.readbacks == n
+
+
+def test_doc_size_change_voids_view_notices_and_serves_only_the_new_size():
+    env = Env()
+    env.autofetch_view = False
+    env.pump()
+    e = env.connect("external")
+    env.send(e, vmsg("td"))
+    set_output(env)
+    env.pump(10)
+    assert env.x.clients[e].view.outstanding is not None
+    env.o.par.Docw.val, env.o.par.Doch.val = 80, 40
+    env.pump()
+    assert env.x.clients[e].view.outstanding is None and env.x.out.msg is None
+    assert env.get("/view", client=env.x.clients[e].cid)["statusCode"] == 404
+    env.autofetch_view = True
+    set_output(env, 4, w=80, h=40)
+    env.pump(20)
+    h, _ = env.view_frames[e][-1]
+    assert (h.doc_w, h.doc_h) == (80, 40)
+
+
+def test_output_readback_of_the_wrong_size_is_dropped(env):
+    env.pump()
+    e = env.connect("external")
+    env.send(e, vmsg("td"))
+    set_output(env, w=10, h=10)
+    env.pump(10)
+    assert not env.s.messages(e, "view")
+
+
+def test_applied_frame_id_in_view_notice_is_the_frame_uploaded_before_the_readback(env):
+    env.pump()
+    e = env.connect("external")
+    env.send(e, {"t": "takeover"})
+    env.doc(e, DOC)
+    env.pump()
+    env.surface(e, 1, (0, 0, 8, 8), wire_img(8, 8), frame_id=77)
+    env.pump()  # uploaded
+    set_output(env, 1)
+    env.send(e, vmsg("td"))
+    env.pump(10)
+    assert env.s.messages(e, "applied")[-1]["frameId"] == 77
+    assert env.s.messages(e, "view")[-1]["appliedFrameId"] == 77
+    # a frame that arrives in the same pump as the readback issue is not claimed by it
+    env.x.out.pending = True
+    env.o.net.out.totalCooks += 1
+    env.surface(e, 1, (0, 0, 8, 8), wire_img(8, 8), frame_id=78)
+    env.pump()  # issues the read (snapshot 77) and then uploads 78
+    env.pump(3)
+    assert env.s.messages(e, "applied")[-1]["frameId"] == 78
+    assert env.s.messages(e, "view")[-1]["appliedFrameId"] == 77
+    env.o.net.out.totalCooks += 1
+    env.pump(10)  # the next read starts after 78 was uploaded
+    assert env.s.messages(e, "view")[-1]["appliedFrameId"] == 78
+
+
+def test_view_notice_never_goes_to_clients_that_are_not_in_td_mode(env):
+    env.pump()
+    a = env.connect("panel")
+    e1 = env.connect("external")
+    e2 = env.connect("external")
+    set_output(env)
+    env.send(e1, vmsg("td"))
+    env.send(e2, vmsg("local"))
+    env.pump(10)
+    assert env.s.messages(e1, "view") and not env.s.messages(e2, "view") and not env.s.messages(a, "view")
+
+
+# ----------------------------------------------------------------------------- persistence
+
+def settled_env(**kw):
+    e = Env(**kw)
+    e.pump()
+    a = e.connect("panel")
+    e.doc(a, DOC, rev=6)
+    e.imgs = {1: wire_img(64, 32, 11, 255), 2: wire_img(64, 32, 12, 200), 3: wire_img(64, 32, 13, 255)}
+    e.imgs[3][..., :3] = e.imgs[3][..., :1]  # grey mask
+    for s, im in e.imgs.items():
+        e.surface(a, s, (0, 0, 64, 32), im, frame_id=s)
+    e.pump()
+    e.a = a
+    return e
+
+
+def test_freeze_flushes_doc_state_uploads_pending_and_locks(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC, rev=3)
+    env.surface(a, 1, (0, 0, 64, 32), wire_img(64, 32, 1, 255))
+    env.x.Freeze()  # before any pump ran: everything pending is flushed first
+    assert json.loads(env.o.doc_state.text)["rev"] == 3
+    assert (env.top(1).uploaded == env.x.surfaces[1]).all() and not env.x._dirty
+    assert env.o.net.frozen and env.x.frozen
+    env.x.Thaw()
+    assert not env.o.net.frozen and not env.x.frozen and env.o.net.thaws == 1
+
+
+def test_restore_rebuilds_network_and_buffers_from_doc_state_and_locked_tops():
+    a = settled_env()
+    a.x.Freeze()
+    n = len(a.o.net.applies)
+    b = Env(like=a)  # the file was reopened: new extension, same DATs / Script TOPs
+    b.pump()
+    assert b.x.doc_layers == DOC and b.x.doc_rev == 6
+    assert b.o.net.applies[n][0] == DOC  # restored straight into the stored document, no default stack first
+    for s, im in a.imgs.items():
+        assert (b.x.surfaces[s] == a.x.surfaces[s]).all(), s
+    assert not b.o.net.frozen and b.o.net.thaws >= 1 and not b.x.frozen
+    c = b.connect("panel", fresh=True)
+    h = b.s.messages(c, "hello")[0]
+    assert h["hasDocument"] is True and h["rev"] == 6
+    b.send(c, {"t": "requestDoc"})
+    assert b.s.messages(c, "docState")[0]["layers"] == DOC
+    assert (b.dump(c, 1)[1] == a.imgs[1]).all()  # opaque layers come back bit-exact
+    assert np.abs(b.dump(c, 2)[1].astype(int) - a.imgs[2]).max() <= 2  # premultiplied round trip
+    assert b.top(1).uploaded is not None and (b.top(1).uploaded == a.x.surfaces[1]).all()
+
+
+def test_restore_to_a_different_doc_size_anchors_top_left():
+    a = settled_env()
+    a.x.Freeze()
+    n = len(a.o.net.applies)
+    b = Env(like=a, Docw=40, Doch=20)
+    b.pump()
+    assert (b.x.doc_w, b.x.doc_h) == (40, 20)
+    assert (b.x.surfaces[1] == a.x.surfaces[1][32 - 20:, :40]).all()
+    assert b.o.net.applies[n][1:] == (40, 20)
+
+
+def test_start_without_stored_document_applies_the_default_stack():
+    e = Env()
+    e.pump()
+    assert e.x.doc_layers is None and e.x.doc_rev is None
+    assert [l["kind"] for l in e.o.net.applies[0][0]] == ["base"]
+    e.send(e.connect("panel"), {"t": "requestDoc"})
+
+
+def test_corrupt_doc_state_is_reported_and_start_continues(capsys):
+    e = Env()
+    e.o.doc_state.text = "{not json"
+    e.x.Start()
+    e.pump()
+    assert e.x._started and e.x.doc_layers is None and "Restore" in capsys.readouterr().out
+    assert e.o.net.applies  # default stack applied
+
+
+def test_doc_state_with_invalid_layers_is_ignored(capsys):
+    e = Env()
+    e.o.doc_state.text = json.dumps({"rev": 1, "layers": [{"id": 1}]})
+    e.x.Start()
+    assert e.x.doc_layers is None and "Restore" in capsys.readouterr().out
+
+
+def test_restore_when_the_network_is_missing_keeps_the_document():
+    a = settled_env()
+    b = Env(like=a)
+    b.o.net_module.module.DocNetwork = lambda comp, glsl: (_ for _ in ()).throw(RuntimeError("x"))
+    b.x.Start()
+    assert b.x.network is None and b.x.doc_layers == DOC and b.x.doc_rev == 6
+
+
+def test_savetox_freezes_around_the_save_and_thaws_after():
+    e = settled_env()
+    assert e.x.SaveTox("/tmp/x.tox") == "/tmp/x.tox"
+    ((path, frozen_during, state_during),) = e.o.saved
+    assert path == "/tmp/x.part.tox" and frozen_during is True and json.loads(state_during)["rev"] == 6
+    assert e.renamed == [("/tmp/x.part.tox", "/tmp/x.tox")]   # temp file, then renamed over the target
+    assert not e.o.net.frozen and not e.x.frozen and e.o.net.thaws == 1
+
+
+def test_savetox_thaws_even_when_the_save_fails():
+    e = settled_env()
+    e.o.save = lambda path: (_ for _ in ()).throw(OSError("disk full"))
+    with pytest.raises(OSError):
+        e.x.SaveTox("/tmp/x.tox")
+    assert not e.o.net.frozen and not e.x.frozen
+
+
+def test_savetox_pulse_uses_the_default_path(env):
+    env.pump()
+    env.x.OnParChange(env.o.par.Savetox)
+    assert env.o.saved and env.o.saved[0][0].endswith(".tox")
+
+
+def test_freeze_thaw_round_trip_keeps_state_and_output_identical():
+    e = settled_env()
+    before = {s: e.top(s).uploaded.copy() for s in e.imgs}
+    rev = e.x.doc_rev
+    e.x.Freeze()
+    e.x.Thaw()
+    e.pump(3)
+    assert e.x.doc_rev == rev
+    for s in e.imgs:
+        assert (e.top(s).uploaded == before[s]).all()
+
+
+def test_active_toggle_restarts_and_restores_from_doc_state_and_tops():
+    e = settled_env()
+    e.o.par.Active.val = 0
+    e.x.OnParChange(e.o.par.Active)
+    e.o.par.Active.val = 1
+    e.x.OnParChange(e.o.par.Active)
+    e.pump()
+    assert e.x.doc_layers == DOC and (e.x.surfaces[1] == e.top(1).uploaded).all()
+    c = e.connect("external")  # nothing was locked, yet the pixels survive the restart
+    assert (e.dump(c, 1)[1] == e.imgs[1]).all() and (e.dump(c, 3)[1] == e.imgs[3]).all()
+
+
+def test_pending_doc_state_is_flushed_before_a_restart():
+    e = Env()
+    e.pump()
+    a = e.connect("panel")
+    e.doc(a, DOC, rev=9)  # no pump yet: doc_state not written
+    assert e.o.doc_state.text == ""
+    e.x.Start()
+    assert json.loads(e.o.doc_state.text)["rev"] == 9 and e.x.doc_rev == 9
+
+
+def test_network_is_ticked_every_pump_and_told_about_the_input(env):
+    env.pump(5)
+    assert env.o.net.ticks >= 5
+    env.set_input(64, 32)
+    env.pump()
+    assert env.o.net.input_flags[-1] is True
+
+
+def test_failed_first_apply_is_retried_every_second_until_it_works(capsys):
+    e = Env()
+    e.pump()
+    e.o.net.raise_on_apply = True
+    e.x._net_applied = False
+    n = len(e.o.net.applies)
+    e.pump(40)  # 1.36 s
+    assert e.o.switch.par.index.eval() == 0 and capsys.readouterr().out.count("[raster_editor] Pump/network") == 1
+    e.o.net.raise_on_apply = False
+    e.pump(40)
+    assert e.x._net_applied and len(e.o.net.applies) == n + 1 and e.o.switch.par.index.eval() == 1
+
+
+def test_restore_survives_a_failing_first_apply_and_finishes_on_the_retry():
+    a = settled_env()
+    a.x.Freeze()
+    b = Env(like=a)
+    b.o.net.raise_on_apply = True
+    b.pump()
+    assert b.o.net.frozen and not b.x._net_applied  # nothing lost: still locked, pixels still in the TOPs
+    b.o.net.raise_on_apply = False
+    b.pump(40)
+    assert b.x._net_applied and not b.o.net.frozen and not b.x.frozen
+    for s, im in a.imgs.items():
+        assert (b.x.surfaces[s] == a.x.surfaces[s]).all(), s
+
+
+def test_failed_locked_read_stays_locked_retries_then_recovers():
+    a = settled_env()
+    a.x.Freeze()
+    b = Env(like=a)
+    b.o.net.raise_on_read = True
+    b.pump()
+    assert b.o.net.frozen and b.x._restore_pending and b.o.net.thaws == 0   # nothing unlocked: pixels still in the TOPs
+    b.pump(40)
+    assert b.o.net.frozen and b.x._restore_fail >= 2
+    b.o.net.raise_on_read = False
+    b.pump(40)
+    assert not b.o.net.frozen and not b.x._restore_pending
+    for s_ in a.imgs:
+        assert (b.x.surfaces[s_] == a.x.surfaces[s_]).all()
+
+
+def test_restore_gives_up_after_the_retry_limit_and_thaws():
+    a = settled_env()
+    a.x.Freeze()
+    b = Env(like=a)
+    b.o.net.raise_on_read = True
+    b.pump(E.RESTORE_TRIES * 40)
+    assert not b.o.net.frozen and not b.x._restore_pending
+
+
+# ----------------------------------------------------------------------------- M1: masks stay white
+
+def white_mask_env():
+    e = Env()
+    e.pump()
+    a = e.connect("panel")
+    e.doc(a, DOC, rev=1)
+    return e, a
+
+
+def test_mask_grows_white_when_the_document_grows():
+    e, a = white_mask_env()
+    e.surface(a, 1, (0, 0, 64, 32), wire_img(64, 32, 1, 255))
+    e.o.par.Docw.val, e.o.par.Doch.val = 80, 40
+    e.pump()
+    assert (e.dump(a, 3)[1] == 255).all()          # old area white, new area white too
+    p = e.dump(a, 1)[1]
+    assert not p[32:].any() and not p[:, 64:].any()   # pixel layers grow transparent
+
+
+def test_painted_mask_keeps_its_pixels_and_only_the_new_area_is_white():
+    e, a = white_mask_env()
+    black = np.zeros((32, 64, 4), np.uint8)
+    black[..., 3] = 255   # a fully black (hidden) mask
+    e.surface(a, 3, (0, 0, 64, 32), black)
+    e.o.par.Docw.val, e.o.par.Doch.val = 80, 40
+    e.pump()
+    m = e.dump(a, 3)[1]
+    assert (m[:32, :64] == black).all() and (m[32:] == 255).all() and (m[:, 64:] == 255).all()
+
+
+def test_restore_into_a_larger_document_fills_masks_white():
+    a = settled_env()
+    a.x.Freeze()
+    b = Env(like=a, Docw=80, Doch=40)
+    b.pump()
+    c = b.connect("external")
+    m = b.dump(c, 3)[1]
+    assert (m[:32, :64] == a.imgs[3]).all() and (m[32:] == 255).all() and (m[:, 64:] == 255).all()
+    assert not b.dump(c, 1)[1][32:].any()
+
+
+def test_input_resize_keeps_masks_white():
+    e, a = white_mask_env()
+    e.set_input(100, 50)
+    e.pump()
+    assert (e.dump(a, 3)[1] == 255).all()
+
+
+def test_restart_carry_fills_masks_white_on_growth():
+    e, a = white_mask_env()
+    e.pump()
+    e.o.par.Active.val = 0
+    e.x.OnParChange(e.o.par.Active)
+    e.o.par.Docw.val, e.o.par.Doch.val = 80, 40
+    e.o.par.Active.val = 1
+    e.x.OnParChange(e.o.par.Active)
+    e.pump()
+    c = e.connect("external")
+    assert (e.dump(c, 3)[1] == 255).all()
+
+
+# ----------------------------------------------------------------------------- M2: save robustness
+
+def test_freeze_writes_every_slot_with_verification_and_locks():
+    e = settled_env()
+    e.x.Freeze()
+    for s_ in e.imgs:
+        t = e.top(s_)
+        assert t.lock and t.uploaded.shape == (32, 64, 4) and (t.uploaded == e.x.surfaces[s_]).all()
+    assert e.x.frozen
+
+
+def test_freeze_detects_a_callback_that_did_not_write_and_rolls_back():
+    e = settled_env()
+    e.top(2).skip_copy = True   # the locked image stays the blank 128x128
+    with pytest.raises(RuntimeError, match="128x128"):
+        e.x.Freeze()
+    assert not e.o.net.frozen and not e.x.frozen   # every lock taken was released again
+
+
+def test_freeze_rolls_back_when_locking_fails_midway():
+    e = settled_env()
+    e.top(3).raise_on_lock = True
+    with pytest.raises(RuntimeError, match="cannot lock"):
+        e.x.Freeze()
+    assert not any(t.lock for t in e.o.net.tops.values()) and not e.x.frozen
+    e.pump(3)
+    for s_ in e.imgs:   # nothing was lost: unlocking recooked from the buffers
+        assert (e.top(s_).uploaded == e.x.surfaces[s_]).all()
+
+
+def test_freeze_with_a_missing_script_top_raises():
+    e = settled_env()
+    e.o.net.tops.pop(1)
+    with pytest.raises(RuntimeError, match="no Script TOP"):
+        e.x.Freeze()
+
+
+def test_savetox_with_failing_freeze_never_saves():
+    e = settled_env()
+    e.top(2).skip_copy = True
+    with pytest.raises(RuntimeError):
+        e.x.SaveTox("/tmp/y.tox")
+    assert e.o.saved == [] and e.renamed == [] and not e.o.net.frozen
+
+
+def test_project_save_callbacks_never_raise_and_report(capsys):
+    e = settled_env()
+    e.top(2).skip_copy = True
+    e.x.OnProjectSave(True)   # must not raise into TD's save
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "project save freeze" in out and not e.o.net.frozen
+    e.top(2).skip_copy = False
+    e.x.OnProjectSave(True)
+    assert e.o.net.frozen
+    e.x.OnProjectSave(False)
+    assert not e.o.net.frozen and not e.x.frozen
+
+
+def test_missed_post_save_is_undone_by_the_pump(capsys):
+    e = settled_env()
+    e.x.Freeze()
+    e.pump(3)
+    assert e.x.frozen   # a save may be in progress: leave it
+    e.pump(1, dt=E.FROZEN_MAX_S + 1)
+    assert not e.x.frozen and not e.o.net.frozen
+    assert "left frozen" in capsys.readouterr().out
+    e.surface(e.a, 1, (0, 0, 8, 8), wire_img(8, 8), frame_id=77)
+    e.pump()
+    assert (e.top(1).uploaded == e.x.surfaces[1]).all()   # uploads work again
+
+
+def test_savetox_in_progress_is_not_thawed_by_the_pump():
+    e = settled_env()
+    seen = []
+    e.o.save = lambda path: (e.pump(1, dt=E.FROZEN_MAX_S + 1), seen.append(e.o.net.frozen))
+    e.x.SaveTox("/tmp/z.tox")
+    assert seen == [True]
+
+
+# ----------------------------------------------------------------------------- S1..S4
+
+def test_panel_key_is_only_remembered_after_the_overlay_was_applied():
+    e = Env()
+    e.pump()
+    p = e.connect("panel")
+    e.o.net.raise_on_view = True
+    e.send(p, vmsg("td"))
+    e.pump(2)   # fails in the message handler (guarded) and in the pump step
+    assert e.o.par.top.eval() == "./webrender"
+    e.o.net.raise_on_view = False
+    e.pump(2)   # the next pump retries because the key was not stored
+    assert e.o.par.top.eval() == "./panel_view"
+
+
+def test_surface_uploads_are_budgeted_per_pump_but_at_least_one():
+    e = Env(tick=0.003)   # every clock read costs 3 ms
+    e.pump()
+    a = e.connect("panel")
+    layers = [L("base", "base")] + [L(f"p{i}", slot=i + 1) for i in range(6)]
+    e.doc(a, layers)
+    n = [len(e.top(i + 1).uploads) for i in range(6)]
+    e.pump()
+    uploaded = sum(len(e.top(i + 1).uploads) - n[i] for i in range(6))
+    assert 1 <= uploaded < 6   # budget hit: the rest follows
+    e.pump(10)
+    assert not e.x._dirty
+
+
+def test_premultiplied_toggle_reencodes_one_surface_per_pump_and_stays_consistent():
+    e = settled_env()
+    wire = {s_: e.dump(e.a, s_)[1] for s_ in (1, 2)}
+    e.o.par.Premultiplied.val = 0
+    e.x.OnParChange(e.o.par.Premultiplied)
+    assert e.x._stale_enc == {1, 2}   # masks need no re-encode
+    e.pump()
+    assert len(e.x._stale_enc) == 1   # one per pump
+    for s_ in (1, 2):   # the wire view is the same while the toggle is half done
+        assert np.abs(e.dump(e.a, s_)[1].astype(int) - wire[s_]).max() <= 2
+    e.pump(5)
+    assert not e.x._stale_enc
+    e.o.par.Premultiplied.val = 1   # flipping back and forth keeps the bookkeeping right
+    e.x.OnParChange(e.o.par.Premultiplied)
+    e.o.par.Premultiplied.val = 0
+    e.x.OnParChange(e.o.par.Premultiplied)
+    e.pump(5)
+    assert not e.x._stale_enc
+
+
+def test_requests_during_a_pending_restore_are_held_and_replayed():
+    a = settled_env()
+    a.x.Freeze()
+    b = Env(like=a)
+    b.o.net.raise_on_apply = True
+    b.pump()   # restore waits for the network
+    assert b.x._restore_pending
+    c = b.connect("panel")
+    assert b.s.messages(c, "hello")[0]["hasDocument"] is True   # truthful, but nothing is served yet
+    assert b.get("/surface", client=b.x.clients[c].cid, slot=1)["statusCode"] == 503
+    b.send(c, {"t": "requestDoc"})
+    assert not b.s.messages(c, "docState")
+    tile = wire_img(4, 4, 5, 255)
+    b.doc(c, DOC, rev=9)
+    b.surface(c, 1, (0, 0, 4, 4), tile, frame_id=3)
+    assert b.x.doc_rev == 6   # held, not applied (and not lost)
+    b.o.net.raise_on_apply = False
+    b.pump(40)
+    assert not b.x._restore_pending and b.x.doc_rev == 9
+    got = b.dump(c, 1)[1]
+    assert (got[:4, :4] == tile).all() and (got[10:20, 10:20] == a.imgs[1][10:20, 10:20]).all()   # tile on top of the restored pixels
+    assert b.s.messages(c, "docState")   # the waiting requestDoc was answered after the restore
+
+
+def test_zero_by_zero_input_keeps_the_current_document_size():
+    e = Env()
+    e.set_input(64, 32)
+    e.pump()
+    a = e.connect("panel")
+    e.doc(a, DOC)
+    e.o.in1.width, e.o.in1.height = 0, 0
+    e.pump(3)
+    assert (e.x.doc_w, e.x.doc_h) == (64, 32) and not e.s.messages(a, "docSize")
+    assert e.x.surfaces[1].shape == (32, 64, 4)
+
+
+def test_restore_converts_slot_by_slot_releasing_each_float_copy():
+    a = settled_env()
+    a.x.Freeze()
+    b = Env(like=a)
+    seen = []
+    orig = b.x.frames.from_float
+    b.x.frames.from_float = lambda arr, w, h, white=False: (seen.append(white), orig(arr, w, h, white))[1]
+    b.pump()
+    assert sorted(seen) == [False, False, True]   # one conversion per slot, the mask flagged white
+
+
+def test_webrender_transparency_is_never_toggled_it_reloads_the_page(env):
+    class Spy:
+        def __init__(self):
+            self.sets = []
+
+        def __setattr__(self, k, v):
+            if k == "transparent":
+                object.__getattribute__(self, "sets").append(v)
+            object.__setattr__(self, k, v)
+    env.o.webrender.par = Spy()
+    env.o.webrender.par.active = 1
+    env.pump()
+    p = env.connect("panel")
+    env.send(p, vmsg("td"))
+    env.send(p, vmsg("local"))
+    assert env.o.webrender.par.sets == []
+
+
+# ----------------------------------------------------------------------------- re-review fixes
+
+def pending_restore_env():
+    a = settled_env()
+    a.x.Freeze()
+    b = Env(like=a)
+    b.o.net.raise_on_apply = True
+    b.pump()
+    assert b.x._restore_pending and b.o.net.frozen
+    return a, b
+
+
+def test_freeze_and_thaw_during_a_pending_restore_leave_the_locked_pixels_alone(capsys):
+    a, b = pending_restore_env()
+    before = {s: b.top(s).uploaded.copy() for s in a.imgs}
+    b.x.Freeze()          # e.g. an autosave while the first apply keeps failing
+    b.x.Thaw()
+    assert b.o.net.frozen   # still locked: they are the only copy
+    assert "still being restored" in capsys.readouterr().out
+    for s in a.imgs:
+        assert (b.top(s).uploaded == before[s]).all()
+    b.o.net.raise_on_apply = False
+    b.pump(40)
+    for s in a.imgs:
+        assert (b.x.surfaces[s] == a.x.surfaces[s]).all(), s
+    assert not b.o.net.frozen
+
+
+def test_savetox_is_refused_while_a_restore_is_pending():
+    a, b = pending_restore_env()
+    with pytest.raises(RuntimeError, match="still being restored"):
+        b.x.SaveTox("/tmp/q.tox")
+    assert b.o.saved == [] and b.o.net.frozen
+
+
+def test_project_save_during_a_pending_restore_does_not_unlock():
+    a, b = pending_restore_env()
+    b.x.OnProjectSave(True)
+    b.x.OnProjectSave(False)
+    assert b.o.net.frozen
+
+
+def test_hold_overflow_rejects_the_client_and_makes_it_reload_after_the_restore():
+    a, b = pending_restore_env()
+    c = b.connect("panel")
+    d = b.connect("external")
+    b.x._held_bytes = E.HOLD_MAX_BYTES
+    b.surface(c, 1, (0, 0, 4, 4), wire_img(4, 4), frame_id=5)   # does not fit
+    b.surface(c, 1, (0, 0, 4, 4), wire_img(4, 4), frame_id=6)   # and nothing of it is held afterwards
+    assert b.s.messages(c, "error") and len(b.x._held) == 0 and c in b.x._overflowed
+    b.s.texts.clear()
+    b.o.net.raise_on_apply = False
+    b.x._held_bytes = 0
+    b.pump(40)
+    acts = [m["active"] for m in b.s.messages(c, "active")]
+    assert acts == [False, True]   # the page treats active:true as "load TD's document"
+    assert not b.s.messages(d, "active") and not b.x._overflowed
+
+
+def test_held_messages_replay_in_order_budgeted_across_pumps():
+    a, b = pending_restore_env()
+    b.x._now = TickClock(0.003)   # every clock read costs 3 ms
+    c = b.connect("panel")
+    for i in range(6):
+        b.surface(c, 1, (i * 4, 0, 4, 4), wire_img(4, 4, i, 255), frame_id=10 + i)
+    assert len(b.x._held) == 6
+    b.o.net.raise_on_apply = False
+    b.x._net_retry_at = 0.0
+    b.pump(1)
+    assert b.x._restore_pending is False and 0 < len(b.x._held) < 6   # replay is spread over pumps
+    b.surface(c, 1, (60, 0, 4, 4), wire_img(4, 4, 99, 255), frame_id=50)   # new traffic queues behind the rest
+    assert b.get("/surface", client=b.x.clients[c].cid, slot=1)["statusCode"] == 503
+    b.pump(20)
+    assert not b.x._held and b.get("/surface", client=b.x.clients[c].cid, slot=1)["statusCode"] == 200
+    assert b.x.clients[c].fid_pending == 50   # last one applied last
+
+
+def test_cook_is_round_robin_so_a_busy_slot_cannot_starve_the_others():
+    e = Env(tick=0.003)
+    e.pump()
+    a = e.connect("panel")
+    e.doc(a, [L("base", "base")] + [L(f"p{i}", slot=i + 1) for i in range(4)])
+    e.pump(10)
+    seen = set()
+    for i in range(12):
+        for s_ in (1, 2, 3, 4):   # every slot is dirty every pump, the budget fits one upload
+            e.x._dirty.add(s_)
+        n = {s_: len(e.top(s_).uploads) for s_ in (1, 2, 3, 4)}
+        e.pump()
+        seen |= {s_ for s_ in n if len(e.top(s_).uploads) > n[s_]}
+    assert seen == {1, 2, 3, 4}
+
+
+def test_a_dirty_slot_without_a_script_top_is_dropped_after_a_while_and_applied_goes_out(capsys):
+    e = Env()
+    e.pump()
+    a = e.connect("panel")
+    e.doc(a, DOC)
+    e.pump()
+    e.surface(a, 1, (0, 0, 8, 8), wire_img(8, 8), frame_id=9)
+    e.o.net.tops.pop(1)
+    e.pump(3)
+    assert not e.s.messages(a, "applied") or e.s.messages(a, "applied")[-1]["frameId"] != 9
+    e.pump(1, dt=E.MISSING_TOP_S + 1)
+    e.pump()
+    assert 1 not in e.x._dirty and e.s.messages(a, "applied")[-1]["frameId"] == 9
+    assert "has no Script TOP" in capsys.readouterr().out
+
+
+def test_freeze_reencodes_stale_surfaces_first():
+    e = settled_env()
+    e.o.par.Premultiplied.val = 0
+    e.x.OnParChange(e.o.par.Premultiplied)
+    assert e.x._stale_enc
+    e.x.Freeze()
+    assert not e.x._stale_enc
+    straight = e.x.surfaces[2]
+    assert (e.top(2).uploaded == straight).all()
+    assert (e.dump(e.a, 2)[1] == e.imgs[2]).all() or np.abs(e.dump(e.a, 2)[1].astype(int) - e.imgs[2]).max() <= 2
+
+
+def test_restart_carry_keeps_the_pending_reencode_state():
+    e = settled_env()
+    e.o.par.Premultiplied.val = 0
+    e.x.OnParChange(e.o.par.Premultiplied)
+    assert e.x._stale_enc == {1, 2}
+    e.o.par.Active.val = 0
+    e.x.OnParChange(e.o.par.Active)
+    e.o.par.Active.val = 1
+    e.x.OnParChange(e.o.par.Active)
+    e.pump(5)
+    c = e.connect("external")
+    assert not e.x._stale_enc
+    for s_ in (1, 2):
+        assert np.abs(e.dump(c, s_)[1].astype(int) - e.imgs[s_]).max() <= 2   # wire content unchanged by the restart
+        assert (e.top(s_).uploaded == e.x.surfaces[s_]).all()
+    # straight alpha now: the 200-alpha layer is stored un-premultiplied
+    assert (e.x.surfaces[2][::-1][..., 3] == 200).all() and np.abs(e.x.surfaces[2][::-1][..., :3].astype(int) - e.imgs[2][..., :3]).max() <= 2
