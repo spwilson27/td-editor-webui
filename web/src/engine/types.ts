@@ -9,7 +9,36 @@ export type BlendMode =
 
 export interface Rect { x: number; y: number; w: number; h: number }
 
-export type LayerKind = 'pixel' | 'group' | 'base';
+export type LayerKind = 'pixel' | 'group' | 'base' | 'adjustment';
+
+/** v2: adjustment layers (docs/DESIGN_V2.md §3, docs/PROTOCOL.md §3). */
+export type AdjustmentSpec =
+  | { type: 'levels'; inLow: number; inHigh: number; gamma: number; outLow: number; outHigh: number }
+  | { type: 'brightnessContrast'; brightness: number; contrast: number }
+  | { type: 'hueSaturation'; hue: number; saturation: number; value: number }
+  | { type: 'blur'; radius: number }
+  | { type: 'invert' }
+  | { type: 'threshold'; level: number };
+export type AdjustmentType = AdjustmentSpec['type'];
+
+export type PaintTarget = 'pixels' | 'mask';
+
+/** Wire form of one layer, bottom-first depth-first order (docs/PROTOCOL.md §3). */
+export interface LayerSpec {
+  id: string;
+  kind: LayerKind;
+  parentId: string | null;
+  name: string;
+  visible: boolean;
+  opacity: number;
+  blend: BlendMode;
+  x: number;
+  y: number;
+  slot: number | null;
+  mask: { slot: number; enabled: boolean } | null;
+  adjustment: AdjustmentSpec | null;
+}
+export interface DocSpec { rev: number; width: number; height: number; layers: LayerSpec[] }
 
 /** Read-only view of a layer for the UI. Thumbnails are drawn via EditorEngine.drawThumbnail. */
 export interface LayerInfo {
@@ -23,6 +52,9 @@ export interface LayerInfo {
   depth: number; // 0 = top level
   expanded?: boolean; // groups only
   parentId: string | null;
+  slot: number | null; // pixel surface slot (pixel layers)
+  mask: { slot: number; enabled: boolean } | null; // pixel + adjustment layers
+  adjustment: AdjustmentSpec | null; // adjustment layers
 }
 
 export type ToolId =
@@ -66,7 +98,9 @@ export type EngineEvent =
   | { type: 'resize'; width: number; height: number }
   | { type: 'history' }
   | { type: 'pick'; color: RGBA } // picker tool sampled a colour
-  | { type: 'notice'; message: string }; // e.g. "Layer is locked"
+  | { type: 'notice'; message: string } // e.g. "Layer is locked"
+  | { type: 'surface'; slot: number; rect: Rect } // surface pixels changed (paint, fill, undo patch, load)
+  | { type: 'docspec' }; // docSpec() changed (structure, props, adjustment params, masks, offsets)
 
 export interface EditorEngine {
   readonly width: number;
@@ -112,6 +146,23 @@ export interface EditorEngine {
   history(): { entries: HistoryEntry[]; index: number }; // index = last applied entry
   jumpTo(index: number): void;
   clearHistory(): void; // drop all undo/redo entries (document setup)
+
+  // v2: masks, adjustments, surfaces, document I/O (docs/DESIGN_V2.md §3)
+  addAdjustment(type: AdjustmentType): string; // above the active layer, default params
+  setAdjustment(id: string, spec: AdjustmentSpec): void; // coalesced history like opacity
+  addMask(layerId: string): number; // returns mask slot; white (fully visible)
+  deleteMask(layerId: string): void;
+  setMaskEnabled(layerId: string, enabled: boolean): void;
+  setPaintTarget(layerId: string, target: PaintTarget): void; // also makes the layer active
+  paintTarget(): { layerId: string | null; target: PaintTarget };
+  drawMaskThumbnail(layerId: string, target: HTMLCanvasElement): void;
+  docSpec(): DocSpec; // rev increments on every 'docspec' event
+  surfaceSlots(): number[];
+  readSurface(slot: number, rect: Rect, out?: Uint8ClampedArray): Uint8ClampedArray; // straight RGBA; masks grey
+  loadDocument(spec: DocSpec): void; // replace document, surfaces empty, clears history
+  writeSurface(slot: number, rect: Rect, rgba: Uint8Array | Uint8ClampedArray): void; // no history
+  commitSurfaces(): void; // recomposite / thumbnails after a batch of writeSurface
+  setPreviewEnabled(enabled: boolean): void; // false = TD-view mode, compositor only on demand
 
   dispose(): void;
 }
