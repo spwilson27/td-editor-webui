@@ -123,7 +123,8 @@ export interface LayerInfo {
 
 export type ToolId =
   | 'move' | 'marquee' | 'lasso' | 'wand' | 'crop' | 'brush' | 'pencil' | 'eraser'
-  | 'fill' | 'gradient' | 'clone' | 'smudge' | 'text' | 'shape' | 'picker' | 'hand' | 'zoom';
+  | 'fill' | 'gradient' | 'clone' | 'smudge' | 'text' | 'shape' | 'picker' | 'hand' | 'zoom'
+  | 'blur' | 'dodge'; // v5: blur/sharpen and dodge/burn brushes
 
 export interface ToolPointer {
   x: number; // document px (float)
@@ -265,6 +266,24 @@ export interface EditorEngine {
   setSnap(opts: SnapOptions): void;
   snapPoint(x: number, y: number, zoom: number): { x: number; y: number; guideX: number | null; guideY: number | null };
   snapRect(r: Rect, zoom: number): { dx: number; dy: number; guideX: number | null; guideY: number | null };
+
+  // v5: retouch tools, crop, floating selection, quick mask, selection ops, effects, inputs (docs/DESIGN_V5.md)
+  setCloneOptions(o: CloneOptions): void; // source set by Alt-click with the clone tool (ToolPointer.alt)
+  setRetouchOptions(o: { strength: number /*0..1*/; sharpen: boolean; burn: boolean; range: DodgeBurnRange; exposure: number /*0..1*/ }): void;
+  cropTo(rect: Rect): void; // canvas becomes rect (integer), transforms/guides/specs shifted; history
+  liftSelection(): boolean; // active pixel layer's selected pixels → floating selection (false if nothing to lift)
+  floating(): { bounds: Rect; transform: LayerTransform } | null;
+  setFloatingTransform(t: LayerTransform): void;
+  commitFloating(): void; // resample into the layer; history
+  cancelFloating(): void;
+  setQuickMask(on: boolean): void; // while on, paint tools paint the selection mask (white adds, black removes)
+  quickMask(): boolean;
+  modifySelection(op: 'grow' | 'shrink' | 'smooth' | 'feather' | 'border', px: number): void; // history
+  setEffects(id: string, effects: Effect[]): void; // coalesced history like opacity
+  setInputs(items: Array<{ input: number; w: number; h: number; connected: boolean }>): void; // from TD; auto-creates layers
+  addInputLayer(input: number): string;
+  writeInput(input: number, rect: Rect, rgba: Uint8Array | Uint8ClampedArray): void; // replaces writeBase (no history)
+  commitInput(input: number): void; // replaces commitBase
   // v4 engine additions (optional so fakes keep compiling; the real engine implements all of them)
   /** Fit a layer's box (doc px) to `box`: pixel/base layers get the mapping transform, text/shape layers scale their geometry (one drag = one history entry). */
   setLayerBox?(id: string, box: Rect): void;
