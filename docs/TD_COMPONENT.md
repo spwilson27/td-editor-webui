@@ -277,3 +277,15 @@ Extension (`ext.py`), all on the main thread, bounded per pump, nothing large on
   previous error. `Exportpath` is a File parameter; TD 2025.32820 has no file-type filter for custom File parameters (no `Par.fileTypes`), so a missing `.tox` ending is added on export.
 - **Build.** `export_tox` builds the clean `.tox` in `/project1/_re_tox_build` and always destroys that COMP (also when the build
   or the save fails, and any leftover first).
+- **Deleting the COMP.** The Web Server DAT (Poco) blocks TD's main thread on destruction until every idle HTTP keep-alive connection
+  times out (10 s each; a browser page always holds some), so every response carries `Connection: close`. TD calls the extension's
+  `onDestroyTD()` before destroying a deleted COMP (Execute DAT `onExit`/`onDestroy` are not called; on extension re-initialisation
+  it is called on the OLD instance, which `_superseded()` detects and ignores): it closes the WebSocket clients, stops the server and
+  the panel's browser and drops imports. TD's undo snapshot of the delete is taken *before* that hook (a lock taken in it is not in
+  the snapshot), so the surface pixels are saved by a worker thread to a side cache (`<tmp>/raster_editor_undo/` -- mode 0700, owned by
+  us -- `<hash of path>_<pid>_<hash of the stored doc_state text>/`: npy + an atomically written `meta.json` that also names the layer
+  behind each slot; skipped above 256 MiB, pruned after 6 h on start and delete). The recreated instance's `Restore()` reads it only
+  when the document text hash matches exactly and only for slots whose layer id and size match and that the locked images did not
+  already provide (an immediate undo waits for the writer); `Premultiplied` is converted; any mismatch or damage removes the cache, as
+  does a restore without a stored document. Ctrl+Z after a delete therefore brings the document back. A delete while a restore is
+  pending leaves the locked images alone. Undo only works in the same TD session.

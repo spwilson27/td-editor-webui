@@ -10,12 +10,16 @@ TD objects in ``td/tests``.
 
 import collections
 import functools
+import hashlib
 import hmac
 import ipaddress
 import json
 import os
 import re
 import secrets
+import shutil
+import tempfile
+import threading
 import time
 import traceback
 from urllib.parse import parse_qs
@@ -156,6 +160,8 @@ class RasterEditorExt:
     def __init__(self, ownerComp):
         self.o = ownerComp
         self._now = time.perf_counter
+        self._destroyed = False
+        self._cache_root = lambda: os.path.join(tempfile.gettempdir(), "raster_editor_undo")  # test seam
         self.pump_count = 0
         self._open_url = None  # test seam; defaults to TD's ui.viewFile
         self._abs_frame = None  # test seam; defaults to TD's absTime.frame
@@ -273,6 +279,8 @@ class RasterEditorExt:
     @_guard
     def Start(self):
         """(Re)start: reset state, bring the server and the panel up, restore the stored document. Idempotent."""
+        if self._destroyed:
+            return
         if self._doc_state_dirty:
             self._flush_doc_state()
         carry = self.surfaces  # a restart in a live session: Script TOPs are not locked, keep our pixels
@@ -294,6 +302,7 @@ class RasterEditorExt:
             self._sync_doc_size()
         if not self._restore_pending:
             self._carry, self._carry_stale = {}, set()
+        self._prune_undo_caches()
 
     @_guard
     def Stop(self):
@@ -305,6 +314,198 @@ class RasterEditorExt:
         self.active_id = None
         self._started = False
         self._op("webserver").par.active = 0
+
+    def _superseded(self):
+        """True when the COMP already runs a NEWER extension instance (initializeExtensions, a re-saved extension DAT, a module
+        reload: TD builds the new instance, then calls onDestroyTD on the old one). On a real delete the extension is already
+        gone from the COMP (AttributeError), which is not 'superseded'."""
+        try:
+            cur = self.o.ext.RasterEditorExt
+        except Exception:  # noqa: BLE001
+            return False
+        return cur is not None and cur is not self
+
+    def onDestroyTD(self):
+        """TD calls this on the extension when the COMP is deleted (verified: before its children are destroyed, the COMP still
+        valid; Execute DAT onExit / onDestroy are NOT called) -- and also on the OLD instance when the extension is re-initialised,
+        which must not touch the server the new instance owns (``_superseded``). Quiet everything that talks to the outside so the
+        destruction has nothing to wait for: close the WebSocket clients, stop the server, stop the panel's browser, drop imports
+        and temporaries. TD's undo snapshot of the delete is taken BEFORE this hook (verified: a lock taken here is not in it), so
+        the surface pixels would come back blank after Ctrl+Z; they are therefore saved to a temp-folder side cache that the
+        recreated instance's Restore() picks up (``_save_undo_cache``). While a restore is pending the locked images already
+        are the document (and in the snapshot): nothing is written. Every step is independent and never raises."""
+        if self._superseded():
+            return
+        self._destroyed = True
+        self._started = False
+        for name, step in (
+                ("undo cache", lambda: None if self._restore_pending else self._save_undo_cache()),
+                ("sockets", self._close_all_sockets),
+                ("server", lambda: setattr(self._op("webserver").par, "active", 0)),
+                ("panel", lambda: setattr(self._op("webrender").par, "active", 0)),
+                ("clients", self.clients.clear)):
+            try:
+                step()
+            except Exception as e:  # noqa: BLE001 - the COMP is going away; nothing may escape into TD
+                print(f"[raster_editor] onDestroyTD/{name}: {type(e).__name__}: {e}")
+        self.active_id = None
+
+    # --- undo of a delete: surface pixels in a temp-folder side cache
+
+    UNDO_CACHE_MAX_BYTES = 256 << 20
+    UNDO_CACHE_MAX_AGE_S = 6 * 3600
+    _undo_writers = {}  # class level: cache dir -> writer thread (so an immediate undo waits for the files)
+
+    @staticmethod
+    def _text_hash(text):
+        return hashlib.sha1((text or "").encode("utf-8", "replace")).hexdigest()
+
+    def _undo_prefix(self):
+        return hashlib.sha1(str(self.o.path).encode()).hexdigest()[:12] + f"_{os.getpid()}_"
+
+    def _undo_cache_dir(self, doc_hash):
+        """One directory per (component path, TD process, stored document): a different document at the same path never finds it."""
+        return os.path.join(self._cache_root(), self._undo_prefix() + doc_hash[:16])
+
+    def _undo_root(self, create=False):
+        """The cache root (private to the user: mode 0700, owned by us) or None."""
+        root = self._cache_root()
+        try:
+            if create:
+                os.makedirs(root, mode=0o700, exist_ok=True)
+            st = os.stat(root)
+            if hasattr(os, "getuid") and st.st_uid != os.getuid():
+                return None
+            return root
+        except OSError:
+            return None
+
+    def _slot_identity(self, layers):
+        """{slot: "<layer id>:pixel|mask"}: which layer a surface belongs to."""
+        out = {}
+        for l in layers or ():
+            if l.get("slot") is not None:
+                out[l["slot"]] = f"{l.get('id')}:pixel"
+            m = l.get("mask")
+            if isinstance(m, dict) and m.get("slot") is not None:
+                out[m["slot"]] = f"{l.get('id')}:mask"
+        return out
+
+    def _save_undo_cache(self):
+        """Hand every surface buffer (npy, as stored) + a meta file (written last, atomically = complete marker) to a worker thread so
+        the delete never waits for the disk (nothing writes the buffers any more: the pump is off and the sockets are closed).
+        Identity = hash of the stored document text at this moment (= what TD's undo snapshot holds) + the layer behind each slot.
+        Skipped above UNDO_CACHE_MAX_BYTES."""
+        self._prune_undo_caches()
+        bufs = dict(self.surfaces)
+        if not bufs or sum(b.nbytes for b in bufs.values()) > self.UNDO_CACHE_MAX_BYTES:
+            return
+        doc_hash = self._text_hash(self._op("doc_state").text)
+        root = self._undo_root(create=True)
+        if root is None:
+            return
+        d = self._undo_cache_dir(doc_hash)
+        meta = {"doc_hash": doc_hash, "rev": self.doc_rev, "time": time.time(), "slots": {}}
+        ident = self._slot_identity(self.doc_layers)
+        for slot, buf in bufs.items():
+            meta["slots"][str(slot)] = {"file": f"s{slot}.npy", "w": int(buf.shape[1]), "h": int(buf.shape[0]),
+                                        "premult": self._slot_premult(slot), "layer": ident.get(slot)}
+        self._doc_state_dirty = False
+
+        def write():
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+                os.makedirs(d, mode=0o700, exist_ok=True)
+                for slot, buf in bufs.items():
+                    np.save(os.path.join(d, f"s{slot}.npy"), buf, allow_pickle=False)
+                tmp = os.path.join(d, "meta.json.tmp")
+                with open(tmp, "w") as f:
+                    json.dump(meta, f)
+                os.replace(tmp, os.path.join(d, "meta.json"))
+            except Exception as e:  # noqa: BLE001
+                shutil.rmtree(d, ignore_errors=True)
+                print(f"[raster_editor] undo cache not written: {type(e).__name__}: {e}")
+            finally:
+                self._undo_writers.pop(d, None)
+        if getattr(self, "_sync_cache_writes", False):  # tests
+            write()
+            return
+        t = threading.Thread(target=write, name="raster_editor_undo_cache", daemon=True)
+        self._undo_writers[d] = t
+        t.start()
+
+    def _drop_undo_caches(self, keep=None):
+        """Remove this component's caches (all, or all except ``keep``): they can no longer be used."""
+        root = self._undo_root()
+        if root is None:
+            return
+        try:
+            names = os.listdir(root)
+        except OSError:
+            return
+        pre = self._undo_prefix()
+        for n in names:
+            if n.startswith(pre) and os.path.join(root, n) != keep:
+                shutil.rmtree(os.path.join(root, n), ignore_errors=True)
+
+    def _load_undo_cache(self, skip):
+        """Fill the buffers of slots not restored from locked images / carried over (``skip``) from the side cache of the instance
+        that was deleted with exactly the document ``Restore()`` just read (hash of the doc_state text and the layer behind each
+        slot must match), then remove it. Any mismatch or damage removes the cache."""
+        doc_hash = getattr(self, "_restore_doc_hash", None)
+        if not doc_hash:
+            return set()
+        d = self._undo_cache_dir(doc_hash)
+        t = self._undo_writers.get(d)
+        if t is not None:
+            t.join(10.0)  # an undo right after the delete: wait for the writer
+        taken = set()
+        try:
+            root = self._undo_root()
+            if root is None or not os.path.isdir(d):
+                return taken
+            with open(os.path.join(d, "meta.json")) as f:
+                meta = json.load(f)
+            if meta.get("doc_hash") != doc_hash:
+                return taken
+            ident = self._slot_identity(self.doc_layers)
+            for key, info in meta["slots"].items():
+                slot = int(key)
+                buf = self.surfaces.get(slot)
+                if slot in skip or buf is None or (buf.shape[1], buf.shape[0]) != (info["w"], info["h"]) \
+                        or info.get("layer") != ident.get(slot):
+                    continue
+                arr = np.load(os.path.join(d, info["file"]), allow_pickle=False)
+                if arr.shape != buf.shape or arr.dtype != np.uint8:
+                    continue
+                if slot not in self._mask_slots and bool(info.get("premult")) != bool(self._p("Premultiplied")):
+                    self.frames.convert_premultiplication(arr, bool(self._p("Premultiplied")))
+                self.surfaces[slot] = arr
+                self._dirty.add(slot)
+                taken.add(slot)
+        except Exception as e:  # noqa: BLE001 - damaged / foreign cache: never fatal
+            print(f"[raster_editor] undo cache unusable: {type(e).__name__}: {e}")
+        finally:
+            self._drop_undo_caches()   # consumed, or not ours: no later instance may pick it up
+        return taken
+
+    def _prune_undo_caches(self):
+        """Remove side caches older than UNDO_CACHE_MAX_AGE_S (a delete that was never undone)."""
+        root = self._undo_root()
+        if root is None:
+            return
+        try:
+            names = os.listdir(root)
+        except OSError:
+            return
+        now = time.time()
+        for n in names:
+            p = os.path.join(root, n)
+            try:
+                if now - os.path.getmtime(p) > self.UNDO_CACHE_MAX_AGE_S:
+                    shutil.rmtree(p, ignore_errors=True)
+            except OSError:
+                pass
 
     def _close_all_sockets(self):
         self._drop_all_tops()
@@ -500,6 +701,9 @@ class RasterEditorExt:
     def _reply(response, code, reason, data="", ctype="text/plain; charset=utf-8"):
         response["statusCode"] = code
         response["statusReason"] = reason
+        # No HTTP keep-alive: TD's Web Server DAT (Poco) waits for every idle keep-alive connection to time out (10 s each) when
+        # it is destroyed, which freezes TD for as long as a browser (the panel's CEF page!) holds connections open.
+        response["Connection"] = "close"
         response["content-type"] = ctype
         response["data"] = data
         return response
@@ -600,7 +804,7 @@ class RasterEditorExt:
     @_guard
     def OnWebSocketBinary(self, client, data, _replay=False):
         c = self.clients.get(client)
-        if c is None or not c.ready or not c.active:
+        if self._destroyed or c is None or not c.ready or not c.active:
             return  # only the active editor may write surfaces
         if not _replay and (self._restore_pending or self._held):
             self._hold(client, ("bin", client, bytes(data)), len(data))
@@ -1049,7 +1253,9 @@ class RasterEditorExt:
             return False
         stored = self._read_doc_state()
         if stored is None:
+            self._drop_undo_caches()   # nothing to restore: a leftover cache of an earlier component here is unusable
             return False
+        self._restore_doc_hash = self._text_hash(self._op("doc_state").text)
         rev, layers, guides, canvas = stored
         self._restore_pending = True
         self.doc_layers, self.doc_rev, self.guides = layers, rev, guides
@@ -1094,6 +1300,9 @@ class RasterEditorExt:
                         self.frames.convert_premultiplication(buf, bool(self._p("Premultiplied")))
                     self.surfaces[slot] = buf
                     self._dirty.add(slot)
+            taken = self._load_undo_cache(restored | {sl for sl in self.surfaces if sl in self._carry})
+            if taken:
+                print(f"[raster_editor] restored {len(taken)} surface(s) from the delete's undo cache")
         finally:
             self.network.thaw()  # a TOP left locked would ignore every upload
             self.frozen = False
@@ -1200,6 +1409,8 @@ class RasterEditorExt:
         self.stats["pump"].append(self._now() - t0)
 
     def _pump(self, now):
+        if self._destroyed:
+            return  # the COMP is being deleted
         if not self._started:
             self.Start()
         if not self._p("Active"):

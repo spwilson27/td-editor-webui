@@ -10,6 +10,18 @@ import protocol as P
 from faketd import Clock, FakeOwner, TickClock
 
 
+import tempfile  # noqa: E402
+
+CACHE_ROOT = tempfile.mkdtemp(prefix="re_undo_cache_test_")
+
+
+@pytest.fixture(autouse=True)
+def _clean_undo_cache():
+    import shutil
+    shutil.rmtree(CACHE_ROOT, ignore_errors=True)
+    yield
+
+
 class Env:
     def __init__(self, tick=None, like=None, **pars):
         self.o = FakeOwner(**pars)
@@ -23,6 +35,8 @@ class Env:
         self.autofetch = True  # a well-behaved web client fetches every `base` / `view` notice
         self.x = E.RasterEditorExt(self.o)
         self.x._now = self.clock
+        self.x._cache_root = lambda: CACHE_ROOT
+        self.x._sync_cache_writes = True
         self.o.ext = self.x
         self.n = 0
         self.opened = []
@@ -4204,3 +4218,260 @@ def test_default_fit_uses_whole_pixels():
     e.pump()
     (b,) = e.o.net.applies[-1][0]
     assert b["x"] == int(b["x"]) and b["y"] == int(b["y"])
+
+
+# ----------------------------------------------------------------------------- deleting the COMP (TD freeze: Poco waits for idle connections)
+
+def test_every_http_response_closes_the_connection():
+    e = Env()
+    for r in (e.get("/"), e.get("/nope"), e.get("/base", client="x"), e.get("/surface", client="x", slot=1),
+              e.x.OnHTTPRequest(req(uri="/", data=b"", pars={}, clientAddress="8.8.8.8:1"), {})):
+        assert r["Connection"] == "close", r["statusCode"]
+
+
+def test_on_destroy_td_quiets_everything_the_destruction_could_wait_for():
+    e = settled_env()
+    c2 = e.connect("external")
+    install_tops(e, FakeTop("/project1/t", 6, 4, array=tops_img(6, 4)))
+    e.send(c2, {"t": "importTop", "requestId": "r", "path": "/project1/t"})
+    e.s.webSocketConnections[:] = [e.a, c2]
+    e.x.onDestroyTD()
+    assert set(e.s.closed) == {e.a, c2}   # every WebSocket peer closed by us
+    assert e.o.server.par.active.val == 0 and e.o.webrender.par.active.val == 0
+    assert not e.x.clients and e.x.active_id is None
+    assert e.x._imp is None and not e.x._imp_queue and not e.x._tops_held
+    assert json.loads(e.o.doc_state.text)["rev"] == 6   # the pending document state was stored
+    assert not e.o.net.frozen   # (nothing is locked: TD's undo snapshot predates this hook anyway)
+
+
+def test_after_destroy_the_pump_and_callbacks_do_nothing_and_never_restart():
+    e = settled_env()
+    e.x.onDestroyTD()
+    n = len(e.o.net.applies)
+    e.pump(5)
+    e.x.Start()
+    assert not e.x._started and len(e.o.net.applies) == n and e.o.server.par.active.val == 0
+    e.x.OnWebSocketText("127.0.0.1:1", "{}")
+    e.x.OnProjectSave(True)   # (a late callback must not raise)
+
+
+def test_on_destroy_td_survives_failing_operators_and_is_idempotent(capsys):
+    e = settled_env()
+    e.o.server.webSocketClose = lambda c: (_ for _ in ()).throw(RuntimeError("dead"))
+    e.o.server.webSocketConnections.append("127.0.0.1:9")
+    e.o._ops["webrender"] = None            # an operator that is already gone
+    e.x._save_undo_cache = lambda: (_ for _ in ()).throw(OSError("disk full"))
+    e.x.onDestroyTD()
+    e.x.onDestroyTD()
+    out = capsys.readouterr().out
+    assert "onDestroyTD/panel" in out and "onDestroyTD/undo cache" in out
+    assert e.o.server.par.active.val == 0
+
+
+# ----------------------------------------------------------------------------- undo of a delete / re-initialised extension
+
+def test_on_destroy_td_of_an_old_instance_after_reinit_does_not_touch_the_server():
+    e = settled_env()
+    e.o.ext = types.SimpleNamespace(RasterEditorExt=object())   # TD built the new instance first
+    e.x.onDestroyTD()
+    assert e.o.server.par.active.val == 1 and not e.s.closed and e.x.clients and e.x._started and not e.x._destroyed
+    e.o.ext = types.SimpleNamespace()                       # on a real delete the extension is already gone
+    e.x.onDestroyTD()
+    assert e.o.server.par.active.val == 0 and e.x._destroyed
+
+
+def cache_dirs(x):
+    import os
+    return sorted(n for n in (os.listdir(CACHE_ROOT) if os.path.isdir(CACHE_ROOT) else []) if n.startswith(x._undo_prefix()))
+
+
+def recreated(a, **kw):
+    """What TD's undo of the delete builds: the snapshot's stored document, blank unlocked Script TOPs, a new instance."""
+    b = Env(**kw)
+    b.o.doc_state.text = a.o.doc_state.text
+    return b
+
+
+def test_delete_during_a_pending_restore_leaves_the_locked_images_alone():
+    a = sized_env()
+    a.x.Freeze()
+    b = Env(like=a)
+    b.o.net.raise_on_apply = True
+    b.x.Start()
+    assert b.x._restore_pending
+    b.x.onDestroyTD()
+    assert all(t.lock for t in b.o.net.tops.values())   # the only copy of the pixels stays locked
+    assert not cache_dirs(b.x)
+
+
+def test_undo_of_the_delete_gets_the_pixels_back_from_the_side_cache():
+    a = sized_env()
+    want = {s: buf.copy() for s, buf in a.x.surfaces.items()}
+    a.x.onDestroyTD()
+    assert len(cache_dirs(a.x)) == 1
+    b = recreated(a)
+    b.x.Start()
+    b.pump(3)
+    assert not b.x._restore_pending
+    for s, buf in want.items():
+        assert (b.x.surfaces[s] == buf).all(), s
+    assert b.top(1).uploaded.shape == (10, 20, 4)   # re-uploaded to the Script TOP
+    assert not cache_dirs(b.x)                      # consumed
+
+
+def test_side_cache_converts_premultiplied():
+    a = sized_env()
+    a.x.onDestroyTD()
+    b = recreated(a, Premultiplied=0)
+    b.x.Start()
+    b.pump(3)
+    assert np.abs(b.x.surfaces[2].astype(int) - a.imgs[2][::-1].astype(int)).max() <= 1   # (alpha-200 straight pixels)
+
+
+def test_a_different_document_at_the_same_path_never_gets_the_deleted_pixels():
+    a = sized_env()
+    a.x.onDestroyTD()
+    other = json.loads(a.o.doc_state.text)
+    other["rev"] += 1   # same layers and slot sizes, another document (e.g. a component pasted later at this path)
+    d = Env()
+    d.o.doc_state.text = json.dumps(other)
+    d.x.Start()
+    d.pump(3)
+    assert d.x.surfaces[1].shape == (10, 20, 4) and not d.x.surfaces[1].any() and not d.x.surfaces[2].any()
+    assert not cache_dirs(d.x)   # and the stale cache is gone
+
+
+def test_a_different_layer_behind_a_slot_is_not_taken():
+    import os
+    a = sized_env()
+    a.x.onDestroyTD()
+    (name,) = cache_dirs(a.x)
+    mp = os.path.join(CACHE_ROOT, name, "meta.json")
+    meta = json.load(open(mp))
+    meta["slots"]["1"]["layer"] = "someone_else:pixel"
+    json.dump(meta, open(mp, "w"))
+    b = recreated(a)
+    b.x.Start()
+    b.pump(3)
+    assert not b.x.surfaces[1].any() and b.x.surfaces[2].any()   # only the slot whose layer matches
+
+
+def test_slots_restored_from_locked_images_or_carry_are_never_overwritten_by_the_cache():
+    a = sized_env()
+    a.x.Freeze()
+    locked = {s: t.uploaded.copy() for s, t in a.o.net.tops.items()}
+    a.x.onDestroyTD()   # (frozen + cached: both exist)
+    for s in a.o.net.tops:
+        a.x.surfaces[s][...] = 7   # change after the cache was written: the locked image is the truth
+    a.x.Freeze()
+    b = Env(like=a)
+    b.x.Start()
+    b.pump(3)
+    assert (b.x.surfaces[1] == 7).all() and (b.x.surfaces[2] == 7).all()   # the locked images win over the cache
+    # direct check of the skip set
+    c = recreated(sized_env())
+    c.x.Start()
+    c.pump(2)
+    c.x._restore_doc_hash = a.x._text_hash(c.o.doc_state.text)
+    c.x.surfaces[1][...] = 9
+    assert c.x._load_undo_cache({1, 2, 3}) == set() and (c.x.surfaces[1] == 9).all()
+
+
+def test_no_stored_document_removes_leftover_caches_and_the_restore_hash_is_unused():
+    a = sized_env()
+    a.x.onDestroyTD()
+    f = Env()
+    f.x.Start()
+    f.pump(3)
+    assert not f.x.surfaces and not cache_dirs(f.x)
+
+
+def test_old_side_caches_are_pruned_on_start_and_on_delete(tmp_path):
+    import os
+    e = Env()
+    e.x._cache_root = lambda: str(tmp_path)
+    old, new = tmp_path / "old", tmp_path / "new"
+    for d in (old, new):
+        d.mkdir()
+        (d / "meta.json").write_text("{}")
+    t = os.path.getmtime(old) - 7 * 3600
+    os.utime(old, (t, t))
+    e.x.Start()
+    assert not old.exists() and new.exists()
+    os.utime(new, (t, t))
+    e.x.onDestroyTD()
+    assert not new.exists()
+
+
+def test_side_cache_is_skipped_when_too_big(monkeypatch):
+    assert E.RasterEditorExt.UNDO_CACHE_MAX_BYTES == 256 << 20
+    a = sized_env()
+    monkeypatch.setattr(type(a.x), "UNDO_CACHE_MAX_BYTES", 10)
+    a.x.onDestroyTD()
+    assert not cache_dirs(a.x)
+
+
+def test_cache_is_written_by_a_worker_thread_and_an_immediate_undo_waits_for_it(monkeypatch):
+    import threading
+    import time as _t
+    a = sized_env()
+    a.x._sync_cache_writes = False
+    real_save = np.save
+    gate = threading.Event()
+    monkeypatch.setattr(E.np, "save", lambda *args, **kw: (gate.wait(5), real_save(*args, **kw))[1])
+    want = a.x.surfaces[1].copy()
+    t0 = _t.time()
+    a.x.onDestroyTD()
+    assert _t.time() - t0 < 1.0 and a.x._undo_writers   # the delete returned while the writer is still blocked
+    b = recreated(a)
+    threading.Timer(0.3, gate.set).start()
+    b.x.Start()    # the undo comes at once: it waits for the files
+    b.pump(3)
+    assert (b.x.surfaces[1] == want).all()
+    assert not a.x._undo_writers
+
+
+def test_a_failing_write_leaves_no_cache_and_a_damaged_cache_is_removed_without_raising(monkeypatch, capsys):
+    import os
+    a = sized_env()
+    monkeypatch.setattr(E.np, "save", lambda *a_, **k: (_ for _ in ()).throw(OSError("disk full")))
+    a.x.onDestroyTD()
+    monkeypatch.undo()
+    assert not cache_dirs(a.x) and "undo cache not written" in capsys.readouterr().out
+    c = sized_env()
+    c.x.onDestroyTD()
+    (name,) = cache_dirs(c.x)
+    open(os.path.join(CACHE_ROOT, name, "s1.npy"), "wb").write(b"garbage")
+    b = recreated(c)
+    b.x.Start()
+    b.pump(3)
+    assert not b.x._restore_pending and not cache_dirs(b.x)
+    c2 = sized_env()
+    c2.x.onDestroyTD()
+    (name,) = cache_dirs(c2.x)
+    open(os.path.join(CACHE_ROOT, name, "meta.json"), "w").write("{")
+    b2 = recreated(c2)
+    b2.x.Start()
+    b2.pump(3)
+    assert not cache_dirs(b2.x)
+
+
+def test_meta_is_written_atomically_last_and_the_root_is_private(tmp_path):
+    import os
+    import stat
+    a = sized_env()
+    a.x._cache_root = lambda: str(tmp_path / "root")
+    a.x.onDestroyTD()
+    root = tmp_path / "root"
+    assert stat.S_IMODE(os.stat(root).st_mode) == 0o700
+    (d,) = list(root.iterdir())
+    assert sorted(p.name for p in d.iterdir()) == ["meta.json", "s1.npy", "s2.npy", "s3.npy"]   # (no .tmp left)
+
+
+def test_a_cache_root_owned_by_someone_else_is_not_used(tmp_path, monkeypatch):
+    import os
+    a = sized_env()
+    a.x._cache_root = lambda: str(tmp_path)
+    monkeypatch.setattr(os, "getuid", lambda: os.stat(tmp_path).st_uid + 1)
+    a.x.onDestroyTD()
+    assert not list(tmp_path.iterdir())

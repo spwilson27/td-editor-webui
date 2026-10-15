@@ -1906,10 +1906,15 @@ def xf_scene(args, a_tf=XF_A):
         ed.send_canvas(XF_W, XF_H, "fixed")
         if not wait_for(lambda: out1_size() == [XF_W, XF_H], 4):
             return f"canvas did not become {XF_W}x{XF_H}: {out1_size()} status={status()!r}"
-        ed.send_doc(xf_layers(a_tf), 60)
-        fids = [ed.send_surface(1, (0, 0, 8, 8), a, (8, 8)), ed.send_surface(2, (0, 0, 128, 128), b, (128, 128)),
-                ed.send_surface(3, (0, 0, 16, 16), c, (16, 16)), ed.send_surface(4, (0, 0, 16, 16), m, (16, 16))]
-        if not wait_applied(ed, fids[-1], 6):
+        for attempt in range(3):   # (the real page may still be settling after a UI step: take over again and re-send)
+            if attempt:
+                ed.takeover()
+            ed.send_doc(xf_layers(a_tf), 60)
+            fids = [ed.send_surface(1, (0, 0, 8, 8), a, (8, 8)), ed.send_surface(2, (0, 0, 128, 128), b, (128, 128)),
+                    ed.send_surface(3, (0, 0, 16, 16), c, (16, 16)), ed.send_surface(4, (0, 0, 16, 16), m, (16, 16))]
+            if wait_applied(ed, fids[-1], 6):
+                break
+        else:
             return f"no `applied`: {ed.texts[-3:]} status={status()!r}"
         time.sleep(0.4)
     finally:
@@ -2349,6 +2354,116 @@ print(json.dumps({'help': (p.help or ''), 'style': p.style, 'ft': str(getattr(p,
     return ok_all, "\n        ".join(notes)
 
 
+def s30_delete_component(args):
+    """Deleting the COMP while clients are connected must not freeze TD (the Web Server DAT's destructor waits for idle HTTP
+    keep-alive connections, 10 s each), and undoing the delete must bring the document back with its pixels.
+    A throwaway copy (the exported .tox, loaded into a temp container; the live editor is switched off meanwhile: one port)
+    with a browser-like keep-alive HTTP client, a WebSocket client and its own panel page connected is deleted (inside an undo
+    block): the delete must return quickly, TD must stay responsive and the port must be free; then ui.undo.undo() recreates it
+    and its surfaces must be identical to before. Run last."""
+    path = os.path.join(ROOT, "dist", "raster_editor.tox")
+    was_active = td_json("print(json.dumps(int(comp.par.Active)))")
+    notes, ok_all = [], True
+    conns, ws = [], None
+    try:
+        td("comp.par.Active = 0")
+        time.sleep(0.5)
+        td(f"""
+old = op('/project1/_validate_load')
+if old: old.destroy()
+box = op('/project1').create(baseCOMP, '_validate_load')
+box.loadTox({path!r})
+""", 120)
+        time.sleep(2.0)   # the copy starts its server on the port and its panel page connects
+        info = td_json("""
+box = op('/project1/_validate_load'); c = box.children[0]
+x = c.ext.RasterEditorExt
+print(json.dumps({'name': c.name, 'started': x._started, 'token': x.token, 'port': int(c.op('webserver').par.port)}))
+""")
+        port = info["port"]
+        for _ in range(3):   # browser-like: HTTP/1.1 keep-alive connections left open
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+            c.request("GET", "/")
+            r = c.getresponse()
+            r.read()
+            notes.append(f"GET / -> {r.status}, Connection: {r.getheader('connection')}")
+            ok_all &= (r.getheader("connection") or "").lower() == "close"
+            conns.append(c)
+        ws = WS(port)
+        ws.send(P.ready("external", info["token"], False, "validate"))
+        hello = None
+        for _ in range(5):
+            m = ws.recv(1.0)
+            if isinstance(m, str) and json.loads(m)["t"] == "hello":
+                hello = json.loads(m)
+                break
+        ws.send(json.dumps({"t": "takeover"}))
+        ws.recv(1.0)
+        # a small document with pixels, so the undo has something to bring back
+        W = H = 64
+        ws.send(P.doc(1, [L("base", "base", size=(W, H)), L("p1", slot=1, size=(W, H))]))
+        px = np.random.RandomState(5).randint(0, 256, (H, W, 4), np.uint8)
+        px[..., 3] = 255
+        for m in P.encode_frames(P.TYPE_SURFACE, 1, W, H, (0, 0, W, H), px, slot=1):
+            ws.send(m)
+        sig_code = """
+import hashlib
+c = op('/project1/_validate_load').children[-1]
+x = c.ext.RasterEditorExt
+print(json.dumps({'sig': {str(s): hashlib.md5(b.tobytes()).hexdigest() for s, b in sorted(x.surfaces.items())},
+                  'clients': len(x.clients), 'doc': [x.doc_w, x.doc_h], 'nonblank': bool(x.surfaces.get(1) is not None and x.surfaces[1][..., 3].max() > 0)}))
+"""
+        before = wait_for(lambda: (lambda d: d if d["nonblank"] else None)(td_json(sig_code)), 5) or td_json(sig_code)
+        clients = before["clients"]
+        ok_all &= clients >= 2 and before["nonblank"]
+        notes.append(f"clients connected to the copy (its own panel page + ours): {clients} (>= 2 required); surfaces {list(before['sig'])}, pixels sent: {before['nonblank']}")
+        t0 = time.time()
+        td("""
+c = op('/project1/_validate_load').children[0]
+ui.undo.startBlock('validate delete')
+c.destroy()
+ui.undo.endBlock()
+""", 120)
+        dt = time.time() - t0
+        ok_all &= dt < 3.0
+        notes.append(f"deleting the COMP with {clients} client(s) and 3 keep-alive connections took {dt:.2f} s (< 3 s; 10-15 s before the fix)")
+        t1 = time.time()
+        alive = td_json("print(json.dumps(1))", 10) == 1
+        ok_all &= alive and time.time() - t1 < 2
+        notes.append(f"TD responsive afterwards: {alive}")
+        probe = socket.socket()
+        try:
+            free = bool(wait_for(lambda: probe.connect_ex(("127.0.0.1", port)) != 0, 5))
+        finally:
+            probe.close()
+        notes.append(f"port {port} released: {free}")
+        ok_all &= free
+        # undo of the delete: TD recreates the COMP from its snapshot; the pixels come back from the side cache
+        td("ui.undo.undo()")
+        time.sleep(1.5)
+        after = wait_for(lambda: (lambda d: d if d and d["nonblank"] else None)(td_json(sig_code.replace("children[-1]", "children[0]"))), 10)
+        same = bool(after) and after["sig"] == before["sig"]
+        ok_all &= same
+        notes.append(f"undo of the delete: COMP recreated with surfaces {list(after['sig']) if after else None}, pixels identical to before: {same}")
+    finally:
+        for c in conns:
+            try:
+                c.close()
+            except OSError:
+                pass
+        if ws is not None:
+            try:
+                ws.sock.close()
+            except OSError:
+                pass
+        td(f"""
+box = op('/project1/_validate_load')
+if box: box.destroy()
+comp.par.Active = {was_active}
+""")
+    return ok_all, "\n        ".join(notes)
+
+
 STEPS = [
     (1, "build component, no operator errors, document survives a rebuild", "build", False),
     (2, "web server serves the UI", "server", False),
@@ -2379,6 +2494,7 @@ STEPS = [
     (27, "real UI: Canvas Size anchors, Follow Input reset, input resolution while following / fixed", "uicanvas", True),
     (28, "renderLayer (Flatten source) equals TD's own rendering; errors", "renderlayer", False),
     (29, "Exportpath / Exportdoc round trip; guides + canvas persisted through loadTox", "export", False),
+    (30, "deleting the COMP with clients connected does not freeze TD; undo of the delete restores the pixels (run last)", "delete", False),
 ]
 FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinput": "s4_no_input", "scene": "s5_scene",
          "masks": "s6_masks", "view": "s7_view_stream", "latency": "s8_latency", "overlay": "s9_panel_overlay",
@@ -2387,7 +2503,7 @@ FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinp
          "help": "s17_param_help", "fonts": "s18_fonts", "topimport": "s19_top_import", "uitop": "s20_ui_top_import",
          "uitextshape": "s21_ui_text_shape", "uiselect": "s22_ui_selection_clip",
          "xform": "s23_transforms_td", "uixform": "s24_ui_transform_parity", "uipaintscaled": "s25_ui_paint_scaled",
-         "canvas": "s26_canvas_td", "uicanvas": "s27_ui_canvas", "renderlayer": "s28_render_layer", "export": "s29_export"}
+         "canvas": "s26_canvas_td", "uicanvas": "s27_ui_canvas", "renderlayer": "s28_render_layer", "export": "s29_export", "delete": "s30_delete_component"}
 
 
 def main():
