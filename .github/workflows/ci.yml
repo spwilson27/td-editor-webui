@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      # Perf budget tests are machine dependent; keep them out of CI (they skip when this is '0').
+      VITE_PERF: '0'
+      PERF: '0'
+      CI: 'true'
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Unit tests
+        run: npx vitest run --project unit
+      - name: Resolve Playwright version
+        id: pw
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Cache Playwright browsers
+        id: pwcache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+      - name: Install Chromium (with system deps)
+        if: steps.pwcache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+      - name: Install system deps only (browser cache hit)
+        if: steps.pwcache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+      - name: Browser tests (vitest, headless chromium)
+        run: npx vitest run --project browser
+      - name: Build
+        run: npm run build
+      - name: E2E (playwright)
+        run: npx playwright test
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-test-results
+          path: |
+            web/test-results
+            web/playwright-report
+          if-no-files-found: ignore
+
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: .github/workflows/ci.yml
+      - run: python -m pip install pytest numpy
+      - run: python -m pytest td/tests -q
