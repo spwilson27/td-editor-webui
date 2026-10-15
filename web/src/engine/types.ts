@@ -59,9 +59,20 @@ export interface LayerSpec {
   adjustment: AdjustmentSpec | null;
   text: TextSpec | null;
   shape: ShapeSpec | null;
-  rasterize: boolean;
+  sx: number; // v4: scale (> 0), doc = (x,y) + (sx,sy)·layer
+  sy: number;
+  surfaceW: number | null; // v4: pixel/base surface size; null for other kinds
+  surfaceH: number | null;
 }
-export interface DocSpec { rev: number; width: number; height: number; layers: LayerSpec[] }
+export interface Guides { h: number[]; v: number[] } // doc px: h = horizontal guides (y), v = vertical (x)
+export type CanvasMode = 'input' | 'fixed';
+export interface DocSpec {
+  rev: number; width: number; height: number; layers: LayerSpec[];
+  guides: Guides; canvas: { mode: CanvasMode };
+}
+export interface LayerTransform { x: number; y: number; sx: number; sy: number }
+export type Anchor = 'tl' | 't' | 'tr' | 'l' | 'c' | 'r' | 'bl' | 'b' | 'br';
+export interface SnapOptions { enabled: boolean; guides: boolean; canvas: boolean; layers: boolean; threshold: number /*screen px*/ }
 
 /** Read-only view of a layer for the UI. Thumbnails are drawn via EditorEngine.drawThumbnail. */
 export interface LayerInfo {
@@ -80,7 +91,9 @@ export interface LayerInfo {
   adjustment: AdjustmentSpec | null; // adjustment layers
   text: TextSpec | null; // text layers
   shape: ShapeSpec | null; // shape layers
-  rasterize: boolean; // text/shape: true = browser renders into a surface slot
+  transform: LayerTransform; // v4: pixel/base layers (identity for others)
+  surfaceW: number | null; // v4: pixel/base surface size
+  surfaceH: number | null;
 }
 
 export type ToolId =
@@ -202,8 +215,8 @@ export interface EditorEngine {
   addShapeLayer(spec: ShapeSpec): string;
   setText(id: string, spec: TextSpec): void; // coalesced history like opacity
   setShape(id: string, spec: ShapeSpec): void;
-  setRasterize(id: string, rasterize: boolean): void;
-  flattenLayer(id: string): void; // text/shape → pixel layer
+  /** v4: text/shape → pixel layer from pixels rendered by TD (straight RGBA, w×h, doc-space at 0,0). */
+  replaceWithPixels(id: string, rgba: Uint8Array | Uint8ClampedArray, w: number, h: number): void;
   setShapeTool(type: ShapeType): void; // shape drawn by the 'shape' tool
   textLayerAt(x: number, y: number): string | null; // hit test for the text tool (doc px)
   importImage(rgba: Uint8Array | Uint8ClampedArray, w: number, h: number, name: string): string;
@@ -212,6 +225,21 @@ export interface EditorEngine {
    *  match; 'canvas' = Canvas 2D paths (Chromium's own antialiasing). Not part of the document. */
   setShapeRenderer(mode: 'sdf' | 'canvas'): void;
   shapeRenderer(): 'sdf' | 'canvas';
+
+  // v4: transforms, canvas, guides, snapping (docs/DESIGN_V4.md)
+  setTransform(id: string, t: LayerTransform): void; // pixel/base layers; coalesced history like opacity
+  applyTransform(id: string): void; // bake a pixel layer's transform (resample; history)
+  layerBounds(id: string): Rect | null; // doc-space bounds (float) of the layer's content/surface
+  setCanvasSize(w: number, h: number, anchor: Anchor): void; // fixed mode; shifts transforms per anchor; history
+  setCanvasMode(mode: CanvasMode): void;
+  canvasMode(): CanvasMode;
+  guides(): Guides;
+  addGuide(axis: 'h' | 'v', pos: number): void;
+  moveGuide(axis: 'h' | 'v', index: number, pos: number): void;
+  removeGuide(axis: 'h' | 'v', index: number): void;
+  setSnap(opts: SnapOptions): void;
+  snapPoint(x: number, y: number, zoom: number): { x: number; y: number; guideX: number | null; guideY: number | null };
+  snapRect(r: Rect, zoom: number): { dx: number; dy: number; guideX: number | null; guideY: number | null };
 
   dispose(): void;
 }

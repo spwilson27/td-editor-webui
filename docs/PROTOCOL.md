@@ -165,3 +165,29 @@ that has not fetched for 10 s is stalled (no further notices of that kind until 
 | web → TD | `importTop` | `requestId`, `path` | snapshot that TOP once |
 | TD → web | `topReady` | `requestId`, `w`, `h` | fetch with `GET /top?token&client&requestId=` (frame type 6; `404` unknown/expired after 30 s) |
 | TD → web | `topError` | `requestId`, `msg` | path invalid, not a TOP, too large (> 8192²), or readback failed |
+
+## 7. Version 5 additions (DESIGN_V4)
+
+`ready.protocol` / `hello.protocol` = **5**. Changes to §1–6:
+
+- **LayerSpec:** `rasterize` removed (text/shape layers never have a `slot`; TD renders them from the
+  spec). New fields `sx`, `sy` (scale, > 0; 1 = identity) for every layer (used by pixel and base layers;
+  1 for others) and `surfaceW`, `surfaceH` (size of the layer's pixel surface for pixel and base layers,
+  `null` otherwise; a mask has the same size as its layer's surface). `x`, `y` (may be fractional) are
+  the doc-space position of the surface's top-left pixel; mapping `doc = (x,y) + (sx,sy)·layer`. The
+  base layer's `x, y, sx, sy` are the TD Input transform; its `surfaceW/H` are the input size.
+- **DocSpec message `doc`:** adds `guides: {h: number[], v: number[]}` and `canvas: {mode: "input" |
+  "fixed"}`; stored in `doc_state`, returned in `docState`.
+- **SURFACE / SURFACE_DUMP frames:** `docW/docH` header fields carry the **surface** size (stale check:
+  a frame whose size differs from that slot's current surface size is dropped). Rects lie inside the
+  surface.
+- **BASE frames:** `docW/docH` = the input's size (the base surface size), not the document size.
+- **`docSize`** keeps its meaning (document/canvas size) and gains `mode: "input" | "fixed"`; it no longer
+  implies reallocating surfaces. A base-size change (input resolution) is announced by the next BASE
+  notice's `docW/docH` and a `baseSize {w, h}` message.
+
+| Direction | `t` | Fields | Meaning |
+| --- | --- | --- | --- |
+| web → TD | `setCanvas` | `w`, `h`, `mode` | active client sets the canvas size / mode (`mode:"input"` = follow input; `w,h` ignored) |
+| TD → web | `baseSize` | `w`, `h` | TD Input resolution changed (or input (dis)connected: 0×0 = no input) |
+| web → TD | `renderLayer` | `requestId`, `layerId` | Flatten: render that text/shape layer alone at doc size; reply `topReady` / `topError` and `GET /top` as §6 (frame type 6, `docW/docH` = doc size) |
