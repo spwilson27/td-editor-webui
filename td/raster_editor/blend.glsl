@@ -7,13 +7,21 @@
 //   uXform   vec4  layer -> document mapping  doc = (x, y) + (sx, sy) * layer  (document pixels, top-left
 //                  origin, x/y fractional, sx/sy > 0).  Layer pixel (0,0) is the top-left texel of the source
 //                  (its size = textureSize of the source input).
-// uAdjust = 7: RESAMPLE pass (only exists for layers whose transform is not an integer offset at scale 1).
+// uAdjust = 7: RESAMPLE pass (exists for layers whose transform is not an integer offset at scale 1, and for
+//   layers with effects / a mask that must be applied before the effects: then it is the identity / integer case).
 //   Inputs: 0 = layer surface, 1 = mask surface (or the surface again when uHasMask = 0).  Output (document
 //   sized, custom resolution) = source * coverage * mask, premultiplied, in document space.  The mask covers the
-//   same layer rect (normalised coordinates).  Sampling: linear; trilinear mip level
-//   lod = max(0, -log2(sqrt(sx*sy)) - 0.5) (what Canvas 2D drawImage imageSmoothingQuality 'medium' does); the
-//   network sets this node's "Input Smoothness" to mipmap while lod > 0 and linear otherwise, input extend = hold.
-//   The pixel footprint is clipped to the source rect (coverage 0 outside -> transparent, fractional on the edge).
+//   same layer rect (normalised coordinates).
+//   AFFINE (v5): layer -> document  doc = T(x,y) . R(rot) . K(kx,ky) . S(sx,sy) . layer  (rot clockwise on screen,
+//   K = [[1, tan kx],[tan ky, 1]], about the surface's top-left, document top-left origin / y down).  In this pass
+//   uXform = (m00, m01, m10, m11) is the INVERSE of the linear part (document offset -> layer pixels) and
+//   uA.xy = (x, y), so  layer = M * (docPixelCentre - uA.xy).
+//   Coverage = area of (the document pixel's footprint, a parallelogram in layer space, clipped to the source rect
+//   by Sutherland-Hodgman) / footprint area: fractional on the rotated / skewed edges.  Sampling: linear at the pixel
+//   centre; trilinear mip level lod = max(0, -log2(sqrt(|det A|)) - 0.5) with A the forward linear part (the
+//   geometric mean of the singular values = Skia's area-scale rule; for pure scale = -0.5 log2(sx*sy) - 0.5, what
+//   Canvas 2D drawImage imageSmoothingQuality 'medium' does); the network sets this node's "Input Smoothness" to
+//   mipmap while lod > 0 and linear otherwise, input extend = hold.
 //   Only this pass ever reads through a mipmap filter; the blend passes below use texelFetch only.
 // uAdjust 0..6 (blend / adjust passes): inputs 0 = below, 1 = source, 2 = mask.  The source is at document
 //   size (a resample result, group result, adjustment source) or a surface placed by an INTEGER offset:
@@ -142,22 +150,73 @@ vec3 adjustFn(int k, vec3 c) {
     return hsv2rgb(vec3(h.x + uA.x, min(1.0, h.y * uA.y), h.z * uA.z));
 }
 
-// document pixel centre (top-left origin, continuous) -> layer pixels; samples source (input 0) and mask (input 1)
+// Clips the convex polygon p[0..n) to the half plane dot(v, nrm) >= d (Sutherland-Hodgman); returns the new count (<= 8).
+int clipPoly(inout vec2 p[8], int n, vec2 nrm, float d) {
+    vec2 q[8];
+    for (int i = 0; i < 8; i++) q[i] = vec2(0.0);
+    int m = 0;
+    for (int i = 0; i < 8; i++) {
+        if (i >= n) break;
+        vec2 a = p[i];
+        vec2 b = p[(i + 1) % n];
+        float da = dot(a, nrm) - d;
+        float db = dot(b, nrm) - d;
+        if (da >= 0.0 && m < 8) q[m++] = a;
+        if ((da >= 0.0) != (db >= 0.0) && m < 8) q[m++] = a + (b - a) * (da / (da - db));
+    }
+    for (int i = 0; i < 8; i++) p[i] = q[i];
+    return m;
+}
+
+// Fraction of the pixel footprint (the unit document pixel at c, mapped into layer pixels = a parallelogram with
+// centre l and half edges e0, e1) that lies inside the source rect [0, srcSz].
+float footprintCoverage(vec2 l, vec2 e0, vec2 e1, vec2 srcSz) {
+    vec2 ext = abs(e0) + abs(e1);
+    vec2 lo = l - ext, hi = l + ext;                       // bounding box of the footprint
+    if (hi.x <= 0.0 || hi.y <= 0.0 || lo.x >= srcSz.x || lo.y >= srcSz.y) return 0.0;
+    float area0 = abs(e0.x * e1.y - e0.y * e1.x) * 4.0;
+    if (area0 <= 1e-12) return 0.0;
+    if (e0.y == 0.0 && e1.x == 0.0) {                      // axis aligned: product of the 1-D overlaps
+        vec2 cv = clamp((min(l + ext, srcSz) - max(l - ext, vec2(0.0))) / (2.0 * ext), 0.0, 1.0);
+        return cv.x * cv.y;
+    }
+    if (lo.x >= 0.0 && lo.y >= 0.0 && hi.x <= srcSz.x && hi.y <= srcSz.y) return 1.0;
+    vec2 p[8];
+    p[0] = l - e0 - e1; p[1] = l + e0 - e1; p[2] = l + e0 + e1; p[3] = l - e0 + e1;
+    p[4] = p[5] = p[6] = p[7] = vec2(0.0);
+    int n = 4;
+    n = clipPoly(p, n, vec2(1.0, 0.0), 0.0);
+    n = clipPoly(p, n, vec2(-1.0, 0.0), -srcSz.x);
+    n = clipPoly(p, n, vec2(0.0, 1.0), 0.0);
+    n = clipPoly(p, n, vec2(0.0, -1.0), -srcSz.y);
+    float a2 = 0.0;
+    for (int i = 0; i < 8; i++) {
+        if (i >= n) break;
+        vec2 a = p[i], b = p[(i + 1) % n];
+        a2 += a.x * b.y - b.x * a.y;
+    }
+    return clamp(abs(a2) * 0.5 / area0, 0.0, 1.0);
+}
+
+// document pixel centre (top-left origin, continuous) -> layer pixels; samples source (input 0) and mask (input 1).
+// uXform = (m00, m01, m10, m11): the INVERSE linear map (document -> layer pixels), uA.xy = the layer's translation
+// (x, y) in document pixels:  l = M * (c - uA.xy).
 void resample() {
     vec2 outSize = uTDOutputInfo.res.zw;
     vec2 srcSz = vec2(textureSize(sTD2DInputs[0], 0));
-    vec2 sc = max(uXform.zw, vec2(1e-6));
     vec2 c = vec2(gl_FragCoord.x, outSize.y - gl_FragCoord.y);
-    vec2 l = (c - uXform.xy) / sc;
-    vec2 h = 0.5 / sc;                                   // half pixel footprint in layer pixels
-    vec2 cov2 = clamp((min(l + h, srcSz) - max(l - h, vec2(0.0))) / (2.0 * h), 0.0, 1.0);
-    float cov = cov2.x * cov2.y;
+    vec2 d = c - uA.xy;
+    vec2 l = vec2(uXform.x * d.x + uXform.y * d.y, uXform.z * d.x + uXform.w * d.y);
+    vec2 e0 = 0.5 * vec2(uXform.x, uXform.z);            // footprint half edges in layer pixels (document x / y)
+    vec2 e1 = 0.5 * vec2(uXform.y, uXform.w);
+    float cov = footprintCoverage(l, e0, e1, srcSz);
     vec4 src = vec4(0.0);
     if (cov > 0.0) {
-        bool exact = abs(sc.x - 1.0) < 1e-6 && abs(sc.y - 1.0) < 1e-6
-            && abs(uXform.x - floor(uXform.x + 0.5)) < 1e-4 && abs(uXform.y - floor(uXform.y + 0.5)) < 1e-4;
+        bool exact = abs(uXform.x - 1.0) < 1e-6 && abs(uXform.w - 1.0) < 1e-6 && abs(uXform.y) < 1e-6 && abs(uXform.z) < 1e-6
+            && abs(uA.x - floor(uA.x + 0.5)) < 1e-4 && abs(uA.y - floor(uA.y + 0.5)) < 1e-4;
         vec2 uv = vec2(l.x / srcSz.x, 1.0 - l.y / srcSz.y);
-        float lod = max(0.0, -0.5 * log2(sc.x * sc.y) - 0.5);
+        float det = abs(uXform.x * uXform.w - uXform.y * uXform.z);
+        float lod = max(0.0, 0.5 * log2(max(det, 1e-12)) - 0.5);       // sqrt(|det M|) layer px per document px
         ivec2 ip = ivec2(floor(l));
         float m = 1.0;
         if (exact) {

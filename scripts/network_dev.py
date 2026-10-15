@@ -91,6 +91,14 @@ def setup(doc_w: int = 64, doc_h: int = 64) -> None:
     net_src = open(os.path.join(ROOT, "td", "raster_editor", "network.py"), encoding="utf-8").read()
     glsl_src = open(os.path.join(ROOT, "td", "raster_editor", "blend.glsl"), encoding="utf-8").read()
     shape_src = open(os.path.join(ROOT, "td", "raster_editor", "shape.glsl"), encoding="utf-8").read()
+    fx_src = open(os.path.join(ROOT, "td", "raster_editor", "effects.py"), encoding="utf-8").read()
+    fx_dir = os.path.join(ROOT, "shared", "effects")
+    fx_common, fx_bodies = "", {}
+    if os.path.isfile(os.path.join(fx_dir, "common.glsl")):
+        fx_common = open(os.path.join(fx_dir, "common.glsl"), encoding="utf-8").read()
+        for t in ("dropShadow", "outerGlow", "innerGlow", "stroke", "bevel", "colorOverlay", "pixelSort", "glitch",
+                  "chromaticAberration", "halftone"):
+            fx_bodies[t] = open(os.path.join(fx_dir, t + ".glsl"), encoding="utf-8").read()
     code = PRELUDE + f'''
 p = op("/project1")
 if p.op("_netdev"): p.op("_netdev").destroy()
@@ -120,13 +128,17 @@ c.initializeExtensions()
 def _load(name, src):
     m = types.ModuleType(name); m.__dict__["__name__"] = name
     exec(compile(src, name, "exec"), m.__dict__); sys.modules[name] = m; return m
+GLSL_SRC = {glsl_src!r}
+FX_COMMON = {fx_common!r}
+FX_BODIES = {fx_bodies!r}
 net_mod = _load("re_network", {net_src!r})
+fx_mod = _load("re_effects", {fx_src!r})
 st = types.ModuleType("re_state"); sys.modules["re_state"] = st
 st.buffers = {{}}
 st.net_mod = net_mod
-st.glsl = {glsl_src!r}
+st.glsl = GLSL_SRC
 st.comp = c
-st.net = net_mod.DocNetwork(c, {glsl_src!r}, shape_glsl={shape_src!r})
+st.net = net_mod.DocNetwork(c, GLSL_SRC, shape_glsl={shape_src!r}, effects=fx_mod, effect_shaders={{t: FX_COMMON + chr(10) + b for t, b in FX_BODIES.items()}})
 st.w, st.h = {doc_w}, {doc_h}
 _emit("ok")
 '''
@@ -194,7 +206,7 @@ _emit("ok")
 
 def layer(id_, kind="pixel", **kw) -> dict:
     d = dict(id=id_, kind=kind, parentId=None, name=id_, visible=True, opacity=1.0, blend="normal",
-             x=0, y=0, sx=1.0, sy=1.0, surfaceW=None, surfaceH=None, slot=None, mask=None, adjustment=None)
+             x=0, y=0, sx=1.0, sy=1.0, rot=0.0, kx=0.0, ky=0.0, surfaceW=None, surfaceH=None, slot=None, mask=None, adjustment=None)
     d.update(kw)
     return d
 
@@ -688,7 +700,7 @@ _emit(1)
     out = read_out(True)
     ref = over("normal", np.tile(np.array([1.0, 0, 0, 1.0]), (S, S, 1)), A, 0.5)
     d = np.abs(out - ref).max() * 255
-    check("misc: base layer takes COMP input 1 when connected (base_src -> ../in1)", d < 1.0, f"max {d:.2f}")
+    check("misc: base layer takes COMP input 1 when connected (src_in1 -> ../in1)", d < 1.0, f"max {d:.2f}")
     td(PRELUDE + """
 st = _st(); st.comp.inputConnectors[0].disconnect(); _emit(1)
 """)
@@ -1044,11 +1056,13 @@ const fs = require('fs');
         const layer = document.createElement('canvas'); layer.width = W; layer.height = H;
         const lx = layer.getContext('2d');
         lx.imageSmoothingEnabled = true; lx.imageSmoothingQuality = q;
-        lx.drawImage(src, cs.x, cs.y, cs.sw * cs.sx, cs.sh * cs.sy);
+        if (cs.A) lx.setTransform(cs.A[0], cs.A[2], cs.A[1], cs.A[3], cs.x, cs.y);
+        const dr = (img) => cs.A ? lx.drawImage(img, 0, 0, cs.sw, cs.sh) : lx.drawImage(img, cs.x, cs.y, cs.sw * cs.sx, cs.sh * cs.sy);
+        dr(src);
         if (cs.mask) {
           const m = mk(cs.mask, cs.sw, cs.sh, true);
           lx.globalCompositeOperation = 'destination-in';
-          lx.drawImage(m, cs.x, cs.y, cs.sw * cs.sx, cs.sh * cs.sy);
+          dr(m);
           lx.globalCompositeOperation = 'source-over';
         }
         const o = document.createElement('canvas'); o.width = W; o.height = H;
@@ -1065,6 +1079,12 @@ const fs = require('fs');
 """
 
 
+def _affine(c):
+    sys.path.insert(0, os.path.join(ROOT, "td", "tests"))
+    import fakenet
+    return fakenet.affine_forward(c["sx"], c["sy"], c.get("rot", 0.0), c.get("kx", 0.0), c.get("ky", 0.0))
+
+
 def chromium_xform(cases, W, H):
     """Canvas 2D drawImage(smoothing) reference for each case -> list of {quality: premultiplied float (H, W, 4) 0..255}."""
     web = os.path.join(ROOT, "web")
@@ -1077,7 +1097,8 @@ def chromium_xform(cases, W, H):
         json.dump({"W": W, "H": H, "cases": [
             {"src": c["src"].ravel().tolist(), "sw": c["src"].shape[1], "sh": c["src"].shape[0],
              "mask": None if c.get("mask") is None else c["mask"].ravel().tolist(),
-             "x": c["x"], "y": c["y"], "sx": c["sx"], "sy": c["sy"], "opacity": c.get("opacity", 1.0)} for c in cases]},
+             "x": c["x"], "y": c["y"], "sx": c["sx"], "sy": c["sy"], "opacity": c.get("opacity", 1.0),
+             "A": None if not any(k in c for k in ("rot", "kx", "ky")) else _affine(c).ravel().tolist()} for c in cases]},
             open(inp, "w"))
         env = dict(os.environ, NODE_PATH=os.path.join(web, "node_modules"))
         r = subprocess.run(["node", js, inp, outp], cwd=web, capture_output=True, text=True, timeout=300, env=env)
@@ -1141,6 +1162,20 @@ def xform_cases():
         c("mask x2.5 at (4.5,3.25) op .8", A, 4.5, 3.25, 2.5, 2.5, "up", mask=MA, opacity=0.8),
         c("mask exact (6,5) x1", A, 6, 5, 1.0, 1.0, "exact", mask=MA),
         c("mask x0.5 at (4,4)", B, 4, 4, 0.5, 0.5, "down", mask=MB),
+        # v5 affine: rotation clockwise on screen, skew kx / ky (degrees), about the surface's top-left
+        c("rot 30 at (30,5)", B[:60, :80].copy(), 30, 5, 1.0, 1.0, "affine", rot=30.0),
+        c("rot -50 at (45,40) x1.3", B[:60, :80].copy(), 45, 40, 1.3, 1.3, "affine", rot=-50.0),
+        c("rot 90 at (70,5)", B[:60, :80].copy(), 70, 5, 1.0, 1.0, "affine", rot=90.0),
+        c("rot 180 at (80,70)", B[:50, :60].copy(), 80, 70, 1.0, 1.0, "affine", rot=180.0),
+        c("rot 12.5 sx1.5 sy0.8 at (8.25,4.5)", B[:40, :60].copy(), 8.25, 4.5, 1.5, 0.8, "affine", rot=12.5),
+        c("skew kx 25 at (5,8)", B[:50, :60].copy(), 5, 8, 1.0, 1.0, "affine", kx=25.0),
+        c("skew ky -20 at (6,40)", B[:50, :60].copy(), 6, 40, 1.0, 1.0, "affine", ky=-20.0),
+        c("rot 20 kx 15 ky 8 sx1.2 at (20.5,10.5)", B[:40, :60].copy(), 20.5, 10.5, 1.2, 1.2, "affine", rot=20.0, kx=15.0, ky=8.0),
+        c("rot 33 x0.5 at (30,4)", B, 30, 4, 0.5, 0.5, "affine-down", rot=33.0),
+        c("rot 20 kx 20 x0.4 at (10,15)", B, 10, 15, 0.4, 0.4, "affine-down", rot=20.0, kx=20.0),
+        c("mask rot 25 at (28,6) op .8", A, 28, 6, 2.0, 2.0, "affine", rot=25.0, mask=MA, opacity=0.8),
+        c("mask rot -35 x0.6 at (45,45)", B, 45, 45, 0.6, 0.6, "affine-down", rot=-35.0, mask=MB),
+        c("[stress, hard edges] checker rot 15 at (10,10)", K[:60, :80].copy(), 10, 10, 1.0, 1.0, "affine-stress", rot=15.0),
     ]
 
 
@@ -1153,23 +1188,26 @@ def test_xform():
         print("  (Chromium/Playwright unavailable: only the numpy comparison runs)")
     sys.path.insert(0, os.path.join(ROOT, "td", "tests"))
     import fakenet
-    worst = {"exact": [0, 0], "frac": [0, 0], "up": [0, 0], "down": [0, 0], "mixed": [0, 0], "stress": [0, 0]}
+    worst = {"exact": [0, 0], "frac": [0, 0], "up": [0, 0], "down": [0, 0], "mixed": [0, 0], "stress": [0, 0],
+             "affine": [0, 0], "affine-down": [0, 0], "affine-stress": [0, 0]}
+    affine_edge = []
     for i, cs in enumerate(cases):
         src = cs["src"]
         sh, sw = src.shape[:2]
         upload(1, src)
+        rk = dict(rot=cs.get("rot", 0.0), kx=cs.get("kx", 0.0), ky=cs.get("ky", 0.0))
         lay = layer("a", slot=1, x=cs["x"], y=cs["y"], sx=cs["sx"], sy=cs["sy"], surfaceW=sw, surfaceH=sh,
-                    opacity=cs.get("opacity", 1.0))
+                    opacity=cs.get("opacity", 1.0), **rk)
         if cs.get("mask") is not None:
             upload(2, cs["mask"])
             lay["mask"] = {"slot": 2, "enabled": True}
         apply([base_layer(), lay], DW, DH)
         out = read_out(True) * 255.0
         P = premul_f(src)
-        ref = fakenet.sample_reference(P, DW, DH, cs["x"], cs["y"], cs["sx"], cs["sy"])
+        ref = fakenet.sample_reference(P, DW, DH, cs["x"], cs["y"], cs["sx"], cs["sy"], **rk)
         if cs.get("mask") is not None:
             m = fakenet.sample_reference(cs["mask"][..., :1] / 255.0, DW, DH, cs["x"], cs["y"], cs["sx"], cs["sy"],
-                                         coverage=False)
+                                         coverage=False, **rk)
             ref = ref * m
         ref = ref * cs.get("opacity", 1.0) * 255.0
         # interior = every pixel whose footprint lies fully inside the source rect (coverage 1)
@@ -1177,6 +1215,10 @@ def test_xform():
         lx, ly = (ii + 0.5 - cs["x"]) / cs["sx"], (jj + 0.5 - cs["y"]) / cs["sy"]
         hx, hy = 0.5 / cs["sx"], 0.5 / cs["sy"]
         inner = (lx - hx >= 0) & (lx + hx <= sw) & (ly - hy >= 0) & (ly + hy <= sh)
+        if rk != dict(rot=0.0, kx=0.0, ky=0.0):
+            cov_ = fakenet.coverage_supersampled(_affine(cs), cs["x"], cs["y"], sw, sh, DW, DH)
+            full = cov_ == 1.0       # interior = footprints fully inside, one pixel away from any edge
+            inner = full & np.roll(full, 1, 0) & np.roll(full, -1, 0) & np.roll(full, 1, 1) & np.roll(full, -1, 1)
         edge = ~inner & (np.abs(out).sum(-1) + np.abs(ref).sum(-1) > 0)
         dn = np.abs(out - ref)
         line = f"  [{cs['name']}] ({inner.sum()} interior, {edge.sum()} edge px)\n      TD vs numpy: interior max {dn[inner].max():.2f}"
@@ -1193,8 +1235,12 @@ def test_xform():
             best = min(np.abs(out - chrome[i][q]).max(-1)[inner].max() for q in ("low", "medium"))
             worst[k][0] = max(worst[k][0], best)
         worst[cs["kind"]][1] = max(worst[cs["kind"]][1], dn[inner].max())
+        if cs["kind"].startswith("affine") and edge.any():
+            # edge pixels: TD's exact parallelogram coverage vs the numpy point-sampled coverage (and Chromium's AA)
+            affine_edge.append(np.abs(out - ref).max(-1)[edge].max())
+            line += f"\n      TD vs numpy edge pixels: max {affine_edge[-1]:.1f}, mean {np.abs(out - ref).max(-1)[edge].mean():.2f}"
         print(line)
-        lim = 0.6 if cs["kind"] == "exact" else 2.5 if cs["kind"] in ("frac", "up", "mixed") else 6.0
+        lim = 0.6 if cs["kind"] == "exact" else 2.5 if cs["kind"] in ("frac", "up", "mixed", "affine") else 6.0
         check(f"xform: TD vs numpy reference, {cs['name']}", dn[inner].max() < lim, f"interior max {dn[inner].max():.2f} (limit {lim})")
     if chrome is not None:
         check("xform: integer position at scale 1 vs Chromium canvas <= 3/255", worst["exact"][0] <= 3.0, f"{worst['exact'][0]:.1f}")
@@ -1203,6 +1249,15 @@ def test_xform():
                   f"{worst[k][0]:.1f}")
         check("xform: stress (hard-edged checker, noise) interiors vs Chromium canvas medium <= 8/255", worst["stress"][0] <= 8.0,
               f"{worst['stress'][0]:.1f}")
+        check("xform: rotated / skewed interiors vs Chromium canvas (best of low/medium) <= 8/255", worst["affine"][0] <= 8.0,
+              f"{worst['affine'][0]:.1f}")
+        check("xform: rotated / skewed minified interiors vs Chromium canvas (best of low/medium) <= 10/255", worst["affine-down"][0] <= 10.0,
+              f"{worst['affine-down'][0]:.1f}")
+        check("xform: rotated hard-edged stress interiors vs Chromium canvas <= 20/255", worst["affine-stress"][0] <= 20.0,
+              f"{worst['affine-stress'][0]:.1f}")
+    if affine_edge:
+        check("xform: rotated / skewed edge pixels vs the numpy point-sampled coverage <= 12/255 (32x32 sampling error)",
+              max(affine_edge) <= 12.0, f"{max(affine_edge):.1f}")
 
 
 def test_xform_base_and_flatten():
@@ -1302,6 +1357,285 @@ _emit({{"w": op_.width, "h": op_.height, "name": op_.name, "same": tok == net.re
               t["w"] == DW and t["h"] == DH and ink > 50 and d < 1.5 and t['same'], f"{t['w']}x{t['h']} node {t['name']}, {ink} inked px, max diff {d:.2f}/255")
 
 
+def _over(below, src):
+    """premultiplied float source-over (normal blend)"""
+    return src + below * (1.0 - src[..., 3:4])
+
+
+def _input_script(n, arr_td_order):
+    """In TOP ``in<n>`` inside the scratch COMP, fed by a Script TOP of the given premultiplied float image (TD row order)."""
+    h, w = arr_td_order.shape[:2]
+    path = os.path.join(WORK, f"input_{n}.npy")
+    np.save(path, np.ascontiguousarray(arr_td_order.astype(np.float32)))
+    td(PRELUDE + f"""
+p = op("/project1")
+for nm in ("_netdev_src{n}", "_netdev_src{n}_cb"):
+    if p.op(nm): p.op(nm).destroy()
+s = p.create(scriptTOP, "_netdev_src{n}")
+s.par.outputresolution = "custom"; s.par.resolutionw = {w}; s.par.resolutionh = {h}
+cb = p.create(textDAT, "_netdev_src{n}_cb")
+cb.text = "import numpy as np\\ndef onCook(scriptOp):\\n    scriptOp.copyNumpyArray(np.load({path!r}))\\n"
+s.par.callbacks = cb
+c = _st().comp
+if not c.op("in{n}"): c.create(inTOP, "in{n}")
+s.cook(force=True)
+_emit([s.width, s.height])
+""")
+
+
+def _connect_input(n, on=True):
+    td(PRELUDE + f"""
+c = _st().comp
+n = {n}
+if {on!r}:
+    c.inputConnectors[n - 1].connect(op("/project1/_netdev_src" + str(n)))
+else:
+    c.inputConnectors[n - 1].disconnect()
+_emit(1)
+""")
+
+
+def test_inputs():
+    """v6 multiple inputs: three In TOPs of different sizes, several input layers (transform / rotation / mask / blend),
+    a disconnected input stays transparent and keeps its placement on reconnection; compared with the numpy reference."""
+    sys.path.insert(0, os.path.join(ROOT, "td", "tests"))
+    import fakenet
+    DW, DH = 96, 80
+    setup(DW, DH)
+    A, B, MA, MB, K = xform_sources()
+    imgs = {1: B[:90, :120].copy(), 2: A.copy(), 3: K[:50, :70].copy()}
+    for n, im in imgs.items():
+        _input_script(n, premul_f(im)[::-1])
+    for n in (1, 2, 3):
+        _connect_input(n)
+    upload(7, MB[:50, :70].copy())
+    mask3 = {"slot": 7, "enabled": True}
+    specs = [
+        dict(id="i1", input=1, x=-8.0, y=-5.0, sx=0.8, sy=0.8),
+        dict(id="i2", input=2, x=30.5, y=10.25, sx=2.0, sy=2.0, rot=20.0),
+        dict(id="i3", input=3, x=40.0, y=35.0, sx=0.9, sy=0.9, rot=-15.0, kx=10.0, opacity=0.8, blend="normal", mask=mask3),
+    ]
+
+    def layers(skip=()):
+        return [layer(sp["id"], "input", **{k: v for k, v in sp.items() if k != "id"},
+                      surfaceW=imgs[sp["input"]].shape[1], surfaceH=imgs[sp["input"]].shape[0])
+                for sp in specs if sp["id"] not in skip]
+
+    def reference(skip=()):
+        acc = np.zeros((DH, DW, 4))
+        edge = np.zeros((DH, DW), bool)
+        for sp in specs:
+            if sp["id"] in skip:
+                continue
+            im = imgs[sp["input"]]
+            P = premul_f(im)
+            kw = dict(rot=sp.get("rot", 0.0), kx=sp.get("kx", 0.0), ky=sp.get("ky", 0.0))
+            r = fakenet.sample_reference(P, DW, DH, sp["x"], sp["y"], sp["sx"], sp["sy"], **kw)
+            if sp.get("mask"):
+                r = r * fakenet.sample_reference(MB[:50, :70, :1] / 255.0, DW, DH, sp["x"], sp["y"], sp["sx"], sp["sy"], coverage=False, **kw)
+            r = r * sp.get("opacity", 1.0)
+            acc = _over(acc, r)
+            cov = fakenet.coverage_supersampled(fakenet.affine_forward(sp["sx"], sp["sy"], **kw), sp["x"], sp["y"], im.shape[1], im.shape[0], DW, DH)
+            e = (cov > 0) & (cov < 1)
+            edge |= e | np.roll(e, 1, 0) | np.roll(e, -1, 0) | np.roll(e, 1, 1) | np.roll(e, -1, 1)
+        return acc * 255.0, edge
+
+    def compare(label, skip=()):
+        apply(layers(skip), DW, DH)
+        out = read_out(True) * 255.0
+        ref, edge = reference(skip)
+        d = np.abs(out - ref).max(-1)
+        check(f"inputs: {label}: TD vs numpy (non-edge pixels)", d[~edge].max() < 3.5,
+              f"max {d[~edge].max():.2f} over {int((~edge).sum())} px ({int((ref[..., 3] > 0).sum())} inked)")
+        return out
+
+    r = td(PRELUDE + "st = _st(); _emit([[bool(i.connections) for i in st.comp.inputConnectors]])")
+    print("  COMP input connectors connected:", r)
+    full = compare("3 input layers (120x90, 40x30, 70x50 sources; rotation, skew, mask, opacity)")
+    st = td(PRELUDE + "_emit(_st().net.stats())")
+    check("inputs: one src_in<N> Select per referenced input, selects of the connected inputs", st["by_type"].get("selectTOP") == 3,
+          json.dumps(st["by_type"]))
+    td(PRELUDE + "_emit(1)")
+    _connect_input(2, False)
+    apply(layers(), DW, DH)
+    out = read_out(True) * 255.0
+    ref, edge = reference(skip=("i2",))
+    d = np.abs(out - ref).max(-1)
+    check("inputs: disconnected input 2 renders transparent (the other layers are untouched)", d[~edge].max() < 3.5, f"max {d[~edge].max():.2f}")
+    nx = td(PRELUDE + "_emit(['xf_L_i2' in _st().net._ops, str(_st().net._ops['src_in2'].par.top.val)])")
+    check("inputs: no resample pass for a disconnected input, its select points at blank", nx == [False, "blank"], str(nx))
+    _connect_input(2, True)
+    apply(layers(), DW, DH)
+    again = read_out(True) * 255.0
+    check("inputs: reconnecting restores the same placement (spec unchanged)", np.abs(again - full).max() < 0.5, f"max {np.abs(again - full).max():.2f}")
+    # input 3 swaps resolution (placement kept, new size is picked up by the resample pass)
+    _input_script(3, premul_f(K[:60, :100])[::-1].copy())
+    imgs[3] = K[:60, :100].copy()
+    apply(layers(), DW, DH)
+    out = read_out(True) * 255.0
+    check("inputs: an input changing resolution is resampled at its new size", np.abs(out - full).max() > 5.0)
+    # blend mode between two inputs
+    imgs[3] = K[:50, :70].copy()
+    _input_script(3, premul_f(imgs[3])[::-1].copy())
+    apply([layer("a", "input", input=1, surfaceW=120, surfaceH=90), layer("b", "input", input=3, blend="multiply", x=5.0, y=5.0, surfaceW=70, surfaceH=50)], DW, DH)
+    o = read_out(True)
+    P1 = fakenet.sample_reference(premul_f(imgs[1]), DW, DH, 0, 0, 1.0, 1.0)
+    P3 = fakenet.sample_reference(premul_f(imgs[3]), DW, DH, 5, 5, 1.0, 1.0)
+    exp = P1.copy()
+    inside = P3[..., 3] > 0
+    mult = P1[..., :3] * P3[..., :3]            # opaque sources: multiply == product of straight colours
+    exp[inside, :3] = mult[inside]
+    check("inputs: blend modes apply between input layers (multiply)", np.abs(o[..., :3] - exp[..., :3])[inside].max() * 255 < 2.5,
+          f"max {np.abs(o[..., :3] - exp[..., :3])[inside].max() * 255:.2f}")
+    # movable / deletable: delete an input layer, the select for its input goes away
+    apply(layers(skip=("i1", "i3")), DW, DH)
+    ks = td(PRELUDE + "_emit(sorted(n for n in _st().net._ops if n.startswith('src_in')))")
+    check("inputs: deleting input layers drops their selects", ks == ["src_in2"], str(ks))
+    td(PRELUDE + """
+p = op("/project1")
+for n in (1, 2, 3):
+    for nm in ("_netdev_src%d" % n, "_netdev_src%d_cb" % n):
+        if p.op(nm): p.op(nm).destroy()
+_emit(1)
+""")
+
+
+def test_effects_net():
+    """Effects wiring on the live GPU: chain nodes compile and cook, exact / rotated / masked layers, shape effects,
+    parameter edits, removal back to the pool."""
+    sys.path.insert(0, os.path.join(ROOT, "td", "tests"))
+    import fakenet
+    DW, DH = 96, 80
+    setup(DW, DH)
+    A, B, MA, MB, K = xform_sources()
+    src = B[:50, :60].copy()
+    sh, sw = src.shape[:2]
+    upload(1, src)
+    upload(2, MB[:50, :60].copy())
+    P = premul_f(src)
+    blue = {"r": 0, "g": 0, "b": 255, "a": 255}
+    ov = {"type": "colorOverlay", "enabled": True, "opacity": 1.0, "color": blue}
+
+    def chain_errors():
+        return td(PRELUDE + """
+net = _st().net
+errs = []
+for lid, ch in net._chains.items():
+    for n in ch.nodes:
+        n.cook(force=True)
+        e = n.errors(recurse=False)
+        if e: errs.append([n.name, e])
+_emit(errs)
+""")
+
+    # 1. integer offset + overlay: the exact path through the staged resample pass
+    apply([layer("a", slot=1, x=7, y=5, surfaceW=sw, surfaceH=sh, effects=[ov])], DW, DH)
+    out = read_out(True) * 255.0
+    ref = fakenet.sample_reference(P, DW, DH, 7, 5, 1.0, 1.0)
+    exp = np.concatenate([np.zeros_like(ref[..., :2]), ref[..., 3:4], ref[..., 3:4]], -1) * 255.0       # blue * alpha
+    d = np.abs(out - exp).max()
+    check("effects: colour overlay on an integer-offset pixel layer (staged exact resample + chain)", d < 2.0, f"max {d:.2f}")
+    check("effects: no GPU errors in the chain nodes", chain_errors() == [], str(chain_errors()))
+    # 2. rotated + masked + overlay at 0.6 opacity (mask applied BEFORE the effect)
+    ov2 = dict(ov, opacity=0.6)
+    lay = layer("a", slot=1, x=30.5, y=10.25, sx=1.3, sy=1.3, rot=25.0, surfaceW=sw, surfaceH=sh, mask={"slot": 2, "enabled": True}, effects=[ov2])
+    apply([lay], DW, DH)
+    out = read_out(True) * 255.0
+    kw = dict(rot=25.0)
+    r = fakenet.sample_reference(P, DW, DH, 30.5, 10.25, 1.3, 1.3, **kw)
+    m = fakenet.sample_reference(MB[:50, :60, :1] / 255.0, DW, DH, 30.5, 10.25, 1.3, 1.3, coverage=False, **kw)
+    cont = r * m
+    k = 0.6
+    exp = np.concatenate([cont[..., :3] * (1 - k), cont[..., 3:4]], -1)
+    exp[..., 2] += k * cont[..., 3]
+    cov = fakenet.coverage_supersampled(fakenet.affine_forward(1.3, 1.3, **kw), 30.5, 10.25, sw, sh, DW, DH)
+    e = (cov > 0) & (cov < 1)
+    e = e | np.roll(e, 1, 0) | np.roll(e, -1, 0) | np.roll(e, 1, 1) | np.roll(e, -1, 1)
+    d = np.abs(out - exp * 255.0).max(-1)
+    check("effects: rotated + masked pixel layer, overlay 60% (content masked first)", d[~e].max() < 3.5, f"max {d[~e].max():.2f}")
+    # 3. drop shadow on a shape with a mask: shadow below, offset, no blur
+    shadow = {"type": "dropShadow", "enabled": True, "blur": 0.0, "dx": 9.0, "dy": 6.0, "opacity": 1.0, "color": {"r": 0, "g": 0, "b": 0, "a": 255}}
+    rect = {"type": "rect", "x": 10.0, "y": 8.0, "w": 30.0, "h": 24.0, "radius": 0, "fill": fill_(), "stroke": stroke_(on=False), "rotation": 0}
+    apply([shape_layer("s", dict(rect), effects=[shadow])], DW, DH)
+    out = read_out(True)
+    solid = out[16, 20]            # inside the rect
+    sh_only = out[36, 45]          # inside the shifted rect (x 19..49, y 14..38), outside the original (x 10..40, y 8..32)
+    none = out[60, 80]
+    check("effects: drop shadow below a shape (offset 9,6): content on top, black shadow outside it, nothing elsewhere",
+          solid[3] > 0.99 and solid[0] > 0.8 and sh_only[3] > 0.99 and sh_only[:3].max() < 0.01 and none[3] == 0.0,
+          f"content {np.round(solid, 2)}, shadow-only {np.round(sh_only, 2)}, outside {np.round(none, 2)}")
+    check("effects: shape chain nodes compile (no GPU errors)", chain_errors() == [], str(chain_errors()))
+    # 4. edits, removal
+    st0 = td(PRELUDE + "_emit(_st().net.stats())")
+    r = apply([shape_layer("s", dict(rect), effects=[dict(shadow, dx=12.0)])], DW, DH)
+    check("effects: a parameter edit creates / destroys / rewires nothing", r["stats"]["last"]["created"] == 0 and r["stats"]["last"]["connects"] == 0
+          and r["stats"]["last"]["destroyed"] == 0 and 0 < r["stats"]["last"]["par_sets"] <= 4, json.dumps(r["stats"]["last"]))
+    r = apply([shape_layer("s", dict(rect), effects=[dict(shadow, enabled=False)])], DW, DH)
+    out2 = read_out(True)
+    check("effects: all effects disabled -> chain removed, shape renders plain", r["stats"]["fx_chains"] == 0 and out2[36, 45, 3] == 0.0,
+          f"fx_chains {r['stats']['fx_chains']}, pixel {out2[36, 45]}")
+    settle()
+    # a recycled effect node must serve a normal blend again (vector names restored)
+    apply([layer("a", slot=1, x=7, y=5, surfaceW=sw, surfaceH=sh, blend="multiply"), layer("b", slot=1, x=20, y=15, surfaceW=sw, surfaceH=sh,
+           adjustment=None)], DW, DH)
+    adj_l = layer("adj", "adjustment", adjustment={"type": "invert"})
+    apply([layer("a", slot=1, x=7, y=5, surfaceW=sw, surfaceH=sh), adj_l], DW, DH)
+    out3 = read_out(True)
+    ref3 = fakenet.sample_reference(P, DW, DH, 7, 5, 1.0, 1.0)
+    inside = ref3[..., 3] > 0.99
+    straight = ref3[..., :3]
+    check("effects: nodes recycled from a removed chain work as plain blend / adjustment nodes", np.abs(out3[..., :3] - (1 - straight))[inside].max() * 255 < 2.0,
+          f"max {np.abs(out3[..., :3] - (1 - straight))[inside].max() * 255:.2f}")
+
+
+def test_effects_perf():
+    W, H = 1920, 1080
+    setup(W, H)
+    td(PRELUDE + f"""
+st = _st(); rng = np.random.default_rng(1)
+a = rng.integers(0, 256, (64, 64, 4), dtype=np.uint8)
+st.buffers[1] = np.ascontiguousarray(np.tile(a, ({H} // 64 + 1, {W} // 64 + 1, 1))[:{H}, :{W}])
+_emit(1)
+""", timeout=300)
+    shadow = {"type": "dropShadow", "enabled": True, "blur": 8.0, "dx": 6.0, "dy": 6.0, "opacity": 0.7, "color": {"r": 0, "g": 0, "b": 0, "a": 255}}
+    ov = {"type": "colorOverlay", "enabled": True, "opacity": 0.5, "color": {"r": 255, "g": 0, "b": 0, "a": 255}}
+
+    def gpu():
+        code = PRELUDE + """
+net = _st().net
+tops = [c for c in net.doc.children if c.isTOP]
+g = sum(c.gpuCookTime for c in tops if c.OPType == "glslTOP")
+net.surface_top(1).cook(force=True)
+net.output().cook(force=True)
+_emit({"g": g})
+"""
+        rows = [td(code, timeout=120)["g"] for _ in range(24)][6:]
+        return float(np.median(rows))
+    mk = lambda fx, rot=0.0: [layer("a", slot=1, x=3.0, y=2.0, rot=rot, surfaceW=W, surfaceH=H, effects=fx)]
+    res = {}
+    for label, ls in (("no effects", mk([])), ("colour overlay", mk([ov])), ("drop shadow r8 (2 passes)", mk([shadow])),
+                      ("shadow + overlay, rotated 12 deg", mk([shadow, ov], 12.0))):
+        apply(ls, W, H)
+        settle()
+        res[label] = gpu()
+        print(f"  GPU cook, one full-size layer @1080p, {label:34s}: median {res[label]:.2f} ms")
+    times = []
+    cur = mk([shadow, ov])
+    apply(cur, W, H)
+    for i in range(20):
+        cur[0]["effects"][0] = dict(shadow, dx=6.0 + i, opacity=0.5 + 0.02 * i)
+        times.append(apply(json.loads(json.dumps(cur)), W, H)["ms"])
+    check("effects perf: apply() for an effect parameter edit < 1 ms (median)", float(np.median(times)) < 1.0,
+          f"{np.median(times):.2f} ms (max {max(times):.2f})")
+    times = []
+    for i in range(10):
+        ls = mk([shadow, ov] if i % 2 == 0 else [])
+        times.append(apply(ls, W, H)["ms"])
+        settle()
+    print(f"  apply() add/remove effect chain (3 passes): median {np.median(times):.2f} ms max {max(times):.2f} ms")
+    check("effects perf: apply() adding / removing a 3-pass chain < 10 ms (pooled nodes)", max(times) < 10.0, f"max {max(times):.2f} ms")
+
+
 def test_xform_perf():
     W, H = 1920, 1080
     setup(W, H)
@@ -1325,6 +1659,9 @@ _emit(1)
                 kw.update(x=(i * 3) % 40 + 0.5, y=(i * 5) % 30 + 0.25, sx=1.0 + 0.02 * i, sy=1.0 + 0.02 * i)
             elif mode == "mip":
                 kw.update(x=(i * 3) % 40 + 0.5, y=(i * 5) % 30 + 0.25, sx=0.45, sy=0.45)
+            elif mode == "rotated":      # v5 affine: every layer rotated (+ some skew), parallelogram coverage on every pixel
+                kw.update(x=(i * 3) % 40 + 0.5, y=(i * 5) % 30 + 0.25, sx=1.0 + 0.02 * i, sy=1.0 + 0.02 * i,
+                          rot=5.0 + 2.0 * i, kx=(8.0 if i % 3 == 0 else 0.0))
             if i % 4 == 1:
                 kw["mask"] = {"slot": 100 + i // 4 % 3, "enabled": True}
             ls.append(layer(f"p{i}", **kw))
@@ -1343,7 +1680,7 @@ _emit({"g": g})
         return float(np.median(rows)), float(max(rows))
 
     res = {}
-    for mode in ("identity", "int-offset", "bilinear", "mip"):
+    for mode in ("identity", "int-offset", "bilinear", "mip", "rotated"):
         apply(doc(mode), W, H)
         settle()
         res[mode] = gpu_cook()
@@ -1351,6 +1688,9 @@ _emit({"g": g})
     over = (res["bilinear"][0] - res["int-offset"][0]) / n
     check("xform perf: a resample pass (bilinear, full-size layer @1080p) adds < 0.2 ms over the exact path",
           over < 0.2, f"{over:.3f} ms per layer ({res['bilinear'][0]:.2f} vs {res['int-offset'][0]:.2f} ms for 16 layers)")
+    over_rot = (res["rotated"][0] - res["int-offset"][0]) / n
+    check("xform perf: a rotated / skewed resample pass (full-size layer @1080p) adds < 0.35 ms over the exact path",
+          over_rot < 0.35, f"{over_rot:.3f} ms per layer ({res['rotated'][0]:.2f} vs {res['int-offset'][0]:.2f} ms for 16 layers)")
     setup(W, H)
     td(PRELUDE + f"""
 st = _st(); rng = np.random.default_rng(1)
@@ -1401,9 +1741,13 @@ _emit(1)
     t_move = edit(lambda c, i: c[5].__setitem__("x", 10.0 + 0.25 * i))
     t_scale = edit(lambda c, i: (c[6].__setitem__("sx", 1.0 + 0.01 * i), c[6].__setitem__("sy", 1.0 + 0.01 * i)))
     t_drag = edit(lambda c, i: (c[7].__setitem__("sx", 0.9 - 0.02 * i), c[7].__setitem__("sy", 0.9 - 0.02 * i), c[7].__setitem__("x", i)))
+    t_rot = edit(lambda c, i: (c[8].__setitem__("rot", 3.0 + 0.5 * i), c[8].__setitem__("kx", 0.25 * i)))
+    t_rotmip = edit(lambda c, i: (c[9].__setitem__("rot", 3.0 + 4 * i), c[9].__setitem__("sx", 0.9 - 0.02 * i), c[9].__setitem__("sy", 0.9 - 0.02 * i)))
+    print(f"  apply() rotate/skew edit (17 layers @1080p): rotate {med(t_rot):.2f}/{max(t_rot):.2f} ms, rotate+scale across the mip threshold "
+          f"{med(t_rotmip):.2f}/{max(t_rotmip):.2f} ms")
     print(f"  apply() transform edit (17 layers @1080p): move {med(t_move):.2f}/{max(t_move):.2f} ms, scale {med(t_scale):.2f}/{max(t_scale):.2f} ms, "
           f"scale across the mip threshold {med(t_drag):.2f}/{max(t_drag):.2f} ms")
-    worst = max(med(t_move), med(t_scale), med(t_drag))
+    worst = max(med(t_move), med(t_scale), med(t_drag), med(t_rot), med(t_rotmip))
     check("xform perf: apply() for a transform edit < 1 ms (median)", worst < 1.0, f"{worst:.2f} ms")
 
 
@@ -2176,8 +2520,14 @@ def main() -> int:
             test_xform()
         if which in ("all", "xform"):
             test_xform_base_and_flatten()
+        if which in ("all", "inputs"):
+            test_inputs()
+        if which in ("all", "effects"):
+            test_effects_net()
         if which in ("all", "xperf"):
             test_xform_perf()
+        if which in ("all", "fxperf"):
+            test_effects_perf()
         if which in ("all", "view"):
             test_view()
         if which in ("all", "persist"):

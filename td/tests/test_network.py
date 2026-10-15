@@ -89,9 +89,9 @@ def test_build_chain_wiring(env):
     net, comp, log, _ = env
     net.apply(stack_of_three(), W, H)
     # chain bottom -> top, each blend takes the previous as input 0 and its surface as input 1
-    assert source_of(net, "blend_base", 0) == "blank"
-    assert source_of(net, "blend_base", 1) == "base_src"
-    assert source_of(net, "blend_L_a", 0) == "blend_base"
+    assert source_of(net, "blend_L_base", 0) == "blank"
+    assert source_of(net, "blend_L_base", 1) == "src_in1"
+    assert source_of(net, "blend_L_a", 0) == "blend_L_base"
     assert source_of(net, "blend_L_a", 1) == "s1"
     assert source_of(net, "blend_L_b", 0) == "blend_L_a"
     assert source_of(net, "blend_L_b", 1) == "s2"
@@ -100,7 +100,7 @@ def test_build_chain_wiring(env):
     assert source_of(net, "out", 0) == "blend_L_c"
     assert net.output() is net._ops["out"]
     # all three glsl inputs are always wired (sTD2DInputs[] is sized by the wired inputs)
-    for r in ("blend_base", "blend_L_a", "blend_L_b", "blend_L_c"):
+    for r in ("blend_L_base", "blend_L_a", "blend_L_b", "blend_L_c"):
         assert source_of(net, r, 2) == "blank"
 
 
@@ -161,7 +161,7 @@ def test_hidden_layer_is_bypassed(env):
 def test_node_layout_is_columnar_and_distinct(env):
     net, comp, log, _ = env
     net.apply(stack_of_three(), W, H)
-    ys = [net._ops[r].nodeY for r in ("blend_base", "blend_L_a", "blend_L_b", "blend_L_c")]
+    ys = [net._ops[r].nodeY for r in ("blend_L_base", "blend_L_a", "blend_L_b", "blend_L_c")]
     assert ys == sorted(ys, reverse=True) and len(set(ys)) == 4          # one row per layer, top of stack lowest on screen
     assert net._ops["s1"].nodeX < net._ops["blend_L_a"].nodeX              # surfaces left of the blend column
 
@@ -225,7 +225,7 @@ def test_reorder_only_rewires(env):
     net.apply([base(), b, a, c], W, H)
     d = log.since(m)
     assert not d["creates"] and not d["destroys"] and not d["par_sets"]
-    assert source_of(net, "blend_L_b", 0) == "blend_base"
+    assert source_of(net, "blend_L_b", 0) == "blend_L_base"
     assert source_of(net, "blend_L_a", 0) == "blend_L_b"
     assert source_of(net, "blend_L_c", 0) == "blend_L_a"
     assert len(d["connects"]) <= 6
@@ -599,20 +599,20 @@ def test_name_sanitising_and_collisions(env):
 def test_orphans_are_attached_to_root(env):
     net, comp, log, _ = env
     net.apply([base(), px("a", 1, parentId="missing")], W, H)
-    assert source_of(net, "blend_L_a", 0) == "blend_base"
+    assert source_of(net, "blend_L_a", 0) == "blend_L_base"
 
 
 def test_input_connection_switches_base_source(env):
     net, comp, log, _ = env
     net.apply([base(), px("a", 1)], W, H)
-    assert net._ops["base_src"].par.value("top") == "blank"
+    assert net._ops["src_in1"].par.value("top") == "blank"
     comp.inputConnectors[0].source = comp.in1          # any connected source
     m = log.mark()
     net.apply([base(), px("a", 1)], W, H)               # apply detects the change itself
-    assert net._ops["base_src"].par.value("top") == "../in1"
+    assert net._ops["src_in1"].par.value("top") == "../in1"
     assert len(log.since(m)["par_sets"]) == 1
     net.set_input_connected(False)
-    assert net._ops["base_src"].par.value("top") == "blank"
+    assert net._ops["src_in1"].par.value("top") == "blank"
 
 
 def test_stats(env):
@@ -757,7 +757,7 @@ def test_reparent_out_of_group(env):
     net.apply([base(), L("g", "group"), px("a", 1), px("b", 2, parentId="g")], W, H)
     d = log.since(m)
     assert not d["creates"] and not d["destroys"]
-    assert source_of(net, "blend_L_g", 0) == "blend_base"
+    assert source_of(net, "blend_L_g", 0) == "blend_L_base"
     assert source_of(net, "blend_L_g", 1) == "blend_L_b"
     assert source_of(net, "blend_L_b", 0) == "blank"
     assert source_of(net, "blend_L_a", 0) == "blend_L_g"
@@ -1085,7 +1085,7 @@ def test_shape_layer_builds_shape_node_without_surface(env):
     n = net._ops["shape_s"]
     assert n.OPType == "glslTOP" and n.par.value("pixeldat") == "shape_glsl"
     assert net.slots() == [] and "s1" not in net._ops
-    assert source_of(net, "blend_L_s", 0) == "blend_base"
+    assert source_of(net, "blend_L_s", 0) == "blend_L_base"
     assert source_of(net, "blend_L_s", 1) == "shape_s"
     assert source_of(net, "blend_L_s", 2) == "blank"
     assert not n.inputConnectors[0].connections                       # no inputs
@@ -1592,7 +1592,8 @@ def test_xform_uniforms_mapping():
 def test_transform_reaches_resample_pass_unflipped(env):
     net, comp, log, _ = env
     net.apply([base(), px("a", 1, x=2.5, y=-1.25, sx=0.25, sy=0.5, surfaceW=16, surfaceH=8)], W, H)
-    assert pvals(net, "xf_L_a", "vec1") == (2.5, -1.25, 0.25, 0.5)            # document top-left px; the shader flips
+    assert pvals(net, "xf_L_a", "vec1") == (4.0, 0.0, 0.0, 2.0)               # inverse linear part diag(1/sx, 1/sy)
+    assert pvals(net, "xf_L_a", "vec2")[:2] == (2.5, -1.25)                    # translation: document top-left px; the shader flips
     xf = net._ops["xf_L_a"].par.value
     assert xf("vec0valuew") == network.ADJ_RESAMPLE and xf("inputfiltertype") == "mipmap"
     assert (xf("outputresolution"), xf("resolutionw"), xf("resolutionh")) == ("custom", W, H)
@@ -1621,11 +1622,12 @@ def test_transform_edit_is_uniform_sets_only(env):
     net.apply(L1(x=3.5, y=1.25, sx=1.7, sy=1.6), W, H)
     d = log.since(m)
     assert not d["creates"] and not d["destroys"] and not d["connects"] and not d["disconnects"]
-    assert {(n, k) for n, k, v in d["par_sets"]} == {(gname, "vec1value" + c) for c in "xyzw"}
+    assert {(n, k) for n, k, v in d["par_sets"]} == {(gname, "vec1valuex"), (gname, "vec1valuew"),
+                                                         (gname, "vec2valuex"), (gname, "vec2valuey")}      # off-diagonals stay 0
     m = log.mark()
     net.apply(L1(x=3.5, y=1.25, sx=0.5, sy=0.5), W, H)                  # starts minifying: filter flag on the resample node
     d = log.since(m)
-    assert {(n, k) for n, k, v in d["par_sets"]} == {(gname, "vec1valuez"), (gname, "vec1valuew"), (gname, "inputfiltertype")}
+    assert {(n, k) for n, k, v in d["par_sets"]} == {(gname, "vec1valuex"), (gname, "vec1valuew"), (gname, "inputfiltertype")}
     assert [v for n, k, v in d["par_sets"] if k == "inputfiltertype"] == ["mipmap"]
     assert not d["creates"] and not d["connects"]
 
@@ -1655,7 +1657,7 @@ def _mip_inputs_are_surfaces(net):
             if con.source is None:
                 continue
             src = next(n for n, o in net._ops.items() if o is con.source)
-            assert re.fullmatch(r"s\d+|base_src", src), (name, "reads", src)
+            assert re.fullmatch(r"s\d+|src_in[1-8]", src), (name, "reads", src)
     # and every other glsl node is texelFetch-only
     for name, op in net._ops.items():
         if op.OPType == "glslTOP" and name.startswith(("blend_", "shape_")):
@@ -1675,7 +1677,7 @@ def test_accumulator_is_never_read_through_a_mipmap_filter(env):
     layers[0] = L("base", "base", sx=0.3, sy=0.3, x=1.5)
     net.apply(layers, W, H)
     _mip_inputs_are_surfaces(net)
-    assert source_of(net, "xf_L_base", 0) == "base_src"
+    assert source_of(net, "xf_L_base", 0) == "src_in1"
     # churn through pool recycling: nothing keeps a stale mipmap flag
     for i in range(4):
         layers[1]["sx"] = layers[1]["sy"] = 0.3 if i % 2 else 1.0
@@ -1725,18 +1727,18 @@ def test_base_transform_applies_only_with_a_connected_input(env):
     b = L("base", "base", x=10.5, y=-4, sx=0.5, sy=0.5)
     net.apply([b], W, H)
     assert "xf_L_base" not in net._ops
-    assert pvals(net, "blend_base", "vec1") == (0.0, 0.0, 1.0, 1.0)        # no input: transparent blank, nothing to move
-    assert source_of(net, "blend_base", 1) == "base_src" and source_of(net, "blend_base", 0) == "blank"
+    assert pvals(net, "blend_L_base", "vec1") == (0.0, 0.0, 1.0, 1.0)        # no input: transparent blank, nothing to move
+    assert source_of(net, "blend_L_base", 1) == "src_in1" and source_of(net, "blend_L_base", 0) == "blank"
     comp.inputConnectors[0].connect(comp.in1)
     net.apply([b], W, H)
-    assert pvals(net, "xf_L_base", "vec1") == (10.5, -4.0, 0.5, 0.5)
-    assert net._ops["xf_L_base"].par.value("inputfiltertype") == "mipmap" and source_of(net, "xf_L_base", 0) == "base_src"
-    assert source_of(net, "blend_base", 1) == "xf_L_base"
-    assert net._ops["base_src"].par.value("top") == "../in1"
+    assert pvals(net, "xf_L_base", "vec1") == (2.0, 0.0, 0.0, 2.0) and pvals(net, "xf_L_base", "vec2")[:2] == (10.5, -4.0)
+    assert net._ops["xf_L_base"].par.value("inputfiltertype") == "mipmap" and source_of(net, "xf_L_base", 0) == "src_in1"
+    assert source_of(net, "blend_L_base", 1) == "xf_L_base"
+    assert net._ops["src_in1"].par.value("top") == "../in1"
     comp.inputConnectors[0].disconnect()
     net.set_input_connected(False)
     net.apply([b], W, H)
-    assert "xf_L_base" not in net._ops and pvals(net, "blend_base", "vec1") == (0.0, 0.0, 1.0, 1.0)
+    assert "xf_L_base" not in net._ops and pvals(net, "blend_L_base", "vec1") == (0.0, 0.0, 1.0, 1.0)
 
 
 def test_set_input_connected_true_replans_the_base_transform(env):
@@ -1747,7 +1749,7 @@ def test_set_input_connected_true_replans_the_base_transform(env):
     comp.inputConnectors[0].connect(comp.in1)      # the ext flips the flag, then applies the (unchanged) stack
     net.set_input_connected(True)
     net.apply([b], W, H)
-    assert "xf_L_base" in net._ops and net._ops["base_src"].par.value("top") == "../in1"
+    assert "xf_L_base" in net._ops and net._ops["src_in1"].par.value("top") == "../in1"
 
 
 def test_render_layer_source_returns_the_unblended_source_node(env):
@@ -1973,13 +1975,27 @@ GLSL_PINS = {
     "blend source flip": "ivec2 sp = ivec2(d.x, srcSize.y - 1 - d.y);",
     "blend mask flip": "ivec2 mp = ivec2(d.x, mSize.y - 1 - d.y);",
     "doc y flip": "vec2 c = vec2(gl_FragCoord.x, outSize.y - gl_FragCoord.y);",
-    "layer coords": "vec2 l = (c - uXform.xy) / sc;",
-    "coverage": "vec2 cov2 = clamp((min(l + h, srcSz) - max(l - h, vec2(0.0))) / (2.0 * h), 0.0, 1.0);",
+    "translation": "vec2 d = c - uA.xy;",
+    "layer coords (inverse matrix)": "vec2 l = vec2(uXform.x * d.x + uXform.y * d.y, uXform.z * d.x + uXform.w * d.y);",
+    "footprint edge x": "vec2 e0 = 0.5 * vec2(uXform.x, uXform.z);",
+    "footprint edge y": "vec2 e1 = 0.5 * vec2(uXform.y, uXform.w);",
+    "coverage": "float cov = footprintCoverage(l, e0, e1, srcSz);",
     "coverage applied": "src *= cov * m;",
+    "footprint area": "float area0 = abs(e0.x * e1.y - e0.y * e1.x) * 4.0;",
+    "axis aligned coverage": "vec2 cv = clamp((min(l + ext, srcSz) - max(l - ext, vec2(0.0))) / (2.0 * ext), 0.0, 1.0);",
+    "footprint corners": "p[0] = l - e0 - e1; p[1] = l + e0 - e1; p[2] = l + e0 + e1; p[3] = l - e0 + e1;",
+    "clip left": "n = clipPoly(p, n, vec2(1.0, 0.0), 0.0);",
+    "clip right": "n = clipPoly(p, n, vec2(-1.0, 0.0), -srcSz.x);",
+    "clip top": "n = clipPoly(p, n, vec2(0.0, 1.0), 0.0);",
+    "clip bottom": "n = clipPoly(p, n, vec2(0.0, -1.0), -srcSz.y);",
+    "clip intersection": "q[m++] = a + (b - a) * (da / (da - db));",
+    "coverage ratio": "return clamp(abs(a2) * 0.5 / area0, 0.0, 1.0);",
     "uv flip": "vec2 uv = vec2(l.x / srcSz.x, 1.0 - l.y / srcSz.y);",
-    "lod": "float lod = max(0.0, -0.5 * log2(sc.x * sc.y) - 0.5);",
+    "determinant": "float det = abs(uXform.x * uXform.w - uXform.y * uXform.z);",
+    "lod": "float lod = max(0.0, 0.5 * log2(max(det, 1e-12)) - 0.5);",
     "exact flip": "ivec2(ip.x, int(srcSz.y) - 1 - ip.y)",
-    "exact tolerance": "abs(uXform.x - floor(uXform.x + 0.5)) < 1e-4 && abs(uXform.y - floor(uXform.y + 0.5)) < 1e-4",
+    "exact linear part": "abs(uXform.x - 1.0) < 1e-6 && abs(uXform.w - 1.0) < 1e-6 && abs(uXform.y) < 1e-6 && abs(uXform.z) < 1e-6",
+    "exact tolerance": "abs(uA.x - floor(uA.x + 0.5)) < 1e-4 && abs(uA.y - floor(uA.y + 0.5)) < 1e-4",
     "resample dispatch": "if (uParams.w > 6.5) { resample(); return; }",
     "sampling by lod": "textureLod(sTD2DInputs[0], uv, lod)",
     "mask sampling by lod": "textureLod(sTD2DInputs[1], uv, lod).r",
@@ -2000,12 +2016,23 @@ def test_glsl_matches_the_pinned_port_formulas():
     ("coverage applied", "src *= cov * m;", "src *= m;"),
     ("doc y flip", "outSize.y - gl_FragCoord.y", "gl_FragCoord.y"),
     ("uv flip", "1.0 - l.y / srcSz.y", "l.y / srcSz.y"),
-    ("lod", "- 0.5);", "+ 0.5);"),
-    ("lod", "log2(sc.x * sc.y)", "log2(max(sc.x, sc.y))"),
-    ("coverage", "(2.0 * h)", "(1.0 * h)"),
+    ("lod", "1e-12)) - 0.5);", "1e-12)) + 0.5);"),
+    ("lod", "0.5 * log2(max(det, 1e-12))", "-0.5 * log2(max(det, 1e-12))"),
+    ("determinant", "uXform.x * uXform.w - uXform.y * uXform.z", "uXform.x * uXform.w"),
+    ("layer coords (inverse matrix)", "uXform.x * d.x + uXform.y * d.y", "uXform.x * d.x + uXform.z * d.y"),
+    ("footprint edge y", "0.5 * vec2(uXform.y, uXform.w)", "0.5 * vec2(uXform.z, uXform.w)"),
+    ("translation", "d = c - uA.xy", "d = c - uA.zw"),
+    ("footprint area", "e0.x * e1.y - e0.y * e1.x", "e0.x * e1.y + e0.y * e1.x"),
+    ("axis aligned coverage", "(2.0 * ext)", "(1.0 * ext)"),
+    ("coverage ratio", "abs(a2) * 0.5 / area0", "abs(a2) / area0"),
+    ("clip right", "vec2(-1.0, 0.0), -srcSz.x", "vec2(-1.0, 0.0), srcSz.x"),
+    ("clip bottom", "vec2(0.0, -1.0), -srcSz.y", "vec2(0.0, -1.0), -srcSz.x"),
+    ("clip intersection", "da / (da - db)", "da / (da + db)"),
+    ("footprint corners", "p[2] = l + e0 + e1;", "p[2] = l + e0 - e1;"),
     ("blend source flip", "srcSize.y - 1 - d.y", "d.y"),
     ("exact flip", "int(srcSz.y) - 1 - ip.y", "ip.y"),
-    ("exact tolerance", "< 1e-4 && abs(uXform.y", "< 1e-2 && abs(uXform.y"),
+    ("exact tolerance", "abs(uA.x - floor(uA.x + 0.5)) < 1e-4", "abs(uA.x - floor(uA.x + 0.5)) < 1e-2"),
+    ("exact linear part", "abs(uXform.y) < 1e-6", "abs(uXform.y) < 1e-1"),
 ])
 def test_shader_mutations_are_caught(pin, old, new):
     assert old in GLSL
@@ -2076,3 +2103,581 @@ def test_status_polls_with_no_change_keep_the_token(env):
     net._text_todo.add("text_t")                      # forced re-poll: the measurements are cached, the pars identical
     assert net.render_layer_status("t") == "ready"
     assert net.render_layer_token("t") == tok
+
+
+# --------------------------------------------------------------------------- v6: affine (rotate / skew) resample
+
+
+def test_affine_matrix_conventions():
+    """doc = T(x,y) R(rot) K(kx,ky) S(sx,sy) layer; rot clockwise on screen (y down), K = [[1, tan kx],[tan ky, 1]]."""
+    a = network.layer_affine(L("a", x=5, y=7, sx=2.0, sy=3.0))
+    assert a.pure and a.lin == (2.0, 0.0, 0.0, 3.0) and a.inv == (0.5, 0.0, 0.0, pytest.approx(1 / 3)) and not a.dead
+    a = network.layer_affine(L("a", rot=90.0))                       # clockwise: layer +x (right) maps to doc +y (down)
+    assert a.lin[0] == pytest.approx(0, abs=1e-12) and a.lin[2] == pytest.approx(1.0)       # (1,0) -> (a, c) = (0, 1)
+    assert a.lin[1] == pytest.approx(-1.0) and a.lin[3] == pytest.approx(0, abs=1e-12)      # (0,1) -> (b, d) = (-1, 0)
+    a = network.layer_affine(L("a", kx=45.0))                        # x' = x + tan(kx) y
+    assert a.lin == (1.0, pytest.approx(1.0), 0.0, 1.0)
+    a = network.layer_affine(L("a", ky=45.0))
+    assert a.lin == (1.0, 0.0, pytest.approx(1.0), 1.0)
+    a = network.layer_affine(L("a", sx=2.0, sy=0.5, rot=30.0, kx=20.0, ky=-10.0))
+    ref = fakenet.affine_forward(2.0, 0.5, 30.0, 20.0, -10.0)
+    assert np.allclose(np.array(a.lin).reshape(2, 2), ref, atol=1e-12)
+    inv = np.array(a.inv).reshape(2, 2)
+    assert np.allclose(inv @ np.array(a.lin).reshape(2, 2), np.eye(2), atol=1e-12)
+    assert not a.pure and a.det == pytest.approx(np.linalg.det(ref))
+
+
+def test_affine_degenerate_and_invalid_inputs():
+    a = network.layer_affine(L("a", kx=45.0, ky=45.0))                # 1 - tan tan = 0: singular
+    assert a.dead and a.inv == (1.0, 0.0, 0.0, 1.0)
+    assert not network.layer_affine(L("a", kx=89.0, ky=-89.0)).dead
+    assert not network.layer_affine(L("a", kx=400.0)).dead                # skew is clamped to +-89 degrees
+    a = network.layer_affine(L("a", rot=float("nan"), kx=float("inf")))
+    assert a.pure and not a.dead
+    for kind in ("text", "shape", "group", "adjustment"):
+        assert network.layer_affine(L("a", kind, rot=30.0, sx=2)) is network.IDENTITY
+    assert network.layer_affine(L("a", "input", input=2, rot=15.0)).pure is False
+    assert network.layer_affine(L("a", "base", rot=15.0)).pure is False
+
+
+@pytest.mark.parametrize("rot,kx,ky,sx,sy,mip", [
+    (0, 0, 0, 0.7, 0.7, True), (45, 0, 0, 0.7, 0.7, True), (45, 0, 0, 0.8, 0.8, False),     # rotation keeps |det|
+    (0, 40, 0, 1.0, 0.6, False), (0, 60, 20, 1.0, 0.6, True),                                 # det = sx sy (1 - tan kx tan ky)
+    (20, 30, -25, 0.9, 0.9, False)])
+def test_mip_threshold_is_the_determinant(rot, kx, ky, sx, sy, mip):
+    a = network.layer_affine(L("a", rot=rot, kx=kx, ky=ky, sx=sx, sy=sy))
+    ref = fakenet.affine_forward(sx, sy, rot, kx, ky)
+    assert a.mip is mip and bool(fakenet.affine_lod(ref) > 0) is mip
+
+
+def test_rotated_layer_gets_a_resample_pass_with_the_inverse_matrix(env):
+    net, comp, log, _ = env
+    layer = px("a", 1, x=10, y=6, sx=1.5, sy=0.75, rot=30.0, kx=12.0, ky=-7.0, surfaceW=16, surfaceH=8)
+    net.apply([base(), layer], W, H)                                  # integer x, y: still needs the pass (rotated)
+    assert "xf_L_a" in net._ops and source_of(net, "blend_L_a", 1) == "xf_L_a"
+    inv, t = fakenet.resample_uniforms(10, 6, 1.5, 0.75, 30.0, 12.0, -7.0)
+    assert pvals(net, "xf_L_a", "vec1") == pytest.approx(inv)
+    assert pvals(net, "xf_L_a", "vec2")[:2] == (10.0, 6.0)
+    xf = net._ops["xf_L_a"].par.value
+    assert xf("vec0valuew") == network.ADJ_RESAMPLE and xf("inputfiltertype") == "linear"      # |det| 0.9 -> no mip
+    assert pvals(net, "blend_L_a", "vec1") == (0.0, 0.0, 1.0, 1.0)
+    # a rotation edit is uniform sets on the resample node only
+    settle(net)
+    m = log.mark()
+    net.apply([base(), dict(layer, rot=31.0)], W, H)
+    d = log.since(m)
+    assert not d["creates"] and not d["destroys"] and not d["connects"] and not d["disconnects"]
+    assert {n for n, k, v in d["par_sets"]} == {net._ops["xf_L_a"].name}
+    assert {k for n, k, v in d["par_sets"]} <= {"vec1value" + c for c in "xyzw"}
+    m = log.mark()
+    net.apply([base(), dict(layer, rot=0.0, kx=0.0, ky=0.0, sx=1.0, sy=1.0)], W, H)           # integer offset again: pass dropped
+    assert "xf_L_a" not in net._ops and source_of(net, "blend_L_a", 1) == "s1"
+
+
+def test_rotation_mip_flag_follows_the_determinant(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1, rot=33.0, sx=0.6, sy=0.6, surfaceW=16, surfaceH=8)], W, H)
+    assert net._ops["xf_L_a"].par.value("inputfiltertype") == "mipmap"
+    net.apply([base(), px("a", 1, rot=33.0, sx=0.9, sy=0.9, surfaceW=16, surfaceH=8)], W, H)
+    assert net._ops["xf_L_a"].par.value("inputfiltertype") == "linear"
+    _mip_inputs_are_surfaces(net)
+
+
+def test_singular_transform_renders_nothing_without_a_resample_pass(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1, kx=45.0, ky=45.0, surfaceW=16, surfaceH=8)], W, H)
+    assert "xf_L_a" not in net._ops and source_of(net, "blend_L_a", 1) == "blank"
+
+
+@pytest.mark.parametrize("x,y,sx,sy,rot,kx,ky", [
+    (6.3, 4.1, 1.0, 1.0, 30.0, 0.0, 0.0), (20.0, -2.0, 1.4, 0.8, -50.0, 0.0, 0.0), (8.0, 3.0, 1.0, 1.0, 0.0, 25.0, 0.0),
+    (4.0, 6.5, 1.0, 1.0, 0.0, 0.0, -20.0), (14.5, 3.5, 0.9, 1.2, 17.0, 30.0, -12.0), (24.0, 20.0, 0.5, 0.5, 90.0, 0.0, 0.0),
+    (3.0, 2.0, 0.6, 0.45, 25.0, 10.0, 5.0)])
+@pytest.mark.parametrize("masked", [False, True])
+def test_resample_port_affine_matches_reference(x, y, sx, sy, rot, kx, ky, masked):
+    """The shader port (inverse-matrix uniforms, parallelogram clipping, lod from the determinant) vs the independent
+    top-down reference (forward matrix, point sampled coverage): equal in the interior, edges within the 32x32 point
+    sampling error."""
+    src, mask = _tex(16, 20, 5), _tex(16, 20, 6)
+    port = fakenet.resample_port(src[::-1], mask[::-1], 48, 40, x, y, sx, sy, has_mask=masked, rot=rot, kx=kx, ky=ky)
+    ref = fakenet.sample_reference(src, 48, 40, x, y, sx, sy, rot=rot, kx=kx, ky=ky)
+    if masked:
+        ref = ref * fakenet.sample_reference(mask[..., :1], 48, 40, x, y, sx, sy, rot=rot, kx=kx, ky=ky, coverage=False)
+    A = fakenet.affine_forward(sx, sy, rot, kx, ky)
+    cov_ref = fakenet.coverage_supersampled(A, x, y, 20, 16, 48, 40)
+    assert (cov_ref > 0).sum() > 30
+    full = cov_ref == 1.0
+    full = full & np.roll(full, 1, 0) & np.roll(full, -1, 0) & np.roll(full, 1, 1) & np.roll(full, -1, 1)    # not on an edge
+    assert full.sum() >= 5 or abs(np.linalg.det(A)) < 0.5
+    assert np.abs(port - ref)[full].max() < 1e-9
+    assert np.abs(port - ref).max() < 0.045          # edges: point sampling error (<= 1/32 of the coverage) x colour <= 1
+
+
+def test_footprint_coverage_analytic_cases():
+    f = fakenet.footprint_coverage
+    s = np.sin(np.radians(45)) * 0.5
+    c45 = (0.5 * np.cos(np.radians(45)), 0.5 * np.sin(np.radians(45)))
+    e0, e1 = c45, (-c45[1], c45[0])                                  # a unit pixel rotated by 45 degrees (a diamond)
+    r = np.hypot(*e0) * np.sqrt(2)                                   # half diagonal 0.7071
+    assert f((50.0, 50.0), e0, e1, 100, 100) == 1.0
+    assert f((0.0, 50.0), e0, e1, 100, 100) == pytest.approx(0.5)     # centred on the edge: half, for any orientation
+    assert f((r - 0.5 * r, 50.0), e0, e1, 100, 100) == pytest.approx(1 - 0.125, abs=1e-9)    # the diamond's tip cut off
+    assert f((r, 50.0), e0, e1, 100, 100) == pytest.approx(1.0)
+    assert f((-r, 50.0), e0, e1, 100, 100) == 0.0
+    assert f((0.0, 0.0), e0, e1, 100, 100) == pytest.approx(0.25, abs=1e-9)        # the corner: a quarter
+    assert f((100.0, 100.0), e0, e1, 100, 100) == pytest.approx(0.25, abs=1e-9)
+    # axis aligned footprints are the v4 separable overlap
+    assert f((0.25, 50.0), (0.5, 0.0), (0.0, 0.5), 100, 100) == pytest.approx(0.75)
+    assert f((0.25, 0.25), (1.0, 0.0), (0.0, 1.0), 100, 100) == pytest.approx((1.25 / 2) * (1.25 / 2))
+    # a magnified skew: the overlap of a sheared pixel with the corner
+    assert 0.0 < f((0.0, 0.0), (0.5, 0.0), (0.4, 0.5), 100, 100) < 0.5
+
+
+def test_rotated_rect_area_is_conserved_by_the_port():
+    """Sum of the coverage over the document == the area of the transformed layer rect (|det| * w * h)."""
+    for rot, kx, ky, sx, sy in ((30.0, 0, 0, 1.0, 1.0), (0, 30.0, 10.0, 1.2, 0.8), (77.0, -20.0, 0, 0.7, 1.1)):
+        A = fakenet.affine_forward(sx, sy, rot, kx, ky)
+        src = np.ones((10, 14, 4))
+        out = fakenet.resample_port(src[::-1], None, 64, 64, 30.0, 20.0, sx, sy, rot=rot, kx=kx, ky=ky)
+        assert out[..., 3].sum() == pytest.approx(abs(np.linalg.det(A)) * 14 * 10, rel=1e-6)
+
+
+def test_rotation_direction_is_clockwise_on_screen():
+    """A layer whose right edge is bright, rotated 90 degrees clockwise, has its bright edge at the BOTTOM."""
+    src = np.zeros((10, 20, 4))
+    src[:, 10:, :] = 1.0                                              # right half: premultiplied white
+    # pivot = layer top-left: rot 90 maps layer (lx, ly) -> doc (x - ly, y + lx): the layer extends to the left and down
+    out = fakenet.sample_reference(src, 40, 40, 20.0, 5.0, 1.0, 1.0, rot=90.0)
+    ys, xs = np.nonzero(out[..., 3] > 0.5)
+    assert xs.min() >= 10 and xs.max() < 20 and ys.min() >= 15 and ys.max() < 25        # bright half: lx 10..20 -> doc y 15..25
+    assert out[22, 12, 3] == pytest.approx(1.0) and out[8, 12, 3] == 0.0                   # lx 17 is bright, lx 3 is transparent
+    port = fakenet.resample_port(src[::-1], None, 40, 40, 20.0, 5.0, 1.0, 1.0, rot=90.0)
+    assert np.abs(port - out).max() < 0.05
+
+
+# --------------------------------------------------------------------------- v6: multiple inputs
+
+
+def inp(id_, n, **kw):
+    return L(id_, "input", input=n, **kw)
+
+
+def connect_inputs(comp, *ns):
+    for n in ns:
+        while len(comp.inputConnectors) < n:
+            comp.inputConnectors.append(fakenet.FakeConnector(comp, len(comp.inputConnectors)))
+        comp.inputConnectors[n - 1].source = comp.in1
+
+
+def test_input_layers_read_their_own_select(env):
+    net, comp, log, _ = env
+    connect_inputs(comp, 1, 3)
+    net.apply([inp("i1", 1), inp("i3", 3, x=4.5, sx=0.5, sy=0.5), inp("i2", 2), px("p", 1, surfaceW=8, surfaceH=8)], W, H)
+    assert {n for n in net._ops if n.startswith("src_in")} == {"src_in1", "src_in2", "src_in3"}
+    top = lambda n: net._ops["src_in%d" % n].par.value("top")
+    assert (top(1), top(2), top(3)) == ("../in1", "blank", "../in3")
+    assert net._ops["src_in1"].OPType == "selectTOP"
+    assert source_of(net, "blend_L_i1", 1) == "src_in1" and source_of(net, "blend_L_i2", 1) == "src_in2"
+    assert source_of(net, "xf_L_i3", 0) == "src_in3" and source_of(net, "blend_L_i3", 1) == "xf_L_i3"
+    assert "xf_L_i2" not in net._ops                              # disconnected: transparent, nothing to resample
+    assert source_of(net, "blend_L_i1", 0) == "blank" and source_of(net, "blend_L_i3", 0) == "blend_L_i1"
+    _mip_inputs_are_surfaces(net)
+
+
+def test_input_layer_blend_mode_and_opacity_are_honoured(env):
+    net, comp, log, _ = env
+    connect_inputs(comp, 1)
+    net.apply([inp("i1", 1, blend="multiply", opacity=0.4)], W, H)
+    p = net._ops["blend_L_i1"].par.value
+    assert p("vec0valuex") == float(network.BLEND_INDEX["multiply"]) and p("vec0valuey") == 0.4
+
+
+def test_two_layers_may_read_the_same_input(env):
+    net, comp, log, _ = env
+    connect_inputs(comp, 2)
+    net.apply([inp("a", 2), inp("b", 2, x=3.5, sx=0.5, sy=0.5)], W, H)
+    assert source_of(net, "blend_L_a", 1) == "src_in2" and source_of(net, "xf_L_b", 0) == "src_in2"
+    assert [n for n in net._ops if n.startswith("src_in")] == ["src_in2"]
+
+
+def test_unreferenced_input_selects_are_removed(env):
+    net, comp, log, _ = env
+    connect_inputs(comp, 1, 2)
+    net.apply([inp("a", 1), inp("b", 2)], W, H)
+    assert "src_in2" in net._ops
+    net.apply([inp("a", 1)], W, H)
+    assert "src_in2" not in net._ops and net.input_connected(2) is True
+
+
+def test_connect_disconnect_keeps_placement_and_is_cheap(env):
+    net, comp, log, _ = env
+    layers = [inp("i2", 2, x=3.5, y=1.0, sx=0.5, sy=0.5, rot=10.0)]
+    net.apply(layers, W, H)
+    assert "xf_L_i2" not in net._ops                              # not connected yet: transparent
+    connect_inputs(comp, 2)
+    net.set_inputs({2: True})
+    m = log.mark()
+    net.apply(layers, W, H)                                       # the layer's spec never changed: the placement is back
+    assert "xf_L_i2" in net._ops and net._ops["src_in2"].par.value("top") == "../in2"
+    inv, t = fakenet.resample_uniforms(3.5, 1.0, 0.5, 0.5, 10.0)
+    assert pvals(net, "xf_L_i2", "vec1") == pytest.approx(inv)
+    comp.inputConnectors[1].disconnect()
+    net.apply(layers, W, H)
+    assert "xf_L_i2" not in net._ops and net._ops["src_in2"].par.value("top") == "blank"
+
+
+def test_set_inputs_repoints_the_selects_at_once_and_replans(env):
+    net, comp, log, _ = env
+    layers = [inp("i4", 4, x=0.5, sx=0.5, sy=0.5), inp("i1", 1)]
+    net.apply(layers, W, H)
+    assert net._ops["src_in4"].par.value("top") == "blank"
+    net.set_inputs({4: True})                                     # connector 4 of the fake COMP does not exist: fallback
+    assert net._ops["src_in4"].par.value("top") == "../in4"
+    net.apply(layers, W, H)
+    assert "xf_L_i4" in net._ops and net.input_connected(4) and not net.input_connected(1)
+    net.set_inputs({4: False, 1: True})
+    assert net._ops["src_in4"].par.value("top") == "blank" and net._ops["src_in1"].par.value("top") == "../in1"
+
+
+def test_legacy_base_layer_is_input_one(env):
+    net, comp, log, _ = env
+    connect_inputs(comp, 1)
+    net.apply([L("base", "base", x=1.5), inp("i2", 2)], W, H)
+    assert source_of(net, "xf_L_base", 0) == "src_in1" and net._ops["src_in1"].par.value("top") == "../in1"
+
+
+def test_input_index_is_clamped(env):
+    assert network.input_index(inp("a", 0)) == 1 and network.input_index(inp("a", 99)) == network.MAX_INPUTS
+    assert network.input_index(L("a", "input")) == 1 and network.input_index(L("a", "input", input="x")) == 1
+
+
+def test_input_layer_with_mask_uses_the_input_size_for_the_mask(env):
+    net, comp, log, _ = env
+    connect_inputs(comp, 2)
+    net.apply([inp("i2", 2, x=0.5, sx=0.5, sy=0.5, surfaceW=120, surfaceH=90, mask={"slot": 7, "enabled": True})], W, H)
+    assert (net._ops["s7"].par.value("resolutionw"), net._ops["s7"].par.value("resolutionh")) == (120, 90)
+    assert source_of(net, "xf_L_i2", 1) == "s7" and source_of(net, "xf_L_i2", 0) == "src_in2"
+
+
+def test_inputs_reorder_and_delete_only_rewire(env):
+    net, comp, log, _ = env
+    connect_inputs(comp, 1, 2)
+    a, b, c = inp("a", 1), inp("b", 2), px("c", 1, surfaceW=8, surfaceH=8)
+    net.apply([a, b, c], W, H)
+    settle(net)
+    m = log.mark()
+    net.apply([b, a, c], W, H)
+    d = log.since(m)
+    assert not d["creates"] and not d["destroys"] and not d["par_sets"]
+    net.apply([a, c], W, H)
+    assert "blend_L_b" not in net._ops and "src_in2" not in net._ops
+
+
+# --------------------------------------------------------------------------- v6: layer effects integration
+
+
+def shadow(**kw):
+    return dict({"type": "dropShadow", "enabled": True, "blur": 4.0, "dx": 3.0, "dy": 3.0, "opacity": 0.8,
+                 "color": {"r": 0, "g": 0, "b": 0, "a": 255}}, **kw)
+
+
+def overlay(**kw):
+    return dict({"type": "colorOverlay", "enabled": True, "opacity": 1.0, "color": {"r": 255, "g": 0, "b": 0, "a": 255}}, **kw)
+
+
+def fx_chain_nodes(net, lid):
+    return net._chains[lid].nodes if lid in net._chains else []
+
+
+def source_op_name(net, op):
+    return next((n for n, o in net._ops.items() if o is op), None)
+
+
+def test_effects_module_is_found(env):
+    net, *_ = env
+    assert net._fx is not None and net.fx_error is None and "dropShadow" in net._fx_shaders
+
+
+def test_pixel_layer_with_effects_is_staged_even_at_an_integer_offset(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1, x=3, y=2, surfaceW=16, surfaceH=8, effects=[shadow()])], W, H)
+    nodes = fx_chain_nodes(net, "a")
+    assert len(nodes) == 2                                                # drop shadow = 2 passes
+    assert "xf_L_a" in net._ops and source_of(net, "xf_L_a", 0) == "s1"
+    # exact (integer, scale 1) resample uniforms: identity matrix, translation (3, 2)
+    assert pvals(net, "xf_L_a", "vec1") == (1.0, 0.0, 0.0, 1.0) and pvals(net, "xf_L_a", "vec2")[:2] == (3.0, 2.0)
+    # chain input 0 = the resample node, the last pass is the blend's source
+    assert nodes[0].inputConnectors[0].source is net._ops["xf_L_a"]
+    assert net._ops["blend_L_a"].inputConnectors[1].source is nodes[-1]
+    assert pvals(net, "blend_L_a", "vec1") == (0.0, 0.0, 1.0, 1.0) and net._ops["blend_L_a"].par.value("vec0valuez") == 0.0
+    assert net._ops["xf_L_a"].par.value("inputfiltertype") == "linear"
+
+
+def test_effect_masks_are_applied_before_the_effects(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1, surfaceW=16, surfaceH=8, mask={"slot": 5, "enabled": True}, effects=[overlay()])], W, H)
+    assert source_of(net, "xf_L_a", 1) == "s5" and net._ops["xf_L_a"].par.value("vec0valuez") == 1.0
+    assert net._ops["blend_L_a"].par.value("vec0valuez") == 0.0
+    assert fx_chain_nodes(net, "a")[0].inputConnectors[0].source is net._ops["xf_L_a"]
+
+
+def test_text_and_shape_effects(env):
+    net, comp, log, _ = env
+    net.apply([base(), shp("s", effects=[overlay()]), txt("t", effects=[overlay()], mask={"slot": 9, "enabled": True})], W, H)
+    # no mask: the chain reads the shape node directly
+    assert fx_chain_nodes(net, "s")[0].inputConnectors[0].source is net._ops["shape_s"]
+    assert "xf_L_s" not in net._ops
+    # a mask is applied first by an identity resample pass (source x mask)
+    assert "xf_L_t" in net._ops and source_of(net, "xf_L_t", 0) == "text_t" and source_of(net, "xf_L_t", 1) == "s9"
+    assert pvals(net, "xf_L_t", "vec1") == (1.0, 0.0, 0.0, 1.0) and net._ops["xf_L_t"].par.value("vec0valuez") == 1.0
+    assert fx_chain_nodes(net, "t")[0].inputConnectors[0].source is net._ops["xf_L_t"]
+    assert net._ops["blend_L_t"].par.value("vec0valuez") == 0.0 and source_of(net, "blend_L_t", 2) == "blank"
+    assert net.render_layer_source("s") is net._ops["shape_s"]           # Flatten = content only
+
+
+def test_input_layer_effects(env):
+    net, comp, log, _ = env
+    connect_inputs(comp, 2)
+    net.apply([inp("i2", 2, effects=[overlay()])], W, H)
+    assert "xf_L_i2" in net._ops and source_of(net, "xf_L_i2", 0) == "src_in2" and len(fx_chain_nodes(net, "i2")) == 1
+    comp.inputConnectors[1].disconnect()
+    net.apply([inp("i2", 2, effects=[overlay()])], W, H)                   # disconnected: transparent, nothing to decorate
+    assert "i2" not in net._chains and "xf_L_i2" not in net._ops
+
+
+def test_groups_and_adjustments_ignore_effects(env):
+    net, comp, log, _ = env
+    net.apply([base(), L("g", "group", effects=[overlay()]), px("c", 1, parentId="g", surfaceW=8, surfaceH=8),
+               adj("adj", {"type": "invert"}, effects=[overlay()])], W, H)
+    assert not net._chains
+
+
+def test_effect_param_edit_is_par_sets_only(env):
+    net, comp, log, _ = env
+    mk = lambda **kw: [base(), px("a", 1, x=2, surfaceW=16, surfaceH=8, effects=[shadow(**kw)])]
+    net.apply(mk(), W, H)
+    settle(net)
+    m = log.mark()
+    net.apply(mk(dx=7.0, opacity=0.5), W, H)
+    d = log.since(m)
+    assert not d["creates"] and not d["destroys"] and not d["connects"] and not d["disconnects"]
+    assert {n for n, k, v in d["par_sets"]} <= {o.name for o in fx_chain_nodes(net, "a")} and d["par_sets"]
+    m = log.mark()
+    net.apply(mk(dx=7.0, opacity=0.5), W, H)                                # identical: nothing at all
+    assert log.since(m)["par_sets"] == [] and net.stats()["last"]["par_sets"] == 0
+
+
+def test_toggling_effects_builds_and_pools_the_chain_cleanly(env):
+    net, comp, log, _ = env
+    settle(net)
+    on = [base(), px("a", 1, x=2, surfaceW=16, surfaceH=8, effects=[shadow(), overlay()])]
+    off = [base(), px("a", 1, x=2, surfaceW=16, surfaceH=8, effects=[shadow(enabled=False), overlay(enabled=False)])]
+    net.apply(on, W, H)
+    nodes = list(fx_chain_nodes(net, "a"))
+    assert len(nodes) == 3 and "xf_L_a" in net._ops
+    assert not [c for c in log.creates if c[1].startswith("fx_")]             # nodes came from the pool, not parent.create
+    net.apply(off, W, H)                                                      # all disabled: no chain, no resample pass
+    assert "a" not in net._chains and "xf_L_a" not in net._ops
+    assert net._ops["blend_L_a"].inputConnectors[1].source is net._ops["s1"]
+    pooled = [n for n, c in net._pool]
+    assert all(n in pooled or n in [g for g, c in net._garbage] for n in nodes)
+    for n in nodes:                                                           # returned as clean spares, disconnected
+        assert all(con.source is None for con in n.inputConnectors)
+        if n in pooled:
+            assert n.par.value("pixeldat") == "blend_glsl" and n.par.value("vec2name") == "uA" and n.par.value("format") == network.FMT_BLEND
+    for _ in range(3):                                                        # churn: re-enable, then a blend reuses spares
+        net.apply(on, W, H)
+        net.apply(off + [px("b", 2, surfaceW=8, surfaceH=8, blend="multiply")], W, H)
+        settle(net)
+    pv = net._ops["blend_L_b"].par.value
+    assert pv("pixeldat") == "blend_glsl" and pv("vec2name") == "uA" and pv("vec3name") == "uB" and pv("vec0name") == "uParams"
+
+
+def test_deleting_the_layer_destroys_the_chain_and_reorder_keeps_it(env):
+    net, comp, log, _ = env
+    a = px("a", 1, surfaceW=16, surfaceH=8, effects=[overlay()])
+    b = px("b", 2, surfaceW=16, surfaceH=8)
+    net.apply([base(), a, b], W, H)
+    chain = net._chains["a"]
+    m = log.mark()
+    net.apply([base(), b, a], W, H)
+    d = log.since(m)
+    assert net._chains["a"] is chain and not d["creates"] and not d["par_sets"]
+    net.apply([base(), b], W, H)
+    assert not net._chains and "fx_L_a" not in net._fx_out
+    assert all(not n.valid or all(c.source is None for c in n.inputConnectors) for n in chain.nodes) or chain.node_count == 0
+
+
+def test_chain_nodes_survive_unknown_node_cleanup(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1, surfaceW=16, surfaceH=8, effects=[shadow()])], W, H)
+    nodes = list(fx_chain_nodes(net, "a"))
+    net.apply([base(), px("a", 1, surfaceW=16, surfaceH=8, effects=[shadow()]), px("b", 2, surfaceW=8, surfaceH=8)], W, H)
+    net._scanned = False                                                      # force the leftover scan
+    net.apply([base(), px("a", 1, surfaceW=16, surfaceH=8, effects=[shadow()])], W, H)
+    assert all(n.valid for n in nodes)
+    assert not [n for n, c in net._pool if n in nodes]                         # not handed out as spares
+    assert comp.op("doc").op("fxsrc_dropShadow") is not None                  # the shader DATs are not "unknown" either
+
+
+def test_shared_effect_shader_dats_are_reused(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1, surfaceW=8, surfaceH=8, effects=[shadow()]), px("b", 2, surfaceW=8, surfaceH=8, effects=[shadow()])], W, H)
+    assert len([c for c in log.creates if c[1] == "fxsrc_dropShadow"]) == 1
+
+
+def test_effect_chain_failure_shows_the_layer_without_effects(env, monkeypatch):
+    net, comp, log, _ = env
+    monkeypatch.setattr(net._fx.EffectChain, "apply", lambda self, *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    net.apply([base(), px("a", 1, surfaceW=16, surfaceH=8, effects=[overlay()])], W, H)
+    assert "boom" in net.fx_error and net._ops["blend_L_a"].inputConnectors[1].source is net._ops["xf_L_a"]
+
+
+def test_without_an_effects_module_layers_render_plainly(monkeypatch):
+    comp, log = fakenet.make_comp()
+    net = DocNetwork(comp, GLSL, effects=object(), effect_shaders={})        # a module without EffectChain / plan_chain
+    net.apply([base(), px("a", 1, surfaceW=16, surfaceH=8, effects=[overlay()])], W, H)
+    assert not net._chains and "xf_L_a" not in net._ops
+
+
+def test_malformed_effect_entries_are_ignored(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1, surfaceW=16, surfaceH=8, effects=[None, "x", {"type": "nope"}, {"type": "stroke", "width": 0}])], W, H)
+    assert not net._chains and "xf_L_a" not in net._ops
+
+
+def test_stats_report_effects(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1, surfaceW=16, surfaceH=8, effects=[shadow()])], W, H)
+    s = net.stats()
+    assert s["fx_chains"] == 1 and s["fx_nodes"] == 2 and s["fx_error"] is None
+
+
+# --------------------------------------------------------------------------- review follow-ups
+
+
+def test_skew_is_clamped_to_the_web_limit_of_85_degrees():
+    assert network.SKEW_MAX == 85.0
+    a, b = network.layer_affine(L("a", kx=89.0)), network.layer_affine(L("a", kx=85.0))
+    assert a.lin == b.lin                                                   # 89 -> 85, like web/src/engine/xform.ts
+    assert network.layer_affine(L("a", ky=-400.0)).lin == network.layer_affine(L("a", ky=-85.0)).lin
+    assert network.layer_affine(L("a", kx=84.0)).lin != b.lin
+
+
+def _stale_glsl(comp, name, tags, res="custom", filt="mipmap"):
+    node = comp.op("doc").create("glslTOP", name)           # (the fixture's DocNetwork already made doc)
+    node.tags = list(tags)
+    node.comment = "stale"
+    node.bypass = True
+    node.par.outputresolution = res
+    node.par.resolutionw = 333
+    node.par.inputfiltertype = filt
+    return node
+
+
+def test_recycled_stale_nodes_get_neutral_parameters(env):
+    net, comp, log, clock = env
+    net.apply([base()], W, H)
+    settle(net)
+    tagged = _stale_glsl(comp, "g90", ["role:xf_L_gone"])                    # a tagged stale resample node
+    spare = _stale_glsl(comp, "g91", [])                                      # an untagged spare
+    net2 = DocNetwork(comp, GLSL, clock=clock)
+    net2.apply([base()], W, H)
+    pooled = [n for n, c in net2._pool]
+    for node in (tagged, spare):
+        assert node.valid and node in pooled
+        v = node.par.value
+        assert v("outputresolution") == "useinput" and v("inputfiltertype") == "nearest"
+        assert node.bypass is False and node.tags == [] and node.comment == ""
+        assert not any(c.source for c in node.inputConnectors)
+
+
+def test_v4_document_adoption_resets_stale_resample_and_drops_old_names(env):
+    """A v4 file: blend_base + base_src + a tagged xf_L_* with a custom resolution and the mipmap filter."""
+    net, comp, log, clock = env
+    doc = net.doc
+    old_blend = _stale_glsl(comp, "g1", ["role:blend_base"], res="useinput", filt="linear")
+    stale_xf = _stale_glsl(comp, "g2", ["role:xf_L_old"])
+    base_src = doc.create("selectTOP", "base_src")
+    net2 = DocNetwork(comp, GLSL, clock=clock)
+    net2.apply([base(), px("a", 1, surfaceW=16, surfaceH=8)], W, H)
+    assert net2.output() is not None
+    assert not base_src.valid                                                  # v4 name no longer part of the network
+    assert stale_xf.valid and stale_xf in [n for n, c in net2._pool]          # recycled, not destroyed
+    v = stale_xf.par.value
+    assert v("outputresolution") == "useinput" and v("inputfiltertype") == "nearest" and stale_xf.tags == []
+    assert old_blend.valid and old_blend.tags == [] and old_blend.par.value("inputfiltertype") == "nearest"   # v4 role: not a v5 role
+    assert source_of(net2, "blend_L_a", 1) == "s1" and source_of(net2, "blend_L_a", 0) == "blend_L_base"
+    assert not any(o.OPType == "glslTOP" and o.par.value("inputfiltertype") == "mipmap" for o in net2._ops.values())
+    _mip_inputs_are_surfaces(net2)
+
+
+def test_set_inputs_is_only_effective_after_the_next_apply(env):
+    """The documented one-frame caveat: set_inputs re-points the Select, the transform / resample is re-planned by apply()."""
+    net, comp, log, _ = env
+    b = L("i", "input", input=1, x=2.5, y=0, sx=0.5, sy=0.5, surfaceW=16, surfaceH=8)
+    net.apply([b], W, H)
+    assert "xf_L_i" not in net._ops
+    comp.inputConnectors[0].connect(comp.in1)
+    net.set_inputs({1: True})
+    assert net._ops["src_in1"].par.value("top") == "../in1"                    # Select updated at once ...
+    assert "xf_L_i" not in net._ops                                            # ... but the placement is still the old plan
+    net.apply([b], W, H)                                                       # (the ext applies right after set_inputs)
+    assert "xf_L_i" in net._ops and net._ops["xf_L_i"].par.value("inputfiltertype") == "mipmap"
+
+
+def test_disconnected_input_layer_has_no_mask_wiring(env):
+    net, comp, log, _ = env
+    b = L("i", "input", input=3, surfaceW=16, surfaceH=8, mask={"slot": 6, "enabled": True})
+    net.apply([b], W, H)                                                       # input 3 is not connected
+    assert net._ops["blend_L_i"].par.value("vec0valuez") == 0.0 and source_of(net, "blend_L_i", 2) == "blank"
+    connect_inputs(comp, 3)
+    net.apply([b], W, H)
+    assert net._ops["blend_L_i"].par.value("vec0valuez") == 1.0 and source_of(net, "blend_L_i", 2) == "s6"
+
+
+def test_effect_chain_failure_backs_off_and_cleans_partial_nodes(env, monkeypatch):
+    net, comp, log, clock = env
+    calls = []
+    orig = net._fx.EffectChain.apply
+
+    def partial(self, *a, **k):
+        calls.append(1)
+        orig(self, *a, **k)                       # builds the nodes ...
+        raise RuntimeError("late failure")       # ... then fails
+    monkeypatch.setattr(net._fx.EffectChain, "apply", partial)
+    mk = lambda op_=1.0, fx=None: [base(), px("a", 1, opacity=op_, surfaceW=16, surfaceH=8, effects=fx or [overlay()])]
+    net.apply(mk(), W, H)
+    assert len(calls) == 1 and "late failure" in net.fx_error and "a" not in net._chains
+    for i in range(5):                                                         # unrelated edits: no retry storm
+        net.apply(mk(0.5 - 0.05 * i), W, H)
+    assert len(calls) == 1
+    assert net._ops["blend_L_a"].inputConnectors[1].source is net._ops["xf_L_a"]
+    net.apply(mk(fx=[overlay(opacity=0.5)]), W, H)                             # a changed effect list retries at once
+    assert len(calls) == 2
+    clock.t += 1.0
+    net.apply(mk(0.3, fx=[overlay(opacity=0.5)]), W, H)                        # back-off (0.5 * 2**2 = 2 s) not over yet
+    assert len(calls) == 2
+    clock.t += 5.0
+    net.apply(mk(0.2, fx=[overlay(opacity=0.5)]), W, H)
+    assert len(calls) == 3
+    monkeypatch.setattr(net._fx.EffectChain, "apply", orig)                    # recovers
+    clock.t += 60.0
+    net.apply(mk(0.1, fx=[overlay(opacity=0.5)]), W, H)
+    assert "a" in net._chains and net._fx_fail == {}
+
+
+def test_glsl_pins_for_exact_mask_branch_and_footprint_early_out():
+    pins = {
+        "exact mask size branch": "if (exact && mSize == ivec2(srcSz)) {",
+        "footprint early-out": "if (hi.x <= 0.0 || hi.y <= 0.0 || lo.x >= srcSz.x || lo.y >= srcSz.y) return 0.0;",
+        "footprint inside": "if (lo.x >= 0.0 && lo.y >= 0.0 && hi.x <= srcSz.x && hi.y <= srcSz.y) return 1.0;",
+    }
+    for name, text in pins.items():
+        assert text in GLSL, name
+    for old, new in (("mSize == ivec2(srcSz)", "mSize != ivec2(srcSz)"),
+                     ("hi.x <= 0.0 || hi.y <= 0.0", "hi.x <= 0.0 && hi.y <= 0.0"),
+                     ("lo.x >= 0.0 && lo.y >= 0.0 && hi.x", "lo.x >= 0.0 || lo.y >= 0.0 && hi.x")):
+        assert old in GLSL
+        mutated = GLSL.replace(old, new, 1)
+        assert any(t not in mutated for t in pins.values())

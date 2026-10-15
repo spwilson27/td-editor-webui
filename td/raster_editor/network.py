@@ -8,7 +8,7 @@ unit-tested against fake TD objects (``td/tests/test_network*.py``).
 
 Network shape (all names inside ``doc``)::
 
-    blank (constantTOP, transparent, doc size)      base_src (selectTOP: ../in1 or blank)
+    blank (constantTOP, transparent, doc size)      src_in<N> (selectTOP: ../in<N> or blank; only for inputs a layer uses)
     s<slot>        scriptTOP  surface pixels (callbacks DAT surface_callbacks -> OnSurfaceCook)
     g<N>           glslTOP    blend.glsl nodes: role in tag/comment ``blend_<id>`` (inputs 0 below, 1 source,
                               2 mask; always 3 wired).  They are
@@ -55,18 +55,34 @@ adjustment.  Same maths, folded into the shader to cut GPU passes and cooks.)
 
 Blend uniforms (GLSL TOP Vectors page): ``uParams`` vec4 = (BlendMode index, opacity, hasMask,
 uAdjust 0..7) and ``uXform`` vec4 = (x, y, sx, sy), the layer -> document mapping ``doc = (x, y) + (sx, sy) * layer``
-(v4 transforms; x/y fractional, identity for every layer that is not a pixel / base layer).  The layer's own surface
-is the Script TOP ``s<slot>`` at ``surfaceW x surfaceH`` (the base layer's is ``in1`` at its own resolution).
+of the blend pass (only an INTEGER offset at scale 1 is ever placed by the blend pass; identity for every layer that is
+not a pixel / input layer).  The layer's own surface is the Script TOP ``s<slot>`` at ``surfaceW x surfaceH`` (an input
+layer's is ``src_in<N>``, a Select TOP of ``in<N>``, at the input's own resolution; a disconnected input is ``blank``).
 
-Resampling is a separate pass: a pixel / base layer whose transform is NOT an integer offset at scale 1 gets a node
-``xf_L_<id>`` (uAdjust 7, custom resolution = document size; inputs: surface, mask or the surface again) that renders
-surface x coverage x mask into document space; the blend node then reads that through ``texelFetch`` with an identity
-mapping and no mask.  Only the ``xf_L`` node has ``inputfiltertype`` = ``mipmap`` (while lod =
-``max(0, -log2(sqrt(sx*sy)) - 0.5)`` > 0, i.e. sx*sy < 0.5; trilinear, which is what Canvas 2D drawImage 'medium'
-does) or ``linear``; its inputs are surfaces (or ``base_src``), never an accumulator.  Every other glsl node is
-``nearest`` / texelFetch only (TD builds mip chains for ALL inputs of a mipmap-filtered node, and keeps them).
-Integer offsets at scale 1 have no resample node: the blend pass places the surface itself (exact).  Text / shape
-layers are always TD rendered at document size (they never have a surface slot); see ``render_layer_source``.
+Resampling is a separate pass (v5 affine): a pixel / input layer whose transform is NOT an integer offset at scale 1
+(any rotation or skew included), or that has enabled effects, gets a node ``xf_L_<id>`` (uAdjust 7, custom resolution
+= document size; inputs: surface, mask or the surface again, surface) that renders surface x coverage x mask into
+document space; the blend node (or the layer's effect chain, see below) then reads that through ``texelFetch`` with an
+identity mapping and no mask.  The layer -> document map is  ``doc = T(x,y) R(rot) K(kx,ky) S(sx,sy) layer``  (rot in
+degrees clockwise on screen, K = [[1, tan kx],[tan ky, 1]], document y down, about the surface's top-left);
+the resample node gets the INVERSE of the linear part in ``uXform`` = (m00, m01, m10, m11) and the translation in
+``uA.xy``.  Coverage is the area of the document pixel's parallelogram footprint inside the source rect.  Only the
+``xf_L`` node has ``inputfiltertype`` = ``mipmap`` (while lod = ``max(0, -0.5 log2|det A| - 0.5)`` > 0, i.e. |det A| <
+0.5 with A the forward linear part; trilinear; |det A| = sx*sy for a pure scale: what Canvas 2D drawImage 'medium'
+does, and Skia's area-scale rule for rotated / skewed draws) or ``linear``; its inputs are surfaces (or ``src_in<N>``),
+never an accumulator.  Every other glsl node is ``nearest`` / texelFetch only (TD builds mip chains for ALL inputs of a
+mipmap-filtered node, and keeps them).  Integer offsets at scale 1 without effects have no resample node: the blend pass
+places the surface itself (exact).  Text / shape layers are always TD rendered at document size (they never have a
+surface slot); see ``render_layer_source``.
+
+Inputs (v6): layers of kind ``input`` (input 1..8; a legacy ``base`` layer is input 1) read ``src_in<N>``.  The ext tells
+the network which COMP inputs are connected with :meth:`DocNetwork.set_inputs` (the connectors of the COMP are also read
+by apply()); a layer on a disconnected input renders transparent (no resample node) but keeps its transform.
+
+Layer effects: a layer with enabled effects (pixel, input, text, shape) feeds its doc-space content (the resample node
+when it has a mask or a transform, the source node otherwise) through an effect chain (effects.EffectChain, one per
+layer, owned by the network) whose output is the *source* of the layer's blend node.  Flatten is content only
+(``render_layer_source`` ignores effects).
 
 Persistence (verified): a LOCKED Script TOP keeps its pixels in COMP.save()/loadTox (and so in a saved .toe).
 Locking resets the locked image, so ``freeze()`` does ``top.lock = True`` and then calls ``comp.OnSurfaceCook(top)``
@@ -105,7 +121,8 @@ FMT_SHAPE = "rgba8fixed"       # shape / text layer outputs (the browser surface
 FMT_BLEND = "rgba16fixed"     # blend outputs: 1.5e-5 steps (float16 is 2.4e-4 near 1.0 and colour-burn amplifies it)
 
 # reserved (non layer) node names inside doc
-RESERVED = ("blend_glsl", "shape_glsl", "text_measure", "surface_callbacks", "blank", "base_src", "out")
+RESERVED = ("blend_glsl", "shape_glsl", "text_measure", "surface_callbacks", "blank", "out")
+MAX_INPUTS = 8
 VIEW_NODES = ("view_doc", "view_glsl", "doc_view", "panel_view")
 
 SURFACE_CALLBACKS = (
@@ -184,26 +201,101 @@ def blur_preshrink(radius):
     return 1 if radius < 6 else 2 if radius < 14 else 4 if radius < 32 else 8
 
 
-def xform_uniforms(layer):
-    """LayerSpec -> blend ``uXform`` (x, y, sx, sy) and whether the sampler must be mipmapped (mip lod > 0, i.e. sx*sy < 0.5).  Only pixel and
-    base layers carry a transform; everything else (text, shape, group, adjustment) maps 1:1 at the origin."""
-    if layer.get("kind") not in ("pixel", "base"):
-        return (0.0, 0.0, 1.0, 1.0), False
-    x, y = float(layer.get("x", 0) or 0), float(layer.get("y", 0) or 0)
-    sx, sy = float(layer.get("sx", 1.0) or 1.0), float(layer.get("sy", 1.0) or 1.0)
-    if not (sx > 0 and math.isfinite(sx)):
-        sx = 1.0
-    if not (sy > 0 and math.isfinite(sy)):
-        sy = 1.0
-    if not (math.isfinite(x) and math.isfinite(y)):
+IDENTITY_XF = (0.0, 0.0, 1.0, 1.0)
+SKEW_MAX = 85.0       # degrees: web/src/engine/xform.ts MAX_SKEW (tan() stays finite)
+
+
+class Affine:
+    """A layer's layer -> document map  ``doc = T(x,y) R(rot) K(kx,ky) S(sx,sy) layer`` (document px, y down; rot
+    clockwise on screen; K = [[1, tan kx],[tan ky, 1]]).
+
+    ``xf`` = (x, y, sx, sy) (what the blend pass uses for integer offsets), ``lin`` = (a, b, c, d) the forward 2x2
+    (doc = (x, y) + [[a, b],[c, d]] layer), ``inv`` = (m00, m01, m10, m11) its inverse (the resample uniform
+    ``uXform``), ``det`` = a d - b c, ``mip`` = the resample needs a mip level > 0 (|det| < 0.5), ``pure`` = no rotation or
+    skew, ``dead`` = a singular matrix (the layer covers no area: rendered transparent)."""
+
+    __slots__ = ("xf", "lin", "inv", "det", "mip", "pure", "dead")
+
+    def __init__(self, x=0.0, y=0.0, sx=1.0, sy=1.0, rot=0.0, kx=0.0, ky=0.0):
+        self.xf = (x, y, sx, sy)
+        self.pure = rot == 0.0 and kx == 0.0 and ky == 0.0
+        if self.pure:
+            a, b, c, d = sx, 0.0, 0.0, sy
+        else:
+            r = math.radians(rot)
+            cs, sn = math.cos(r), math.sin(r)
+            tx, ty = math.tan(math.radians(kx)), math.tan(math.radians(ky))
+            a, b = sx * (cs - sn * ty), sy * (cs * tx - sn)
+            c, d = sx * (sn + cs * ty), sy * (sn * tx + cs)
+        self.lin = (a, b, c, d)
+        self.det = a * d - b * c
+        self.dead = not (abs(self.det) > 1e-9 * max(1.0, abs(a * d) + abs(b * c)) and math.isfinite(self.det))
+        if self.dead:
+            self.inv = (1.0, 0.0, 0.0, 1.0)
+        else:
+            self.inv = (d / self.det, -b / self.det, -c / self.det, a / self.det)
+        self.mip = abs(self.det) < 0.5
+
+    @property
+    def exact(self):
+        """An integer offset at scale 1: the blend pass places the surface itself, no resample pass."""
+        return self.pure and xform_is_exact(self.xf)
+
+
+def _num(v, default):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
+
+
+IDENTITY = Affine()
+
+
+def layer_affine(layer):
+    """LayerSpec -> :class:`Affine`.  Only pixel and input layers (and a legacy ``base``) carry a transform;
+    everything else (text, shape, group, adjustment) maps 1:1 at the origin.  Invalid numbers fall back to the identity."""
+    if layer.get("kind") not in ("pixel", "input", "base"):
+        return IDENTITY
+    x, y = _num(layer.get("x", 0) or 0, None), _num(layer.get("y", 0) or 0, None)
+    if x is None or y is None:
         x = y = 0.0
-    return (x, y, sx, sy), (sx * sy < 0.5)
+    sx, sy = _num(layer.get("sx", 1.0) or 1.0, 1.0), _num(layer.get("sy", 1.0) or 1.0, 1.0)
+    if not sx > 0:
+        sx = 1.0
+    if not sy > 0:
+        sy = 1.0
+    rot, kx, ky = _num(layer.get("rot", 0.0) or 0.0, 0.0), _num(layer.get("kx", 0.0) or 0.0, 0.0), \
+        _num(layer.get("ky", 0.0) or 0.0, 0.0)
+    kx, ky = max(-SKEW_MAX, min(SKEW_MAX, kx)), max(-SKEW_MAX, min(SKEW_MAX, ky))
+    if abs(rot) > 1e6:
+        rot = 0.0
+    return Affine(x, y, sx, sy, rot, kx, ky)
+
+
+def xform_uniforms(layer):
+    """LayerSpec -> ``((x, y, sx, sy), mip)``: the blend-pass ``uXform`` and whether the sampler must be mipmapped
+    (mip lod > 0, i.e. |det| = sx*sy < 0.5 for a pure scale).  See :func:`layer_affine` for rotation / skew."""
+    a = layer_affine(layer)
+    return a.xf, a.mip
 
 
 def xform_is_exact(xf):
     """True when the mapping is an integer offset at scale 1: the blend pass places the surface with texelFetch and
     no resample pass is needed.  Same tolerance as blend.glsl."""
     return (xf[2] == 1.0 and xf[3] == 1.0 and abs(xf[0] - round(xf[0])) < 1e-4 and abs(xf[1] - round(xf[1])) < 1e-4)
+
+
+def input_index(layer):
+    """The COMP input (1..8) an ``input`` layer reads; a legacy ``base`` layer is input 1."""
+    if layer.get("kind") == "base":
+        return 1
+    try:
+        n = int(layer.get("input") or 1)
+    except (TypeError, ValueError):
+        n = 1
+    return max(1, min(MAX_INPUTS, n))
 
 
 # --------------------------------------------------------------------------- text / shape specs
@@ -429,7 +521,7 @@ class _Node:
 
 
 class DocNetwork:
-    def __init__(self, comp, blend_glsl, clock=time.monotonic, shape_glsl=None):
+    def __init__(self, comp, blend_glsl, clock=time.monotonic, shape_glsl=None, effects=None, effect_shaders=None):
         self.comp = comp
         self._blend_glsl = blend_glsl
         self._shape_glsl = shape_glsl if shape_glsl is not None else _read_sibling("shape.glsl")
@@ -467,7 +559,8 @@ class DocNetwork:
         self._prev_layers = None
         self._prev_stack = None
         self._prev_size = None
-        self._input_connected = None
+        self._input_connected = None   # {input: bool} of the last apply()
+        self._declared = {}            # set_inputs(): fallback for inputs whose COMP connector is not readable
         self._scanned = False
         self._view = None
         self._view_state = {}
@@ -475,6 +568,13 @@ class DocNetwork:
                           "disconnects": 0, "recycled": 0, "applies": 0, "unknown": 0, "forced": 0}
         self._last = {}
         self._last_ms = 0.0
+        self._chains = {}      # layer id -> effects.EffectChain
+        self._fx_fail = {}     # layer id -> (consecutive failures, retry not before, effect-list key)
+        self._fx_todo = {}     # planned effect chains: alias node name -> (layer id, source node name, effects, pos)
+        self._fx_out = {}      # alias node name -> the chain's output operator
+        self.fx_error = None   # why layer effects are unavailable / the last chain failure (None = fine)
+        self._fx, self._fx_shaders = None, None
+        self._init_effects(effects, effect_shaders)
         self._ensure_base_nodes()
 
     # ------------------------------------------------------------------ public API
@@ -483,7 +583,7 @@ class DocNetwork:
         t0 = time.perf_counter()
         counters0 = dict(self._counters)
         doc_w, doc_h = int(doc_w), int(doc_h)
-        connected = self._detect_input()
+        connected = self._detect_inputs()
         key = (doc_w, doc_h)
         snap = json.dumps(layers, sort_keys=True, separators=(",", ":"))
         if snap == self._prev_layers and key == self._prev_size and connected == self._input_connected:
@@ -609,13 +709,36 @@ class DocNetwork:
     def output(self):
         return self._ops.get("out")
 
+    def set_inputs(self, connected):
+        """The ext calls this when COMP inputs are (dis)connected: ``connected`` = ``{input (1..8): bool}`` or the
+        protocol's ``[{input, connected, ...}]`` list (inputs not mentioned keep their last value).  apply() also reads the COMP's connectors itself (they win where they
+        exist); this is the explicit notification and the fallback for inputs without a readable connector.  The
+        ``src_in<N>`` Select TOPs are re-pointed at once and the next apply() re-plans (a transform only applies to a
+        connected input).  Cheap; call it on every input change.
+
+        ONE-FRAME CAVEAT: only the Select re-point happens here.  The input layer's transform / effects / resample
+        node and its mask wiring depend on "connected" and are rebuilt by the NEXT ``apply()`` (this call only drops
+        the stored-stack snapshot so that apply() re-plans even with an unchanged stack).  Until then the input is
+        shown with the previous plan (untransformed / mis-placed for a newly connected input, a stale transform on a
+        disconnected one).  The ext therefore calls ``apply(last stack)`` right after ``set_inputs`` in the same
+        frame."""
+        changed = []
+        if not isinstance(connected, dict):          # the protocol's [{input, w, h, connected}] list
+            connected = {int(i["input"]): bool(i.get("connected")) for i in (connected or ())}
+        for k, v in connected.items():
+            k, v = int(k), bool(v)
+            if 1 <= k <= MAX_INPUTS and (self._declared.get(k, False) != v or (self._input_connected or {}).get(k, v) != v):
+                self._declared[k] = v
+                changed.append(k)
+        if changed and self._prev_layers is not None:
+            self._input_connected = None
+            self._prev_layers = None
+            for k in changed:
+                self._set_input_source(k, self._declared[k])
+
     def set_input_connected(self, flag):
-        """The ext calls this when the COMP's input 1 is (dis)connected; apply() also detects it."""
-        flag = bool(flag)
-        if flag != self._input_connected and self._prev_layers is not None:
-            self._input_connected = flag
-            self._set_base_source(flag)
-            self._prev_layers = None        # the base transform only applies to a connected input: re-plan on apply()
+        """Legacy (v5) form of :meth:`set_inputs` for input 1."""
+        self.set_inputs({1: bool(flag)})
 
     def freeze(self):
         """Lock every surface TOP so its pixels are stored with the file.
@@ -654,7 +777,8 @@ class DocNetwork:
             "nodes": len(self._ops), "surfaces": len(self._slots), "pending_destroy": len(self._pending),
             "pool": len(self._pool), "garbage": len(self._garbage), "junk": len(self._junk), "by_type": types, "last_apply_ms": self._last_ms,
             "last": dict(self._last), "totals": dict(self._counters),
-            "view": self._view is not None,
+            "view": self._view is not None, "fx_chains": len(self._chains),
+            "fx_nodes": sum(c.node_count for c in self._chains.values()), "fx_error": self.fx_error,
         }
 
     # ---- TD-view overlay -----------------------------------------------------------------
@@ -714,18 +838,30 @@ class DocNetwork:
             self._cache["surface_callbacks"] = {"type": "textDAT", "pars": {}, "inputs": [], "bypass": False, "pos": None}
             dat.nodeX, dat.nodeY = -900, 100
 
-    def _detect_input(self):
+    def _detect_inputs(self):
+        """{1..8: connected}: the COMP's input connectors where they exist, else the last :meth:`set_inputs` value."""
         try:
-            conns = self.comp.inputConnectors[0].connections
-            return bool(conns)
+            conns = self.comp.inputConnectors
+            n = len(conns)
         except Exception:
-            return False
+            conns, n = (), 0
+        out = {}
+        for k in range(1, MAX_INPUTS + 1):
+            try:
+                out[k] = bool(conns[k - 1].connections) if k <= n else bool(self._declared.get(k, False))
+            except Exception:
+                out[k] = bool(self._declared.get(k, False))
+        return out
 
-    def _set_base_source(self, connected):
-        node = self._ops.get("base_src")
+    def input_connected(self, n):
+        """Whether input ``n`` was connected at the last apply()."""
+        return bool((self._input_connected or {}).get(int(n), False))
+
+    def _set_input_source(self, n, connected):
+        name = "src_in%d" % n
+        node = self._ops.get(name)
         if node is not None:
-            want = "../in1" if connected else "blank"
-            self._set_pars("base_src", node, {"top": want})
+            self._set_pars(name, node, {"top": "../in%d" % n if connected else "blank"})
 
     def _alloc_name(self, layer_id):
         n = self._names.get(layer_id)
@@ -899,6 +1035,7 @@ class DocNetwork:
 
     def _plan(self, layers, doc_w, doc_h, connected):
         d = {}
+        self._fx_todo = {}
         self._text_nodes = {}
         self._text_todo = set()
         for gone in [n for n in self._text_retry if not n.startswith("text_")]:
@@ -922,7 +1059,6 @@ class DocNetwork:
         res = {"outputresolution": "custom", "resolutionw": doc_w, "resolutionh": doc_h}
         add(_Node("blank", "constantTOP", dict(res, colorr=0.0, colorg=0.0, colorb=0.0, alpha=0.0,
                                                format="rgba8fixed"), pos=(-600, 0)))
-        add(_Node("base_src", "selectTOP", {"top": "../in1" if connected else "blank"}, pos=(-600, -100)))
 
         row = [0]
 
@@ -936,6 +1072,14 @@ class DocNetwork:
             if name not in d:
                 add(_Node(name, "scriptTOP", {"outputresolution": "custom", "resolutionw": w, "resolutionh": h,
                                               "callbacks": "surface_callbacks"}, pos=(x, y)))
+            return name
+
+        def input_source(n):
+            """Select TOP of COMP input ``n`` (created for the inputs a layer reads)."""
+            name = "src_in%d" % n
+            if name not in d:
+                add(_Node(name, "selectTOP", {"top": "../in%d" % n if connected.get(n) else "blank"},
+                          pos=(-600, -100 - 60 * n)))
             return name
 
         def blend_pars(mode, opacity, has_mask, adjust, xf, mip, fmt=FMT_BLEND, filt="nearest"):
@@ -952,15 +1096,16 @@ class DocNetwork:
             bx = depth * 700
             for l in kids:
                 extra = {}
+                no_fx = False
                 sid = self._alloc_name(l["id"])
                 kind = l.get("kind")
                 y = -row[0] * 160
                 row[0] += 1
                 mask = l.get("mask")
                 mask_name = None
-                if mask and kind in ("pixel", "adjustment", "group", "base", "text", "shape") and mask.get("slot") is not None:
+                if mask and kind in ("pixel", "adjustment", "group", "input", "base", "text", "shape") and mask.get("slot") is not None:
                     # a mask lives in layer space: same size as the layer's surface (document size for the rest)
-                    own = kind in ("pixel", "base")
+                    own = kind in ("pixel", "input", "base")
                     mask_name = surface(int(mask["slot"]), bx - 700, y - 60,
                                         l.get("surfaceW") if own else None, l.get("surfaceH") if own else None)
                     if not mask.get("enabled", True):
@@ -968,15 +1113,20 @@ class DocNetwork:
                 visible = bool(l.get("visible", True))
                 opacity = l.get("opacity", 1.0)
                 mode = BLEND_INDEX.get(l.get("blend", "normal"), 0)
-                bname = "blend_base" if kind == "base" else "blend_L_" + sid
-                xf, mip = xform_uniforms(l)
+                bname = "blend_L_" + sid
+                aff = layer_affine(l)
+                xf, mip = aff.xf, aff.mip
                 if kind in ("text", "shape"):
                     self._source_keys[l["id"]] = json.dumps([kind, l.get(kind), doc_w, doc_h], sort_keys=True,
                                                             separators=(",", ":"))
-                if kind == "base":
-                    src, adjust, mode = "base_src", 0, 0
-                    if not connected:
-                        xf, mip = (0.0, 0.0, 1.0, 1.0), False       # nothing to transform: blank is document sized
+                if kind in ("input", "base"):
+                    n_in = input_index(l)
+                    src, adjust = input_source(n_in), 0
+                    if not connected.get(n_in):
+                        # nothing to transform / decorate: the source is the (document sized) transparent blank
+                        aff, xf, mip = IDENTITY, IDENTITY_XF, False
+                        no_fx = True
+                        mask_name = None       # nothing to mask: the mask surface stays allocated but is not wired / cooked
                 elif kind in ("text", "shape"):        # always TD rendered (v4: no rasterize, never a surface)
                     adjust = 0
                     spec = l.get(kind)
@@ -1029,14 +1179,31 @@ class DocNetwork:
                     continue
                 # sTD2DInputs[] is sized by the number of wired inputs: always wire all three
                 has_mask = mask_name is not None
-                if kind in ("pixel", "base") and src != "blank" and not xform_is_exact(xf):
-                    # non-integer position or scale: a resample pass renders the layer (and its mask) into document
-                    # space; it is the only node that reads through a mipmap filter, the blend below only fetches
+                fx = self._layer_effects(l, kind) if src != "blank" and not no_fx else None
+                if kind in ("pixel", "input", "base") and aff.dead:
+                    src, mask_name, has_mask, xf, mip = "blank", None, False, IDENTITY_XF, False       # singular matrix: no area
+                    fx = None
+                staged = False
+                if kind in ("pixel", "input", "base") and src != "blank" and (not aff.exact or fx):
+                    # non-integer position / scale, rotation or skew (or effects, which need the masked content in
+                    # document space): a resample pass renders the layer (and its mask) into document space; it is the
+                    # only node that reads through a mipmap filter, the blend below only fetches
+                    staged = True
+                    xp = blend_pars(0, 0.0, has_mask, ADJ_RESAMPLE, aff.inv, mip, filt="mipmap" if mip else "linear")
+                    xp.update({"vec2valuex": float(aff.xf[0]), "vec2valuey": float(aff.xf[1]),
+                               "vec2valuez": 0.0, "vec2valuew": 0.0})
+                elif kind in ("text", "shape") and fx and has_mask:
+                    # the mask must be applied before the effects: identity resample (exact path) = source x mask
+                    staged = True
+                    xp = blend_pars(0, 0.0, True, ADJ_RESAMPLE, (1.0, 0.0, 0.0, 1.0), False, filt="linear")
+                    xp.update({"vec2valuex": 0.0, "vec2valuey": 0.0, "vec2valuez": 0.0, "vec2valuew": 0.0})
+                if staged:
                     xname = "xf_L_" + sid
-                    xp = blend_pars(0, 0.0, has_mask, ADJ_RESAMPLE, xf, mip, filt="mipmap" if mip else "linear")
                     xp.update({"outputresolution": "custom", "resolutionw": doc_w, "resolutionh": doc_h})
                     add(_Node(xname, "glslTOP", xp, [src, mask_name or src, src], pos=(bx - 175, y)))      # 3 inputs: sTD2DInputs[] is sized by the wired ones
-                    src, mask_name, has_mask, xf, mip = xname, None, False, (0.0, 0.0, 1.0, 1.0), False
+                    src, mask_name, has_mask, xf, mip = xname, None, False, IDENTITY_XF, False
+                if fx:
+                    src = self._plan_effects(add, l, sid, src, fx, doc_w, doc_h, (bx - 100, y))
                 inputs = [acc, src, mask_name or "blank"]
                 bp = blend_pars(mode, opacity, has_mask, adjust, xf, mip)
                 bp.update(extra)
@@ -1049,6 +1216,122 @@ class DocNetwork:
         for gone in [n for n in self._text_retry if n not in self._text_nodes]:
             del self._text_retry[gone]
         return d
+
+    # ------------------------------------------------------------------ layer effects (hook, see effects.py)
+
+    def _init_effects(self, effects, shaders):
+        """Locate effects.py (the module is injected by the ext; tests / dev scripts find the sibling file) and its shader
+        sources.  Failure disables layer effects (``fx_error`` says why); the rest of the network is unaffected."""
+        try:
+            if effects is None:
+                try:
+                    dat = self.comp.op("effects")
+                    effects = dat.module if dat is not None else None
+                except Exception:
+                    effects = None
+            if effects is None:
+                import importlib.util
+                path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "effects.py")
+                spec = importlib.util.spec_from_file_location("raster_effects", path)
+                effects = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(effects)
+            self._fx = effects
+            self._fx_shaders = shaders if shaders is not None else effects.load_shader_texts()
+        except Exception as e:      # noqa: BLE001 - effects are optional
+            self._fx = self._fx_shaders = None
+            self.fx_error = "%s: %s" % (type(e).__name__, e)
+
+    def _layer_effects(self, layer, kind):
+        """The layer's effect list when at least one effect draws something, else None.  Pixel, input, text and shape
+        layers only (not groups / adjustments in v5)."""
+        if self._fx is None or kind not in ("pixel", "input", "base", "text", "shape"):
+            return None
+        fx = [e for e in (layer.get("effects") or ()) if isinstance(e, dict)]
+        if not fx:
+            return None
+        try:
+            return fx if self._fx.plan_chain(fx) else None
+        except Exception as e:      # noqa: BLE001 - a malformed effect must not break the document
+            self.fx_error = "plan: %s: %s" % (type(e).__name__, e)
+            return None
+
+    def _plan_effects(self, add, layer, sid, src, fx, doc_w, doc_h, pos):
+        """Register the layer's effect chain: its input is the node ``src``; the returned alias name stands for the chain's
+        output in the blend node's wiring (the chain nodes are built by :meth:`_apply_effects`)."""
+        alias = "fx_L_" + sid
+        self._fx_todo[alias] = (layer["id"], src, fx, pos)
+        return alias
+
+    def _fx_acquire(self, optype):
+        if self._pool:
+            op, _cache = self._pool.pop()
+            self._counters["recycled"] += 1
+        else:
+            op, _cache = self._make_pool_node()
+        return op
+
+    def _fx_release(self, op):
+        """Back to the spare pool in the state _make_pool_node leaves it (the chain renamed vectors / the shader DAT)."""
+        cache = {"type": "glslTOP", "pars": {}, "inputs": [], "bypass": False, "pos": None}
+        self._set_pars_raw(op, cache, {
+            "pixeldat": "blend_glsl", "format": FMT_BLEND, "vec0name": "uParams", "vec1name": "uXform",
+            "vec2name": "uA", "vec3name": "uB", "inputfiltertype": "nearest", "outputresolution": "useinput",
+            "vec4name": ""})
+        if op.valid and len(self._pool) < POOL_MAX:
+            self._pool.append((op, cache))
+        else:
+            self._garbage.append((op, cache))
+
+    def _apply_effects(self):
+        """Build / update / remove the effect chains planned by the last _plan (after the nodes exist, before wiring)."""
+        todo = self._fx_todo
+        keep = {v[0] for v in todo.values()}
+        for lid in [k for k in self._chains if k not in keep]:
+            self._chains.pop(lid).destroy()
+        for alias in [a for a in self._fx_out if a not in todo]:
+            del self._fx_out[alias]
+            self._gen.pop(alias, None)
+        now = self._clock()
+        for lid in [k for k in self._fx_fail if k not in keep]:
+            del self._fx_fail[lid]
+        for alias, (lid, src, fx, pos) in todo.items():
+            src_op = self._ops[src]
+            fkey = json.dumps(fx, sort_keys=True, separators=(",", ":"), default=str)
+            fail = self._fx_fail.get(lid)
+            if fail is not None and fail[2] == fkey and now < fail[1]:
+                # this exact effect list failed recently: no retry on every apply(), the layer shows without effects
+                if self._fx_out.get(alias) is not src_op:
+                    self._fx_out[alias] = src_op
+                    self._gen_counter += 1
+                    self._gen[alias] = self._gen_counter
+                continue
+            chain = None
+            try:
+                chain = self._chains.get(lid)
+                if chain is None:
+                    chain = self._chains[lid] = self._fx.EffectChain(
+                        self.doc, "fx_" + sanitize(lid), self._fx_shaders, acquire=self._fx_acquire,
+                        release=self._fx_release, pos=pos, adopt=False)
+                c0 = dict(chain.counters)
+                out = chain.apply(fx, src_op)
+                for k in ("par_sets", "connects"):
+                    self._counters[k] += chain.counters[k] - c0[k]
+                self._fx_fail.pop(lid, None)
+            except Exception as e:      # noqa: BLE001 - never break the document: show the layer without its effects
+                self.fx_error = "chain %s: %s: %s" % (lid, type(e).__name__, e)
+                n = (fail[0] if fail is not None else 0) + 1
+                self._fx_fail[lid] = (n, now + min(30.0, 0.5 * 2 ** n), fkey)
+                try:                                       # clean up the partially built chain (nodes back to the pool)
+                    self._chains.pop(lid, None)
+                    if chain is not None:
+                        chain.destroy()
+                except Exception:      # noqa: BLE001
+                    pass
+                out = src_op
+            if self._fx_out.get(alias) is not out:
+                self._fx_out[alias] = out
+                self._gen_counter += 1
+                self._gen[alias] = self._gen_counter
 
     # ------------------------------------------------------------------ reconcile
 
@@ -1081,6 +1364,8 @@ class DocNetwork:
             if cache["pos"] != spec.pos:
                 op.nodeX, op.nodeY = spec.pos
                 cache["pos"] = spec.pos
+        # 1b. layer effect chains (their input nodes exist now; the blend nodes are wired to their outputs below)
+        self._apply_effects()
         # 2. wiring
         for name, spec in desired.items():
             self._wire(name, spec.inputs)
@@ -1123,20 +1408,19 @@ class DocNetwork:
 
     def _remove_unknown(self):
         self._prune()
-        known = {op.name for op in self._ops.values()} | set(RESERVED) \
+        known = {op.name for op in self._ops.values()} | set(RESERVED) | {n.name for c in self._chains.values() for n in c.nodes} \
             | {p[0].name for p in self._pool} | {g.name for g, _ in self._garbage} | {j.name for j in self._junk}
         leftovers = {o.path for o in self._adopt.values()}      # tagged glsl nodes whose role is gone
         for child in list(self.doc.children):
-            if not child.valid or child.name in known:      # may have died with a destroyed parent node
+            if not child.valid or child.name in known or child.name.startswith("fxsrc_"):      # (fxsrc_*: effect shader DATs)
                 continue
             spare = child.OPType == "glslTOP" and not child.tags and _SPARE_NAME.match(child.name)
             if (child.path in leftovers or spare) and len(self._pool) < POOL_MAX:
-                child.tags = []
-                child.comment = ""
                 for i in range(len(child.inputConnectors)):
                     child.inputConnectors[i].disconnect()
-                child.bypass = False
-                self._pool.append((child, {"type": "glslTOP", "pars": {}, "inputs": [], "bypass": False, "pos": None}))
+                cache = {"type": "glslTOP", "pars": {}, "inputs": [], "bypass": False, "pos": None}
+                self._reset_for_pool(child, cache, force=True)       # a stale xf_L / effect node keeps no custom size / mipmap
+                self._pool.append((child, cache))
                 continue
             self._unknown_names.append(child.name)
             self._destroy_op(child)
@@ -1254,6 +1538,7 @@ class DocNetwork:
         op = self._ops[name]
         cache = self._cache[name]
         want_all = [(n, self._gen[n]) for n in inputs]
+        outs = self._fx_out
         cur = cache["inputs"]
         if cur is None:     # adopted: unknown state, rewire everything
             cur = [object()] * len(op.inputConnectors)
@@ -1268,9 +1553,26 @@ class DocNetwork:
                     op.inputConnectors[i].disconnect()
                     self._counters["disconnects"] += 1
             else:
-                op.inputConnectors[i].connect(self._ops[want[0]])
+                op.inputConnectors[i].connect(outs[want[0]] if want[0] in outs else self._ops[want[0]])
                 self._counters["connects"] += 1
         cache["inputs"] = want_all
+
+    def _reset_for_pool(self, op, cache, force=False):
+        """Make a GLSL TOP a neutral spare: inherit input 0's resolution (shape / resample nodes have a custom one),
+        ``nearest`` filter (never recycle a mipmap flag), not bypassed, untagged.  ``force`` = the cache knows nothing
+        about the node's real parameter values (an adopted node of a loaded file): set them unconditionally."""
+        pars = cache["pars"]
+        if force or pars.get("outputresolution", "useinput") != "useinput":
+            pars.pop("outputresolution", None)
+            self._set_pars_raw(op, cache, {"outputresolution": "useinput"})
+        if force or pars.get("inputfiltertype", "nearest") != "nearest":
+            pars.pop("inputfiltertype", None)
+            self._set_pars_raw(op, cache, {"inputfiltertype": "nearest"})
+        if force or cache["bypass"]:
+            op.bypass = False
+            cache["bypass"] = False
+        op.tags = []
+        op.comment = ""
 
     def _drop(self, name, force_destroy=False):
         """The operator behind ``name`` is not needed any more.  GLSL TOPs go back to the spare pool,
@@ -1286,16 +1588,7 @@ class DocNetwork:
             self._counters["disconnects"] += 1
         cache["inputs"] = []
         if cache["type"] == "glslTOP" and len(self._pool) < POOL_MAX:
-            if cache["pars"].get("outputresolution", "useinput") != "useinput":
-                # shape nodes have a custom resolution; blend nodes inherit input 0's
-                self._set_pars_raw(op, cache, {"outputresolution": "useinput"})
-            if cache["pars"].get("inputfiltertype", "nearest") != "nearest":
-                self._set_pars_raw(op, cache, {"inputfiltertype": "nearest"})      # never recycle a mipmap flag
-            if cache["bypass"]:
-                op.bypass = False
-                cache["bypass"] = False
-            op.tags = []
-            op.comment = ""
+            self._reset_for_pool(op, cache)
             self._pool.append((op, cache))
         elif force_destroy:
             self._destroy_op(op)

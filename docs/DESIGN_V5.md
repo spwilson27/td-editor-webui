@@ -24,15 +24,45 @@ Builds on `DESIGN_V4.md` (tag `v0.4.0`). Protocol: `PROTOCOL.md` §8 (version 6)
 
 ## 3. TouchDesigner
 
-- **Inputs:** `in1..in8` In TOPs created on demand (always one spare connector); per input a `src_in<N>`
-  Select; BASE frames per input (`slot` header field = input index; `GET /base?input=N`); an `inputs`
-  message lists `{input, w, h, connected}` (replaces `baseSize`).
-- **Affine resample:** `uXform` becomes a 2×3 matrix (inverse mapping) + source size; lod from the
-  matrix's minimal singular value; mip only on surfaces (unchanged rule).
-- **Effects:** per layer an effect chain (one GLSL TOP per enabled effect, shader sources in
-  `td/raster_editor/effects/*.glsl` shared with the web preview) applied to the layer's masked, resampled
-  content before its blend node. Drop shadow/glow use a separable blur (Blur TOP or GLSL), pixel sort a
-  bounded multi-pass GPU sort (document the algorithm and its limits), glitch seeded/deterministic.
+- **Inputs:** `in1..in8` In TOPs created on demand (always one spare connector); per *referenced* input a `src_in<N>`
+  Select (`../in<N>` while connected, else `blank`) inside `doc` (replaces `base_src`); BASE frames per input (`slot` header
+  field = input index; `GET /base?input=N`); an `inputs` message lists `{input, w, h, connected}` (replaces `baseSize`).
+  `DocNetwork` interface (ext calls): `set_inputs(connected)` -- `{input: bool}` or the protocol's `[{input, connected, ...}]`
+  list, partial updates allowed, repoints the Selects at once and re-plans on the next `apply()`; `set_input_connected(flag)`
+  stays as input 1 shorthand; `input_connected(n)`. `apply()` also reads the COMP's input connectors itself (they win where
+  they exist; `set_inputs` is the fallback for inputs without a connector). **One-frame caveat:** `set_inputs` only re-points the Selects; the input layers' transform / resample /
+  effects / mask wiring are rebuilt by the NEXT `apply()`, so the ext must call `apply(last stack)` right after `set_inputs`
+  (until then a newly connected input is shown with the old, untransformed plan). Layers `kind: 'input'` (`input` 1..8, clamped; a
+  legacy `base` layer = input 1) read their Select; any number of input layers per input, any position, with blend /
+  opacity / mask (mask size = the input layer's `surfaceW/H`) / transform. A disconnected input renders transparent: no
+  resample pass, no effects, and the transform is kept (it applies again on reconnection with no spec change).
+  `blend_base` / `base_src` no longer exist: every layer is `blend_L_<id>`, input layers use `src_in<N>`.
+- **Affine resample:** `doc = T(x,y)·R(rot)·K(kx,ky)·S(sx,sy)·layer` (rot clockwise on screen, K = [[1, tan kx],[tan ky, 1]],
+  document y down, about the surface's top-left; skew clamped to ±85° (`MAX_SKEW` in `web/src/engine/xform.ts`; TD `SKEW_MAX` uses the same value); a singular matrix renders the layer transparent).
+  Only the resample pass (`xf_L_<id>`, `uAdjust = 7`) takes the transform: `uXform` = (m00, m01, m10, m11), the INVERSE
+  of the linear part (doc offset → layer pixels), `uA.xy` = (x, y); the blend pass keeps `uXform = (x, y, 1, 1)` and only ever
+  places an integer offset at scale 1 (bit exact, no resample node, unchanged). Coverage = area of the document pixel's
+  parallelogram footprint inside the source rect (Sutherland–Hodgman clip in the shader; axis aligned footprints take the
+  old separable formula); colour = linear / trilinear sample at the pixel centre, extend hold. **lod =
+  max(0, −½·log2|det A| − ½)** with A the forward linear part, i.e. the geometric mean of the singular values -- NOT the
+  minimal one: this equals the v4 fit for pure scales (`sx=2, sy=.5` stays lod 0) and is Skia's `sqrt(area scale)` rule for
+  rotated / skewed draws. The node is `mipmap` only while |det A| < 0.5, `linear` otherwise. Mip only on surfaces and
+  `src_in<N>` (unchanged rule). A transform edit is ≤ 6 uniform sets (+ one `inputfiltertype` set when crossing |det| = ½).
+  Preview: `ctx.setTransform(A00, A10, A01, A11, x, y); drawImage(img, 0, 0, w, h)` with `imageSmoothingQuality = 'medium'`
+  matches (measured: interiors ≤ 2/255 for rotation/skew with magnification, ≤ 5/255 minified).
+- **Effects:** per layer an effect chain (`effects.EffectChain`: one GLSL TOP per pass, shader sources shared with the web preview)
+  applied to the layer's masked, resampled content before its blend node. `DocNetwork(comp, blend, shape_glsl=, effects=,
+  effect_shaders=)`: `effects` = the `effects.py` module (default: DAT `effects` in the COMP, else the sibling file),
+  `effect_shaders` = `effects.load_shader_texts()` result (default: loaded by the module); without them layer effects are
+  disabled (`stats()["fx_error"]` says why). Wiring per pixel / input layer with at least one effect that draws: the layer is
+  ALWAYS staged through `xf_L_<id>` (also for an integer offset: the shader's exact texelFetch branch, so the content is
+  bit exact and the mask is applied before the effects), the chain reads `xf_L_<id>` and its last pass is input 1 of the blend
+  (no mask, identity mapping there). Text / shape layers: the chain reads the shape / text node (when masked, an identity
+  `xf_L_<id>` pass applies the mask first). Groups / adjustments ignore `effects`; a disconnected input has none. Chain nodes
+  come from (and return reset to) the spare GLSL pool; shader text DATs `fxsrc_<type>` live in `doc` and are shared;
+  a parameter edit is only `par` sets on the chain's nodes; toggling effects on/off builds / removes the chain in < 1 ms
+  with a warm pool. A failing chain falls back to the layer without effects (`fx_error`). **Flatten (`render_layer_source`) is
+  content only: effects are not included.**
 - **Files:** `Projectfile` (File), `Saveproject`, `Openproject` (pulses), `Pngfile` (File), `Exportpng`
   (pulse) parameters with help; TD writes/reads `.redoc` from its own surface buffers (budgeted, off the
   main thread where possible: PNG encode in a worker thread), PNG from `out1` (`TOP.save`).

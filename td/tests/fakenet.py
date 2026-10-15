@@ -275,30 +275,64 @@ def _bilinear(img, u, v):
             + g(y0 + 1, x0) * (1 - tx) * ty + g(y0 + 1, x0 + 1) * tx * ty)
 
 
-def sample_reference(src, out_w, out_h, x, y, sx, sy, mip=True, coverage=True, lod=None):
+def affine_forward(sx, sy, rot=0.0, kx=0.0, ky=0.0):
+    """Forward linear part R(rot) K(kx,ky) S(sx,sy) (document px, y down; rot degrees clockwise on screen)."""
+    r = np.radians(rot)
+    R = np.array([[np.cos(r), -np.sin(r)], [np.sin(r), np.cos(r)]])
+    K = np.array([[1.0, np.tan(np.radians(kx))], [np.tan(np.radians(ky)), 1.0]])
+    return R @ K @ np.diag([sx, sy])
+
+
+def affine_lod(A):
+    """mip level of the resample pass: -0.5 log2|det A| - 0.5 (geometric mean of the singular values; 0 when magnifying)."""
+    return max(0.0, -0.5 * np.log2(abs(np.linalg.det(A))) - 0.5)
+
+
+def coverage_supersampled(A, x, y, sw, sh, out_w, out_h, n=32):
+    """Fraction of every document pixel covered by the layer rect [0,sw]x[0,sh] mapped through ``doc = (x,y) + A l``,
+    by n x n point sampling (independent of the shader's polygon clipping; error <= ~1/n on an edge)."""
+    Ai = np.linalg.inv(A)
+    o = (np.arange(n) + 0.5) / n
+    cov = np.zeros((out_h, out_w))
+    jj, ii = np.mgrid[0:out_h, 0:out_w]
+    for oy in o:
+        for ox in o:
+            dx, dy = ii + ox - x, jj + oy - y
+            lx = Ai[0, 0] * dx + Ai[0, 1] * dy
+            ly = Ai[1, 0] * dx + Ai[1, 1] * dy
+            cov += (lx >= 0) & (lx < sw) & (ly >= 0) & (ly < sh)
+    return cov / (n * n)
+
+
+def sample_reference(src, out_w, out_h, x, y, sx, sy, mip=True, coverage=True, lod=None, rot=0.0, kx=0.0, ky=0.0):
     """What blend.glsl does to the *source* (premultiplied float (h, w, 4), top row first) for a document of
     out_w x out_h: returns the float (out_h, out_w, 4) layer image in document space (top row first), coverage applied.
 
-    doc = (x, y) + (sx, sy) * layer;  integer position at scale 1 -> exact copy;  otherwise bilinear (clamp to
-    edge) with a trilinear mip level lod = max(0, -log2(sqrt(sx*sy)) - 0.5) (the Canvas 2D 'medium' behaviour, ``mip``), pixel footprint clipped to the source rect
-    (coverage; ``coverage=False`` skips it, e.g. for a mask)."""
-    src = np.asarray(src, np.float64)
+    ``doc = (x, y) + R(rot) K(kx,ky) S(sx,sy) layer`` (v5 affine; rot / kx / ky degrees).  Pure scale + translation keeps
+    the exact formulas of v4 (separable coverage, integer offsets at scale 1 are texel exact); rotated / skewed
+    transforms use point-sampled coverage."""
     sh, sw = src.shape[:2]
-    sx, sy = max(float(sx), 1e-6), max(float(sy), 1e-6)
     jj, ii = np.mgrid[0:out_h, 0:out_w]
     cx, cy = ii + 0.5, jj + 0.5
-    lx, ly = (cx - x) / sx, (cy - y) / sy
-    hx, hy = 0.5 / sx, 0.5 / sy
-    cov = (np.clip((np.minimum(lx + hx, sw) - np.maximum(lx - hx, 0.0)) / (2 * hx), 0, 1)
-           * np.clip((np.minimum(ly + hy, sh) - np.maximum(ly - hy, 0.0)) / (2 * hy), 0, 1))
-    exact = sx == 1.0 and sy == 1.0 and abs(x - round(x)) < 1e-4 and abs(y - round(y)) < 1e-4
+    pure = rot == 0.0 and kx == 0.0 and ky == 0.0
+    A = affine_forward(sx, sy, rot, kx, ky)
+    Ai = np.linalg.inv(A)
+    dx, dy = cx - x, cy - y
+    lx, ly = Ai[0, 0] * dx + Ai[0, 1] * dy, Ai[1, 0] * dx + Ai[1, 1] * dy
+    if pure:
+        hx, hy = 0.5 / sx, 0.5 / sy
+        cov = (np.clip((np.minimum(lx + hx, sw) - np.maximum(lx - hx, 0.0)) / (2 * hx), 0, 1)
+               * np.clip((np.minimum(ly + hy, sh) - np.maximum(ly - hy, 0.0)) / (2 * hy), 0, 1))
+    else:
+        cov = coverage_supersampled(A, x, y, sw, sh, out_w, out_h)
+    exact = pure and sx == 1.0 and sy == 1.0 and abs(x - round(x)) < 1e-4 and abs(y - round(y)) < 1e-4
     if exact:
         iy = np.clip(np.floor(ly).astype(int), 0, sh - 1)
         ix = np.clip(np.floor(lx).astype(int), 0, sw - 1)
         out = src[iy, ix]
     else:
         if lod is None:
-            lod = max(0.0, -0.5 * np.log2(sx * sy) - 0.5) if mip else 0.0
+            lod = affine_lod(A) if mip else 0.0
         chain = _pyramid(src) if lod > 0 else [src]
         l0 = min(int(np.floor(lod)), len(chain) - 1)
         l1 = min(l0 + 1, len(chain) - 1)
@@ -326,23 +360,79 @@ def shader_port(tex_td, out_w, out_h, x, y, sx, sy):
     return out[::-1]                                                  # back to top-row-first document order
 
 
-def resample_port(src_td, mask_td, out_w, out_h, x, y, sx, sy, has_mask=False):
+def clip_poly(poly, nrm, d):
+    """Port of clipPoly() in blend.glsl: Sutherland-Hodgman against dot(v, nrm) >= d (at most 8 vertices kept)."""
+    q = []
+    n = len(poly)
+    for i in range(n):
+        a, b = poly[i], poly[(i + 1) % n]
+        da, db = a[0] * nrm[0] + a[1] * nrm[1] - d, b[0] * nrm[0] + b[1] * nrm[1] - d
+        if da >= 0.0 and len(q) < 8:
+            q.append(a)
+        if (da >= 0.0) != (db >= 0.0) and len(q) < 8:
+            t = da / (da - db)
+            q.append((a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t))
+    return q
+
+
+def footprint_coverage(l, e0, e1, sw, sh):
+    """Port of footprintCoverage() in blend.glsl for one pixel: ``l`` = footprint centre in layer px, ``e0`` / ``e1`` =
+    half edges (layer px) of the document pixel's parallelogram."""
+    ex, ey = abs(e0[0]) + abs(e1[0]), abs(e0[1]) + abs(e1[1])
+    lo, hi = (l[0] - ex, l[1] - ey), (l[0] + ex, l[1] + ey)
+    if hi[0] <= 0 or hi[1] <= 0 or lo[0] >= sw or lo[1] >= sh:
+        return 0.0
+    area0 = abs(e0[0] * e1[1] - e0[1] * e1[0]) * 4.0
+    if area0 <= 1e-12:
+        return 0.0
+    if e0[1] == 0.0 and e1[0] == 0.0:
+        cx = np.clip((min(l[0] + ex, sw) - max(l[0] - ex, 0.0)) / (2 * ex), 0, 1)
+        cy = np.clip((min(l[1] + ey, sh) - max(l[1] - ey, 0.0)) / (2 * ey), 0, 1)
+        return float(cx * cy)
+    if lo[0] >= 0 and lo[1] >= 0 and hi[0] <= sw and hi[1] <= sh:
+        return 1.0
+    poly = [(l[0] - e0[0] - e1[0], l[1] - e0[1] - e1[1]), (l[0] + e0[0] - e1[0], l[1] + e0[1] - e1[1]),
+            (l[0] + e0[0] + e1[0], l[1] + e0[1] + e1[1]), (l[0] - e0[0] + e1[0], l[1] - e0[1] + e1[1])]
+    for nrm, d in (((1.0, 0.0), 0.0), ((-1.0, 0.0), -sw), ((0.0, 1.0), 0.0), ((0.0, -1.0), -sh)):
+        poly = clip_poly(poly, nrm, d)
+        if not poly:
+            return 0.0
+    a2 = 0.0
+    for i in range(len(poly)):
+        a, b = poly[i], poly[(i + 1) % len(poly)]
+        a2 += a[0] * b[1] - b[0] * a[1]
+    return float(min(1.0, abs(a2) * 0.5 / area0))
+
+
+def resample_uniforms(x, y, sx, sy, rot=0.0, kx=0.0, ky=0.0):
+    """(uXform = inverse linear part (m00, m01, m10, m11), uA.xy = (x, y)) as network.py hands them to the resample pass."""
+    A = affine_forward(sx, sy, rot, kx, ky)
+    Ai = np.linalg.inv(A)
+    return (Ai[0, 0], Ai[0, 1], Ai[1, 0], Ai[1, 1]), (x, y)
+
+
+def resample_port(src_td, mask_td, out_w, out_h, x, y, sx, sy, has_mask=False, rot=0.0, kx=0.0, ky=0.0):
     """A literal numpy port of ``resample()`` in blend.glsl (the uAdjust = 7 pass): GL conventions (textures hold
-    TD row order, row 0 = bottom, v up; gl_FragCoord bottom-left, pixel centres at +0.5), coverage, the integer
-    ``exact`` branch (texelFetch), trilinear ``textureLod`` with lod = max(0, -0.5 log2(sx sy) - 0.5) and the mask
-    taken from the second input.  Returns the document image top row first (premultiplied, coverage x mask applied)."""
+    TD row order, row 0 = bottom, v up; gl_FragCoord bottom-left, pixel centres at +0.5), uniforms uXform = inverse linear
+    part and uA.xy = translation, parallelogram coverage by polygon clipping, the integer ``exact`` branch (texelFetch),
+    trilinear ``textureLod`` with lod = max(0, 0.5 log2|det uXform| - 0.5) and the mask taken from the second input.
+    Returns the document image top row first (premultiplied, coverage x mask applied)."""
     src_td = np.asarray(src_td, np.float64)
     sh, sw = src_td.shape[:2]
-    sc = np.maximum(np.array([sx, sy], np.float64), 1e-6)
+    (m00, m01, m10, m11), (tx, ty) = resample_uniforms(x, y, sx, sy, rot, kx, ky)
     pxx, pyy = np.meshgrid(np.arange(out_w), np.arange(out_h))           # pyy counted from the bottom (GL)
     cx, cy = pxx + 0.5, out_h - (pyy + 0.5)
-    lx, ly = (cx - x) / sc[0], (cy - y) / sc[1]
-    hx, hy = 0.5 / sc[0], 0.5 / sc[1]
-    cov = (np.clip((np.minimum(lx + hx, sw) - np.maximum(lx - hx, 0.0)) / (2 * hx), 0, 1)
-           * np.clip((np.minimum(ly + hy, sh) - np.maximum(ly - hy, 0.0)) / (2 * hy), 0, 1))
-    exact = abs(sc[0] - 1) < 1e-6 and abs(sc[1] - 1) < 1e-6 and abs(x - np.floor(x + 0.5)) < 1e-4 and abs(y - np.floor(y + 0.5)) < 1e-4
+    dx, dy = cx - tx, cy - ty
+    lx, ly = m00 * dx + m01 * dy, m10 * dx + m11 * dy
+    e0, e1 = (0.5 * m00, 0.5 * m10), (0.5 * m01, 0.5 * m11)
+    cov = np.zeros(lx.shape)
+    for j in range(out_h):
+        for i in range(out_w):
+            cov[j, i] = footprint_coverage((lx[j, i], ly[j, i]), e0, e1, sw, sh)
+    exact = (abs(m00 - 1) < 1e-6 and abs(m11 - 1) < 1e-6 and abs(m01) < 1e-6 and abs(m10) < 1e-6
+             and abs(tx - np.floor(tx + 0.5)) < 1e-4 and abs(ty - np.floor(ty + 0.5)) < 1e-4)
     u, v = lx / sw, 1.0 - ly / sh
-    lod = max(0.0, -0.5 * np.log2(sc[0] * sc[1]) - 0.5)
+    lod = max(0.0, 0.5 * np.log2(max(abs(m00 * m11 - m01 * m10), 1e-12)) - 0.5)
     ipx, ipy = np.floor(lx).astype(int), np.floor(ly).astype(int)
 
     def tex_lod(tex):
