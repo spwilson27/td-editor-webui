@@ -171,6 +171,24 @@ class FakeOp:
                     if con.source is self:
                         con.source = None
 
+    # -- Text TOP measurement (deterministic stand-in: 0.5 em per character, line box 1.1 em, descender 0.25 em)
+    def _tp(self, k, d=0):
+        v = self.par.value(k)
+        return d if v is None else v
+
+    @property
+    def textWidth(self):
+        lines = str(self._tp("text", "")).split("\n")
+        return 0.5 * float(self._tp("fontsizex", 30)) * max(len(l) for l in lines)
+
+    @property
+    def textHeight(self):
+        return 1.1 * float(self._tp("fontsizex", 30)) * len(str(self._tp("text", "")).split("\n"))
+
+    @property
+    def fontDescender(self):
+        return 0.25 * float(self._tp("fontsizex", 30))
+
     # -- TOP api
     def numpyArray(self):
         return self.pixels

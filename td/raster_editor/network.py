@@ -64,6 +64,9 @@ buffer (not only when dirty).  ``read_locked()`` returns the stored pixels as fl
 """
 
 import json
+import math
+import collections
+import os
 import re
 import time
 
@@ -75,6 +78,8 @@ BLEND_MODES = (
 BLEND_INDEX = {name: i for i, name in enumerate(BLEND_MODES)}
 
 GRACE_S = 2.0
+WIDTH_CACHE_MAX = 100000   # measured widths kept (LRU); far above one max-size (20000 char) text
+MEASURE_BUDGET = 16      # Text TOP measurement cooks per apply() / per tick()
 POOL_TARGET = 6          # spare glsl TOPs kept ready (creating a GLSL TOP costs ~4.7 ms)
 POOL_MAX = 10
 GARBAGE_MAX = 12
@@ -83,10 +88,11 @@ PENDING_MAX = 24
 ROLE_PREFIX = "role:"
 BLUR_SIZE_PER_RADIUS = 4.698   # Blur TOP gaussian: sigma = size / 4.698 (measured)
 FMT = "rgba16float"          # adjustment internals (values may leave 0..1)
+FMT_SHAPE = "rgba8fixed"       # shape / text layer outputs (the browser surfaces are 8 bit too)
 FMT_BLEND = "rgba16fixed"     # blend outputs: 1.5e-5 steps (float16 is 2.4e-4 near 1.0 and colour-burn amplifies it)
 
 # reserved (non layer) node names inside doc
-RESERVED = ("blend_glsl", "surface_callbacks", "blank", "base_src", "out")
+RESERVED = ("blend_glsl", "shape_glsl", "text_measure", "surface_callbacks", "blank", "base_src", "out")
 VIEW_NODES = ("view_doc", "view_glsl", "doc_view", "panel_view")
 
 SURFACE_CALLBACKS = (
@@ -165,6 +171,160 @@ def blur_preshrink(radius):
     return 1 if radius < 6 else 2 if radius < 14 else 4 if radius < 32 else 8
 
 
+# --------------------------------------------------------------------------- text / shape specs
+
+SHAPE_TYPE = {"rect": 1.0, "ellipse": 2.0, "line": 3.0, "polygon": 4.0}
+
+
+def _rgba(c, default=(0, 0, 0, 255)):
+    c = c or {}
+    return (float(c.get("r", default[0])) / 255.0, float(c.get("g", default[1])) / 255.0,
+            float(c.get("b", default[2])) / 255.0, float(c.get("a", default[3])) / 255.0)
+
+
+def shape_uniforms(spec, doc_h):
+    """ShapeSpec (document px, top-left origin, y down, rotation in degrees clockwise) -> GLSL TOP parameters
+    of shape.glsl (TD px, bottom-left origin, y up, rotation radians counter-clockwise).  Pure function."""
+    spec = spec or {}
+    t = spec.get("type", "rect")
+    fill = spec.get("fill") or {}
+    stroke = spec.get("stroke") or {}
+    fill_on = bool(fill.get("enabled")) and t != "line"
+    sw = max(0.0, float(stroke.get("width", 0.0)))
+    stroke_on = bool(stroke.get("enabled")) and (sw > 0.0 or t == "line")      # a line's arrowheads need no width
+    rot = -math.radians(float(spec.get("rotation", 0.0) or 0.0)) if t != "line" else 0.0
+    g = [0.0, 0.0, 0.0, 0.0]          # uOffset
+    a = [0.0, 0.0, sw, 0.0]           # uA
+    H = float(doc_h)
+    if t in ("rect", "ellipse"):
+        w, h = abs(float(spec.get("w", 0.0))), abs(float(spec.get("h", 0.0)))
+        x, y = float(spec.get("x", 0.0)), float(spec.get("y", 0.0))
+        # a negative w/h (drag up/left) is the same box
+        if float(spec.get("w", 0.0)) < 0:
+            x += float(spec.get("w", 0.0))
+        if float(spec.get("h", 0.0)) < 0:
+            y += float(spec.get("h", 0.0))
+        g = [x + w / 2.0, H - (y + h / 2.0), w / 2.0, h / 2.0]
+        if t == "rect":
+            a[0] = max(0.0, min(float(spec.get("radius", 0.0) or 0.0), w / 2.0, h / 2.0))
+    elif t == "line":
+        g = [float(spec.get("x1", 0.0)), H - float(spec.get("y1", 0.0)),
+             float(spec.get("x2", 0.0)), H - float(spec.get("y2", 0.0))]
+        a[3] = (1.0 if spec.get("arrowStart") else 0.0) + (2.0 if spec.get("arrowEnd") else 0.0)
+    elif t == "polygon":
+        g = [float(spec.get("cx", 0.0)), H - float(spec.get("cy", 0.0)), max(0.0, float(spec.get("radius", 0.0))),
+             min(1.0, max(0.05, float(spec.get("innerRatio", 1.0))))]
+        a[1] = float(min(64, max(3, int(round(float(spec.get("sides", 3)))))))
+    fc, sc = _rgba(fill.get("color")), _rgba(stroke.get("color"))
+    pars = {"vec0valuex": SHAPE_TYPE.get(t, 1.0), "vec0valuey": rot, "vec0valuez": 1.0 if fill_on else 0.0,
+            "vec0valuew": 1.0 if stroke_on else 0.0}
+    for i, vals in ((1, g), (2, a), (3, fc), (4, sc)):
+        for j, k in enumerate("xyzw"):
+            pars["vec%dvalue%s" % (i, k)] = float(vals[j])
+    return pars
+
+
+# Text TOP parameter names (TouchDesigner 2025.32820) -- see text_pars
+TEXT_PAR = {
+    "text": "text", "font": "font", "size": "fontsizex", "colorr": "fontcolorr", "colorg": "fontcolorg",
+    "colorb": "fontcolorb", "alpha": "fontalpha", "alignx": "alignx", "aligny": "aligny",
+    "typeface": "typeface", "spacing": "linespacing", "wrap": "wordwrap",
+    "posx": "positionx", "posy": "positiony", "border": "borderspace1",
+}
+TEXT_ASCENT = 0.8        # web/src/engine/textShape.ts ASCENT: baseline = 0.8 em below the em-box top
+
+
+def text_fallback_metrics(spec):
+    """Used when the Text TOP cannot be measured (unit tests, no TD): ascent / natural line pitch / widest line."""
+    size = min(TEXT_SIZE[1], max(TEXT_SIZE[0], float(spec.get("size", 16.0))))
+    lines = str(spec.get("text", ""))[:TEXT_MAX].split("\n")
+    box = spec.get("boxWidth")
+    if box is not None:                  # approximate the browser wrap with 0.5 em per character
+        lines = wrap_text("\n".join(lines), float(box), lambda t: 0.5 * size * len(t))
+    return {"asc": 0.75 * size, "pitch": 0.95 * size, "tw": 0.5 * size * max(len(l) for l in lines),
+            "text": "\n".join(lines)}
+
+
+def wrap_text(text, box_width, width):
+    """The browser's greedy wrap, a literal port of layoutText (web/src/engine/textShape.ts): paragraphs split on
+    "\\n", words on single spaces; the candidate line ``cur + " " + word`` is MEASURED (``width(str)``) and taken
+    while its width is <= box_width; an over-long word is not broken; an empty paragraph is an empty line.
+    Returns the list of lines."""
+    lines = []
+    for para in text.split("\n"):
+        if para == "":
+            lines.append(para)
+            continue
+        words = para.split(" ")
+        cur = words[0]
+        for w in words[1:]:
+            cand = cur + " " + w
+            if width(cand) <= box_width:
+                cur = cand
+            else:
+                lines.append(cur)
+                cur = w
+        lines.append(cur)
+    return lines
+
+
+TEXT_SIZE = (1.0, 4000.0)        # web sanitizeText: clamp(size, 1, 4000)
+TEXT_LINE_HEIGHT = (0.2, 10.0)   # clamp(lineHeight, 0.2, 10)
+TEXT_MAX = 20000
+
+
+def text_pars(spec, doc_w, doc_h, metrics=None):
+    """TextSpec -> Text TOP parameters (document resolution, transparent background, premultiplied).  Pure.
+
+    Conventions (web/src/engine/textShape.ts): the layout block has its top-left at (x, y); with ``boxWidth`` it is
+    that wide (greedy word wrap), otherwise as wide as the widest line.  Line pitch = size * lineHeight; the
+    baseline of line 0 is ``(size*lineHeight - size)/2 + 0.8*size`` below y; align left / centre / right puts every
+    line at the left / centre / right of the block.
+
+    Text TOP mapping (all positions are TD pixels, y up; ``aligny = top``, ``alignx/y mode = metrics``):
+    * the TOP's first line box starts at ``positiony`` below the top edge (positiony = -top); its baseline is
+      ``asc`` below that, ``asc = textHeight - fontDescender`` of a one-line text (measured, hinting makes it
+      non-linear), so ``top = y + (size*lh - size)/2 + 0.8*size - asc``.
+    * the natural line pitch ``pitch0`` (measured: height of 2 lines - 1 line) is corrected with ``linespacing``
+      (extra pixels) to ``size * lineHeight``.
+    * word wrap is done HERE (the Text TOP can only wrap inside its own width): greedy at single spaces exactly like
+      the browser, with widths from Text TOP measurements (per word, cached) and the lines handed over as "\\n"
+      separated text (``metrics["text"]``, wordwrap off).  A word wider than the box overflows.
+    * the block width ``bw`` (= boxWidth, or without a box the widest line measured) anchors centre / right
+      alignment: ``positionx = x + bw/2 - W/2`` (centre), ``x + bw - W`` (right), ``x`` (left).
+    """
+    spec = spec or {}
+    P = TEXT_PAR
+    m = metrics if metrics is not None else text_fallback_metrics(spec)
+    c = _rgba(spec.get("color"), (0, 0, 0, 255))
+    align = spec.get("align", "left")
+    if align not in ("left", "center", "right"):
+        align = "left"
+    size = min(TEXT_SIZE[1], max(TEXT_SIZE[0], float(spec.get("size", 16.0))))
+    lh = min(TEXT_LINE_HEIGHT[1], max(TEXT_LINE_HEIGHT[0], float(spec.get("lineHeight", 1.2))))
+    x, y = float(spec.get("x", 0.0)), float(spec.get("y", 0.0))
+    W = float(doc_w)
+    box = spec.get("boxWidth")
+    top = y + (size * lh - size) / 2.0 + TEXT_ASCENT * size - float(m["asc"])
+    bw = max(1.0, float(box)) if box is not None else float(m.get("tw", 0.0))      # block width
+    border = 0.0
+    posx = x if align == "left" else x + bw / 2.0 - W / 2.0 if align == "center" else x + bw - W
+    return {
+        "outputresolution": "custom", "resolutionw": int(doc_w), "resolutionh": int(doc_h),
+        "format": "rgba8fixed",
+        "bgcolorr": 0.0, "bgcolorg": 0.0, "bgcolorb": 0.0, "bgalpha": 0.0,
+        P["text"]: str(m.get("text", spec.get("text", "")))[:TEXT_MAX], P["font"]: str(spec.get("font", "")),
+        "fontsizexunit": "pixels", "fontsizeyunit": "pixels", P["size"]: size, "fontsizey": size,
+        P["colorr"]: c[0], P["colorg"]: c[1], P["colorb"]: c[2], P["alpha"]: c[3],
+        P["alignx"]: align, "alignxmode": "metrics", P["aligny"]: "top", "alignymode": "metrics",
+        "typeface": ("Bold Italic" if spec.get("bold") and spec.get("italic") else "Bold" if spec.get("bold")
+                     else "Italic" if spec.get("italic") else "Regular"),
+        P["spacing"]: size * lh - float(m["pitch"]),
+        P["wrap"]: False, P["border"]: border,
+        P["posx"]: posx, P["posy"]: -top,
+    }
+
+
 class Plan:
     """How one adjustment layer is built.
 
@@ -214,6 +374,10 @@ def adjustment_plan(adj, sid, doc_w=0, doc_h=0):
     return Plan([(base, "nullTOP", {}, False, ["$acc"], "null")], ADJ_PREMULT)
 
 
+class _OutOfBudget(Exception):
+    pass
+
+
 class _Node:
     """Desired state of one operator."""
 
@@ -230,9 +394,10 @@ class _Node:
 
 
 class DocNetwork:
-    def __init__(self, comp, blend_glsl, clock=time.monotonic):
+    def __init__(self, comp, blend_glsl, clock=time.monotonic, shape_glsl=None):
         self.comp = comp
         self._blend_glsl = blend_glsl
+        self._shape_glsl = shape_glsl if shape_glsl is not None else _read_sibling("shape.glsl")
         self._clock = clock
         self.doc = comp.op("doc") or comp.create("baseCOMP", "doc")
         self._ops = {}        # name -> operator (every node we manage, incl. surfaces pending destroy)
@@ -246,6 +411,14 @@ class DocNetwork:
         self._junk = []       # companion DATs TD auto-creates (g1_info, g1_pixel, s3_callbacks ...)
         self._garbage = []    # disconnected operators waiting to be destroyed by tick()
         self._adopt = {}
+        self._metrics = {}    # (resolved font, bold, italic, size) -> measured text metrics
+        self._budget = MEASURE_BUDGET
+        self._text_nodes = {}  # text node name -> (spec, doc_w, doc_h)
+        self._text_todo = set()     # text nodes laid out with the fallback metrics, finished by tick()
+        self._text_retry = {}       # text node name -> (consecutive failures, retry not before)
+        self._fontset = None
+        self._fonts_at = -1e9
+        self._widths = collections.OrderedDict()     # LRU: (font key, string or its hash) -> measured width
         self._names = {}      # layer id -> sanitised, unique
         self._used_names = set()
         self._desired = {}
@@ -277,6 +450,7 @@ class DocNetwork:
             return
         self._input_connected = connected
         self._ensure_base_nodes()
+        self._budget = MEASURE_BUDGET
         desired = self._plan(layers, doc_w, doc_h, connected)
         self._reconcile(desired)
         self._prev_layers = snap
@@ -287,7 +461,11 @@ class DocNetwork:
 
     def tick(self):
         """Housekeeping, cheap, call once per frame: destroys ONE expired surface (2 s grace) or ONE
-        garbage node, otherwise tops up the spare GLSL pool by one node (a few ms at most)."""
+        garbage node, otherwise tops up the spare GLSL pool by one node (a few ms at most).  First it finishes
+        pending text measurements (``MEASURE_BUDGET`` cooks per tick)."""
+        if self._text_todo and self._text_due():
+            self._refresh_texts()
+            return
         if self._tick_pending():
             return
         if self._garbage:
@@ -404,6 +582,13 @@ class DocNetwork:
             self._ops["blend_glsl"] = dat
             self._cache["blend_glsl"] = {"type": "textDAT", "pars": {}, "inputs": [], "bypass": False, "pos": None}
             dat.nodeX, dat.nodeY = -900, 200
+        if "shape_glsl" not in self._ops:
+            dat = doc.op("shape_glsl") or doc.create("textDAT", "shape_glsl")
+            if dat.text != self._shape_glsl:
+                dat.text = self._shape_glsl
+            self._ops["shape_glsl"] = dat
+            self._cache["shape_glsl"] = {"type": "textDAT", "pars": {}, "inputs": [], "bypass": False, "pos": None}
+            dat.nodeX, dat.nodeY = -900, 300
         if "surface_callbacks" not in self._ops:
             dat = doc.op("surface_callbacks") or doc.create("textDAT", "surface_callbacks")
             if dat.text != SURFACE_CALLBACKS:
@@ -437,10 +622,167 @@ class DocNetwork:
             self._used_names.add(n)
         return n
 
+    # ------------------------------------------------------------------ text measurement
+
+    def _measure_node(self):
+        m = self._ops.get("text_measure")
+        if m is None:
+            m = self.doc.op("text_measure") or self.doc.create("textTOP", "text_measure")
+            self._ops["text_measure"] = m
+            self._cache["text_measure"] = {"type": "textTOP", "pars": {}, "inputs": [], "bypass": False, "pos": None}
+            self._set_pars("text_measure", m, {
+                "outputresolution": "custom", "resolutionw": 16, "resolutionh": 16, "format": "rgba8fixed",
+                "fontsizexunit": "pixels", "fontsizeyunit": "pixels", "wordwrap": False, "linespacing": 0.0,
+                "alignx": "left", "aligny": "top"})
+            m.nodeX, m.nodeY = -900, 400
+        return m
+
+    def _font_names(self, refresh=False):
+        """Families of the Text TOP's font menu (cached; re-read at most every 5 s while a requested font is
+        missing, so a font installed later is picked up).  None = unknown."""
+        now = self._clock()
+        if self._fontset is None or (refresh and now - self._fonts_at > 5.0):
+            try:
+                self._fontset = set(self._measure_node().par.font.menuNames)
+            except Exception:
+                self._fontset = set()
+            self._fonts_at = now
+        return self._fontset or None
+
+    def _resolve_font(self, font):
+        """The family the Text TOP will really use: ``font`` if it is in the menu, else Helvetica (the metrics are
+        cached by resolved family, so they follow a font that appears later)."""
+        names = self._font_names()
+        if names is not None and font not in names:
+            names = self._font_names(refresh=True)
+            if names is not None and font not in names:
+                return "Helvetica"
+        return font
+
+    def _text_due(self):
+        now = self._clock()
+        return any(self._text_retry.get(n, (0, 0.0))[1] <= now for n in self._text_todo)
+
+    def _text_metrics(self, spec, owner=None):
+        """-> (metrics, complete).  ``asc`` (baseline below the line-box top) and ``pitch`` (natural line pitch) are
+        measured per (resolved font, bold, italic, size); ``text`` is the text with the browser's wrap applied
+        (candidate lines are measured, cached per string); ``tw`` = widest line (only when needed: centre / right
+        without a box).  Measurements cook a 16x16 Text TOP (~0.3-1 ms each) and are cached.  At most
+        ``self._budget`` cooks are spent per call: beyond that, or after a failure (retried with back-off) the
+        0.5 em fallback layout is used and ``complete`` is False (tick() finishes the job over the next frames)."""
+        size = min(TEXT_SIZE[1], max(TEXT_SIZE[0], float(spec.get("size", 16.0))))
+        bold, italic = bool(spec.get("bold")), bool(spec.get("italic"))
+        box = spec.get("boxWidth")
+        text = str(spec.get("text", ""))[:TEXT_MAX]
+        now = self._clock()
+        if now < self._text_retry.get(owner, (0, 0.0))[1]:
+            return dict(text_fallback_metrics(spec)), False
+        try:
+            font = self._resolve_font(str(spec.get("font", "")))
+            key = (font, bold, italic, size)
+            m = self._measure_node()
+            ready = [False]
+
+            def prepare():
+                if not ready[0]:
+                    self._set_pars("text_measure", m, {
+                        "font": font, "typeface": "Bold Italic" if bold and italic else "Bold" if bold
+                        else "Italic" if italic else "Regular", "fontsizex": size, "fontsizey": size})
+                    ready[0] = True
+
+            def cook(s_):
+                if self._budget <= 0:
+                    raise _OutOfBudget()
+                self._budget -= 1
+                prepare()
+                self._set_pars("text_measure", m, {"text": s_})
+                m.cook(force=True)
+
+            got = self._metrics.get(key)
+            if got is None:
+                cook("H")
+                th1, desc = float(m.textHeight), float(m.fontDescender)
+                cook("H\nH")
+                got = {"asc": th1 - desc, "pitch": float(m.textHeight) - th1}
+                self._metrics[key] = got
+
+            def cached(k):
+                w = self._widths.get(k)
+                if w is not None:
+                    self._widths.move_to_end(k)
+                return w
+
+            def store(k, w):
+                self._widths[k] = w
+                while len(self._widths) > WIDTH_CACHE_MAX:         # LRU: the entries a layer is using stay
+                    self._widths.popitem(last=False)
+
+            def skey(s_):       # long candidate lines are keyed by hash (a 20000 char paragraph is quadratic in size)
+                return s_ if len(s_) <= 64 else hash(s_)
+
+            def width(s_):
+                if s_ == "":
+                    return 0.0
+                k = (key, skey(s_))
+                w = cached(k)
+                if w is None:
+                    if s_[0] == " " or s_[-1] == " ":          # the Text TOP may trim outer spaces: bracket them
+                        w = width_raw("|" + s_ + "|") - 2 * width_raw("|")
+                    else:
+                        w = width_raw(s_)
+                    store(k, w)
+                return w
+
+            def width_raw(s_):
+                k = (key, "raw", skey(s_))
+                w = cached(k)
+                if w is None:
+                    cook(s_)
+                    w = float(m.textWidth)
+                    store(k, w)
+                return w
+
+            out = dict(got, text=text, tw=0.0)
+            if box is not None:
+                out["text"] = "\n".join(wrap_text(text, float(box), width))
+            elif spec.get("align", "left") != "left":
+                out["tw"] = max([width(l) for l in text.split("\n")] or [0.0])
+            self._text_retry.pop(owner, None)
+            return out, True
+        except _OutOfBudget:
+            return dict(text_fallback_metrics(spec)), False
+        except Exception:
+            fails = self._text_retry.get(owner, (0, 0.0))[0] + 1
+            self._text_retry[owner] = (fails, now + min(30.0, 0.5 * 2 ** fails))
+            return dict(text_fallback_metrics(spec)), False
+
+    def _refresh_texts(self):
+        """tick(): finish text layers whose measurements did not fit the per-apply budget (or failed)."""
+        self._budget = MEASURE_BUDGET
+        for name in sorted(self._text_todo):
+            node = self._text_nodes.get(name)
+            op = self._ops.get(name)
+            if node is None or op is None:
+                self._text_todo.discard(name)
+                continue
+            spec, w, h = node
+            if self._clock() < self._text_retry.get(name, (0, 0.0))[1]:
+                continue                                  # this layer is backing off; the others go on
+            metrics, complete = self._text_metrics(spec, name)
+            self._set_pars(name, op, text_pars(spec, w, h, metrics))
+            if complete:
+                self._text_todo.discard(name)
+            if self._budget <= 0:
+                break
+
     # ------------------------------------------------------------------ planning
 
     def _plan(self, layers, doc_w, doc_h, connected):
         d = {}
+        self._text_nodes = {}
+        self._text_todo = set()
+        for gone in [n for n in self._text_retry if not n.startswith("text_")]:
+            del self._text_retry[gone]
         self._slot_nodes = {}
         def add(node):
             d[node.name] = node
@@ -486,7 +828,7 @@ class DocNetwork:
                 row[0] += 1
                 mask = l.get("mask")
                 mask_name = None
-                if mask and kind in ("pixel", "adjustment", "group", "base") and mask.get("slot") is not None:
+                if mask and kind in ("pixel", "adjustment", "group", "base", "text", "shape") and mask.get("slot") is not None:
                     mask_name = surface(int(mask["slot"]), bx - 700, y - 60)
                     if not mask.get("enabled", True):
                         mask_name = None   # surface exists, but is not cooked / wired
@@ -494,10 +836,31 @@ class DocNetwork:
                 opacity = l.get("opacity", 1.0)
                 mode = BLEND_INDEX.get(l.get("blend", "normal"), 0)
                 bname = "blend_base" if kind == "base" else "blend_L_" + sid
-                ox, oy = (l.get("x", 0), l.get("y", 0)) if kind == "pixel" else (0, 0)
+                raster = kind in ("text", "shape") and bool(l.get("rasterize"))
+                ox, oy = (l.get("x", 0), l.get("y", 0)) if kind == "pixel" or raster else (0, 0)
                 if kind == "base":
                     src, adjust, mode = "base_src", 0, 0
-                elif kind == "pixel":
+                elif kind in ("text", "shape") and not raster:
+                    adjust = 0
+                    spec = l.get(kind)
+                    if not spec:
+                        src = "blank"
+                    elif kind == "text":
+                        src = "text_" + sid
+                        metrics, complete = self._text_metrics(spec, src)
+                        self._text_nodes[src] = (spec, doc_w, doc_h)
+                        if not complete:
+                            self._text_todo.add(src)
+                        add(_Node(src, "textTOP", text_pars(spec, doc_w, doc_h, metrics), (), pos=(bx - 350, y)))
+                    else:
+                        src = "shape_" + sid
+                        pars = {"outputresolution": "custom", "resolutionw": doc_w, "resolutionh": doc_h,
+                                "pixeldat": "shape_glsl", "format": FMT_SHAPE,
+                                "vec0name": "uParams", "vec1name": "uOffset", "vec2name": "uA", "vec3name": "uB",
+                                "vec4name": "uC"}
+                        pars.update(shape_uniforms(spec, doc_h))
+                        add(_Node(src, "glslTOP", pars, (), pos=(bx - 350, y)))
+                elif kind in ("pixel", "text", "shape"):
                     slot = l.get("slot")
                     src = surface(int(slot), bx - 350, y) if slot is not None else "blank"
                     adjust = 0
@@ -534,6 +897,8 @@ class DocNetwork:
 
         root = walk(children.get(None, []), "blank", 0)
         add(_Node("out", "nullTOP", {}, [root], pos=(1000, 0)))
+        for gone in [n for n in self._text_retry if n not in self._text_nodes]:
+            del self._text_retry[gone]
         return d
 
     # ------------------------------------------------------------------ reconcile
@@ -719,8 +1084,16 @@ class DocNetwork:
         cp = cache["pars"]
         for k, v in pars.items():
             if cp.get(k, _MISSING) != v:
-                setattr(op.par, k, v)
+                try:
+                    setattr(op.par, k, v)
+                except Exception:
+                    if k not in ("font", "typeface"):
+                        raise
+                    # family not in the Text TOP's font menu / face missing: stay usable
+                    setattr(op.par, k, "Helvetica" if k == "font" else "Regular")
                 cp[k] = v
+                if k == "font":
+                    cp.pop("typeface", None)       # the face must be (re)applied for the new family
                 self._counters["par_sets"] += 1
 
     def _wire(self, name, inputs):
@@ -759,6 +1132,9 @@ class DocNetwork:
             self._counters["disconnects"] += 1
         cache["inputs"] = []
         if cache["type"] == "glslTOP" and len(self._pool) < POOL_MAX:
+            if cache["pars"].get("outputresolution", "useinput") != "useinput":
+                # shape nodes have a custom resolution; blend nodes inherit input 0's
+                self._set_pars_raw(op, cache, {"outputresolution": "useinput"})
             if cache["bypass"]:
                 op.bypass = False
                 cache["bypass"] = False
@@ -806,3 +1182,11 @@ class DocNetwork:
 
 _MISSING = object()
 _SPARE_NAME = re.compile(r"^g\d+$")
+
+
+def _read_sibling(name):
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), name), encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
