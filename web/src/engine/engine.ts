@@ -255,7 +255,7 @@ export class Engine implements EditorEngine, Host {
     this.doc.height = h;
     for (const l of this.doc.pixelLayers()) {
       const old = l.surface;
-      l.surface = resizedCopy(old, w, h);
+      l.surface = resizedCopy(old, w, h, l.kind === 'text' || l.kind === 'shape');
       releaseSurface(old);
     }
     for (const m of this.doc.masks()) {
@@ -649,7 +649,7 @@ export class Engine implements EditorEngine, Host {
         const raster = !!sp.rasterize;
         if (raster) maxSlot = Math.max(maxSlot, sp.slot as number);
         const v = {
-          ...common, rasterize: raster, surface: raster ? createSurface(w, h) : null, slot: raster ? (sp.slot as number) : null,
+          ...common, rasterize: raster, surface: raster ? createSurface(w, h, true) : null, slot: raster ? (sp.slot as number) : null,
           x: 0, y: 0, mask: mk(sp.mask),
         };
         layer = sp.kind === 'text'
@@ -1043,7 +1043,7 @@ export class Engine implements EditorEngine, Host {
     const slot = rasterize ? this.doc.newSlot() : null; // may throw: do it before touching the layer
     this.structural(rasterize ? 'Rasterize on' : 'Rasterize off', () => {
       if (rasterize) {
-        l.surface = createSurface(this.doc.width, this.doc.height);
+        l.surface = createSurface(this.doc.width, this.doc.height, true); // software canvas, like the compositor scratch
         l.slot = slot;
         l.rasterize = true;
         this.freshSlots.add(slot as number); // empty outside the shape: only the shape's area is announced below
@@ -1062,7 +1062,7 @@ export class Engine implements EditorEngine, Host {
     const loc = this.doc.locate(id);
     if (!l || !loc || !isVector(l)) return;
     this.finishStroke();
-    const surface = createSurface(this.doc.width, this.doc.height);
+    const surface = createSurface(this.doc.width, this.doc.height, !l.surface);
     if (l.surface) surface.ctx.drawImage(l.surface.canvas as CanvasImageSource, 0, 0);
     else if (l.kind === 'text') drawText(surface.ctx, l.spec);
     else drawShape(surface.ctx, l.spec);

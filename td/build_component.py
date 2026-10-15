@@ -144,6 +144,55 @@ def onPulse(par):
     parent().OnParChange(par)
 '''
 
+# Help text for every custom parameter (shown by TD as the tooltip / help of the parameter). Said in the
+# order: what it does, units / range, default, when to change it.
+HELP = {
+    "Active": "Turns the editor on or off. On (default): the web server runs, the editor panel is shown and the "
+              "output is the edited document. Off: the server is stopped, clients are disconnected and the output "
+              "is the input passed through unchanged. Turn off to save GPU/CPU when the editor is not needed; the "
+              "document is kept.",
+    "Port": "TCP port of the editor's web server on 127.0.0.1 (1024-65535, default 9980). The editor panel and "
+            "Open in Browser connect to it. Change it only if another program already uses 9980, or to run two "
+            "editors in one project; changing it restarts the server and reloads the panel.",
+    "Docw": "Document width in pixels (1-16384, default 1920) when the input is not connected. Ignored while an "
+            "input is connected: then the document takes the input's size. Changing it resizes all layers, "
+            "anchored at the top-left, and clears the editor's undo history.",
+    "Doch": "Document height in pixels (1-16384, default 1080) when the input is not connected. Ignored while an "
+            "input is connected: then the document takes the input's size. Changing it resizes all layers, "
+            "anchored at the top-left, and clears the editor's undo history.",
+    "Premultiplied": "Whether TouchDesigner's image data is premultiplied by alpha (on, default, which is TD's "
+                     "convention). On: the input is un-premultiplied before the editor sees it and the output is "
+                     "premultiplied again. Turn off only if your input is straight (non-premultiplied) alpha "
+                     "and the output should be straight too. Has no visible effect on fully opaque images.",
+    "Maxsendfps": "Upper limit, in frames per second (1-120, default 30), that the web editor uses when it sends "
+                  "painted pixels to TouchDesigner. Lower it to reduce load on slow machines; raise it for the "
+                  "smoothest live strokes. Sent to the editor when it connects.",
+    "Maxinputfps": "Upper limit, in frames per second (1-120, default 30), at which the connected input image is "
+                   "copied to the editor as the background layer. Only matters for inputs that change over time "
+                   "(video, generative). Lower it to save CPU; static inputs cost nothing.",
+    "Maxviewfps": "Upper limit, in frames per second (1-120, default 30), at which the finished output is sent to "
+                  "the editor while its view mode is TD (the editor shows TouchDesigner's result). Lower it to save "
+                  "CPU; it does not affect the output TOP itself.",
+    "Viewmode": "Informational, read-only: whether the active editor currently shows its own preview (Local) or "
+                "TouchDesigner's rendered output (TD). Switch it in the editor's View menu, not here.",
+    "Devurl": "Developer option: URL of a web development server (for example http://localhost:5173/) that the "
+              "panel should load instead of the built-in editor. Leave empty (default) in normal use.",
+    "Panelquery": "Developer option: extra URL query string added to the panel and Open in Browser addresses, "
+                  "for example test=1 to enable the automated-test hook. Leave empty (default) in normal use.",
+    "Openbrowser": "Pulse: opens the editor in your default web browser (a second window onto the same document, "
+                   "authorised with this session's token). The panel stays the active editor until the "
+                   "browser window takes over.",
+    "Reloadui": "Pulse: reloads the editor page in the panel. Use it if the panel looks stuck or after updating "
+                "the editor; the document is kept in TouchDesigner and reloaded.",
+    "Savetox": "Pulse: exports this component, including the current document and all its pixels, to "
+               "raster_editor_export.tox next to the project file. Does not save the project itself.",
+    "Status": "Informational, read-only: a one-line summary of the editor (which window is active, document size, "
+              "tiles per second received, connected windows, errors). Nothing to set here.",
+}
+COMMENT = ("Raster Editor: a layer-based raster editor with a web UI. Wire a TOP into the input or set the "
+           "document size on the Raster Editor page; Open in Browser opens a second window. Hover a parameter "
+           "for help.")
+
 PARAMS = "Active Port Docw Doch Premultiplied Maxsendfps Maxinputfps Maxviewfps Devurl Panelquery Openbrowser Reloadui Savetox"
 
 
@@ -151,7 +200,8 @@ PARAMS = "Active Port Docw Doch Premultiplied Maxsendfps Maxinputfps Maxviewfps 
 
 
 SOURCES = ("td/raster_editor/protocol.py", "td/raster_editor/frames.py", "td/raster_editor/ext.py",
-           "td/raster_editor/network.py", "td/raster_editor/blend.glsl", "dist/ui/index.html")
+           "td/raster_editor/network.py", "td/raster_editor/blend.glsl", "td/raster_editor/shape.glsl",
+           "dist/ui/index.html")
 
 
 def read_sources():
@@ -278,6 +328,12 @@ def build(dev=False, name=NAME, in_place=True):
     for pname in ("Active", "Port", "Docw", "Doch", "Premultiplied", "Maxsendfps", "Maxinputfps", "Maxviewfps"):
         getattr(comp.par, pname).val = getattr(comp.par, pname).default
     comp.par.Viewmode = "local"
+    for pname, text in HELP.items():
+        getattr(comp.par, pname).help = text
+    comp.comment = COMMENT
+    probe = comp.create(textTOP, "font_probe")  # hidden: never cooked; its `font` menu lists the system fonts
+    probe.nodeX, probe.nodeY = -300, -350
+    probe.viewer = False
 
     # --- python modules + html + shader (before the extension is wired)
     text_dat(comp, "protocol", "td/raster_editor/protocol.py", dev, -600, 500, sources)
@@ -286,6 +342,7 @@ def build(dev=False, name=NAME, in_place=True):
     text_dat(comp, "RasterEditorExt", "td/raster_editor/ext.py", dev, -600, 200, sources)
     text_dat(comp, "ui_html", "dist/ui/index.html", dev, -600, 100, sources)
     text_dat(comp, "blend_glsl", "td/raster_editor/blend.glsl", dev, -600, 0, sources)
+    text_dat(comp, "shape_glsl", "td/raster_editor/shape.glsl", dev, -600, -100, sources)
     if comp.op("doc_state") is None:
         ds = comp.create(textDAT, "doc_state")
         ds.nodeX, ds.nodeY = -900, 200

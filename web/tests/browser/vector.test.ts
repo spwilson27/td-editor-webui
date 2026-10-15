@@ -581,3 +581,39 @@ describe('importImage', () => {
     expect(e.layers()[0].name).toBe('Image');
   });
 });
+
+describe('rasterize on / off render identically for every shape type', () => {
+  const F = { enabled: true, color: { r: 200, g: 40, b: 90, a: 220 } };
+  const S = { enabled: true, color: { r: 10, g: 120, b: 250, a: 200 }, width: 5 };
+  const cases: Record<string, ShapeSpec> = {
+    rect: { type: 'rect', x: 13.5, y: 17, w: 70, h: 50, radius: 0, fill: F, stroke: S, rotation: 0 },
+    'rounded rect': { type: 'rect', x: 13, y: 17, w: 70, h: 50, radius: 18, fill: F, stroke: S, rotation: 0 },
+    'rounded rect, fill only': { type: 'rect', x: 20, y: 20, w: 60, h: 60, radius: 12, fill: F, stroke: { ...S, enabled: false }, rotation: 0 },
+    'rotated rounded rect': { type: 'rect', x: 20, y: 30, w: 60, h: 30, radius: 10, fill: F, stroke: S, rotation: 33 },
+    'huge radius': { type: 'rect', x: 20, y: 30, w: 60, h: 30, radius: 400, fill: F, stroke: S, rotation: 0 },
+    ellipse: { type: 'ellipse', x: 12, y: 22, w: 76, h: 44, fill: F, stroke: S, rotation: 0 },
+    'rotated ellipse': { type: 'ellipse', x: 12, y: 22, w: 76, h: 44, fill: F, stroke: S, rotation: 40 },
+    line: { type: 'line', x1: 10, y1: 12, x2: 90, y2: 70, stroke: S, arrowStart: false, arrowEnd: false },
+    'line with arrows': { type: 'line', x1: 10, y1: 12, x2: 90, y2: 70, stroke: S, arrowStart: true, arrowEnd: true },
+    polygon: { type: 'polygon', cx: 50, cy: 45, radius: 38, sides: 7, innerRatio: 1, fill: F, stroke: S, rotation: 0 },
+    star: { type: 'polygon', cx: 50, cy: 45, radius: 38, sides: 5, innerRatio: 0.45, fill: F, stroke: S, rotation: 17 },
+  };
+  for (const [name, spec] of Object.entries(cases)) {
+    it(name, () => {
+      e = newEngine(100, 90);
+      const id = e.addShapeLayer(spec);
+      const off = e.readComposite({ x: 0, y: 0, w: 100, h: 90 });
+      e.setRasterize(id, true);
+      const on = e.readComposite({ x: 0, y: 0, w: 100, h: 90 });
+      const surf = e.readSurface(layer(id).slot!, { x: 0, y: 0, w: 100, h: 90 });
+      let worst = 0;
+      let worstS = 0;
+      for (let i = 0; i < off.length; i++) {
+        worst = Math.max(worst, Math.abs(off[i] - on[i]));
+        worstS = Math.max(worstS, Math.abs(off[i] - surf[i]));
+      }
+      expect(worst).toBeLessThanOrEqual(1);
+      expect(worstS).toBeLessThanOrEqual(1);
+    });
+  }
+});

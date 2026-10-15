@@ -211,3 +211,33 @@ Why BASE frames are pulled over HTTP (measured)
   `/surface` answers 503. A client that overflows the 64 MB hold queue gets an `error` and, after the restore, `active:false`
   then `active:true` (the page reloads TD's document). Surface uploads are round robin and budgeted (~4 ms/pump); a dirty
   slot without a Script TOP is dropped after 3 s. `Freeze` first re-encodes slots still waiting for a `Premultiplied` toggle.
+
+## 7. Protocol v4 additions (DESIGN_V3)
+
+Extension (`ext.py`), all on the main thread, bounded per pump, nothing large on a WebSocket:
+
+- **Text / shape layers:** `protocol.parse_doc` validates `text` / `shape` specs, `rasterize` and requires a surface `slot`
+  exactly when `rasterize` is true (then it is a pixel layer for TD). The stack is handed to `DocNetwork.apply` unchanged
+  (the network renders `rasterize: false` layers; network.py).
+- **Fonts:** after `hello` the extension sends `fonts {families}`. The list comes from the `font` menu of the hidden
+  Text TOP `font_probe` (built by `build_component.py`; a temporary one is created if it is missing), reduced to
+  family names by `ext.font_families` (trailing style words such as Bold / Italic are dropped), sorted and de-duplicated, cached
+  for the session. A failure sends `[]` (the web app falls back to its built-in list).
+- **TOP import:** `listTops` walks `/project1` for TOPs outside `raster_editor` (path, w, h; at most 2000, at most 50000
+  scanned). Nothing is cooked to list: a custom resolution is read from its parameters, other sizes are read once per cook count and
+  cached, a TOP that has never cooked reports 0x0. `importTop {requestId, path}`: the path must be a TOP outside the component (the
+  resolved `op.path` is checked again, so wildcards / `..` cannot reach internals), at most 8192 x 8192 (known sizes are refused before anything is read).
+  One import runs at a time (all clients), at most `TOP_QUEUE_MAX` (2) wait behind it, one per client: a newer request from the same
+  client replaces its queued one or cancels its running one (`topError` "superseded") and is never refused for room; otherwise a full queue answers
+  `topError "busy"`. **Memory:** the image is first shrunk on the GPU (a temporary Select + Resolution TOP, destroyed afterwards, filter
+  mipmap) to fit `min(8192, 2*docW) x min(8192, 2*docH)` (aspect kept, never enlarged) and 32 Mpx (`protocol.import_target_size`); the
+  reduced size is what `topReady` and the type-6 header report. Peak memory is therefore the float32 readback (at most 512 MB at 32 Mpx, typically
+  34 MB for a 1080p document and a 4096x2160 source -> 3840x2025 is 124 MB) plus one header + RGBA8 buffer (at most 128 MB) that the converter writes into directly (no extra copy).
+  The readback is the same two-step `numpyArray(delayed=True)` as BASE / VIEW (the first result is ignored, a late or wrong-sized
+  read is repeated, 10 s timeout); rows are converted within 4 ms per pump (flip to top-left, un-premultiply per `Premultiplied`, read once per import).
+  The finished buffer is the held message: 30 s, or 5 s after its last successful `GET /top`; at most 2 per client and 640 MB in total (oldest evicted).
+  `Active` off, `Stop` and a `Port` change release all imports, temporaries and held images. `GET /top` (same token / loopback / `Host` /
+  CORS / `no-store` rules as `/surface`) needs `client` and `requestId`; `404` for unknown or expired.
+- **Parameter help:** `build_component.HELP` gives every custom parameter its `help`; the component's `comment` carries a
+  short description (TD has no per-page description). The live step 17 of `scripts/validate_td.py` asserts that no
+  custom parameter has an empty help.

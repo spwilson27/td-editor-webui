@@ -283,6 +283,54 @@ class FakePanel:
         self.wheel = Par("wheel", 0.0)
 
 
+class FakeFontPar:
+    def __init__(self, names, labels):
+        self.menuNames, self.menuLabels = names, labels
+
+
+class FakeFontProbe:
+    """Hidden Text TOP whose `font` menu lists faces."""
+
+    def __init__(self, names=("Arial", "Arial Bold", "Arial Bold Italic", "Helvetica", "Helvetica Neue Light", "Courier New"),
+                 labels=None):
+        self.par = types.SimpleNamespace(font=FakeFontPar(list(names), list(labels if labels is not None else names)))
+
+
+class FakeTop:
+    """A TOP somewhere in the project (listTops / importTop) with TD's two-step delayed readback."""
+
+    def __init__(self, path, w, h, cooks=1, array=None, family="TOP"):
+        self.path, self._w, self._h, self.totalCooks, self.family = path, w, h, cooks, family
+        self.size_reads = 0  # reads of .width / .height: on a real TOP these can cook it
+        self.array = array  # float32 (h, w, 4) bottom-first
+        self.par = Pars(outputresolution="useinput", resolutionw=w, resolutionh=h)
+        self.calls = 0
+        self._requested = None
+
+    @property
+    def width(self):
+        self.size_reads += 1
+        return self._w
+
+    @width.setter
+    def width(self, v):
+        self._w = v
+
+    @property
+    def height(self):
+        self.size_reads += 1
+        return self._h
+
+    @height.setter
+    def height(self, v):
+        self._h = v
+
+    def numpyArray(self, delayed=False):
+        self.calls += 1
+        out, self._requested = self._requested, self.array
+        return out
+
+
 class FakeOwner:
     def __init__(self, **par_overrides):
         pars = dict(Active=1, Port=9980, Docw=64, Doch=32, Premultiplied=1, Maxsendfps=30, Maxinputfps=30,
@@ -303,12 +351,14 @@ class FakeOwner:
         self.doc_state = FakeText("")
         self.saved = []  # (path, frozen, doc_state) per comp.save() call
         self.glsl = FakeText("// glsl")
-        self.net_module = Module(types.SimpleNamespace(DocNetwork=lambda comp, glsl: self.net))
+        self.net_module = Module(types.SimpleNamespace(DocNetwork=lambda comp, glsl, shape_glsl=None: self.net))
         self._ops = {
             "protocol": Module(protocol), "frames": Module(frames), "webserver": self.server,
             "webrender": self.webrender, "in1": self.in1, "out_switch": self.switch,
             "ui_html": self.ui, "network": self.net_module, "blend_glsl": self.glsl, "doc_state": self.doc_state,
+            "font_probe": FakeFontProbe(),
         }
+        self.tops = {}  # path -> FakeTop (see ext._all_tops / _lookup_top seams in test_ext)
 
     def save(self, path):
         self.saved.append((path, self.net.frozen, self.doc_state.text))

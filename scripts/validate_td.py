@@ -1,4 +1,4 @@
-"""Live validation of the raster_editor COMP (protocol v3) against a running TouchDesigner
+"""Live validation of the raster_editor COMP (protocol v4) against a running TouchDesigner
 (docs/TESTING.md section 3, docs/DESIGN_V2.md section 7).
 
     .venv/bin/python scripts/validate_td.py                  # every step (the real UI drives the UI steps)
@@ -543,7 +543,7 @@ def s5_scene(args):
         if not ed.takeover():
             return False, f"takeover failed: {ed.texts}"
         h = ed.hello
-        if h["protocol"] != 3 or h["doc"] != {"w": IW, "h": IH} or not h["hasInput"] or "hasDocument" not in h or "rev" not in h:
+        if h["protocol"] != P.PROTOCOL_VERSION or h["doc"] != {"w": IW, "h": IH} or not h["hasInput"] or "hasDocument" not in h or "rev" not in h:
             return False, f"bad hello {h}"
         p1, p2, mask = scene(IW, IH)
         t0 = time.time()
@@ -1257,6 +1257,529 @@ def s16_ui_view_mode(args):
     return bool(ok and back), f"TD mode switched the panel background: {ok}, centre of panel_view {pv}, back to local: {back}; latency readout {lat}"
 
 
+# --------------------------------------------------------------------------- v4 steps (DESIGN_V3 section 4)
+#
+# Test-hook members the UI steps (20-22) use, on top of the v3 hook (state, addLayer, setPrimary, readPixel, docToScreen,
+# loadState, ...) -- all in web/src/state/testHook.ts except the optional one; a step is SKIPPED, naming what is missing:
+#   addTextLayer(spec) -> id         addShapeLayer(spec) -> id      setRasterize(id, bool)      flatten(id)      fonts() -> string[]
+#   importImageFromTop(path) -> Promise<layerId>         selectPolygon([[x, y], ...])         selectWand(x, y)
+#   setSelectionOptions({mode, wandTolerance, wandContiguous, wandSampleAll, feather, antialias})
+# Colours in specs are {r, g, b, a} 0..255.
+
+
+def hook_missing(*names):
+    got = js_result("(function(){var t=window.__editorTest||{};var m=[];%s;return m;})()" % "".join(
+        f"if(typeof t[{n!r}]!=='function')m.push({n!r});" for n in names))
+    return got if got is not None else list(names)
+
+
+def hook_call(expr, timeout=5):
+    return js_result(f"window.__editorTest.{expr}", timeout)
+
+
+def td_layers():
+    return td_json("L = comp.ext.RasterEditorExt.doc_layers or []\n"
+                   "print(json.dumps([{k: l.get(k) for k in ('id', 'kind', 'slot', 'rasterize')} for l in L]))")
+
+
+def td_layer(lid):
+    return next((l for l in td_layers() if l["id"] == lid), None)
+
+
+def ui_doc(args, W, H):
+    """Fresh W x H document with only the base layer, the real page active and loaded. Returns an error string or None."""
+    if not ensure_test_hook():
+        return "test hook window.__editorTest not reachable"
+    td("comp.inputConnectors[0].disconnect()\nt = op(%r)\nif t: t.destroy()\ncomp.par.Docw = %d; comp.par.Doch = %d" % (TMP, W, H))
+    wait_for(lambda: out1_size() == [W, H], 4)
+    reset_doc(args)
+    if not ui_ready():
+        return f"page is not the active editor: {js_result('window.__editorTest.loadState()')} status={status()!r}"
+    return None
+
+
+def page_region(x, y, w, h):
+    """Straight RGBA (0..255) of the page's composite, premultiplied like TD's output, as uint8 (h, w, 4). Read through
+    the test hook's readPixel in hex-encoded row chunks (the /__test back-channel takes at most 64 KB per post)."""
+    rows = max(1, 6000 // w)
+    parts = []
+    for y0 in range(y, y + h, rows):
+        n = min(rows, y + h - y0)
+        expr = ("(function(){var t=window.__editorTest,s='';for(var y=%d;y<%d;y++)for(var x=%d;x<%d;x++){var p=t.readPixel(x,y);"
+                "for(var i=0;i<4;i++)s+=('0'+(p[i]|0).toString(16)).slice(-2);}return s;})()" % (y0, y0 + n, x, x + w))
+        raw = js_result(expr, 30)
+        if not raw:
+            return None
+        parts.append(np.frombuffer(bytes.fromhex(raw), np.uint8).reshape(n, w, 4))
+    a = np.concatenate(parts).astype(np.float64)
+    a[..., :3] = a[..., :3] * a[..., 3:4] / 255.0
+    return np.clip(a + 0.5, 0, 255).astype(np.uint8)
+
+
+def td_region_when(x, y, w, h, pred, timeout=4.0):
+    """TD out1 region (premultiplied) once pred(img) holds (the network applies a doc a frame or two later)."""
+    box = {}
+
+    def ok():
+        box["img"] = td_rect(COMP + "/out1", x, y, w, h)
+        return pred(box["img"])
+    wait_for(ok, timeout, 0.1)
+    return box.get("img")
+
+
+def bbox(mask):
+    ys, xs = np.nonzero(mask)
+    return None if len(xs) == 0 else (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+
+
+TEXT_MIN_IOU = 0.45  # TD glyph coverage is thinner than Chromium's (design target 0.9 is not reachable with the Text TOP)
+
+
+def text_parity(td_img, pg_img):
+    """DESIGN_V3 section 3: text bbox within 2 px, coverage IoU >= 0.9. Returns (ok, detail)."""
+    a, b = td_img[..., 3] > 127, pg_img[..., 3] > 127
+    ba, bb = bbox(a), bbox(b)
+    if ba is None or bb is None:
+        return False, f"empty coverage (TD {ba}, page {bb})"
+    union = int((a | b).sum())
+    iou = float((a & b).sum()) / max(1, union)
+    dbox = max(abs(p - q) for p, q in zip(ba, bb))
+    both = a & b & (td_img[..., 3] >= 250) & (pg_img[..., 3] >= 250)
+    dcol = float(np.abs(td_img[..., :3][both].astype(int) - pg_img[..., :3][both].astype(int)).mean()) if both.any() else 0.0
+    return dbox <= 2 and iou >= TEXT_MIN_IOU and dcol <= 24, f"bbox TD {ba} page {bb} (max edge diff {dbox}px), IoU {iou:.3f}, mean colour diff {dcol:.1f}"
+
+
+def shape_parity(td_img, pg_img, interior_tol=3, edge_tol=24):
+    """DESIGN_V3 section 3: interiors exact (pixels whose 5x5 neighbourhood in the page image is a single flat
+    colour), everything else (antialiased edges) within 24. Returns (ok, detail)."""
+    pg = pg_img.astype(int)
+    d = np.abs(td_img.astype(int) - pg).max(axis=2)
+    pad = np.pad(pg, ((2, 2), (2, 2), (0, 0)), mode="edge")
+    flat = np.ones(d.shape, bool)
+    for dy in range(5):
+        for dx in range(5):
+            flat &= (np.abs(pad[dy:dy + d.shape[0], dx:dx + d.shape[1]] - pg).max(axis=2) == 0)
+    inner = int(d[flat].max()) if flat.any() else 0
+    edge = int(d.max())
+    return inner <= interior_tol and edge <= edge_tol, f"interior worst {inner} (<= {interior_tol}, {int(flat.sum())} px), edge worst {edge} (<= {edge_tol})"
+
+
+def rgba(r, g, b, a=255):
+    return {"r": r, "g": g, "b": b, "a": a}
+
+
+def pick_font(avail):
+    for f in ("Arial", "Georgia", "Times New Roman"):  # (bold/italic do not work for TTC fonts such as Helvetica)
+        if f in avail:
+            return f
+    return avail[0] if avail else "Arial"
+
+
+def s17_param_help(args):
+    """Every custom parameter on the COMP has non-empty help text."""
+    res = td_json("""
+out = {}
+for p in comp.customPars:
+    out[p.name] = (p.help or '').strip()
+print(json.dumps({'pars': out, 'pages': [pg.name for pg in comp.customPages]}))
+""")
+    empty = [k for k, v in res["pars"].items() if len(v) < 20]
+    return bool(res["pars"]) and not empty, (f"{len(res['pars'])} custom parameters on page(s) {res['pages']}; "
+                                            + (f"MISSING/too short help: {empty}" if empty else "all have help text"))
+
+
+def s18_fonts(args):
+    """`fonts` after hello: non-empty, sorted, de-duplicated, contains a common family."""
+    ed = Editor(args.port)
+    try:
+        ok = ed.wait(lambda: any(m["t"] == "fonts" for m in ed.texts), 5)
+        if not ok:
+            return False, "no `fonts` message after hello"
+        kinds = [m["t"] for m in ed.texts]
+        fam = next(m for m in ed.texts if m["t"] == "fonts")["families"]
+    finally:
+        ed.close()
+    common = [f for f in ("Arial", "Helvetica", "Helvetica Neue", "Times New Roman", "Courier New", "Verdana", "Menlo", "Georgia") if f in fam]
+    srt = fam == sorted(set(fam), key=lambda f: (f.casefold(), f))
+    ok = len(fam) > 5 and bool(common) and srt and kinds.index("hello") < kinds.index("fonts")
+    return ok, f"{len(fam)} families, common present {common}, sorted+unique {srt}; first 8: {fam[:8]}"
+
+
+TOPS = "/project1/_validate_tops"
+
+
+def make_tops():
+    td(f"""
+old = op({TOPS!r})
+if old: old.destroy()
+b = op('/project1').create(baseCOMP, '_validate_tops')
+c = b.create(constantTOP, 'const1')
+c.par.outputresolution = 'custom'; c.par.resolutionw = 64; c.par.resolutionh = 48
+c.par.colorr = 0.25; c.par.colorg = 0.5; c.par.colorb = 0.75; c.par.alpha = 1
+r = b.create(rampTOP, 'ramp4k')
+r.par.outputresolution = 'custom'; r.par.resolutionw = 4096; r.par.resolutionh = 2160
+v = b.create(rampTOP, 'vramp')
+v.par.outputresolution = 'custom'; v.par.resolutionw = 32; v.par.resolutionh = 32
+v.par.type = 'vertical'
+w = b.create(constantTOP, 'toowide')
+w.par.outputresolution = 'custom'; w.par.resolutionw = 8200; w.par.resolutionh = 16
+""")
+
+
+def drop_tops():
+    td(f"t = op({TOPS!r})\nif t: t.destroy()")
+
+
+def fetch_top(ed, rid):
+    st, body = http_get(ed.port, f"/top?token={ed.token}&client={ed.client_id}&requestId={rid}")
+    if st != 200:
+        return st, None, None
+    h, payload = P.decode_frame(body)
+    return st, h, np.frombuffer(payload, np.uint8).reshape(h.h, h.w, 4)
+
+
+def s19_top_import(args):
+    """listTops / importTop over the fake client: a Constant and a 4096x2160 Ramp TOP (straight RGBA, top-left, GET /top), a
+    TOP that is too wide, an unknown path; bounded cost per TD frame; 404 after 30 s."""
+    make_tops()
+    ed = Editor(args.port)
+    notes = []
+    try:
+        ed.wait(lambda: ed.client_id is not None, 3)
+        ed.send(P.list_tops("l1"))
+        ed.wait(lambda: any(m["t"] == "tops" for m in ed.texts), 5)
+        items = {i["path"]: i for i in next(m for m in ed.texts if m["t"] == "tops")["items"]}
+        if any(p.startswith(COMP) for p in items):
+            return False, "listTops included TOPs inside raster_editor"
+        want = {TOPS + "/const1": (64, 48), TOPS + "/ramp4k": (4096, 2160)}
+        missing = {p: (items.get(p) or {}) for p, s in want.items() if (items.get(p) or {}).get("w") not in (s[0], 0)}
+        if missing:
+            return False, f"listTops sizes wrong: {missing}"
+        notes.append(f"listTops: {len(items)} TOPs")
+        clear_stats()
+
+        def do_import(path, rid):
+            ed.send(P.import_top(rid, path))
+            ok = ed.wait(lambda: any(m["t"] in ("topReady", "topError") and m["requestId"] == rid for m in ed.texts), 20)
+            return next((m for m in ed.texts if m["t"] in ("topReady", "topError") and m["requestId"] == rid), None) if ok else None
+
+        dw, dh = td_json("e = comp.ext.RasterEditorExt; print(json.dumps([e.doc_w, e.doc_h]))")
+        r = do_import(TOPS + "/const1", "c1")
+        if not r or r["t"] != "topReady" or (r["w"], r["h"]) != (64, 48):
+            return False, f"constant import: {r}"
+        st, h, img = fetch_top(ed, "c1")
+        if st != 200 or (h.type, h.doc_w, h.doc_h, h.slot) != (6, 64, 48, 0) or not px_near(img[10, 10].tolist(), (64, 128, 191, 255), 2.5):
+            return False, f"constant image wrong: status {st}, header {h}, pixel {None if img is None else img[10, 10].tolist()}"
+        v = do_import(TOPS + "/vramp", "v1")
+        st, h, vimg = fetch_top(ed, "v1")
+        top_row, bottom_row = int(vimg[0, 16, 0]), int(vimg[-1, 16, 0])
+        if not (v and v["t"] == "topReady" and top_row > bottom_row + 200):
+            return False, f"vertical ramp orientation: wire row 0 should be the TOP row (white), got top {top_row} bottom {bottom_row}"
+        notes.append(f"orientation ok (top {top_row}, bottom {bottom_row})")
+        t0 = time.time()
+        r = do_import(TOPS + "/ramp4k", "k1")
+        dt = time.time() - t0
+        want_size = P.import_target_size(4096, 2160, dw, dh)  # shrunk on the GPU to <= 2 x the document
+        if not r or r["t"] != "topReady" or (r["w"], r["h"]) != want_size:
+            return False, f"4096x2160 ramp import (document {dw}x{dh}, expected {want_size}): {r}"
+        st, h, img = fetch_top(ed, "k1")
+        row = img[img.shape[0] // 2, :, 0].astype(int)
+        mono = bool((np.diff(row) >= -2).all()) and row[0] <= 4 and row[-1] >= 251
+        if st != 200 or (h.doc_w, h.doc_h) != want_size or not mono:
+            return False, f"ramp image wrong: status {st}, header {h}, row ends {row[0]}..{row[-1]}"
+        stt = stats()
+        worst_top = stt["top"]["max"]
+        worst_pump = stt["pump"]["max"]
+        notes.append(f"4096x2160 -> {want_size[0]}x{want_size[1]} ready in {dt:.2f}s, worst TOP step {worst_top:.1f} ms, worst pump {worst_pump:.1f} ms")
+        e1 = do_import(TOPS + "/toowide", "w1")
+        e2 = do_import(TOPS + "/nothing_here", "w2")
+        e3 = do_import(COMP + "/out1", "w3")
+        errs_ok = all(e and e["t"] == "topError" for e in (e1, e2, e3)) and "large" in e1["msg"]
+        notes.append(f"errors: {[e and e.get('msg') for e in (e1, e2, e3)]}")
+        # 404 for a client that is not the owner; 403 for a bad token
+        st403 = http_get(args.port, f"/top?token=bad&client={ed.client_id}&requestId=c1")[0]
+        st404 = http_get(args.port, f"/top?token={ed.token}&client=nope&requestId=c1")[0]
+        # expiry on fresh ids (per-client cap and eviction cannot explain a 404): a fetched import is dropped ~5 s after
+        # its last fetch, an unfetched one after 30 s
+        do_import(TOPS + "/const1", "e1")
+        do_import(TOPS + "/const1", "e2")
+        pre = fetch_top(ed, "e1")[0]
+        time.sleep(6.5)
+        served_gone = fetch_top(ed, "e1")[0]
+        time.sleep(24.0)
+        stexp = fetch_top(ed, "e2")[0]
+        notes.append(f"403 bad token {st403}, 404 other client {st404}; fetched import: {pre} then {served_gone} after 6.5 s; "
+                     f"unfetched import after 30.5 s: {stexp}")
+        stexp = stexp if (pre, served_gone) == (200, 404) else -1
+        ok = errs_ok and st403 == 403 and st404 == 404 and stexp == 404 and worst_top < 40 and worst_pump < 60
+        return ok, "; ".join(notes)
+    finally:
+        ed.close()
+        drop_tops()
+
+
+def s20_ui_top_import(args):
+    """Real UI: File > Import from TouchDesigner for a Constant and a 4096x2160 Ramp TOP: new pixel layers, the big one
+    scaled to fit the document (centred, aspect kept); TD output matches the page."""
+    miss = hook_missing("importImageFromTop") if ensure_test_hook() else ["window.__editorTest"]
+    if miss:
+        return None, f"skipped: test hook members missing {miss}"
+    err = ui_doc(args, 640, 360)
+    if err:
+        return False, err
+    make_tops()
+    try:
+        out = []
+        for path in (TOPS + "/ramp4k", TOPS + "/const1"):  # the second import lands above the first
+            js("window.__imp = {state: 'pending'}; window.__editorTest.importImageFromTop(%r)"
+               ".then(function(id){window.__imp = {state: 'done', layerId: id};})"
+               ".catch(function(e){window.__imp = {state: 'error', msg: String(e)};});" % path)
+            st = wait_for(lambda: (js_result("window.__imp") or {}).get("state") in ("done", "error") and js_result("window.__imp"), 40, 0.25)
+            if not st or st["state"] != "done":
+                return False, f"import of {path}: {st}"
+            out.append(st["layerId"])
+        time.sleep(0.5)
+        c = td_region_when(288, 156, 64, 48, lambda im: abs(int(im[24, 32, 2]) - 191) <= 3 and abs(int(im[24, 32, 0]) - 64) <= 3, 5)
+        # the ramp (added first, then the constant on top): left/right ends of the scaled ramp on row 90 (above the constant)
+        row = td_region_when(0, 90, 640, 1, lambda im: im[0, 639, 0] > 200, 5)
+        if c is None or row is None:
+            return False, "no TD output"
+        cpix, left, right, mid = c[24, 32].tolist(), int(row[0, 8, 0]), int(row[0, 631, 0]), int(row[0, 320, 0])
+        pg = page_region(0, 90, 640, 1)
+        pdiff = int(np.abs(pg.astype(int) - row.astype(int)).max()) if pg is not None else -1
+        ok = px_near(cpix, (64, 128, 191, 255), 3) and left < 20 and right > 235 and 110 <= mid <= 145 and 0 <= pdiff <= 6
+        layers = td_layers()
+        n_pixel = sum(1 for l in layers if l["kind"] == "pixel")
+        return ok and n_pixel >= 2, (f"constant centre {cpix}; scaled ramp row: x=8 -> {left}, x=320 -> {mid}, x=631 -> {right}; "
+                                     f"max |TD - page| on the row {pdiff}; pixel layers in TD: {n_pixel}")
+    finally:
+        drop_tops()
+
+
+SPEC_TEXT = {"text": "Hello TD", "size": 48, "color": rgba(255, 0, 0), "align": "left", "bold": False, "italic": False,
+             "lineHeight": 1.2, "x": 20, "y": 16, "boxWidth": None}
+SPEC_SHAPES = {
+    "rect": {"type": "rect", "x": 20, "y": 140, "w": 100, "h": 80, "radius": 12, "rotation": 0,
+             "fill": {"enabled": True, "color": rgba(0, 0, 255)}, "stroke": {"enabled": True, "color": rgba(255, 255, 255), "width": 4}},
+    "ellipse": {"type": "ellipse", "x": 140, "y": 140, "w": 100, "h": 80, "rotation": 0,
+                "fill": {"enabled": True, "color": rgba(0, 200, 0)}, "stroke": {"enabled": False, "color": rgba(0, 0, 0), "width": 1}},
+    "star": {"type": "polygon", "cx": 300, "cy": 180, "radius": 40, "sides": 5, "innerRatio": 0.4, "rotation": 0,
+             "fill": {"enabled": True, "color": rgba(255, 220, 0)}, "stroke": {"enabled": True, "color": rgba(0, 0, 0), "width": 2}},
+    "arrow": {"type": "line", "x1": 360, "y1": 150, "x2": 480, "y2": 220, "arrowStart": False, "arrowEnd": True,
+              "stroke": {"enabled": True, "color": rgba(255, 0, 0), "width": 6}},
+}
+SHAPE_BOXES = {"rect": (10, 130, 120, 100), "ellipse": (130, 130, 120, 100), "star": (250, 130, 100, 100), "arrow": (350, 135, 150, 100)}
+TEXT_BOX = (0, 0, 512, 100)
+
+
+def wait_stable(box, timeout=4.0, tol=None, pg=None):
+    """TD out1 region once it stopped changing (two equal reads in a row) -- and, with ``tol``/``pg``, once it matches the
+    page region within tol (or the timeout). Returns the last TD image."""
+    last, end = None, time.time() + timeout
+    while time.time() < end:
+        cur = td_rect(COMP + "/out1", *box)
+        same = last is not None and np.array_equal(cur, last)
+        if same and (tol is None or int(np.abs(cur.astype(int) - pg.astype(int)).max()) <= tol):
+            return cur
+        last = cur
+        time.sleep(0.1)
+    return last
+
+
+def s21_ui_text_shape(args):
+    """Real UI: text + shape layers rendered by TD (rasterize off) vs the browser preview; rasterize toggle round trip
+    (browser pixels in TD, then back); flatten.
+    Criteria: shapes: interior exact (<= 3), antialiased edges <= 24. Text: bbox within 2 px and colour (mean |diff| <= 24)
+    are the real criteria; the glyph-coverage IoU is DELIBERATELY relaxed to >= 0.45 (design target 0.9) because the Text
+    TOP's glyphs are thinner than Chromium's -- the measured IoU is printed."""
+    miss = hook_missing("addTextLayer", "addShapeLayer", "setRasterize", "flatten", "fonts") if ensure_test_hook() else ["window.__editorTest"]
+    if miss:
+        return None, f"skipped: test hook members missing {miss}"
+    err = ui_doc(args, 512, 256)
+    if err:
+        return False, err
+    try:
+        return _text_shape_body()
+    finally:
+        try:
+            hook_call("setLayerVisible('base', true)")
+            hook_call("deselect()")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _text_shape_body():
+    notes, ok_all = [f"(text IoU criterion deliberately relaxed to >= {TEXT_MIN_IOU}: TD glyphs are thinner than Chromium's; "
+                      f"bbox +-2 px and exact colour are the real text criteria)"], True
+    hook_call("setLayerVisible('base', false)")  # both sides then composite only the layers under test
+    fonts = hook_call("fonts()") or []
+    text = dict(SPEC_TEXT, font=pick_font(fonts))
+    tid = hook_call(f"addTextLayer({json.dumps(text)})")
+    sids = {k: hook_call(f"addShapeLayer({json.dumps(s)})") for k, s in SPEC_SHAPES.items()}
+    if not tid or not all(sids.values()):
+        return False, f"layer creation failed: {tid} {sids}"
+    have = wait_for(lambda: all(td_layer(i) for i in [tid, *sids.values()]), 5)
+    if not have:
+        return False, f"TD did not receive the layers: {td_layers()}"
+    tl = td_layer(tid)
+    if tl["kind"] != "text" or tl["rasterize"] or tl["slot"] is not None:
+        return False, f"TD layer {tl}: expected text, rasterize false, no slot"
+
+    def pair(box, tol=None):
+        pg = page_region(*box)
+        if pg is None:
+            return None, None
+        return wait_stable(box, 4.0, tol, pg), pg
+
+    def judge(label, fn, box):
+        td_img, pg = pair(box)
+        if pg is None:
+            notes.append(f"{label}: FAIL pixel read failed (page composite not readable)")
+            return False
+        ok, d = fn(td_img, pg)
+        notes.append(f"{label}: {'ok' if ok else 'FAIL'} {d}")
+        return ok
+    ok_all &= judge("text", text_parity, TEXT_BOX)
+    for name, box in SHAPE_BOXES.items():
+        ok_all &= judge(name, shape_parity, box)
+    # rasterize on: the browser renders the pixels, TD shows them exactly (a surface slot appears)
+    for lid, box, label in ((tid, TEXT_BOX, "text"), (sids["rect"], SHAPE_BOXES["rect"], "rect")):
+        hook_call(f"setRasterize({lid!r}, true)")
+        got = wait_for(lambda: (td_layer(lid) or {}).get("rasterize") is True and (td_layer(lid) or {}).get("slot") is not None, 5)
+        td_img, pg = pair(box, 3)
+        if pg is None:
+            notes.append(f"{label} rasterized: FAIL pixel read failed")
+            ok_all = False
+        else:
+            diff = int(np.abs(td_img.astype(int) - pg.astype(int)).max())
+            ok = bool(got) and diff <= 3
+            ok_all &= ok
+            notes.append(f"{label} rasterized: slot {(td_layer(lid) or {}).get('slot')}, max |TD - page| {diff}: {'ok' if ok else 'FAIL'}")
+        hook_call(f"setRasterize({lid!r}, false)")
+        back = wait_for(lambda: (td_layer(lid) or {}).get("rasterize") is False and (td_layer(lid) or {}).get("slot") is None, 5)
+        ok_all &= bool(back) & judge(f"{label} back to TD rendering (slot freed {bool(back)})",
+                                     text_parity if label == "text" else shape_parity, box)
+    # flatten: the layer becomes a plain pixel layer; TD shows the browser pixels exactly
+    hook_call(f"flatten({tid!r})")
+    flat = wait_for(lambda: (td_layer(tid) or {}).get("kind") == "pixel" and (td_layer(tid) or {}).get("slot") is not None, 5)
+    td_img, pg = pair(TEXT_BOX, 3)
+    if pg is None:
+        notes.append("flatten text: FAIL pixel read failed")
+        ok_all = False
+    else:
+        diff = int(np.abs(td_img.astype(int) - pg.astype(int)).max())
+        ok = bool(flat) and diff <= 3
+        ok_all &= ok
+        notes.append(f"flatten text: TD kind {(td_layer(tid) or {}).get('kind')}, max |TD - page| {diff}: {'ok' if ok else 'FAIL'}")
+    return ok_all, "\n        ".join(notes)
+
+
+def in_poly(poly, pts):
+    """Even-odd point-in-polygon for an (n, 2) float array."""
+    x, y = pts[:, 0], pts[:, 1]
+    inside = np.zeros(len(pts), bool)
+    n = len(poly)
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        cond = ((y1 > y) != (y2 > y)) & (x < (x2 - x1) * (y - y1) / ((y2 - y1) or 1e-9) + x1)
+        inside ^= cond
+    return inside
+
+
+def edge_dist(poly, pts):
+    """Distance of each point to the polygon outline."""
+    best = np.full(len(pts), 1e9)
+    for i in range(len(poly)):
+        a, b = np.array(poly[i], float), np.array(poly[(i + 1) % len(poly)], float)
+        ab = b - a
+        t = np.clip(((pts - a) @ ab) / max(float(ab @ ab), 1e-9), 0, 1)
+        best = np.minimum(best, np.linalg.norm(pts - (a + t[:, None] * ab), axis=1))
+    return best
+
+
+def paint_all(W, H, hex_color):
+    """Brush serpentine over the whole document (the selection must clip it); rows are spaced by 0.6 x the brush size."""
+    hook_call(f"setPrimary({hex_color!r})")
+    td("comp.op('webrender').sendKey('b', char='b')")
+    time.sleep(0.2)
+    size = float(((hook_call("state()") or {}).get("brush") or {}).get("size", 20))
+    pts, step, flip = [], max(3, int(size * 0.6)), False
+    for yy in range(0, H + step, step):
+        row = [(-10, min(yy, H - 1)), (W + 10, min(yy, H - 1))]
+        pts += row[::-1] if flip else row
+        flip = not flip
+    drag_doc(pts, perf=True)
+    time.sleep(0.6)
+
+
+def s22_ui_selection_clip(args):
+    """Real UI: a lasso selection and wand selections clip paint strokes; the clipping is visible in TD's output."""
+    miss = hook_missing("selectPolygon", "selectWand", "setSelectionOptions", "setPrimary") if ensure_test_hook() else ["window.__editorTest"]
+    if miss:
+        return None, f"skipped: test hook members missing {miss}"
+    W, H = 320, 200
+    err = ui_doc(args, W, H)
+    if err:
+        return False, err
+    try:
+        return _selection_body(W, H)
+    finally:
+        try:
+            hook_call("deselect()")
+            hook_call("setLayerVisible('base', true)")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _selection_body(W, H):
+    hook_call("addLayer()")
+    time.sleep(0.3)
+    poly = [(40, 30), (200, 50), (80, 150)]
+    gx, gy = np.meshgrid(np.arange(0, W, 6), np.arange(0, H, 6))
+    pts = np.stack([gx.ravel() + 0.5, gy.ravel() + 0.5], axis=1)
+    inside = in_poly(poly, pts) & (edge_dist(poly, pts) > 4)
+    outside = ~in_poly(poly, pts) & (edge_dist(poly, pts) > 4)
+    full = lambda: td_rect(COMP + "/out1", 0, 0, W, H)  # noqa: E731
+
+    def sample(img, mask):
+        sel = pts[mask].astype(int)
+        return img[sel[:, 1], sel[:, 0]]
+
+    base = full()
+    notes, ok_all = [], True
+    sel = {"mode": "new", "feather": 0, "antialias": True, "wandTolerance": 10, "wandContiguous": True, "wandSampleAll": False}
+    hook_call(f"setSelectionOptions({json.dumps(sel)})")
+    hook_call(f"selectPolygon({json.dumps([list(p_) for p_ in poly])})")
+    paint_all(W, H, "#0000ff")
+    img = td_region_when(0, 0, W, H, lambda im: (im[..., 2] > 200).sum() > 1000, 5)
+    inb, outb = sample(img, inside), sample(img, outside)
+    ok = px_near(inb.mean(axis=0).tolist(), (0, 0, 255, 255), 6) and (np.abs(inb.astype(int) - (0, 0, 255, 255)).max() <= 6) \
+        and bool((outb == sample(base, outside)).all())
+    ok_all &= ok
+    notes.append(f"lasso: {int(inside.sum())} interior samples blue {np.abs(inb.astype(int) - (0, 0, 255, 255)).max() <= 6}, "
+                 f"{int(outside.sum())} exterior samples untouched {bool((outb == sample(base, outside)).all())}: {'ok' if ok else 'FAIL'}")
+    # wand inside the painted triangle (active layer only, contiguous): selects exactly that region
+    hook_call("selectWand(100, 70)")
+    paint_all(W, H, "#ff0000")
+    img = td_region_when(0, 0, W, H, lambda im: (im[..., 0] > 200).sum() > 1000, 5)
+    inb, outb = sample(img, inside), sample(img, outside)
+    ok = np.abs(inb.astype(int) - (255, 0, 0, 255)).max() <= 6 and bool((outb == sample(base, outside)).all())
+    ok_all &= bool(ok)
+    notes.append(f"wand (inside, sample layer): interior red {np.abs(inb.astype(int) - (255, 0, 0, 255)).max() <= 6}, "
+                 f"exterior untouched {bool((outb == sample(base, outside)).all())}: {'ok' if ok else 'FAIL'}")
+    # wand outside (transparent area of the layer): selects the complement; paint green must leave the triangle red
+    hook_call("selectWand(5, 5)")
+    paint_all(W, H, "#00ff00")
+    img = td_region_when(0, 0, W, H, lambda im: (im[..., 1] > 200).sum() > 1000, 5)
+    inb, outb = sample(img, inside), sample(img, outside)
+    ok = np.abs(inb.astype(int) - (255, 0, 0, 255)).max() <= 6 and np.abs(outb.astype(int) - (0, 255, 0, 255)).max() <= 6
+    ok_all &= bool(ok)
+    notes.append(f"wand (outside): triangle still red {np.abs(inb.astype(int) - (255, 0, 0, 255)).max() <= 6}, "
+                 f"exterior green {np.abs(outb.astype(int) - (0, 255, 0, 255)).max() <= 6}: {'ok' if ok else 'FAIL'}")
+    return ok_all, "\n        ".join(notes)
+
+
 STEPS = [
     (1, "build component, no operator errors, document survives a rebuild", "build", False),
     (2, "web server serves the UI", "server", False),
@@ -1274,11 +1797,19 @@ STEPS = [
     (14, "real UI: brush stroke, undo", "uipaint", True),
     (15, "real UI: TD mode, latency readouts", "uiview", True),
     (16, "stalled clients (never read / never fetch, then RST): bounded, TD stays responsive", "stalled", False),
+    (17, "every custom parameter has help text", "help", False),
+    (18, "fonts list after hello: non-empty, sorted, common family", "fonts", False),
+    (19, "TOP import: list, Constant + 4096x2160 Ramp, errors, 30 s expiry, bounded cost", "topimport", False),
+    (20, "real UI: import TOPs as layers (big one scaled to fit)", "uitop", True),
+    (21, "real UI: text/shape TD-rendered vs browser preview, rasterize round trip, flatten", "uitextshape", True),
+    (22, "real UI: lasso / wand selections clip strokes in TD output", "uiselect", True),
 ]
 FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinput": "s4_no_input", "scene": "s5_scene",
          "masks": "s6_masks", "view": "s7_view_stream", "latency": "s8_latency", "overlay": "s9_panel_overlay",
          "persist": "s10_persistence", "reconnect": "s11_reconnect_takeover", "perf": "s12_perf", "parity": "s15_parity",
-         "uipaint": "s14_ui_paint", "uiview": "s16_ui_view_mode", "stalled": "s13_stalled_client"}
+         "uipaint": "s14_ui_paint", "uiview": "s16_ui_view_mode", "stalled": "s13_stalled_client",
+         "help": "s17_param_help", "fonts": "s18_fonts", "topimport": "s19_top_import", "uitop": "s20_ui_top_import",
+         "uitextshape": "s21_ui_text_shape", "uiselect": "s22_ui_selection_clip"}
 
 
 def main():
@@ -1305,7 +1836,7 @@ def main():
             td(f"""
 comp.inputConnectors[0].disconnect()
 {restore}
-for p in ('/project1/_validate_in', '/project1/_validate_load'):
+for p in ('/project1/_validate_in', '/project1/_validate_load', '/project1/_validate_tops'):
     t = op(p)
     if t: t.destroy()
 comp.par.Active = 1

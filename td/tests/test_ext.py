@@ -1,4 +1,5 @@
 import json
+import types
 
 import numpy as np
 import pytest
@@ -193,7 +194,7 @@ def test_first_client_becomes_active_and_gets_hello(env):
     env.pump()
     a = env.connect("external")
     (hello,) = env.s.messages(a, "hello")
-    assert hello["protocol"] == 3 and hello["active"] is True and hello["hasInput"] is False
+    assert hello["protocol"] == 4 and hello["active"] is True and hello["hasInput"] is False
     assert hello["doc"] == {"w": 64, "h": 32} and hello["maxSendFps"] == 30
     assert hello["hasDocument"] is False and hello["rev"] is None
 
@@ -570,7 +571,7 @@ def test_no_input_output_is_the_network_at_doc_size(env):
 
 
 def test_network_failure_keeps_passthrough_and_reports(env, capsys):
-    env.o.net_module.module.DocNetwork = lambda comp, glsl: (_ for _ in ()).throw(RuntimeError("no network"))
+    env.o.net_module.module.DocNetwork = lambda comp, glsl, **kw: (_ for _ in ()).throw(RuntimeError("no network"))
     env.x.Start()
     env.pump(3)
     assert env.x.network is None and env.o.switch.par.index.eval() == 0
@@ -2883,3 +2884,596 @@ def test_restart_carry_keeps_the_pending_reencode_state():
         assert (e.top(s_).uploaded == e.x.surfaces[s_]).all()
     # straight alpha now: the 200-alpha layer is stored un-premultiplied
     assert (e.x.surfaces[2][::-1][..., 3] == 200).all() and np.abs(e.x.surfaces[2][::-1][..., :3].astype(int) - e.imgs[2][..., :3]).max() <= 2
+
+
+# ----------------------------------------------------------------------------- v4: fonts, TOP import, text/shape docs
+
+from faketd import FakeFontProbe, FakeTop  # noqa: E402
+
+
+def rgba(r=0, g=0, b=0, a=255):
+    return {"r": r, "g": g, "b": b, "a": a}
+
+
+def TEXT(id, rasterize=False, slot=None, **kw):
+    spec = {"text": "Hi", "font": "Arial", "size": 32, "color": rgba(255, 0, 0), "align": "left", "bold": False,
+            "italic": False, "lineHeight": 1.2, "x": 10, "y": 20, "boxWidth": None}
+    spec.update(kw)
+    return L(id, "text", slot=slot, text=spec, shape=None, rasterize=rasterize)
+
+
+def SHAPE(id, rasterize=False, slot=None):
+    spec = {"type": "rect", "x": 1, "y": 2, "w": 30, "h": 20, "radius": 4, "rotation": 0,
+            "fill": {"enabled": True, "color": rgba(0, 0, 255)}, "stroke": {"enabled": False, "color": rgba(), "width": 2}}
+    return L(id, "shape", slot=slot, text=None, shape=spec, rasterize=rasterize)
+
+
+def install_tops(env, *tops):
+    env.o.tops = {t.path: t for t in tops}
+    env.x._all_tops = lambda: list(env.o.tops.values())
+    env.x._lookup_top = lambda path: env.o.tops.get(path)
+
+
+def get_top(env, cid, rid, token=None, client=True, **extra):
+    pars = {"token": token or env.x.token, "requestId": rid}
+    if client:
+        pars["client"] = env.x.clients[cid].cid
+    return env.x.OnHTTPRequest(req(uri="/top", pars=pars, **extra), {})
+
+
+def tops_img(w, h, seed=3):
+    return np.random.RandomState(seed).rand(h, w, 4).astype(np.float32)  # bottom-first float, like a TOP readback
+
+
+def run_import(env, cid, path, rid="r1", frames=12):
+    env.send(cid, {"t": "importTop", "requestId": rid, "path": path})
+    env.pump(frames)
+
+
+def test_fonts_are_sent_after_hello_sorted_deduped_family_names(env):
+    env.o._ops["font_probe"] = FakeFontProbe(names=["Zapfino", "Arial Bold", "Arial", "arial bold italic", "Helvetica Neue Light",
+                                                    "", "Arial Black", "Courier New Bold"])
+    env.pump()
+    a = env.connect("external")
+    kinds = [m["t"] for c, m in env.s.texts if c == a]
+    assert kinds.index("hello") < kinds.index("fonts")
+    (f,) = env.s.messages(a, "fonts")
+    assert f["families"] == ["Arial", "Arial Black", "Courier New", "Helvetica Neue Light", "Zapfino"]
+
+
+def test_fonts_prefer_menu_labels_and_are_cached(env):
+    probe = FakeFontProbe(names=["x1", "x2"], labels=["Georgia Bold", "Georgia"])
+    env.o._ops["font_probe"] = probe
+    env.pump()
+    a, b = env.connect("external"), env.connect("external")
+    assert env.s.messages(a, "fonts")[0]["families"] == ["Georgia"]
+    probe.par.font.menuLabels = ["changed"]
+    assert env.s.messages(b, "fonts")[0]["families"] == ["Georgia"]  # cached after the first enumeration
+
+
+def test_fonts_failure_sends_empty_list_and_reports(env, capsys):
+    env.o._ops["font_probe"] = object()  # no .par
+    env.pump()
+    a = env.connect("external")
+    assert env.s.messages(a, "fonts")[0]["families"] == []
+    assert "fonts:" in capsys.readouterr().out
+
+
+def test_font_families_helper():
+    assert E.font_families(["Arial Bold", "Arial-Italic"]) == ["Arial"]
+    assert E.font_families(["Bold"]) == ["Bold"]  # never reduced to nothing
+    assert E.font_families(["Menlo Regular", "Menlo Bold Italic", "Menlo"]) == ["Menlo"]
+    assert E.font_families([]) == []
+
+
+def test_list_tops_excludes_raster_editor_and_never_cooks(env):
+    env.pump()
+    a = env.connect("external")
+    inside = FakeTop("/project1/raster_editor/doc/out", 10, 10)
+    t1 = FakeTop("/project1/b_ramp", 4096, 2160)
+    t2 = FakeTop("/project1/a_const", 64, 32)
+    fresh = FakeTop("/project1/never_cooked", 99, 99, cooks=0)
+    fresh.par = types.SimpleNamespace()  # a TOP without resolution parameters
+    custom = FakeTop("/project1/custom_res", 5, 5, cooks=0)
+    ev = lambda v: types.SimpleNamespace(eval=lambda: v)  # noqa: E731
+    custom.par = types.SimpleNamespace(outputresolution=ev("custom"), resolutionw=ev(5), resolutionh=ev(5))
+    install_tops(env, inside, t1, t2, fresh, custom)
+    env.send(a, {"t": "listTops", "requestId": "q1"})
+    (m,) = env.s.messages(a, "tops")
+    assert m["requestId"] == "q1"
+    assert m["items"] == [{"path": "/project1/a_const", "w": 64, "h": 32}, {"path": "/project1/b_ramp", "w": 4096, "h": 2160},
+                          {"path": "/project1/custom_res", "w": 5, "h": 5},
+                          {"path": "/project1/never_cooked", "w": 0, "h": 0}]
+    assert t1.calls == 0 and t2.calls == 0  # nothing was read back
+
+
+def test_list_tops_is_capped_at_2000(env):
+    env.pump()
+    a = env.connect("external")
+    install_tops(env, *[FakeTop(f"/project1/t{i:05d}", 8, 8) for i in range(2500)])
+    env.send(a, {"t": "listTops", "requestId": 1})
+    assert len(env.s.messages(a, "tops")[0]["items"]) == 2000
+
+
+def test_list_tops_bad_request_id_is_an_error_not_a_crash(env):
+    env.pump()
+    a = env.connect("external")
+    install_tops(env)
+    env.send(a, {"t": "listTops"})
+    assert env.s.messages(a, "topError") and not env.s.messages(a, "tops")
+
+
+def test_import_top_converts_to_straight_top_first_rgba_and_serves_it(env):
+    env.pump()
+    a = env.connect("external")
+    arr = tops_img(6, 4)
+    arr[..., :3] *= arr[..., 3:4]  # premultiplied, as TD hands it over
+    install_tops(env, FakeTop("/project1/img", 6, 4, array=arr))
+    run_import(env, a, "/project1/img", "r1")
+    (ready,) = env.s.messages(a, "topReady")
+    assert ready == {"t": "topReady", "requestId": "r1", "w": 6, "h": 4}
+    r = get_top(env, a, "r1")
+    assert r["statusCode"] == 200 and r["content-type"] == "application/octet-stream" and r["Cache-Control"] == "no-store"
+    h, payload = P.decode_frame(r["data"])
+    assert (h.type, h.slot, h.doc_w, h.doc_h, h.x, h.y, h.w, h.h, h.frame_end) == (6, 0, 6, 4, 0, 0, 6, 4, True)
+    got = np.frombuffer(payload, np.uint8).reshape(4, 6, 4)
+    want = frames.WireConverter().to_wire(arr, True)  # reference conversion
+    assert (got == want).all()
+    assert (got[0] == want[0]).all()
+    # wire row 0 is the TOP's TOP row = last row of the bottom-first array
+    assert np.abs(got[0, :, 3].astype(int) - np.round(arr[3, :, 3] * 255)).max() <= 1
+
+
+def test_import_top_premultiplied_off_keeps_straight_values():
+    e = Env(Premultiplied=0)
+    e.pump()
+    a = e.connect("external")
+    arr = tops_img(5, 3, 9)
+    install_tops(e, FakeTop("/project1/img", 5, 3, array=arr))
+    run_import(e, a, "/project1/img")
+    h, payload = P.decode_frame(get_top(e, a, "r1")["data"])
+    got = np.frombuffer(payload, np.uint8).reshape(3, 5, 4)
+    assert np.abs(got[0].astype(int) - np.round(arr[2] * 255)).max() <= 1
+
+
+def test_import_top_is_delayed_never_blocking_and_ignores_the_first_result(env):
+    env.pump()
+    a = env.connect("external")
+    top = FakeTop("/project1/img", 6, 4, array=tops_img(6, 4))
+    top._requested = np.zeros((4, 6, 4), np.float32)  # a stale result left by someone else's earlier read
+    install_tops(env, top)
+    env.send(a, {"t": "importTop", "requestId": "r1", "path": "/project1/img"})
+    env.pump(1)
+    assert top.calls == 1 and not env.s.messages(a, "topReady")  # first call only issues the read
+    env.pump(1)
+    assert env.s.messages(a, "topReady")
+    h, payload = P.decode_frame(get_top(env, a, "r1")["data"])
+    assert np.frombuffer(payload, np.uint8).any()  # the real image, not the stale zeros
+
+
+def test_import_top_waits_for_a_late_readback(env):
+    env.pump()
+    a = env.connect("external")
+    top = FakeTop("/project1/img", 6, 4, array=tops_img(6, 4))
+    calls = []
+    real = top.numpyArray
+
+    def slow(delayed=False):
+        calls.append(1)
+        out = real(delayed)
+        return out if len(calls) >= 5 else None  # the GPU read takes a few frames
+    top.numpyArray = slow
+    install_tops(env, top)
+    run_import(env, a, "/project1/img", frames=3)
+    assert not env.s.messages(a, "topReady")
+    env.pump(6)
+    assert env.s.messages(a, "topReady")
+
+
+def test_import_top_readback_timeout(env):
+    env.pump()
+    a = env.connect("external")
+    top = FakeTop("/project1/img", 6, 4, array=tops_img(6, 4))
+    top.numpyArray = lambda delayed=False: None
+    install_tops(env, top)
+    env.send(a, {"t": "importTop", "requestId": "r1", "path": "/project1/img"})
+    env.pump(2)
+    env.clock.advance(E.TOP_READ_TIMEOUT_S + 1)
+    env.pump(2)
+    (err,) = env.s.messages(a, "topError")
+    assert err["requestId"] == "r1" and "timed out" in err["msg"]
+    assert env.x._imp is None
+
+
+def test_import_top_conversion_is_budgeted_over_several_pumps():
+    e = Env(tick=0.002, Docw=400, Doch=1200)  # every clock read costs 2 ms against a 4 ms budget
+    e.pump()
+    a = e.connect("external")
+    install_tops(e, FakeTop("/project1/big", 200, 600, array=tops_img(200, 600)))
+    e.send(a, {"t": "importTop", "requestId": "r1", "path": "/project1/big"})
+    e.pump(2)
+    assert e.x._imp is not None and e.x._imp["stage"] == "convert" and 0 < e.x._imp["row"] < 600
+    e.pump(40)
+    assert e.s.messages(a, "topReady")
+    h, payload = P.decode_frame(get_top(e, a, "r1")["data"])
+    assert (h.w, h.h) == (200, 600)
+
+
+@pytest.mark.parametrize("path,why", [("/project1/nothing", "not a TOP"), ("/project1/raster_editor/doc/out", "raster editor")])
+def test_import_top_invalid_paths(env, path, why):
+    env.pump()
+    a = env.connect("external")
+    install_tops(env, FakeTop("/project1/img", 6, 4, array=tops_img(6, 4)))
+    run_import(env, a, path, "rX", frames=2)
+    (err,) = env.s.messages(a, "topError")
+    assert err["requestId"] == "rX" and why in err["msg"]
+
+
+def test_import_top_bad_message_is_an_error(env):
+    env.pump()
+    a = env.connect("external")
+    install_tops(env)
+    for bad in ({"t": "importTop", "requestId": "r", "path": "relative"}, {"t": "importTop", "path": "/x"},
+                {"t": "importTop", "requestId": "r", "path": 5}):
+        env.send(a, bad)
+    assert len(env.s.messages(a, "error")) == 3
+
+
+def test_import_top_too_large_and_empty(env):
+    env.pump()
+    a = env.connect("external")
+    install_tops(env, FakeTop("/project1/huge", 8193, 100), FakeTop("/project1/empty", 0, 0), FakeTop("/project1/max", 8192, 8192, array=None))
+    run_import(env, a, "/project1/huge", "r1", frames=2)
+    run_import(env, a, "/project1/empty", "r2", frames=2)
+    errs = {m["requestId"]: m["msg"] for m in env.s.messages(a, "topError")}
+    assert "too large" in errs["r1"] and "8192" in errs["r1"] and "no image" in errs["r2"]
+    assert env.x._imp is None and not env.s.messages(a, "topReady")
+
+
+def test_import_top_exact_limit_8192_is_accepted_and_scaled_down_on_the_gpu(env):
+    env.pump()
+    a = env.connect("external")
+    top = FakeTop("/project1/max", 8192, 8192, array=None)
+    install_tops(env, top)
+    made = []
+    small = FakeTop("/scaled", 128, 64, array=tops_img(128, 64))  # doc is 64x32 -> at most 128x64
+
+    class Temp:
+        destroyed = 0
+
+        def destroy(self):
+            Temp.destroyed += 1
+    env.x._make_scaler = lambda t, tw, th, tag: (made.append((t, tw, th)) or (small, [Temp(), Temp()]))
+    run_import(env, a, "/project1/max", "r1", frames=12)
+    assert not env.s.messages(a, "topError")
+    assert made and made[0][0] is top and made[0][1:] == (64, 64)  # aspect kept, 2 x doc height limits it
+    assert top.calls == 0  # the huge TOP itself is never read back
+    assert Temp.destroyed == 0  # still needed while reading
+    small.array = tops_img(64, 64)
+    small.width = small.height = 64
+    env.pump(10)
+    (ready,) = env.s.messages(a, "topReady")
+    assert (ready["w"], ready["h"]) == (64, 64)
+    assert Temp.destroyed == 2  # temporary operators are destroyed again
+    h, _ = P.decode_frame(get_top(env, a, "r1")["data"])
+    assert (h.w, h.h, h.doc_w, h.doc_h) == (64, 64, 64, 64)
+
+
+def test_import_target_size_limits():
+    f = P.import_target_size
+    assert f(100, 50, 1920, 1080) == (100, 50)  # never enlarged
+    assert f(8192, 8192, 1920, 1080) == (2160, 2160)  # 2 x doc height
+    assert f(4096, 2160, 1920, 1080) == (3840, 2025) or f(4096, 2160, 1920, 1080)[0] <= 3840
+    w, h = f(8192, 8192, 8192, 8192)
+    assert w * h <= P.MAX_TOP_PIXELS and abs(w - h) <= 1
+    w, h = f(8192, 100, 1000, 1000)
+    assert w == 2000 and h >= 1
+
+
+def test_import_top_readback_exception_becomes_top_error(env, capsys):
+    env.pump()
+    a = env.connect("external")
+    top = FakeTop("/project1/img", 6, 4, array=tops_img(6, 4))
+
+    def boom(delayed=False):
+        raise RuntimeError("gpu gone")
+    top.numpyArray = boom
+    install_tops(env, top)
+    run_import(env, a, "/project1/img", frames=3)
+    (err,) = env.s.messages(a, "topError")
+    assert "readback failed" in err["msg"] and "gpu gone" in err["msg"]
+    assert env.x._imp is None
+
+
+def test_resized_top_restarts_the_read(env):
+    env.pump()
+    a = env.connect("external")
+    top = FakeTop("/project1/img", 6, 4, array=np.zeros((2, 3, 4), np.float32))  # stale-shaped result
+    install_tops(env, top)
+    env.send(a, {"t": "importTop", "requestId": "r1", "path": "/project1/img"})
+    env.pump(4)
+    assert not env.s.messages(a, "topReady")
+    top.array = tops_img(6, 4)
+    env.pump(6)
+    assert env.s.messages(a, "topReady")
+
+
+def test_top_expires_after_30_seconds_and_is_404(env):
+    env.pump()
+    a = env.connect("external")
+    install_tops(env, FakeTop("/project1/img", 6, 4, array=tops_img(6, 4)))
+    run_import(env, a, "/project1/img")
+    env.clock.advance(20)
+    assert get_top(env, a, "r1")["statusCode"] == 200  # served: now kept only 5 s more
+    env.clock.advance(4)
+    assert get_top(env, a, "r1")["statusCode"] == 200  # a retry still works
+    env.clock.advance(E.TOP_SERVED_TTL_S + 1)
+    assert get_top(env, a, "r1")["statusCode"] == 404
+    assert env.x._tops_bytes == 0 and not env.x._tops_held
+
+
+def test_unserved_import_expires_after_30_seconds(env):
+    env.pump()
+    a = env.connect("external")
+    install_tops(env, FakeTop("/project1/img", 6, 4, array=tops_img(6, 4)))
+    run_import(env, a, "/project1/img")
+    env.clock.advance(31)
+    assert get_top(env, a, "r1")["statusCode"] == 404 and env.x._tops_bytes == 0
+
+
+def test_pump_frees_expired_tops(env):
+    env.pump()
+    a = env.connect("external")
+    install_tops(env, FakeTop("/project1/img", 6, 4, array=tops_img(6, 4)))
+    run_import(env, a, "/project1/img")
+    assert env.x._tops_bytes > 0
+    env.clock.advance(31)
+    env.pump()
+    assert env.x._tops_bytes == 0 and not env.x._tops_held
+
+
+def test_get_top_auth_cors_and_unknown(env):
+    env.pump()
+    a = env.connect("external")
+    b = env.connect("external")
+    install_tops(env, FakeTop("/project1/img", 6, 4, array=tops_img(6, 4)))
+    run_import(env, a, "/project1/img")
+    assert get_top(env, a, "r1", token="bad")["statusCode"] == 403
+    assert get_top(env, a, "nope")["statusCode"] == 404
+    assert get_top(env, a, "r1", client=False)["statusCode"] == 404
+    assert get_top(env, b, "r1")["statusCode"] == 404  # another client's id does not see it
+    r = get_top(env, a, "r1", Origin="http://localhost:5173")
+    assert r["Access-Control-Allow-Origin"] == "http://localhost:5173" and r["Vary"] == "Origin"
+    assert "Access-Control-Allow-Origin" not in get_top(env, a, "r1", Origin="http://evil.example")
+    assert get_top(env, a, "r1", Host="evil.example:9980")["statusCode"] == 403
+    assert get_top(env, a, "r1", clientAddress="10.0.0.2:5000")["statusCode"] == 403
+    assert env.x.OnHTTPRequest(req(method="POST", uri="/top", pars={"token": env.x.token}), {})["statusCode"] == 404
+
+
+def test_request_id_may_be_a_number(env):
+    env.pump()
+    a = env.connect("external")
+    install_tops(env, FakeTop("/project1/img", 6, 4, array=tops_img(6, 4)))
+    run_import(env, a, "/project1/img", 7)
+    assert env.s.messages(a, "topReady")[0]["requestId"] == 7
+    assert get_top(env, a, 7)["statusCode"] == 200
+
+
+def test_newest_import_per_client_wins_and_queue_is_bounded(env):
+    env.pump()
+    a, b, c = env.connect("external"), env.connect("external"), env.connect("external")
+    install_tops(env, *[FakeTop(f"/project1/t{i}", 6, 4, array=tops_img(6, 4, i)) for i in range(5)])
+    # a starts, b and c queue, a newer one from b replaces its queued one
+    env.send(a, {"t": "importTop", "requestId": "a1", "path": "/project1/t0"})
+    env.pump(1)
+    env.send(b, {"t": "importTop", "requestId": "b1", "path": "/project1/t1"})
+    env.send(b, {"t": "importTop", "requestId": "b2", "path": "/project1/t2"})
+    assert [j["rid"] for j in env.x._imp_queue] == ["b2"]
+    assert env.s.messages(b, "topError")[0]["requestId"] == "b1"
+    env.send(c, {"t": "importTop", "requestId": "c1", "path": "/project1/t3"})
+    env.send(a, {"t": "importTop", "requestId": "a2", "path": "/project1/t4"})  # cancels the running a1; room is checked after
+    errs_a = [(m["requestId"], m["msg"]) for m in env.s.messages(a, "topError")]
+    assert [r for r, _ in errs_a] == ["a1"] and "superseded" in errs_a[0][1]  # a2 is NOT rejected as busy
+    assert len(env.x._imp_queue) <= E.TOP_QUEUE_MAX + 1
+    env.pump(60)
+    got = {m["requestId"] for cid in (a, b, c) for m in env.s.messages(cid, "topReady")}
+    assert "a1" not in got and {"b2", "c1", "a2"} <= got
+
+
+def test_import_when_queue_is_full_is_rejected_busy(env):
+    env.pump()
+    cs = [env.connect("external") for _ in range(5)]
+    install_tops(env, FakeTop("/project1/t", 6, 4, array=tops_img(6, 4)))
+    for i, cid in enumerate(cs):
+        env.send(cid, {"t": "importTop", "requestId": f"r{i}", "path": "/project1/t"})
+        if i == 0:
+            env.pump(1)  # the first becomes the running one
+    busy = [m for cid in cs for m in env.s.messages(cid, "topError") if "busy" in m["msg"]]
+    assert len(busy) == 2 and len(env.x._imp_queue) == E.TOP_QUEUE_MAX
+
+
+def test_held_tops_per_client_and_total_are_bounded(env, monkeypatch):
+    env.pump()
+    a = env.connect("external")
+    install_tops(env, FakeTop("/project1/t", 6, 4, array=tops_img(6, 4)))
+    for i in range(4):
+        run_import(env, a, "/project1/t", f"r{i}", frames=6)
+    assert len(env.x._tops_held) == E.TOP_HELD_PER_CLIENT
+    assert get_top(env, a, "r0")["statusCode"] == 404 and get_top(env, a, "r3")["statusCode"] == 200
+    one = len(next(iter(env.x._tops_held.values()))["msg"])
+    monkeypatch.setattr(E, "TOP_HELD_MAX_BYTES", one + 1)
+    run_import(env, a, "/project1/t", "r9", frames=6)
+    assert list(k[1] for k in env.x._tops_held) == ["r9"] and env.x._tops_bytes == one
+
+
+def test_disconnect_drops_the_clients_imports_and_held_images(env):
+    env.pump()
+    a, b = env.connect("external"), env.connect("external")
+    install_tops(env, FakeTop("/project1/t", 6, 4, array=tops_img(6, 4)))
+    run_import(env, a, "/project1/t", "r1", frames=6)
+    env.send(a, {"t": "importTop", "requestId": "r2", "path": "/project1/t"})
+    env.send(b, {"t": "importTop", "requestId": "rb", "path": "/project1/t"})
+    env.x.OnWebSocketClose(a)
+    assert env.x._tops_bytes == 0 and all(j["client"] != a for j in env.x._imp_queue + [env.x._imp or {"client": None}])
+    env.pump(30)
+    assert env.s.messages(b, "topReady") and not env.s.messages(a, "topReady")[1:]
+
+
+def test_import_does_not_touch_documents_or_other_streams(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC)
+    env.pump()
+    before = {k: v.copy() for k, v in env.x.surfaces.items()}
+    install_tops(env, FakeTop("/project1/t", 6, 4, array=tops_img(6, 4)))
+    run_import(env, a, "/project1/t", "r1", frames=6)
+    assert all((env.x.surfaces[k] == v).all() for k, v in before.items())
+    assert env.x.doc_layers == DOC
+
+
+def test_text_and_shape_layers_are_accepted_and_applied(env):
+    env.pump()
+    a = env.connect("panel")
+    layers = [L("base", "base"), TEXT("t1"), SHAPE("s1"), TEXT("t2", True, slot=4), SHAPE("s2", True, slot=5)]
+    env.doc(a, layers)
+    assert env.x.doc_layers == layers and not env.s.messages(a, "error")
+    assert set(env.x.surfaces) == {4, 5} and env.o.net.applies[-1][0] == layers
+
+
+def test_text_layer_without_matching_rasterize_slot_is_rejected(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, [L("base", "base"), TEXT("t1", True, slot=None)])
+    env.doc(a, [L("base", "base"), TEXT("t1", False, slot=3)])
+    assert len(env.s.messages(a, "error")) == 2 and env.x.doc_layers is None
+
+
+def test_stored_text_document_survives_a_restart(env):
+    env.pump()
+    a = env.connect("panel")
+    layers = [L("base", "base"), TEXT("t1"), SHAPE("s1")]
+    env.doc(a, layers, rev=5)
+    env.pump(2)
+    e2 = Env(like=env)
+    e2.pump(3)
+    assert e2.x.doc_layers == layers and e2.x.doc_rev == 5
+
+
+def test_active_off_stop_and_port_change_release_every_import_and_held_image():
+    for how in ("off", "stop", "port"):
+        e = Env()
+        e.pump()
+        a, b = e.connect("external"), e.connect("external")
+        install_tops(e, FakeTop("/project1/t", 6, 4, array=tops_img(6, 4)))
+        run_import(e, a, "/project1/t", "r1", frames=6)
+        e.send(b, {"t": "importTop", "requestId": "rb", "path": "/project1/t"})
+        e.send(a, {"t": "importTop", "requestId": "r2", "path": "/project1/t"})
+        assert e.x._tops_bytes > 0
+        if how == "off":
+            e.o.par.Active.val = 0
+            e.x.OnParChange(e.o.par.Active)
+        elif how == "stop":
+            e.x.Stop()
+        else:
+            e.o.par.Port.val = 9981
+            e.x.OnParChange(e.o.par.Port)
+        assert e.x._tops_bytes == 0 and not e.x._tops_held and e.x._imp is None and not e.x._imp_queue, how
+
+
+def test_import_job_temporaries_are_destroyed_on_cancel_and_disconnect(env):
+    env.pump()
+    a = env.connect("external")
+    top = FakeTop("/project1/max", 8192, 8192)
+    install_tops(env, top)
+    destroyed = []
+
+    class Temp:
+        def destroy(self):
+            destroyed.append(1)
+    small = FakeTop("/s", 64, 64, array=None)
+    env.x._make_scaler = lambda t, tw, th, tag: (small, [Temp()])
+    env.send(a, {"t": "importTop", "requestId": "r1", "path": "/project1/max"})
+    env.pump(3)
+    assert env.x._imp is not None and env.x._imp["temps"]
+    env.send(a, {"t": "importTop", "requestId": "r2", "path": "/project1/max"})  # cancels r1
+    assert destroyed == [1]
+    env.pump(3)
+    env.x.OnWebSocketClose(a)
+    assert destroyed == [1, 1] and env.x._imp is None
+
+
+def test_import_resolving_into_the_component_is_refused(env):
+    env.pump()
+    a = env.connect("external")
+    inner = FakeTop("/project1/raster_editor/doc/out", 6, 4, array=tops_img(6, 4))
+    env.x._all_tops = lambda: [inner]
+    env.x._lookup_top = lambda path: inner  # e.g. a wildcard / `..` path that resolves inside
+    run_import(env, a, "/project1/*/out", "r1", frames=3)
+    (err,) = env.s.messages(a, "topError")
+    assert "raster editor" in err["msg"] and inner.calls == 0
+
+
+def test_import_of_a_known_huge_top_is_refused_without_reading_it(env):
+    env.pump()
+    a = env.connect("external")
+    big = FakeTop("/project1/wide", 9000, 10, cooks=0)
+    big.par = types.SimpleNamespace(outputresolution=types.SimpleNamespace(eval=lambda: "custom"),
+                                    resolutionw=types.SimpleNamespace(eval=lambda: 9000),
+                                    resolutionh=types.SimpleNamespace(eval=lambda: 10))
+    install_tops(env, big)
+    run_import(env, a, "/project1/wide", "r1", frames=1)
+    assert "too large" in env.s.messages(a, "topError")[0]["msg"] and big.size_reads == 0 and big.calls == 0
+
+
+def test_list_tops_does_not_read_sizes_of_custom_or_unchanged_tops(env):
+    env.pump()
+    a = env.connect("external")
+    ev = lambda v: types.SimpleNamespace(eval=lambda: v)  # noqa: E731
+    custom = FakeTop("/project1/c", 7, 7)
+    custom.par = types.SimpleNamespace(outputresolution=ev("custom"), resolutionw=ev(7), resolutionh=ev(7))
+    plain = FakeTop("/project1/p", 9, 9)
+    install_tops(env, custom, plain)
+    env.send(a, {"t": "listTops", "requestId": 1})
+    assert custom.size_reads == 0 and plain.size_reads == 2  # read once
+    env.send(a, {"t": "listTops", "requestId": 2})
+    assert plain.size_reads == 2  # cached for the same cook count
+    plain.totalCooks += 1
+    env.send(a, {"t": "listTops", "requestId": 3})
+    assert plain.size_reads == 4
+
+
+def test_font_failure_is_retried_with_backoff(env, capsys):
+    env.o._ops["font_probe"] = object()
+    env.pump()
+    a = env.connect("external")
+    assert env.s.messages(a, "fonts")[0]["families"] == []
+    b = env.connect("external")
+    assert env.s.messages(b, "fonts")[0]["families"] == []
+    assert capsys.readouterr().out.count("fonts:") == 1  # not retried at once
+    env.o._ops["font_probe"] = FakeFontProbe()
+    env.clock.advance(E.FONT_RETRY_S + 1)
+    c = env.connect("external")
+    assert "Arial" in env.s.messages(c, "fonts")[0]["families"]
+
+
+def test_font_families_strip_only_known_trailing_style_tokens():
+    assert E.font_families(["Arial-Bold", "Arial Bold Italic", "Arial"]) == ["Arial"]
+    assert E.font_families(["Bebas Neue", "Hind-Madurai", "Source Code Pro", "Roboto Mono Regular"]) == [
+        "Bebas Neue", "Hind-Madurai", "Roboto Mono", "Source Code Pro"]
+
+
+def test_orphaned_import_temporaries_are_swept_on_start_and_drop(env):
+    class Kid:
+        def __init__(self, name):
+            self.name, self.gone = name, False
+
+        def destroy(self):
+            self.gone = True
+    kids = [Kid("_imp_sel1a2b"), Kid("_imp_res1a2b"), Kid("in1"), Kid("doc")]
+    env.o.children = kids
+    env.x.Start()
+    assert [k.gone for k in kids] == [True, True, False, False]
+    again = [Kid("_imp_res9"), Kid("keep")]
+    env.o.children = again
+    env.x._drop_all_tops()
+    assert [k.gone for k in again] == [True, False]

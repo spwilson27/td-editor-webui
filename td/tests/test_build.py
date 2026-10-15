@@ -175,3 +175,33 @@ def test_frame_exec_calls_freeze_and_thaw_on_project_save():
 def test_new_parameters_are_wired_to_the_par_exec():
     pars = B.PARAMS.split()
     assert "Maxviewfps" in pars and "Savetox" in pars and "Viewmode" not in pars
+
+
+# --------------------------------------------------------------------------- parameter help (DESIGN_V3 section 1)
+
+def _declared_params():
+    """Every custom parameter name that build() creates (parsed from the source: build() needs TD)."""
+    import re
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build_component.py"), encoding="utf-8").read()
+    return set(re.findall(r'page\.append\w+\("(\w+)"', src))
+
+
+def test_every_custom_parameter_has_help_text():
+    declared = _declared_params()
+    assert {"Active", "Port", "Status", "Viewmode", "Savetox"} <= declared
+    assert declared == set(B.HELP), f"missing {declared - set(B.HELP)}, stale {set(B.HELP) - declared}"
+    for name, text in B.HELP.items():
+        assert len(text.strip()) >= 40, name
+
+
+def test_help_says_defaults_units_and_read_only():
+    h = B.HELP
+    assert "default 9980" in h["Port"] and "1920" in h["Docw"] and "1080" in h["Doch"]
+    for k in ("Maxsendfps", "Maxinputfps", "Maxviewfps"):
+        assert "frames per second" in h[k] and "default 30" in h[k]
+    assert "read-only" in h["Status"] and "read-only" in h["Viewmode"] and "Informational" in h["Status"]
+    assert B.COMMENT
+
+
+def test_params_list_matches_help_for_the_parameter_execute_dat():
+    assert set(B.PARAMS.split()) <= set(B.HELP)

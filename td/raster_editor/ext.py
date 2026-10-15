@@ -43,8 +43,37 @@ COOK_BUDGET_S = 0.004  # surface uploads per pump (at least one slot always goes
 HOLD_MAX_BYTES = 64 * 1024 * 1024  # tiles / docs held while a restore is pending
 RESTORE_TRIES = 5
 FROZEN_MAX_S = 2.0  # a Freeze() without a Thaw() this long ago is undone by the pump
+TOP_TTL_S = 30.0  # a converted TOP import is served by GET /top for this long
+TOP_QUEUE_MAX = 2  # imports waiting behind the active one (all clients together)
+TOP_HELD_PER_CLIENT = 2
+TOP_HELD_MAX_BYTES = 640 * 1024 * 1024
+TOP_READ_TIMEOUT_S = 10.0  # delayed readback that never delivers
+TOP_CONVERT_BUDGET_S = CONVERT_BUDGET_S
+TOP_SERVED_TTL_S = 5.0  # a served import is dropped this long after its last fetch (a retry still works)
+TOP_SCAN_MAX = 50000  # listTops looks at this many TOPs at most
+FONT_RETRY_S = 30.0  # a failed font enumeration is retried this often
+FONT_STYLE_SUFFIX = re.compile(r"[\s-]+(?:bold|italic|oblique|regular|roman|bolditalic|boldoblique)$", re.I)
 DEFAULT_LAYER = {"id": "base", "kind": "base", "parentId": None, "name": "Background", "visible": True,
-                 "opacity": 1, "blend": "normal", "x": 0, "y": 0, "slot": None, "mask": None, "adjustment": None}
+                 "opacity": 1, "blend": "normal", "x": 0, "y": 0, "slot": None, "mask": None, "adjustment": None,
+                 "text": None, "shape": None, "rasterize": False}
+
+
+def font_families(names, labels=None):
+    """Font menu entries -> sorted, de-duplicated family names. TD's `font` menu lists faces ("Arial Bold
+    Italic"); trailing style words are dropped so the web side can combine family + bold / italic itself."""
+    out = {}
+    for raw in (labels if labels else names):
+        name = str(raw).strip()
+        if not name:
+            continue
+        fam = name
+        while True:  # only known style words, only as a separate trailing token ("Arial-Bold", "Arial Bold Italic")
+            m = FONT_STYLE_SUFFIX.search(fam)
+            if m is None or m.start() == 0:
+                break
+            fam = fam[:m.start()]
+        out.setdefault(fam.casefold(), fam)
+    return sorted(out.values(), key=str.casefold)
 
 
 def _guard(fn):
@@ -134,13 +163,16 @@ class RasterEditorExt:
         self._seen_errors = set()
         self.last_error = None
         self._started = False
+        self._fonts_retry_at = 0.0
+        self._top_sizes = {}  # path -> (totalCooks, w, h): listTops reads a size once per cook, never forces a cook
+        self._fonts = None  # cached family list (the menu does not change while TD runs)
         self.base = _Pipe("base", 1, "")
         self.out = _Pipe("view", 5, "v")
         self._load_modules()
         self._reset_state()
         self.stats = {k: collections.deque(maxlen=STAT_WINDOW) for k in (
             "pump", "paste", "cook", "convert", "publish", "readback", "vconvert", "vpublish", "vreadback",
-            "apply", "dump")}
+            "apply", "dump", "top")}
 
     # ------------------------------------------------------------------ setup / lifecycle
 
@@ -202,6 +234,11 @@ class RasterEditorExt:
         self._out_times = collections.deque(maxlen=64)
         self._logged_bad_frames = collections.deque(maxlen=8)
         self._log_window = (0.0, 0)
+        self._imp = None  # the TOP import being read / converted (one at a time, for all clients)
+        self._imp_queue = []  # imports waiting for it
+        self._tops_held = collections.OrderedDict()  # (client cid, str(requestId)) -> {msg, expires, w, h}
+        self._tops_bytes = 0
+        self._top_frame_id = 0
 
     def _p(self, name):
         return getattr(self.o.par, name).eval()
@@ -252,12 +289,14 @@ class RasterEditorExt:
         if self._doc_state_dirty:
             self._flush_doc_state()
         self._close_all_sockets()
+        self._drop_all_tops()
         self.clients.clear()
         self.active_id = None
         self._started = False
         self._op("webserver").par.active = 0
 
     def _close_all_sockets(self):
+        self._drop_all_tops()
         ws = self._op("webserver")
         try:
             conns = list(ws.webSocketConnections)
@@ -276,7 +315,9 @@ class RasterEditorExt:
         self._net_applied = False
         try:
             mod = self._op("network").module
-            self.network = mod.DocNetwork(self.o, self._op("blend_glsl").text)
+            shape = self._opt("shape_glsl")  # None (older COMP): DocNetwork falls back to its sibling file
+            self.network = mod.DocNetwork(self.o, self._op("blend_glsl").text,
+                                          shape_glsl=shape.text if shape is not None else None)
             self._net_mod = mod
         except Exception as e:  # noqa: BLE001
             self.network = None
@@ -301,6 +342,7 @@ class RasterEditorExt:
         else:
             ws.par.active = 0
             wr.par.active = 0
+            self._drop_all_tops()
             self.clients.clear()
             self.active_id = None
             self._op("out_switch").par.index = 0  # passthrough while the editor is off
@@ -456,6 +498,8 @@ class RasterEditorExt:
             return self._serve_pipe(self.out, "view", request, response, subscribed_only=True)
         if method == "GET" and path == "/surface":
             return self._serve_surface(request, response)
+        if method == "GET" and path == "/top":
+            return self._serve_top(request, response)
         if method == "GET" and path in ("/", "/index.html"):
             html = self._op("ui_html").text
             if html:
@@ -476,6 +520,7 @@ class RasterEditorExt:
         c = self.clients.pop(client, None)
         if c is None:
             return
+        self._drop_client_tops(c)
         if self.active_id == client:
             self.active_id = None
             ready = [x for x in self.clients.values() if x.ready]
@@ -513,6 +558,10 @@ class RasterEditorExt:
             self._on_request_doc(c)
         elif t == "view":
             self._on_view(c, msg)
+        elif t == "listTops":
+            self._on_list_tops(c, msg)
+        elif t == "importTop":
+            self._on_import_top(c, msg)
         elif t == "log":
             self._on_log(msg)
         # unknown message types are ignored (PROTOCOL.md)
@@ -579,6 +628,7 @@ class RasterEditorExt:
             self.active_id = c.id
         self._send(c.id, P.hello(self.doc_w, self.doc_h, self.has_input, self._p("Maxsendfps"), c.active, c.cid,
                                  self.doc_layers is not None, self.doc_rev))
+        self._send(c.id, P.fonts(self._font_families()))
         self._sync_viewmode()
         self._status_at = 0.0
 
@@ -1046,7 +1096,8 @@ class RasterEditorExt:
                 ("panel", self._keep_panel_cooking), ("mouse", self._flush_mouse),
                 ("doc", self._sync_doc_size), ("panelview", self._sync_panel_view),
                 ("input", lambda: self._poll_base(now)), ("output", lambda: self._poll_view(now)),
-                ("notify", lambda: self._notify_clients(now)), ("surfaces", self._cook_surfaces),
+                ("notify", lambda: self._notify_clients(now)), ("tops", lambda: self._tick_tops(now)),
+                ("surfaces", self._cook_surfaces),
                 ("replay", self._replay_step), ("reencode", self._reencode_one), ("frozen", lambda: self._check_frozen(now)), ("network", lambda: self._tick_network(now)), ("docstate", self._flush_if_dirty),
                 ("switch", self._update_switch)):
             try:
@@ -1149,6 +1200,337 @@ class RasterEditorExt:
             flag(has_input)
         self._apply_network()
         self._status_at = 0.0
+
+    # ------------------------------------------------------------------ fonts
+
+    def _font_families(self):
+        """System font families from a Text TOP's `font` menu (cached; a failure is retried after FONT_RETRY_S).
+        Never raises: [] makes the web app use its built-in list."""
+        if self._fonts is None:
+            now = self._now()
+            if now < self._fonts_retry_at:
+                return []
+            try:
+                names, labels = self._font_menu()
+                self._fonts = font_families(names, labels)
+            except Exception as e:  # noqa: BLE001
+                self._fonts_retry_at = now + FONT_RETRY_S
+                self._report("fonts", e)
+                return []
+        return self._fonts
+
+    def _font_menu(self):
+        """(menuNames, menuLabels) of a hidden Text TOP: the build's `font_probe`, else a temporary one."""
+        probe = self._opt("font_probe")
+        if probe is not None:
+            par = probe.par.font
+            return list(par.menuNames), list(par.menuLabels)
+        tmp = self.o.create("textTOP", "_font_probe_tmp")  # pragma: no cover - needs TD
+        try:
+            return list(tmp.par.font.menuNames), list(tmp.par.font.menuLabels)
+        finally:
+            tmp.destroy()
+
+    # ------------------------------------------------------------------ TOP import (listTops / importTop / GET /top)
+
+    def _all_tops(self):  # pragma: no cover - needs TD
+        """Every TOP of the project (a tree walk, nothing is cooked). Test seam."""
+        root = op("/project1")  # noqa: F821
+        return root.findChildren(type=TOP)  # noqa: F821
+
+    def _lookup_top(self, path):  # pragma: no cover - needs TD
+        """The TOP at ``path`` or None. Test seam."""
+        o = op(path)  # noqa: F821
+        return o if o is not None and getattr(o, "family", None) == "TOP" else None
+
+    def _make_scaler(self, top, tw, th, tag):  # pragma: no cover - needs TD
+        """GPU downscale before the readback: Select TOP -> Resolution TOP (tw x th) inside this COMP. Returns
+        (output TOP, [temporary operators]). Test seam."""
+        sel = self.o.create("selectTOP", f"_imp_sel{tag}")
+        res = None
+        try:
+            sel.par.top = top.path
+            res = self.o.create("resolutionTOP", f"_imp_res{tag}")
+            res.inputConnectors[0].connect(sel)
+            res.par.outputresolution = "custom"
+            res.par.resolutionw, res.par.resolutionh = tw, th
+            try:
+                res.par.inputfiltertype = "mipmap"
+            except Exception:  # noqa: BLE001 - older parameter name / menu
+                pass
+        except Exception:
+            for t in (res, sel):
+                if t is not None:
+                    t.destroy()
+            raise
+        return res, [res, sel]
+
+    def _inside_self(self, path):
+        me = str(self.o.path)
+        return path == me or path.startswith(me + "/")
+
+    def _top_size(self, t):
+        """(w, h) of a TOP without forcing a cook: custom resolution parameters, else the size cached for its current
+        cook count, else (when it has cooked) its reported size, else 0x0 (unknown)."""
+        try:
+            if str(t.par.outputresolution.eval()) == "custom":
+                return int(t.par.resolutionw.eval()), int(t.par.resolutionh.eval())
+        except Exception:  # noqa: BLE001 - not every TOP has these
+            pass
+        path = str(t.path)
+        cooks = getattr(t, "totalCooks", 0)
+        hit = self._top_sizes.get(path)
+        if hit is not None and hit[0] == cooks:
+            return hit[1], hit[2]
+        if cooks > 0:
+            try:
+                w, h = int(t.width), int(t.height)
+            except Exception:  # noqa: BLE001
+                return 0, 0
+            if len(self._top_sizes) > 4 * self.protocol.MAX_TOPS:
+                self._top_sizes.clear()
+            self._top_sizes[path] = (cooks, w, h)
+            return w, h
+        return 0, 0
+
+    def _list_tops(self):
+        items, scanned = [], 0
+        for t in self._all_tops():
+            scanned += 1
+            if scanned > TOP_SCAN_MAX:
+                break
+            path = str(t.path)
+            if self._inside_self(path):
+                continue
+            w, h = self._top_size(t)
+            items.append({"path": path, "w": w, "h": h})
+            if len(items) >= self.protocol.MAX_TOPS:
+                break
+        items.sort(key=lambda i: i["path"])
+        return items
+
+    def _on_list_tops(self, c, msg):
+        P = self.protocol
+        try:
+            rid = P.parse_list_tops(msg)
+        except P.ProtocolError as e:
+            self._send(c.id, P.top_error(msg.get("requestId") if isinstance(msg.get("requestId"), (str, int)) else None,
+                                         f"bad listTops: {e}"))
+            return
+        self._send(c.id, P.tops(rid, self._list_tops()))
+
+    def _on_import_top(self, c, msg):
+        P = self.protocol
+        try:
+            rid, path = P.parse_import_top(msg)
+        except P.ProtocolError as e:
+            self._send(c.id, P.error(f"bad importTop: {e}"))
+            return
+        if self._inside_self(path):
+            self._send(c.id, P.top_error(rid, "that TOP is part of the raster editor"))
+            return
+        try:
+            top = self._lookup_top(path)
+        except Exception:  # noqa: BLE001 - bad path syntax
+            top = None
+        if top is None:
+            self._send(c.id, P.top_error(rid, f"{path} is not a TOP"))
+            return
+        if self._inside_self(str(top.path)):  # wildcards / `..` can resolve into the component
+            self._send(c.id, P.top_error(rid, "that TOP is part of the raster editor"))
+            return
+        w, h = self._top_size(top)  # no cook; 0x0 = unknown, checked again when it is read
+        if w > P.MAX_TOP_DIM or h > P.MAX_TOP_DIM:
+            self._send(c.id, P.top_error(rid, f"{path} is too large ({w}x{h}, limit {P.MAX_TOP_DIM}x{P.MAX_TOP_DIM})"))
+            return
+        # One import per client, newest wins: a queued one is replaced, the running one is cancelled. The capacity
+        # check comes after, so replacing your own request never fails for lack of room.
+        for j in [j for j in self._imp_queue if j["client"] == c.id]:
+            self._imp_queue.remove(j)
+            self._send(c.id, P.top_error(j["rid"], "superseded by a newer import"))
+        if self._imp is not None and self._imp["client"] == c.id:
+            self._send(c.id, P.top_error(self._imp["rid"], "superseded by a newer import"))
+            self._release_job(self._imp)
+            self._imp = None
+        if len(self._imp_queue) + (1 if self._imp is not None else 0) >= TOP_QUEUE_MAX + 1:
+            self._send(c.id, P.top_error(rid, "busy: other TOP imports are pending, try again"))
+            return
+        self._imp_queue.append({"client": c.id, "ccid": c.cid, "rid": rid, "path": path, "stage": "read",
+                                "calls": 0, "started": None, "scaler": None, "temps": []})
+
+    def _release_job(self, job):
+        """Destroy the temporary operators of an import and drop its buffers."""
+        for t in job.pop("temps", []):
+            try:
+                t.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+        job["scaler"] = None
+        job.pop("arr", None)
+        job.pop("out", None)
+
+    def _drop_client_tops(self, c):
+        for j in [j for j in self._imp_queue if j["client"] == c.id]:
+            self._imp_queue.remove(j)
+            self._release_job(j)
+        if self._imp is not None and self._imp["client"] == c.id:
+            self._release_job(self._imp)
+            self._imp = None
+        for k in [k for k in self._tops_held if k[0] == c.cid]:
+            self._tops_bytes -= len(self._tops_held.pop(k)["msg"])
+
+    def _sweep_import_temps(self):
+        """Destroy leftover downscale operators (`_imp_sel*` / `_imp_res*`), e.g. orphaned by a module reload."""
+        try:
+            kids = list(getattr(self.o, "children", None) or [])
+        except Exception:  # noqa: BLE001
+            return
+        for k in kids:
+            if str(getattr(k, "name", "")).startswith(("_imp_sel", "_imp_res")):
+                try:
+                    k.destroy()
+                except Exception as e:  # noqa: BLE001
+                    self._report("sweep", e)
+
+    def _drop_all_tops(self):
+        """Every import and held image (server stopped / clients cleared)."""
+        for j in self._imp_queue + ([self._imp] if self._imp is not None else []):
+            self._release_job(j)
+        self._imp, self._imp_queue = None, []
+        self._sweep_import_temps()
+        self._tops_held.clear()
+        self._tops_bytes = 0
+
+    def _top_fail(self, job, text):
+        self._release_job(job)
+        if self._imp is job:
+            self._imp = None
+        if job["client"] in self.clients:
+            self._send(job["client"], self.protocol.top_error(job["rid"], text))
+
+    def _tick_tops(self, now):
+        """Expire held imports and advance the one running import by one budgeted step per pump."""
+        for k in [k for k, v in self._tops_held.items() if now >= v["expires"]]:
+            self._tops_bytes -= len(self._tops_held.pop(k)["msg"])
+        if self._imp is None and self._imp_queue:
+            self._imp = self._imp_queue.pop(0)
+            self._imp["started"] = now
+        job = self._imp
+        if job is None:
+            return
+        try:
+            if job["stage"] == "read":
+                self._top_read(job, now)
+            else:
+                self._top_convert(job)
+        except Exception as e:  # noqa: BLE001 - one bad TOP must not break the pump
+            self._report("importTop", e)
+            self._top_fail(job, f"readback failed: {type(e).__name__}: {e}")
+
+    def _top_read(self, job, now):
+        P = self.protocol
+        top = self._lookup_top(job["path"])
+        if top is None:
+            return self._top_fail(job, f"{job['path']} no longer exists")
+        if self._inside_self(str(top.path)):
+            return self._top_fail(job, "that TOP is part of the raster editor")
+        w, h = int(top.width), int(top.height)
+        if w < 1 or h < 1:
+            return self._top_fail(job, f"{job['path']} has no image (size {w}x{h})")
+        if w > P.MAX_TOP_DIM or h > P.MAX_TOP_DIM:
+            return self._top_fail(job, f"{job['path']} is too large ({w}x{h}, limit {P.MAX_TOP_DIM}x{P.MAX_TOP_DIM})")
+        if now - job["started"] > TOP_READ_TIMEOUT_S:
+            return self._top_fail(job, "readback failed: timed out")
+        tw, th = P.import_target_size(w, h, self.doc_w, self.doc_h)
+        src = top
+        if (tw, th) != (w, h):  # large image: shrink on the GPU first, so the readback and the message stay small
+            if job["scaler"] is None:
+                job["scaler"], job["temps"] = self._make_scaler(top, tw, th, f"{id(job) & 0xFFFF:04x}")
+                job["calls"] = 0
+                return  # read from the next pump on (the new operators cook then)
+            src = job["scaler"]
+        # Two-step delayed readback as for the BASE stream: a call returns the read issued by the previous one, so
+        # the first result is ignored (it may be stale) and the main thread never waits for the GPU.
+        t = self._now()
+        arr = src.numpyArray(delayed=True)
+        self.stats["top"].append(self._now() - t)
+        job["calls"] += 1
+        if job["calls"] < 2 or arr is None:
+            return
+        if tuple(arr.shape[:2]) != (th, tw):  # the TOP was resized meanwhile: read again
+            job["calls"] = 0
+            return
+        # one buffer holds header + pixels: the converter writes straight into it, the held message is that buffer
+        hdr = P.Header(P.TYPE_TOP_IMAGE, P.FLAG_FRAME_END, 0, tw, th, 0, 0, tw, th)
+        buf = bytearray(P.HEADER_SIZE + tw * th * 4)
+        buf[:P.HEADER_SIZE] = P.encode_header(hdr)
+        out = np.frombuffer(buf, np.uint8, offset=P.HEADER_SIZE).reshape(th, tw, 4)
+        job.update(stage="convert", arr=arr, out=out, buf=buf, row=0, rows=32, w=tw, h=th,
+                   unpre=bool(self._p("Premultiplied")))
+        self._top_convert(job)
+
+    def _top_convert(self, job):
+        arr, out, h = job["arr"], job["out"], job["h"]
+        start = self._now()
+        while job["row"] < h:
+            r0 = job["row"]
+            r1 = min(h, r0 + job["rows"])
+            t = self._now()
+            self.converter.convert_rows(arr, out, r0, r1, job["unpre"])
+            dt = self._now() - t
+            job["row"] = r1
+            if dt > 0:  # adapt the slice so each takes ~1/3 of the budget
+                job["rows"] = max(16, int(job["rows"] * (TOP_CONVERT_BUDGET_S / 3) / dt))
+            if self._now() - start >= TOP_CONVERT_BUDGET_S:
+                break
+        self.stats["top"].append(self._now() - start)
+        if job["row"] < h:
+            return
+        P = self.protocol
+        w, buf = job["w"], job["buf"]
+        self._top_frame_id = (self._top_frame_id + 1) & 0xFFFFFFFF
+        buf[8:12] = self._top_frame_id.to_bytes(4, "little")  # header frameId
+        P.decode_frame(buf)  # sanity: the header we wrote describes the payload
+        job.pop("buf")
+        self._release_job(job)
+        self._imp = None
+        self._hold_top(job, buf, w, h)
+        if job["client"] in self.clients:
+            self._send(job["client"], P.top_ready(job["rid"], w, h))
+
+    def _hold_top(self, job, msg, w, h):
+        """Keep the converted image for GET /top: at most TOP_HELD_PER_CLIENT per client and TOP_HELD_MAX_BYTES in
+        total (oldest evicted first), each for TOP_TTL_S (TOP_SERVED_TTL_S once it was served)."""
+        key = (job["ccid"], str(job["rid"]))
+        old = self._tops_held.pop(key, None)
+        if old is not None:
+            self._tops_bytes -= len(old["msg"])
+        mine = [k for k in self._tops_held if k[0] == job["ccid"]]
+        for k in mine[: max(0, len(mine) - TOP_HELD_PER_CLIENT + 1)]:
+            self._tops_bytes -= len(self._tops_held.pop(k)["msg"])
+        while self._tops_held and self._tops_bytes + len(msg) > TOP_HELD_MAX_BYTES:
+            k = next(iter(self._tops_held))
+            self._tops_bytes -= len(self._tops_held.pop(k)["msg"])
+        self._tops_held[key] = {"msg": msg, "expires": self._now() + TOP_TTL_S, "w": w, "h": h}
+        self._tops_bytes += len(msg)
+
+    def _serve_top(self, request, response):
+        """GET /top?token=T&client=C&requestId=R: the converted TOP image (frame type 6); 404 unknown / expired.
+        After a successful serve the image is only kept TOP_SERVED_TTL_S longer (a retry still works)."""
+        pars = request.get("pars") or {}
+        if not self._token_ok(pars.get("token")):
+            return self._cors(request, self._reply(response, 403, "Forbidden", "bad token"))
+        key = (pars.get("client"), str(pars.get("requestId")))
+        held = self._tops_held.get(key)
+        now = self._now()
+        if held is not None and now >= held["expires"]:
+            self._tops_bytes -= len(self._tops_held.pop(key)["msg"])
+            held = None
+        if held is None or not any(c.cid == key[0] for c in self.clients.values()):
+            return self._cors(request, self._reply(response, 404, "Not Found", "unknown or expired TOP import"))
+        held["expires"] = min(held["expires"], now + TOP_SERVED_TTL_S)
+        response["Cache-Control"] = "no-store"
+        return self._cors(request, self._reply(response, 200, "OK", held["msg"], "application/octet-stream"))
 
     # --- TOP -> clients (BASE from in1, VIEW from doc/out): shared budgeted pipeline
 

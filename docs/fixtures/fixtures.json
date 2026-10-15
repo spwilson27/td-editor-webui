@@ -149,6 +149,27 @@
       "payloadSha256": "f029f014ccd21bcc30bdb1780e02b56211c93c4054cb1ce8245b2c00e81369bf"
     },
     {
+      "name": "top_image",
+      "file": "top_image.bin",
+      "frame": "top_image",
+      "valid": true,
+      "size": 108,
+      "header": {
+        "type": 6,
+        "slot": 0,
+        "flags": 1,
+        "frameEnd": true,
+        "frameId": 21,
+        "docW": 7,
+        "docH": 3,
+        "x": 0,
+        "y": 0,
+        "w": 7,
+        "h": 3
+      },
+      "payloadSha256": "f2f47624973f09fa8e65f43f69b9cb4239f05fee6afbb257b7575b5bdb901933"
+    },
+    {
       "name": "stale_docsize",
       "file": "stale_docsize.bin",
       "frame": "stale_docsize",

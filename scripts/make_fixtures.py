@@ -88,6 +88,10 @@ def main():
     (m,) = P.encode_frames(P.TYPE_VIEW, 12, 5, 4, (0, 0, 5, 4), Pix(0, 0, 5, 4))
     write("view_small", m, "view_small")
 
+    # 5b. TOP_IMAGE (GET /top, v4): a 7x3 TOP; docW/docH are the TOP's own size, one band, slot 0
+    (m,) = P.encode_frames(P.TYPE_TOP_IMAGE, 21, 7, 3, (0, 0, 7, 3), Pix(0, 0, 7, 3))
+    write("top_image", m, "top_image")
+
     # 6. valid on the wire but stale: produced for a 7x7 document while the receiver's is 6x7;
     #    decode_frame accepts it, receivers must drop it silently (PROTOCOL.md rules)
     stale = P.Header(P.TYPE_SURFACE, 1, 11, 7, 7, 0, 0, 2, 2, 5)

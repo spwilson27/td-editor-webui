@@ -41,7 +41,7 @@ def test_slot_field_at_offset_6_roundtrips_for_every_valid_type():
 def test_type_2_is_invalid_to_encode_and_decode():
     with pytest.raises(P.ProtocolError):
         P.encode_header(hdr(type=2))
-    assert 2 not in P.VALID_TYPES and set(P.VALID_TYPES) == {1, 3, 4, 5}
+    assert 2 not in P.VALID_TYPES and set(P.VALID_TYPES) == {1, 3, 4, 5, 6}
 
 
 def test_slot_out_of_range_rejected():
@@ -80,7 +80,7 @@ def test_frame_id_wraps():
     lambda b: b + b"\0",
     lambda b: b[:4] + bytes([0]) + b[5:],  # type 0
     lambda b: b[:4] + bytes([2]) + b[5:],  # type 2 = v1/v2 COMPOSITE, invalid in v3
-    lambda b: b[:4] + bytes([6]) + b[5:],
+    lambda b: b[:4] + bytes([7]) + b[5:],
     lambda b: b"",
 ])
 def test_invalid_frames_rejected(mutate):
@@ -210,7 +210,7 @@ def test_json_decode_rejects(bad):
 
 def test_json_builders():
     assert json.loads(P.hello(10, 20, True, 30, False, "abc")) == {
-        "t": "hello", "protocol": 3, "doc": {"w": 10, "h": 20}, "hasInput": True, "maxSendFps": 30, "active": False,
+        "t": "hello", "protocol": 4, "doc": {"w": 10, "h": 20}, "hasInput": True, "maxSendFps": 30, "active": False,
         "clientId": "abc", "hasDocument": False, "rev": None}
     assert json.loads(P.hello(10, 20, False, 30, True, "abc", True, 12)) ["rev"] == 12
     assert json.loads(P.base_notice(7, 100, 50)) == {"t": "base", "frameId": 7, "docW": 100, "docH": 50,
@@ -227,7 +227,7 @@ def test_json_builders():
 
 def test_web_side_builders_roundtrip_through_decode():
     m = P.decode_json(P.ready("panel", "tok", True, "v1"))
-    assert (m["t"], m["protocol"], m["client"], m["token"], m["fresh"]) == ("ready", 3, "panel", "tok", True)
+    assert (m["t"], m["protocol"], m["client"], m["token"], m["fresh"]) == ("ready", 4, "panel", "tok", True)
     assert P.decode_json(P.request_doc()) == {"t": "requestDoc"}
     d = P.decode_json(P.doc(4, [LAYER]))
     assert P.parse_doc(d) == (4, [LAYER])
@@ -311,9 +311,170 @@ def test_fixture_set_covers_v3_cases():
     by = {e["name"]: e for e in load_fixtures()}
     assert by["surface_band0"]["header"]["slot"] == 5 and by["surface_dump"]["header"]["type"] == 4
     assert by["view_small"]["header"]["type"] == 5 and by["surface_no_end"]["header"]["slot"] == 300
+    # v4: TOP_IMAGE carries the TOP's own size as docW/docH
+    t = by["top_image"]["header"]
+    assert t["type"] == 6 and (t["docW"], t["docH"], t["w"], t["h"], t["x"], t["y"], t["slot"]) == (7, 3, 7, 3, 0, 0, 0)
 
 
 def test_wrong_slot_fixture_decodes_but_slot_is_unknown():
     e = next(e for e in load_fixtures() if e["name"] == "wrong_slot")
     h, _ = P.decode_frame(open(os.path.join(FIX, e["file"]), "rb").read())
     assert h.slot not in e["knownSlots"] and not P.is_stale(h, e["currentDoc"]["w"], e["currentDoc"]["h"])
+
+
+# --------------------------------------------------------------------------- v4 (PROTOCOL.md section 6)
+
+import copy  # noqa: E402
+
+
+def rgba(r=0, g=0, b=0, a=255):
+    return {"r": r, "g": g, "b": b, "a": a}
+
+
+def text_layer(**kw):
+    spec = {"text": "Hello", "font": "Arial", "size": 24, "color": rgba(1, 2, 3), "align": "center", "bold": True,
+            "italic": False, "lineHeight": 1.2, "x": 5, "y": 6, "boxWidth": None}
+    spec.update(kw)
+    return {"id": "t", "kind": "text", "parentId": None, "slot": None, "mask": None, "text": spec, "shape": None,
+            "rasterize": False}
+
+
+def shape_layer(shape, **kw):
+    d = {"id": "s", "kind": "shape", "parentId": None, "slot": None, "mask": None, "text": None, "shape": shape,
+         "rasterize": False}
+    d.update(kw)
+    return d
+
+
+FILL = {"enabled": True, "color": rgba(9, 9, 9)}
+STROKE = {"enabled": True, "color": rgba(), "width": 3}
+SHAPES = {
+    "rect": {"type": "rect", "x": 0, "y": 0, "w": 10, "h": 5, "radius": 2, "fill": FILL, "stroke": STROKE, "rotation": 15},
+    "ellipse": {"type": "ellipse", "x": 0, "y": 0, "w": 10, "h": 5, "fill": FILL, "stroke": STROKE, "rotation": 0},
+    "line": {"type": "line", "x1": 0, "y1": 0, "x2": 9, "y2": 9, "stroke": STROKE, "arrowStart": False, "arrowEnd": True},
+    "polygon": {"type": "polygon", "cx": 5, "cy": 5, "radius": 4, "sides": 5, "innerRatio": 0.5, "fill": FILL, "stroke": STROKE,
+                "rotation": 0},
+}
+
+
+def parse(*layers):
+    return P.parse_doc({"rev": 1, "layers": list(layers)})
+
+
+def test_version_and_new_frame_type():
+    assert P.PROTOCOL_VERSION == 4 and P.TYPE_TOP_IMAGE == 6 and 6 in P.VALID_TYPES
+
+
+def test_top_image_frame_uses_the_tops_own_size_as_doc_size():
+    raw = P.encode_message(P.Header(P.TYPE_TOP_IMAGE, P.FLAG_FRAME_END, 3, 7, 3, 0, 0, 7, 3), bytes(7 * 3 * 4))
+    h, payload = P.decode_frame(raw)
+    assert (h.type, h.slot, h.doc_w, h.doc_h, h.frame_end, len(payload)) == (6, 0, 7, 3, True, 84)
+    with pytest.raises(P.ProtocolError):  # still inside docW x docH
+        P.encode_header(P.Header(P.TYPE_TOP_IMAGE, 1, 1, 7, 3, 1, 0, 7, 3))
+
+
+def test_parse_doc_accepts_text_and_shape_layers_in_every_form():
+    base = {"id": "base", "kind": "base", "parentId": None}
+    layers = [base, text_layer(), shape_layer(SHAPES["rect"], id="s1"), shape_layer(SHAPES["ellipse"], id="s2"),
+              shape_layer(SHAPES["line"], id="s3"), shape_layer(SHAPES["polygon"], id="s4"),
+              {**text_layer(), "id": "tr", "rasterize": True, "slot": 4, "mask": {"slot": 5, "enabled": True}},
+              {**shape_layer(SHAPES["rect"]), "id": "sr", "rasterize": True, "slot": 6}]
+    rev, got = parse(*layers)
+    assert rev == 1 and got == layers and P.layer_slots(got) == [4, 5, 6]
+
+
+def test_parse_doc_keeps_accepting_v3_layers_without_the_new_fields():
+    parse({"id": "b", "kind": "base"}, {"id": "p", "kind": "pixel", "slot": 1})
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda l: l.update(slot=3),                                   # slot but not rasterized
+    lambda l: l.update(rasterize=True),                           # rasterized but no slot
+    lambda l: l.update(rasterize="yes"),
+    lambda l: l.update(text=None),
+    lambda l: l.update(text="Hello"),
+    lambda l: l["text"].update(text=5),
+    lambda l: l["text"].update(text="x" * (P.MAX_TEXT_CHARS + 1)),
+    lambda l: l["text"].update(font=None),
+    lambda l: l["text"].update(size=0),
+    lambda l: l["text"].update(size=float("nan")),
+    lambda l: l["text"].update(size=True),
+    lambda l: l["text"].update(color=rgba(300)),
+    lambda l: l["text"].update(color={"r": 1}),
+    lambda l: l["text"].update(align="justify"),
+    lambda l: l["text"].update(bold="no"),
+    lambda l: l["text"].update(lineHeight=0),
+    lambda l: l["text"].update(boxWidth=-3),
+    lambda l: l["text"].update(x="1"),
+    lambda l: l["text"].pop("y"),
+])
+def test_parse_doc_rejects_bad_text_layers(mutate):
+    l = text_layer()
+    mutate(l)
+    with pytest.raises(P.ProtocolError):
+        parse(l)
+
+
+@pytest.mark.parametrize("kind,mutate", [
+    ("rect", lambda s: s.update(w="10")),
+    ("rect", lambda s: s.update(radius=-1)),
+    ("rect", lambda s: s.pop("fill")),
+    ("rect", lambda s: s["stroke"].update(width=-1)),
+    ("rect", lambda s: s["fill"].update(enabled=1)),
+    ("rect", lambda s: s["fill"].update(color=rgba(a=256))),
+    ("rect", lambda s: s.update(rotation="x")),
+    ("ellipse", lambda s: s.pop("h")),
+    ("line", lambda s: s.pop("x2")),
+    ("line", lambda s: s.update(arrowEnd="yes")),
+    ("polygon", lambda s: s.update(sides=2)),
+    ("polygon", lambda s: s.update(sides=65)),
+    ("polygon", lambda s: s.update(sides=4.5)),
+    ("polygon", lambda s: s.update(innerRatio=0)),
+    ("polygon", lambda s: s.update(innerRatio=1.5)),
+    ("polygon", lambda s: s.update(radius=-1)),
+    ("polygon", lambda s: s.pop("cx")),
+])
+def test_parse_doc_rejects_bad_shapes(kind, mutate):
+    spec = copy.deepcopy(SHAPES[kind])
+    mutate(spec)
+    with pytest.raises(P.ProtocolError):
+        parse(shape_layer(spec))
+
+
+def test_parse_doc_rejects_unknown_shape_type_and_kind():
+    with pytest.raises(P.ProtocolError):
+        parse(shape_layer({**SHAPES["rect"], "type": "star"}))
+    with pytest.raises(P.ProtocolError):
+        parse({"id": "x", "kind": "vector"})
+
+
+def test_parse_doc_ignores_unknown_fields_and_checks_duplicate_slots():
+    l = text_layer()
+    l["future"] = 1
+    l["text"]["future"] = 2
+    parse(l)
+    a = {**text_layer(), "id": "a", "rasterize": True, "slot": 2}
+    b = {**shape_layer(SHAPES["rect"]), "id": "b", "rasterize": True, "slot": 2}
+    with pytest.raises(P.ProtocolError):
+        parse(a, b)
+
+
+def test_v4_json_builders_and_parsers():
+    assert json.loads(P.fonts(["b", "A", "a", "", "B"])) == {"t": "fonts", "families": ["A", "a", "B", "b"]}
+    assert json.loads(P.fonts(["Zed", "Arial", "Arial", " "])) == {"t": "fonts", "families": ["Arial", "Zed"]}
+    assert json.loads(P.tops("q", [{"path": "/a", "w": 1, "h": 2}])) == {
+        "t": "tops", "requestId": "q", "items": [{"path": "/a", "w": 1, "h": 2}]}
+    assert len(json.loads(P.tops("q", [{"path": f"/{i}", "w": 1, "h": 1} for i in range(P.MAX_TOPS + 5)]))["items"]) == P.MAX_TOPS
+    assert json.loads(P.top_ready("r", 8, 9)) == {"t": "topReady", "requestId": "r", "w": 8, "h": 9}
+    assert json.loads(P.top_error("r", "nope")) == {"t": "topError", "requestId": "r", "msg": "nope"}
+    assert P.parse_list_tops(P.decode_json(P.list_tops("q1"))) == "q1"
+    assert P.parse_import_top(P.decode_json(P.import_top(5, "/project1/x"))) == (5, "/project1/x")
+
+
+@pytest.mark.parametrize("msg", [{"requestId": "r"}, {"requestId": "r", "path": "rel"}, {"requestId": "r", "path": "/"},
+                                 {"requestId": "r", "path": "/" + "a" * 600}, {"requestId": None, "path": "/a"},
+                                 {"requestId": True, "path": "/a"}, {"requestId": {"a": 1}, "path": "/a"},
+                                 {"requestId": "r", "path": 5}, {"requestId": "r", "path": "/a\x00"}])
+def test_parse_import_top_rejects(msg):
+    with pytest.raises(P.ProtocolError):
+        P.parse_import_top(msg)

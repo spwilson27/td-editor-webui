@@ -1,4 +1,4 @@
-"""TD <-> web wire protocol (docs/PROTOCOL.md, version 3). Pure python, no TD or numpy needed.
+"""TD <-> web wire protocol (docs/PROTOCOL.md, version 4). Pure python, no TD or numpy needed.
 
 Binary frames: 24-byte little-endian header + RGBA8 straight-alpha payload (top row first).
 JSON messages: text frames with a string field ``t``.
@@ -8,7 +8,7 @@ import json
 import struct
 from typing import Iterator, NamedTuple, Optional, Tuple
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 MAGIC = b"REF1"
 HEADER_SIZE = 24
 TYPE_BASE = 1  # TD -> web, GET /base
@@ -16,7 +16,14 @@ TYPE_BASE = 1  # TD -> web, GET /base
 TYPE_SURFACE = 3  # web -> TD, WebSocket, one slot per frame
 TYPE_SURFACE_DUMP = 4  # TD -> web, GET /surface
 TYPE_VIEW = 5  # TD -> web, GET /view
-VALID_TYPES = (TYPE_BASE, TYPE_SURFACE, TYPE_SURFACE_DUMP, TYPE_VIEW)
+TYPE_TOP_IMAGE = 6  # TD -> web, GET /top (docW/docH = the TOP's own size)
+VALID_TYPES = (TYPE_BASE, TYPE_SURFACE, TYPE_SURFACE_DUMP, TYPE_VIEW, TYPE_TOP_IMAGE)
+MAX_TOPS = 2000  # `tops` list length
+MAX_TOP_DIM = 8192  # importTop: width and height limit
+MAX_TOP_PIXELS = 32_000_000  # importTop result: total pixels after the GPU downscale
+MAX_TEXT_CHARS = 100_000
+LAYER_KINDS = ("base", "pixel", "group", "adjustment", "text", "shape")
+SHAPE_TYPES = ("rect", "ellipse", "line", "polygon")
 FLAG_FRAME_END = 1
 MAX_PAYLOAD = 2 * 1024 * 1024  # bytes of pixel data per message
 MAX_DIM = 0xFFFF
@@ -39,7 +46,7 @@ class Header(NamedTuple):
     y: int
     w: int
     h: int
-    slot: int = 0  # surface slot (SURFACE / SURFACE_DUMP); 0 for BASE and VIEW
+    slot: int = 0  # surface slot (SURFACE / SURFACE_DUMP); 0 for BASE, VIEW and TOP_IMAGE
 
     @property
     def frame_end(self) -> bool:
@@ -184,6 +191,25 @@ def view_notice(frame_id: int, doc_w: int, doc_h: int, applied_frame_id: int) ->
                         "w": doc_w, "h": doc_h, "appliedFrameId": applied_frame_id})
 
 
+def fonts(families) -> str:
+    """Sorted, de-duplicated font family names (sent after `hello`)."""
+    return encode_json({"t": "fonts", "families": sorted({str(f) for f in families if str(f).strip()}, key=lambda f: (f.casefold(), f))})
+
+
+def tops(request_id, items: list) -> str:
+    """Importable TOPs: [{path, w, h}], at most MAX_TOPS."""
+    return encode_json({"t": "tops", "requestId": request_id,
+                        "items": [{"path": i["path"], "w": int(i["w"]), "h": int(i["h"])} for i in items[:MAX_TOPS]]})
+
+
+def top_ready(request_id, w: int, h: int) -> str:
+    return encode_json({"t": "topReady", "requestId": request_id, "w": int(w), "h": int(h)})
+
+
+def top_error(request_id, msg: str) -> str:
+    return encode_json({"t": "topError", "requestId": request_id, "msg": str(msg)})
+
+
 def applied(frame_id: int, td_frame: int) -> str:
     return encode_json({"t": "applied", "frameId": frame_id, "tdFrame": td_frame})
 
@@ -215,6 +241,14 @@ def doc(rev, layers: list) -> str:
     return encode_json({"t": "doc", "rev": rev, "layers": layers})
 
 
+def list_tops(request_id) -> str:
+    return encode_json({"t": "listTops", "requestId": request_id})
+
+
+def import_top(request_id, path: str) -> str:
+    return encode_json({"t": "importTop", "requestId": request_id, "path": path})
+
+
 def request_doc() -> str:
     return encode_json({"t": "requestDoc"})
 
@@ -227,26 +261,137 @@ def _num(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and abs(v) != float("inf")
 
 
+def _int_slot(s) -> bool:
+    return isinstance(s, int) and not isinstance(s, bool) and 0 <= s <= 0xFFFF
+
+
+def _check(cond, what):
+    if not cond:
+        raise ProtocolError(f"bad {what}")
+
+
+def _check_rgba(c, what):
+    _check(isinstance(c, dict) and all(_num(c.get(k)) and 0 <= c[k] <= 255 for k in "rgba"), what)
+
+
+def _check_opt(d, key, pred, what):
+    """An optional field: absent / null is fine, otherwise it must satisfy ``pred``."""
+    if d.get(key) is not None:
+        _check(pred(d[key]), f"{what}.{key}")
+
+
+def _is_bool(v):
+    return isinstance(v, bool)
+
+
+def check_text_spec(t) -> None:
+    """Validate a TextSpec (DESIGN_V3 section 2.2); raises ProtocolError."""
+    _check(isinstance(t, dict), "text spec")
+    _check(isinstance(t.get("text"), str) and len(t["text"]) <= MAX_TEXT_CHARS, "text.text")
+    _check(isinstance(t.get("font"), str) and len(t["font"]) <= 256, "text.font")
+    _check(_num(t.get("size")) and 0 < t["size"] <= 0xFFFF, "text.size")
+    _check_rgba(t.get("color"), "text.color")
+    _check(_num(t.get("x")) and _num(t.get("y")), "text position")
+    _check_opt(t, "align", lambda v: v in ("left", "center", "right"), "text")
+    _check_opt(t, "bold", _is_bool, "text")
+    _check_opt(t, "italic", _is_bool, "text")
+    _check_opt(t, "lineHeight", lambda v: _num(v) and 0 < v <= 100, "text")
+    _check_opt(t, "boxWidth", lambda v: _num(v) and v > 0, "text")
+
+
+def _check_fill(f, what):
+    _check(isinstance(f, dict) and _is_bool(f.get("enabled")), f"{what} fill")
+    _check_rgba(f.get("color"), f"{what} fill colour")
+
+
+def _check_stroke(s, what):
+    _check(isinstance(s, dict) and _is_bool(s.get("enabled")), f"{what} stroke")
+    _check_rgba(s.get("color"), f"{what} stroke colour")
+    _check(_num(s.get("width")) and s["width"] >= 0, f"{what} stroke width")
+
+
+def check_shape_spec(s) -> None:
+    """Validate a ShapeSpec (DESIGN_V3 section 2.2); raises ProtocolError."""
+    _check(isinstance(s, dict) and s.get("type") in SHAPE_TYPES, "shape type")
+    typ = s["type"]
+    if typ in ("rect", "ellipse"):
+        _check(all(_num(s.get(k)) for k in ("x", "y", "w", "h")), f"{typ} geometry")
+        _check_opt(s, "rotation", _num, typ)
+        _check_fill(s.get("fill"), typ)
+        if typ == "rect":
+            _check_opt(s, "radius", lambda v: _num(v) and v >= 0, typ)
+    elif typ == "line":
+        _check(all(_num(s.get(k)) for k in ("x1", "y1", "x2", "y2")), "line geometry")
+        _check_opt(s, "arrowStart", _is_bool, typ)
+        _check_opt(s, "arrowEnd", _is_bool, typ)
+    else:
+        _check(all(_num(s.get(k)) for k in ("cx", "cy", "radius")) and s["radius"] >= 0, "polygon geometry")
+        _check(isinstance(s.get("sides"), int) and not isinstance(s.get("sides"), bool) and 3 <= s["sides"] <= 64,
+               "polygon sides")
+        _check_opt(s, "innerRatio", lambda v: _num(v) and 0 < v <= 1, typ)
+        _check_opt(s, "rotation", _num, typ)
+        _check_fill(s.get("fill"), typ)
+    _check_stroke(s.get("stroke"), typ)
+
+
 def parse_doc(msg: dict):
-    """Validate a ``doc`` message. Returns (rev, layers) or raises ProtocolError. Checks only what the
-    TD side relies on: a list of objects with string id / kind and slot / mask slots as u16 ints."""
+    """Validate a ``doc`` message. Returns (rev, layers) or raises ProtocolError. Checks what the TD side
+    relies on: a list of objects with string id / known kind, slot / mask slots as u16 ints, and for v4
+    text / shape layers their spec and ``rasterize`` (a slot exactly when rasterized)."""
     layers = msg.get("layers")
     if not isinstance(layers, list) or not _num(msg.get("rev")):
         raise ProtocolError("doc needs a numeric rev and a layers list")
     seen = set()
     for l in layers:
-        if not isinstance(l, dict) or not isinstance(l.get("id"), str) or l.get("kind") not in (
-                "base", "pixel", "group", "adjustment"):
+        if not isinstance(l, dict) or not isinstance(l.get("id"), str) or l.get("kind") not in LAYER_KINDS:
             raise ProtocolError("bad layer spec")
+        kind = l["kind"]
+        if kind in ("text", "shape"):
+            if not (l.get("rasterize") is None or isinstance(l["rasterize"], bool)):
+                raise ProtocolError("bad rasterize")
+            (check_text_spec if kind == "text" else check_shape_spec)(l.get(kind))
+            if bool(l.get("rasterize")) != (l.get("slot") is not None):
+                raise ProtocolError(f"{kind} layer {l['id']!r}: a slot is required exactly when rasterize is true")
         for s in (l.get("slot"), (l.get("mask") or {}).get("slot") if isinstance(l.get("mask"), dict) else None):
             if s is None:
                 continue
-            if not (isinstance(s, int) and not isinstance(s, bool) and 0 <= s <= 0xFFFF):
+            if not _int_slot(s):
                 raise ProtocolError(f"bad slot {s!r}")
             if s in seen:
                 raise ProtocolError(f"duplicate surface slot {s}")
             seen.add(s)
     return msg["rev"], layers
+
+
+def import_target_size(w: int, h: int, doc_w: int, doc_h: int):
+    """Size of an imported TOP image on the wire: the TOP's own size, shrunk (aspect kept, never enlarged) to fit
+    min(8192, 2*docW) x min(8192, 2*docH) and MAX_TOP_PIXELS."""
+    s = min(1.0, min(MAX_TOP_DIM, 2 * max(1, doc_w)) / w, min(MAX_TOP_DIM, 2 * max(1, doc_h)) / h,
+            (MAX_TOP_PIXELS / (w * h)) ** 0.5)
+    if s >= 1.0:
+        return w, h
+    return max(1, int(w * s)), max(1, int(h * s))
+
+
+def parse_list_tops(msg: dict):
+    """Validate ``listTops``; returns its requestId (any JSON scalar, echoed back)."""
+    return _request_id(msg)
+
+
+def _request_id(msg):
+    rid = msg.get("requestId")
+    if isinstance(rid, bool) or not isinstance(rid, (str, int, float)) or (isinstance(rid, str) and len(rid) > 128):
+        raise ProtocolError("bad requestId")
+    return rid
+
+
+def parse_import_top(msg: dict):
+    """Validate ``importTop``; returns (requestId, path)."""
+    rid = _request_id(msg)
+    path = msg.get("path")
+    if not isinstance(path, str) or not path.startswith("/") or not 1 < len(path) <= 512 or "\x00" in path:
+        raise ProtocolError("bad TOP path")
+    return rid, path
 
 
 def parse_view(msg: dict) -> dict:
