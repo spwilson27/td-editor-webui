@@ -110,3 +110,59 @@ dominant cost (28 passes of ~0.45 ms = 11 ms).
 6. **Pre-warm resample nodes** (the 20 ms first-use spike on `apply()` for the first scale of a layer): create the
    `xf_L` node lazily one frame early or from the spare pool.
 7. CI: guard WebGL2-dependent tests with `skipIf` so a software-GL-less runner doesn't hard-fail.
+
+## 5. v6 re-measurement (tree after v6 phase A + B; `scripts/perf_td.py --ref WORKTREE`)
+
+Same document as section 3 (34 layers, 3840x2160 and 1920x1080). GPU times are TD `gpuCookTime` of the nodes that cooked; "v0.4.0" are the
+numbers of section 3b. **Caveat on CPU-side numbers:** the TD session used for this run is much slower per Python/TD call than the one behind section 3b
+(measured: the v0.4.0 tree in the same session gives `apply()` opacity 3.65 ms / identical stack 1.36 ms instead of 0.6 / 0.2 ms; creating any operator
+costs ~6 ms there), so `apply()` and CPU-cook numbers must be compared against the "v0.4.0 tree, same session" column, not against section 3b. GPU numbers
+are less affected but bimodal (quote medians; min values in the log).
+
+### 5a. TouchDesigner @3840x2160, 34 layers
+
+| Measure | v0.4.0 (3b) | v6 now | Note |
+| --- | --- | --- | --- |
+| Nodes after cold apply | 92 (98 TOPs) | 68 (76 TOPs) | merged passes: 5 Multi TOPs replace ~22 blend nodes |
+| Full-chain GPU recook (bottom layer dirty) | 14.8 ms, 36 nodes | **7.85 ms** (quiet run 6.95), 13 nodes | blur 3.3 -> 1.3 ms (pyramid) |
+| Update full-size layer p5 / bottom p0 / 2x layer / small layer | 13.5 / 14.2 / 12.3 / 5.4 ms | 8.8 / 8.7 / 9.4 / 5.6 ms | |
+| Edit opacity, stack pos 2 / 7 / 13 / 19 / 24 / 26 / 27 / 30 / 34 (GPU) | (whole chain above: ~14 -> 3 ms) | 9.9 / 9.9 / 7.7 / 6.0 / 6.3 / 3.8 / 3.3 / 3.3 / 3.1 ms | without `set_active_layer` |
+| same WITH `set_active_layer(edited)` | - | 8.6 / 9.8 / 8.1 / 6.1 / 3.7 / 3.3 / 3.4 / 2.7 / **0.87** ms | top layer 3.1 -> 0.87 ms; position 24 6.3 -> 3.7 ms; layers inside a merged run gain nothing |
+| Blur r=8 / 100 / 400 adds (GPU) | +4.5 / +12 / +246 ms | ~0 / +0.4 / +2.0 ms | pyramid (r >= 7): cost ~constant in the radius |
+| Texture memory (estimate) | 3.96 GB (58 x 16 bit blends, 39 x 8 bit) | **1.55 GB** (24 x 16 bit, 49 x 8 bit, 3 x float16) | glslTOP 677 MB, Multi TOP 319 MB, surfaces 317 MB, text 127 MB |
+| Idle | 0 nodes, 0 ms | 0 nodes, 0 ms; `tick()` 0.003 ms | |
+| First use of a resample node | (compile on first use) | `apply` 2.6-14 ms, next output cook 16-33 ms | pre-warm is off by default (v6 `PREWARM`) |
+| `apply()` prop change (34 layers) | 0.6-0.7 ms | 5.1-6.5 ms (v0.4.0 tree in the same session: 2.8-4.7 ms) | +~1.2 ms planner (full re-plan, merge/emit) per apply |
+| `apply()` identical stack | 0.2 ms | 1.5 ms (v0.4.0 tree same session: 1.4 ms) | |
+| `apply()` add 800x600 layer / add shape / delete | 3.8 / 2.1 / 0.6 ms | 26.8 / 17.9 / 5.1 ms (v0.4.0 tree same session: 25.3 / 10.9 / 7.1 ms) | see 5d |
+
+### 5b. 1920x1080, 34 layers
+
+Full-chain recook 5.4 ms (median; min 2.3), edit top layer 0.90 ms -> **0.23 ms with `set_active_layer`**, position 24: 1.47 -> 0.99 ms, position 19: 1.47 -> 1.66 ms;
+bottom-layer edits 6.1-6.8 ms. Blur adds r=8 / 100 / 400: +0.3 / +1.2 / +3.9 ms. Texture memory 384 MB (estimate). `apply()` prop change 4.9-6.2 ms (slow session, see caveat).
+
+### 5c. Filters (v7, 4K, same document; GPU ms added to the 6.95 ms baseline of that run)
+
+| Case | Added |
+| --- | --- |
+| 1 colour filter (posterize) on top | +0.55 |
+| 1 blur filter r=24 on top / in the middle (below p10) | +0.78 / +0.45 |
+| 3 filters (blur 24, bloom, posterize) on top | +2.11 |
+| drop shadow on a group of 3 layers | +0.40 |
+| drop shadow on the levels adjustment | +1.72 |
+| displace by layer p3 (filter adjustment on top) | +0.94 |
+| edit the top filter's parameter | 1.2 ms GPU (chain only) |
+| edit a full-size layer with 3 filters above | 9.1 ms (vs 8.8 without) |
+
+A second run in a busier session gave baseline 9.2 ms and the same deltas within noise (-1.2 .. +0.1 ms).
+
+### 5d. Why a structural `apply()` costs ~18-27 ms (profile)
+
+`cProfile` of adding one 800x600 pixel layer to the 34-layer document at 1080p: **27 ms total; 19 ms is one `COMP.create(scriptTOP)`** (13 ms of it is the
+new Script TOP's callbacks-DAT `initialize`), planning (`_plan` / walk / emit) 4 ms, text-face lookups 1 ms, parameter sets + wiring < 1 ms (the GLSL TOP comes from the pool).
+Micro-benchmark in the same session (median of 8): create Script TOP 7.9 ms, GLSL TOP 25.6 ms, Multi TOP 26.5 ms, Constant TOP 5.8 ms, Text DAT 6.0 ms,
+**rename a GLSL or Script TOP 22 ms**, destroy 2.4 ms, 12 parameter sets on a fresh GLSL TOP 5.9 ms. The v0.4.0 tree costs the same (25 ms) in this session, so this is
+TouchDesigner's operator creation cost, not a v6 regression; pooled GLSL / Multi TOPs already avoid it where the node can be reused.
+Surfaces cannot be pooled by renaming (rename costs more than creating, and `OnSurfaceCook` derives the slot from the node name). A possible cheap mitigation is to
+pre-create the Script TOP of the NEXT surface slot in `tick()` (web slots are monotonic, `++slotSeq`, never reused) and adopt it in `_acquire`; it would hit only for the
+first of the two slots (layer + mask) of a new layer and needs special cases in the unknown-node / grace-period cleanup, so it is not implemented.

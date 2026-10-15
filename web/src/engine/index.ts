@@ -7,3 +7,4 @@ export function createEngine(width: number, height: number): EditorEngine {
 
 export { Engine };
 export type * from './types';
+export { encodeTipPng, decodeTipPng, sanitizeBrushPresets } from './tools/tips';

@@ -188,3 +188,31 @@ d('release cost of full-document edits', () => {
     });
   }
 });
+
+d('v6 textured brush tips', () => {
+  it('textured-tip dab throughput vs the round path', () => {
+    const run = (set: (en: Engine) => void): number => {
+      e = newEngine(1000, 1000);
+      e.addPixelLayer();
+      e.setToolContext(brushCtx({ size: 40, hardness: 0.5, spacing: 0.05, opacity: 1, flow: 0.8 }));
+      set(e);
+      const pts: [number, number][] = [];
+      for (let i = 0; i < 8; i++) pts.push([50, 100 + i * 100], [950, 100 + i * 100 + 50]);
+      const t = performance.now();
+      e.setTool('brush');
+      e.pointerDown(ptr(pts[0][0], pts[0][1]));
+      for (const [x, y] of pts.slice(1)) e.pointerMove(ptr(x, y));
+      e.pointerUp(ptr(50, 800));
+      const ms = performance.now() - t;
+      e.dispose();
+      return ms;
+    };
+    const dabs = Math.round((16 * 900) / (40 * 0.05));
+    run(() => {});
+    const round = Math.min(run(() => {}), run(() => {}));
+    const chalk = run((en) => en.setBrushTip('chalk', { scatter: 0, scatterCount: 1, sizeJitter: 0, angleJitter: 0, hueJitter: 0, satJitter: 0, valJitter: 0, angle: 0, roundness: 1, seed: 1 }));
+    const full = run((en) => en.setBrushTip('bristle', { scatter: 1, scatterCount: 1, sizeJitter: 0.4, angleJitter: 45, hueJitter: 0.3, satJitter: 0.2, valJitter: 0.2, angle: 10, roundness: 0.6, seed: 3 }));
+    perfLog(`PERF brush ~${dabs} dabs of 40 px: round ${round.toFixed(0)} ms, textured chalk ${chalk.toFixed(0)} ms, bristle+all dynamics ${full.toFixed(0)} ms`);
+    expect(chalk).toBeLessThan(round * 8 + 200);
+  });
+});

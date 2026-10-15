@@ -149,6 +149,9 @@ class FakeNetwork:
         self.render_calls = []
         self.token = 0          # bumped to simulate an apply() / layout refinement
         self.not_ready = set()  # layer ids whose text measurement is still pending
+        self.active_calls = []    # v7: set_active_layer(id)
+        self.bounds_calls = []    # v7: set_content_bounds({id: box | None})
+        self.preview_tops = {}    # v7: layer id -> FakeTop returned by layer_preview_source
 
     def render_layer_token(self, layer_id):
         return (self.token, id(self.render_sources.get(layer_id)))
@@ -162,10 +165,22 @@ class FakeNetwork:
             raise KeyError(f"no text / shape layer {layer_id!r}")
         return self.render_sources[layer_id]
 
+    def set_active_layer(self, layer_id):
+        self.active_calls.append(layer_id)
+
+    def set_content_bounds(self, bounds):
+        self.bounds_calls.append(dict(bounds))
+
+    def layer_preview_source(self, layer_id):
+        return self.preview_tops.get(layer_id)
+
     def apply(self, layers, doc_w, doc_h):
         if self.raise_on_apply:
             raise RuntimeError("apply failed")
+        replan = bool(self.applies) and self.applies[-1][0] is layers   # a re-plan of the same stack (hints changed) creates nothing
         self.applies.append((layers, doc_w, doc_h))
+        if replan:
+            return
         want = []
         for l in layers:
             m = l.get("mask")
@@ -403,6 +418,7 @@ class FakeOwner:
             "ui_html": self.ui, "network": self.net_module, "blend_glsl": self.glsl, "doc_state": self.doc_state,
             "font_probe": FakeFontProbe(),
         }
+        self.storage = {}  # COMP storage (store / fetch / unstore)
         self.tops = {}  # path -> FakeTop (see ext._all_tops / _lookup_top seams in test_ext)
 
     def _make_net(self, comp, glsl, shape_glsl=None, **kw):
@@ -436,6 +452,15 @@ class FakeOwner:
         n = int(name[2:])
         self.created.append(name)
         return self._add_input(n)
+
+    def store(self, key, value):
+        self.storage[key] = value
+
+    def fetch(self, key, default=None):
+        return self.storage.get(key, default)
+
+    def unstore(self, key):
+        self.storage.pop(key, None)
 
     def save(self, path):
         self.saved.append((path, self.net.frozen, self.doc_state.text))

@@ -54,7 +54,7 @@ describe('decode validation', () => {
     ['too-short', () => good().subarray(0, 23)],
     ['bad-magic', () => { const m = good(); m[0] = 0x58; return m; }],
     ['bad-type', () => { const m = good(); m[4] = 2; return m; }], // COMPOSITE is invalid in v3
-    ['bad-type', () => { const m = good(); m[4] = 7; return m; }],
+    ['bad-type', () => { const m = good(); m[4] = 8; return m; }],
     ['bad-rect', () => { const m = good(); m[20] = 0; m[21] = 0; return m; }], // w = 0
     ['bad-rect', () => { const m = good(); m[16] = 99; return m; }], // x + w > docW
     ['bad-rect', () => { const m = good(); m[18] = 49; return m; }], // y + h > docH
@@ -159,7 +159,7 @@ describe('frame types', () => {
 });
 
 describe('protocol v3 messages', () => {
-  it('is protocol version 6', () => { expect(PROTOCOL_VERSION).toBe(6); });
+  it('is protocol version 7', () => { expect(PROTOCOL_VERSION).toBe(7); });
 
   it('decodes a base notice and rejects incomplete ones', () => {
     const n = { t: 'base', frameId: 4000000000, input: 3, docW: 1920, docH: 1080, x: 0, y: 0, w: 1920, h: 1080 } as const;
@@ -195,7 +195,7 @@ describe('json messages', () => {
   it('web messages round trip', () => {
     const spec = { id: 'a', kind: 'adjustment', parentId: null, name: 'Levels', visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, rot: 0, kx: 0, ky: 0, input: null, effects: [], slot: null, mask: { slot: 4, enabled: true }, adjustment: { type: 'invert' } };
     const msgs = [
-      { t: 'ready', protocol: 6, client: 'panel', version: '0.1.0', token: 'abc', fresh: true },
+      { t: 'ready', protocol: 7, client: 'panel', version: '0.1.0', token: 'abc', fresh: true },
       { t: 'doc', rev: 5, layers: [spec], guides: { h: [10], v: [] }, canvas: { mode: 'fixed' } },
       { t: 'setCanvas', w: 800, h: 600, mode: 'fixed' },
       { t: 'setCanvas', w: 0, h: 0, mode: 'input' },
@@ -262,7 +262,7 @@ describe('json messages', () => {
   });
 
   it('v6: hello may carry inputs (0x0 = unconnected); malformed lists are dropped; baseSize is gone', () => {
-    const h = { t: 'hello', protocol: 6, doc: { w: 4, h: 4 }, hasInput: true, maxSendFps: 30, active: true };
+    const h = { t: 'hello', protocol: 7, doc: { w: 4, h: 4 }, hasInput: true, maxSendFps: 30, active: true };
     const items = [{ input: 1, w: 1280, h: 720, connected: true }, { input: 2, w: 0, h: 0, connected: false }];
     expect(decodeTdMessage(JSON.stringify({ ...h, inputs: items }))).toMatchObject({ inputs: items });
     expect(decodeTdMessage(JSON.stringify({ ...h, inputs: [] }))).toMatchObject({ inputs: [] });

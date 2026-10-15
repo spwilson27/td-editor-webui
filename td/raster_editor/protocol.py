@@ -1,4 +1,4 @@
-"""TD <-> web wire protocol (docs/PROTOCOL.md, version 6). Pure python, no TD or numpy needed.
+"""TD <-> web wire protocol (docs/PROTOCOL.md, version 7). Pure python, no TD or numpy needed.
 
 Binary frames: 24-byte little-endian header + RGBA8 straight-alpha payload (top row first).
 JSON messages: text frames with a string field ``t``.
@@ -10,7 +10,7 @@ import re
 import struct
 from typing import Iterator, NamedTuple, Optional, Tuple
 
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 APP_VERSION = "0.5.0"  # written to .redoc meta.json
 MAGIC = b"REF1"
 HEADER_SIZE = 24
@@ -20,7 +20,8 @@ TYPE_SURFACE = 3  # web -> TD, WebSocket, one slot per frame
 TYPE_SURFACE_DUMP = 4  # TD -> web, GET /surface
 TYPE_VIEW = 5  # TD -> web, GET /view
 TYPE_TOP_IMAGE = 6  # TD -> web, GET /top (docW/docH = the TOP's own size; the document size for renderLayer)
-VALID_TYPES = (TYPE_BASE, TYPE_SURFACE, TYPE_SURFACE_DUMP, TYPE_VIEW, TYPE_TOP_IMAGE)
+TYPE_LAYER_PREVIEW = 7  # TD -> web, GET /layer (v7): one tdPreview layer's content after its effects, doc-sized, slot 0
+VALID_TYPES = (TYPE_BASE, TYPE_SURFACE, TYPE_SURFACE_DUMP, TYPE_VIEW, TYPE_TOP_IMAGE, TYPE_LAYER_PREVIEW)
 MAX_TOPS = 2000  # `tops` list length
 MAX_TOP_DIM = 8192  # importTop: width and height limit
 MAX_TOP_PIXELS = 32_000_000  # importTop result: total pixels after the GPU downscale
@@ -28,7 +29,15 @@ MAX_TEXT_CHARS = 100_000
 MAX_INPUTS = 8  # TD Inputs (in1..in8)
 LAYER_KINDS = ("input", "base", "pixel", "group", "adjustment", "text", "shape")  # "base" = a v5 document, read as input 1
 SURFACE_KINDS = ("pixel", "input")  # kinds that carry surfaceW / surfaceH
-EFFECT_KINDS = ("pixel", "input", "text", "shape")  # layer kinds that may carry effects (groups / adjustments: none)
+EFFECT_KINDS = ("pixel", "input", "text", "shape", "group", "adjustment")  # layer kinds that may carry effects (v7: groups / adjustments too)
+MAX_HISTORY_BYTES = 256 * 1024 * 1024  # POST /history body limit (also the .redoc history.bin limit)
+HISTORY_NAME = "history.bin"  # .redoc entry
+MAX_BRUSH_PRESETS = 64
+MAX_CUSTOM_TIP_PRESETS = 16  # presets that embed a custom tip
+MAX_TIP_DIM = 512
+MAX_TIP_PNG_CHARS = 2 * 1024 * 1024  # data URL length of one custom tip
+MAX_FILTER_TEXT = 16 * 1024 * 1024  # one string parameter of a filter (a .cube LUT)
+BRUSH_TIPS = ("round", "chalk", "bristle", "spatter", "noise", "square", "star", "custom")
 MAX_EFFECTS = 32  # per layer
 MAX_SKEW_DEG = 85.0  # |kx|, |ky| above this are CLAMPED by parse_doc (like the engine and the network do)
 PROJECT_FORMAT = 1  # .redoc meta.json "format"
@@ -62,7 +71,7 @@ class Header(NamedTuple):
     y: int
     w: int
     h: int
-    slot: int = 0  # surface slot (SURFACE / SURFACE_DUMP), input index 1..8 (BASE); 0 for VIEW and TOP_IMAGE
+    slot: int = 0  # surface slot (SURFACE / SURFACE_DUMP), input index 1..8 (BASE); 0 for VIEW, TOP_IMAGE and LAYER_PREVIEW
 
     @property
     def frame_end(self) -> bool:
@@ -85,6 +94,8 @@ def validate_header(h: Header) -> None:
         raise ProtocolError(f"bad slot {h.slot}")
     if h.type == TYPE_BASE and not 1 <= h.slot <= MAX_INPUTS:
         raise ProtocolError(f"bad input index {h.slot} (BASE slot = input 1..{MAX_INPUTS})")
+    if h.type == TYPE_LAYER_PREVIEW and h.slot != 0:
+        raise ProtocolError(f"bad slot {h.slot} (LAYER_PREVIEW slot = 0)")
     if h.doc_w < 1 or h.doc_h < 1:
         raise ProtocolError(f"bad document size {h.doc_w}x{h.doc_h}")
     if h.w < 1 or h.h < 1:
@@ -230,6 +241,11 @@ def view_notice(frame_id: int, doc_w: int, doc_h: int, applied_frame_id: int) ->
                         "w": doc_w, "h": doc_h, "appliedFrameId": applied_frame_id})
 
 
+def layer_preview_notice(layer_id: str, frame_id: int, doc_w: int, doc_h: int) -> str:
+    """v7: a newer LAYER_PREVIEW frame of ``layer_id`` (doc-sized) can be fetched with GET /layer?layerId=."""
+    return encode_json({"t": "layerPreview", "layerId": layer_id, "frameId": frame_id, "docW": doc_w, "docH": doc_h})
+
+
 def fonts(families) -> str:
     """Sorted, de-duplicated font family names (sent after `hello`)."""
     return encode_json({"t": "fonts", "families": sorted({str(f) for f in families if str(f).strip()}, key=lambda f: (f.casefold(), f))})
@@ -253,10 +269,13 @@ def applied(frame_id: int, td_frame: int) -> str:
     return encode_json({"t": "applied", "frameId": frame_id, "tdFrame": td_frame})
 
 
-def doc_state(rev, layers: list, doc_w: int, doc_h: int, guides=None, canvas=None) -> str:
-    return encode_json({"t": "docState", "rev": rev, "layers": layers, "docW": doc_w, "docH": doc_h,
-                        "guides": guides if guides is not None else {"h": [], "v": []},
-                        "canvas": canvas if canvas is not None else {"mode": "input"}})
+def doc_state(rev, layers: list, doc_w: int, doc_h: int, guides=None, canvas=None, brush_presets=None) -> str:
+    m = {"t": "docState", "rev": rev, "layers": layers, "docW": doc_w, "docH": doc_h,
+         "guides": guides if guides is not None else {"h": [], "v": []},
+         "canvas": canvas if canvas is not None else {"mode": "input"}}
+    if brush_presets is not None:
+        m["brushPresets"] = brush_presets  # v7
+    return encode_json(m)
 
 
 def doc_size(w: int, h: int, has_input: bool, mode: str = "input") -> str:
@@ -298,8 +317,15 @@ def ready(client: str, token: str, fresh: bool = False, version: str = "", proto
                         "token": token, "fresh": bool(fresh)})
 
 
-def doc(rev, layers: list, guides=None, canvas=None) -> str:
+def active_layer(layer_id) -> str:
+    """web -> TD (v7): the active editor's active layer (``None`` = none); a hint for the network's pass planning."""
+    return encode_json({"t": "activeLayer", "id": layer_id})
+
+
+def doc(rev, layers: list, guides=None, canvas=None, brush_presets=None) -> str:
     msg = {"t": "doc", "rev": rev, "layers": layers}
+    if brush_presets is not None:
+        msg["brushPresets"] = brush_presets
     if guides is not None:
         msg["guides"] = guides
     if canvas is not None:
@@ -346,9 +372,15 @@ def choose_file(request_id, purpose: str) -> str:
     return encode_json({"t": "chooseFile", "requestId": request_id, "purpose": purpose})
 
 
-def file_chosen(request_id, path) -> str:
-    """TD -> web: the file the user picked in TD's dialog (``null`` = cancelled / unavailable)."""
-    return encode_json({"t": "fileChosen", "requestId": request_id, "path": path})
+def file_chosen(request_id, path, text=None, error=None) -> str:
+    """TD -> web: the file the user picked in TD's dialog (``null`` = cancelled / unavailable). v7 ``readText``: ``text`` = the file's
+    UTF-8 contents, or ``error`` (too large / binary / unreadable) with ``path`` still set."""
+    m = {"t": "fileChosen", "requestId": request_id, "path": path}
+    if text is not None:
+        m["text"] = text
+    if error:
+        m["error"] = str(error)
+    return encode_json(m)
 
 
 def request_doc() -> str:
@@ -498,23 +530,52 @@ _EFFECT_FIELDS = {
 _EFFECT_TYPE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,47}$")
 
 
-def check_effect(e, what="effect") -> None:
+def _check_filter_value(v, what, depth=0):
+    """Parameters of a filter are JSON values: finite numbers, booleans, strings (<= MAX_FILTER_TEXT), short lists and plain objects."""
+    if v is None or isinstance(v, bool):
+        return
+    if isinstance(v, (int, float)):
+        _check(_num(v), what)
+    elif isinstance(v, str):
+        _check(len(v) <= MAX_FILTER_TEXT, what + " (too long)")
+    elif isinstance(v, list):
+        _check(depth < 4 and len(v) <= 4096, what)
+        for x in v:
+            _check_filter_value(x, what, depth + 1)
+    elif isinstance(v, dict):
+        _check(depth < 4 and len(v) <= 256, what)
+        for k, x in v.items():
+            _check(isinstance(k, str), what)
+            _check_filter_value(x, what, depth + 1)
+    else:
+        _check(False, what)
+
+
+def check_effect(e, what="effect", fx=None) -> None:
     """Validate one Effect (web/src/engine/types.ts): a ``type`` name, boolean ``enabled`` and, for the ten v5 effect types, every field
-    present and in range (extra fields are ignored). Any other type name is a filter of the filters library: only its shape is
-    checked here, the parameters are clamped by TD (effects.norm_params). Raises ProtocolError."""
+    present and in range (extra fields are ignored). Any other type name is a filter of the filters library (v7: also as the effect of a
+    ``filter`` adjustment): its parameters are JSON-sane here (finite numbers, bounded strings / lists) and, when the ``effects`` module is
+    passed as ``fx``, run through ``fx.norm_params`` (the spec's own clamping / defaults; it never rejects a range, only a malformed value
+    raises). A filter name that is unknown to TD draws nothing. Raises ProtocolError."""
     _check(isinstance(e, dict), what)
     typ = e.get("type")
     _check(isinstance(typ, str) and _EFFECT_TYPE_NAME.match(typ) is not None, f"{what} type {typ!r}")
     _check(_is_bool(e.get("enabled")), f"{what} {typ}.enabled")
     if typ not in _EFFECT_FIELDS:
-        # a filter of the filters library (docs/FILTERS.md): its parameters are described, ranged and clamped by the shared
-        # spec shared/effects/<type>.filter.json (effects.norm_params); an unknown name draws nothing in TD
+        for k, v in e.items():
+            _check_filter_value(v, f"{what} {typ}.{k}")
+        specs = getattr(fx, "FILTER_SPECS", None) if fx is not None else None
+        if specs and typ in specs:
+            try:
+                fx.norm_params(specs[typ], e)
+            except Exception as ex:  # noqa: BLE001 - a spec that cannot read the parameters
+                raise ProtocolError(f"bad {what} {typ} parameters ({ex})") from None
         return
     for field, pred in _EFFECT_FIELDS[typ].items():
         _check(field in e and pred(e[field]), f"{what} {typ}.{field}")
 
 
-def check_effects(layer: dict) -> None:
+def check_effects(layer: dict, fx=None) -> None:
     ef = layer.get("effects")
     if ef is None:
         return
@@ -523,7 +584,59 @@ def check_effects(layer: dict) -> None:
     if ef and layer.get("kind") not in EFFECT_KINDS:
         raise ProtocolError(f"layer {lid!r}: {layer.get('kind')} layers cannot have effects")
     for i, e in enumerate(ef):
-        check_effect(e, f"layer {lid!r} effects[{i}]")
+        check_effect(e, f"layer {lid!r} effects[{i}]", fx)
+
+
+def check_adjustment(l: dict, fx=None) -> None:
+    """v7: ``adjustment: {type: "filter", effect: Effect}`` needs a valid effect; the other adjustment types are not validated here
+    (their parameters are clamped by the network)."""
+    a = l.get("adjustment")
+    if a is None or l.get("kind") != "adjustment":
+        return
+    _check(isinstance(a, dict), f"layer {l['id']!r} adjustment")
+    if a.get("type") == "filter":
+        check_effect(a.get("effect"), f"layer {l['id']!r} filter adjustment", fx)
+
+
+def check_brush_presets(presets) -> None:
+    """DocSpec.brushPresets (web/src/engine/types.ts BrushPreset): at most MAX_BRUSH_PRESETS, MAX_CUSTOM_TIP_PRESETS with a custom tip
+    (PNG data URL, <= MAX_TIP_DIM square, <= MAX_TIP_PNG_CHARS)."""
+    _check(isinstance(presets, list) and len(presets) <= MAX_BRUSH_PRESETS, f"brushPresets (a list of at most {MAX_BRUSH_PRESETS})")
+    custom = 0
+    for i, p in enumerate(presets):
+        what = f"brushPresets[{i}]"
+        _check(isinstance(p, dict), what)
+        _check(isinstance(p.get("id"), str) and 0 < len(p["id"]) <= 256, f"{what}.id")   # (a bad name is normalised, see brush_presets_of)
+        _check(isinstance(p.get("settings"), dict) and isinstance(p.get("dynamics"), dict), what)
+        _check(p.get("tip") in BRUSH_TIPS, f"{what}.tip")
+        _check_filter_value(p["settings"], what + ".settings")
+        _check_filter_value(p["dynamics"], what + ".dynamics")
+        ct = p.get("customTip")
+        if ct is not None:
+            custom += 1
+            _check(custom <= MAX_CUSTOM_TIP_PRESETS, f"brushPresets (at most {MAX_CUSTOM_TIP_PRESETS} custom tips)")
+            _check(isinstance(ct, dict), f"{what}.customTip")
+            for k in ("w", "h"):
+                _check(isinstance(ct.get(k), int) and not isinstance(ct.get(k), bool) and 1 <= ct[k] <= MAX_TIP_DIM, f"{what}.customTip.{k}")
+            png = ct.get("png")
+            _check(isinstance(png, str) and png.startswith("data:image/png;base64,") and len(png) <= MAX_TIP_PNG_CHARS,
+                   f"{what}.customTip.png")
+        else:
+            _check(p.get("tip") != "custom", f"{what}.tip (custom needs a customTip)")
+
+
+def brush_presets_of(msg: dict) -> list:
+    """The validated ``brushPresets`` of a ``doc`` / stored document (missing -> [])."""
+    p = msg.get("brushPresets")
+    if not isinstance(p, list):
+        return []
+    out = []
+    for q in p:
+        n = q.get("name") if isinstance(q, dict) else None
+        if isinstance(q, dict) and not (isinstance(n, str) and n.strip() and len(n) <= 256):
+            q = dict(q, name=n.strip()[:256] if isinstance(n, str) and n.strip() else "Brush preset")   # N1: never reject a document for a name
+        out.append(q)
+    return out
 
 
 def migrate_layer(l: dict) -> dict:
@@ -533,13 +646,15 @@ def migrate_layer(l: dict) -> dict:
     return l
 
 
-def parse_doc(msg: dict):
+def parse_doc(msg: dict, fx=None):
     """Validate a ``doc`` message. Returns (rev, layers) or raises ProtocolError. Checks what the TD side
     relies on: a list of objects with string id / known kind, slot / mask slots as u16 ints, finite transform
     numbers (x, y, rot finite; sx, sy > 0; kx, ky finite and clamped to +-85), surface sizes, ``input`` 1..8 on input layers, effects
-    (per type and range, pixel / input / text / shape layers only), text / shape specs, and that text / shape / input
+    (per type and range; v7: any layer kind), text / shape specs, and that text / shape / input
     layers have no slot (TD renders them). A v5 ``base`` layer is migrated to ``input: 1`` (the returned list has
-    the migrated layers). The optional ``guides`` / ``canvas`` are validated too; read them with ``doc_extras``."""
+    the migrated layers). The optional ``guides`` / ``canvas`` / ``brushPresets`` are validated too; read them with ``doc_extras`` /
+    ``brush_presets_of``. v7: filter-library effects (in ``effects[]`` and as ``adjustment: {type: "filter", effect}``) and effects on group /
+    adjustment layers are accepted; ``fx`` = the ``effects`` module (optional) validates filter parameters through ``norm_params``."""
     layers = msg.get("layers")
     if not isinstance(layers, list) or not _num(msg.get("rev")):
         raise ProtocolError("doc needs a numeric rev and a layers list")
@@ -568,7 +683,8 @@ def parse_doc(msg: dict):
             if l.get(k) is not None and abs(l[k]) > MAX_SKEW_DEG:
                 l = dict(l, **{k: math.copysign(MAX_SKEW_DEG, l[k])})
                 out[-1] = l
-        check_effects(l)
+        check_effects(l, fx)
+        check_adjustment(l, fx)
         if kind in SURFACE_KINDS:
             _check_surface_size(l)
         for s in (l.get("slot"), (l.get("mask") or {}).get("slot") if isinstance(l.get("mask"), dict) else None):
@@ -584,6 +700,8 @@ def parse_doc(msg: dict):
     if msg.get("canvas") is not None:
         c = msg["canvas"]
         _check(isinstance(c, dict) and c.get("mode") in CANVAS_MODES, "canvas")
+    if msg.get("brushPresets") is not None:
+        check_brush_presets(msg["brushPresets"])
     return msg["rev"], out
 
 
@@ -619,7 +737,8 @@ def parse_file_request(msg: dict):
     return rid, (path.strip() if path is not None else None)
 
 
-CHOOSE_PURPOSES = ("placeImage", "openProject", "saveProject", "exportPng")
+CHOOSE_PURPOSES = ("placeImage", "openProject", "saveProject", "exportPng", "readText")
+MAX_TEXT_FILE_BYTES = 12 * 1024 * 1024  # readText: larger files are refused
 IMAGE_EXTS = ("png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "tga", "exr", "hdr", "webp", "psd")
 
 
@@ -629,6 +748,41 @@ def parse_choose_file(msg: dict):
     if msg.get("purpose") not in CHOOSE_PURPOSES:
         raise ProtocolError(f"bad purpose {msg.get('purpose')!r} (one of {', '.join(CHOOSE_PURPOSES)})")
     return rid, msg["purpose"]
+
+
+def parse_active_layer(msg: dict):
+    """Validate ``activeLayer`` (v7); returns the layer id (``None`` = no active layer)."""
+    lid = msg.get("id")
+    if lid is not None and (not isinstance(lid, str) or not 0 < len(lid) <= 256):
+        raise ProtocolError("bad layer id")
+    return lid
+
+
+def parse_layer_request(pars: dict):
+    """Query of ``GET /layer``: the layerId (non-empty, <= 256 chars) or ``None`` when it is missing / malformed."""
+    lid = (pars or {}).get("layerId")
+    return lid if isinstance(lid, str) and 0 < len(lid) <= 256 else None
+
+
+def parse_history_rev(pars: dict):
+    """``rev`` of ``POST /history``: a non-negative integer (the document rev the history belongs to). Raises ProtocolError."""
+    v = (pars or {}).get("rev")
+    try:
+        f = float(v)
+        ok = f == int(f) and 0 <= f < 2 ** 53 and isinstance(v, (str, int, float)) and not isinstance(v, bool)
+    except (TypeError, ValueError, OverflowError):
+        ok = False
+    if not ok:
+        raise ProtocolError("bad rev")
+    return int(f)
+
+
+def parse_choose_types(msg: dict) -> list:
+    """Optional ``fileTypes`` hint of ``chooseFile`` (v7, readText): up to 16 extensions ``[A-Za-z0-9]{1,8}``; bad entries are dropped."""
+    t = msg.get("fileTypes")
+    if not isinstance(t, list):
+        return []
+    return [x.lower() for x in t[:16] if isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9]{1,8}", x)]
 
 
 def parse_render_layer(msg: dict):

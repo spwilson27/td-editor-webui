@@ -31,15 +31,18 @@ function Disabled({ children, low }: { children: ComponentChildren; low?: boolea
 
 function BrushOptions() {
   const b = store.brush.value, t = store.tool.value;
-  const preset = BRUSHES.find((p) => p.id === store.brushPreset.value) || BRUSHES[0];
+  store.userPresets.value; store.docPresets.value;
+  const presetName = store.presetByKey(store.brushPreset.value)?.name ?? BRUSHES[0].name;
   return (
     <div class="opts">
       <button aria-label="Brush presets" onClick={() => { store.colorTab.value = 'brushes'; }}
         style="display:flex;align-items:center;gap:8px;height:28px;padding:0 8px;border:1px solid #474747;border-radius:5px;background:#262626">
         <svg width="44" height="14" viewBox="0 0 44 14" aria-hidden="true"><path d="M2 10c8-8 14 4 22-2s14-4 18-2" fill="none" stroke="#e3e3e3" stroke-width="3" stroke-linecap="round" /></svg>
-        <span>{preset.name}</span>
+        <span data-brush-current>{presetName}</span>
         <Icon d="M6 9l6 6 6-6" size={10} sw={2.4} />
       </button>
+      <button class="lowprio" data-brush-tip aria-label="Brush tip" title="Brush tip and dynamics (Brushes panel)" onClick={() => { store.colorTab.value = 'brushes'; }}
+        style="height:28px;padding:0 8px;border:1px solid #474747;border-radius:5px;background:#262626;color:#b5b5b5">Tip: <b style="color:#e3e3e3;font-weight:500">{store.currentTipLabel()}</b></button>
       <RangeRow label="Width" id="bw" min={1} max={300} value={b.size} unit=" px" w={110} span={46} onInput={(v) => store.setBrush({ size: v })} />
       <RangeRow label="Opacity" id="bo" min={0} max={100} value={Math.round(b.opacity * 100)} unit="%" w={80} span={36} onInput={(v) => store.setBrush({ opacity: v / 100 })} />
       {t !== 'pencil' && <>

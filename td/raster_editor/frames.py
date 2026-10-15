@@ -178,6 +178,8 @@ PNG_MAX_PIXELS = 8192 * 8192
 REDOC_MAX_DOC_JSON = 64 * 1024 * 1024
 REDOC_MAX_TOTAL = 3 * 1024 * 1024 * 1024  # declared uncompressed size of all entries
 REDOC_MAX_ENTRIES = 5000
+HISTORY_ENTRY = "history.bin"
+HISTORY_MAX_BYTES = 256 * 1024 * 1024
 _SURFACE_NAME = re.compile(r"^surfaces/(\d{1,5})\.png$")
 
 
@@ -320,9 +322,9 @@ def surface_entry(slot: int) -> str:
     return f"surfaces/{int(slot)}.png"
 
 
-def write_redoc(path: str, doc: dict, surfaces, meta: dict, level: int = 3, replace=os.replace) -> None:
+def write_redoc(path: str, doc: dict, surfaces, meta: dict, level: int = 3, replace=os.replace, history=None) -> None:
     """Write a project: ``doc.json`` + ``surfaces/<slot>.png`` + ``meta.json`` into ``path + ".part"`` and rename
-    it over ``path`` (a failed write never damages an existing file; the temp file is removed). ``surfaces`` yields
+    it over ``path`` (v7: ``history`` = the undo-history blob, stored as ``history.bin``; a failed write never damages an existing file; the temp file is removed). ``surfaces`` yields
     ``(slot, rgba)`` with straight wire-order RGBA8; PNGs are stored, not deflated again."""
     tmp = path + ".part"
     try:
@@ -332,6 +334,8 @@ def write_redoc(path: str, doc: dict, surfaces, meta: dict, level: int = 3, repl
             for slot, rgba in surfaces:
                 z.writestr(zipfile.ZipInfo(surface_entry(slot), (2000, 1, 1, 0, 0, 0)), encode_png(rgba, level),
                            zipfile.ZIP_STORED)
+            if history:
+                z.writestr(zipfile.ZipInfo(HISTORY_ENTRY, (2000, 1, 1, 0, 0, 0)), history, zipfile.ZIP_STORED)
         replace(tmp, path)
     except BaseException:
         try:
@@ -356,8 +360,8 @@ def write_png_file(path: str, rgba: np.ndarray, level: int = 3, replace=os.repla
         raise
 
 
-def read_redoc(path: str, max_format: int = 1):
-    """Open a project: returns ``(doc, meta, {slot: png bytes})``. Validates the container only (entry names, declared
+def read_redoc(path: str, max_format: int = 1, with_history: bool = False):
+    """Open a project: returns ``(doc, meta, {slot: png bytes})`` (``with_history``: a fourth item, the ``history.bin`` bytes or None). Validates the container only (entry names, declared
     sizes, JSON, ``meta.format`` <= ``max_format``); the document and the images are checked by the caller."""
     try:
         z = zipfile.ZipFile(path)
@@ -394,4 +398,15 @@ def read_redoc(path: str, max_format: int = 1):
                     pngs[int(m.group(1))] = z.read(name)
                 except (zipfile.BadZipFile, zlib.error) as e:
                     raise FileFormatError(f"damaged {name} ({e})") from None
-        return doc, meta, pngs
+        if not with_history:
+            return doc, meta, pngs
+        history = None
+        info = infos.get(HISTORY_ENTRY)
+        if info is not None:
+            if info.file_size > HISTORY_MAX_BYTES:
+                raise FileFormatError(f"{HISTORY_ENTRY} is too large")
+            try:
+                history = z.read(HISTORY_ENTRY)
+            except (zipfile.BadZipFile, zlib.error) as e:
+                raise FileFormatError(f"damaged {HISTORY_ENTRY} ({e})") from None
+        return doc, meta, pngs, history

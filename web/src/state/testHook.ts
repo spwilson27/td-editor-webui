@@ -1,6 +1,7 @@
 import type { Store } from './store';
-import type { CloneOptions, DodgeBurnRange, Effect, Rect, Anchor, AdjustmentSpec, AdjustmentType, CanvasMode, LayerTransform, PaintTarget, SnapOptions, SelectionOptions, ShapeSpec, ShapeType, TextSpec, ToolId, ToolPointer } from '../engine/types';
+import type { BrushDynamics, CloneOptions, DodgeBurnRange, Effect, TipShape, Rect, Anchor, AdjustmentSpec, AdjustmentType, CanvasMode, LayerTransform, PaintTarget, SnapOptions, SelectionOptions, ShapeSpec, ShapeType, TextSpec, ToolId, ToolPointer } from '../engine/types';
 import { completeShapeSpec, completeTextSpec } from './specs';
+import { defaultEffect } from './effectDefaults';
 
 /** `window.__editorTest`, installed only with ?test=1; used by automated TouchDesigner validation. */
 export function installTestHook(store: Store, win: Window = window): void {
@@ -102,9 +103,49 @@ export function installTestHook(store: Store, win: Window = window): void {
     inputs: () => store.inputs.peek(),
     addInputLayer: (n: number) => store.engine.addInputLayer(n),
     files: () => store.files.peek(),
-    saveProject: (path?: string) => (store.bridge?.saveProject ? store.bridge.saveProject(path) : Promise.reject(new Error('standalone'))),
+    clearStoredHistory: () => store.clearStoredHistory(),
+    saveProject: (path?: string, includeHistory?: boolean) => (store.bridge?.saveProject ? store.bridge.saveProject(path, includeHistory === undefined ? undefined : { includeHistory }) : Promise.reject(new Error('standalone'))),
     openProject: (path?: string) => (store.bridge?.openProject ? store.bridge.openProject(path) : Promise.reject(new Error('standalone'))),
     exportPng: (path?: string) => (store.bridge?.exportPng ? store.bridge.exportPng(path) : Promise.reject(new Error('standalone'))),
+    // v6 phase B: filters, brushes, presets, history round trip, layer previews
+    /** Appends a library filter (spec defaults + `params`) to a layer's effects; returns its index. */
+    addFilterEffect: (layerId: string, type: string, params: Record<string, unknown> = {}) => {
+      const cur = store.engine.layers().find((l) => l.id === layerId)?.effects ?? [];
+      store.engine.setEffects(layerId, [...cur, { ...defaultEffect(type), ...params } as Effect]);
+      return cur.length;
+    },
+    /** New filter adjustment layer (spec defaults + `params`); returns its id. */
+    addFilterAdjustment: (type: string, params: Record<string, unknown> = {}) => {
+      const id = store.addFilterAdjustment(type);
+      if (Object.keys(params).length) store.engine.setAdjustment(id, { type: 'filter', effect: { ...defaultEffect(type), ...params } as Effect });
+      return id;
+    },
+    setBrushTip: (tip: TipShape, dynamics: Partial<BrushDynamics> = {}) => {
+      if (tip === 'custom') store.useTipFromSelection(); else store.setTip(tip);
+      store.setDynamics(dynamics);
+      return { tip: store.tip.peek(), dynamics: store.dynamics.peek() };
+    },
+    brushState: () => ({ tip: store.tip.peek(), dynamics: store.dynamics.peek(), preset: store.brushPreset.peek(), custom: store.customTip.peek() ? { w: store.customTip.peek()!.w, h: store.customTip.peek()!.h } : null }),
+    applyBrushPreset: (key: string) => store.applyPreset(key),
+    saveBrushPreset: (name: string, where: 'user' | 'document' = 'user') => store.saveCurrentPreset(name, where),
+    renameBrushPreset: (key: string, name: string) => store.renamePreset(key, name),
+    deleteBrushPreset: (key: string) => store.deletePreset(key),
+    brushPresets: () => store.presetEntries().map((e) => ({ key: e.key, source: e.source, name: e.name })),
+    exportBrushPresets: (where: 'user' | 'document' = 'user') => store.exportPresets(where),
+    importBrushPresets: (json: string, where: 'user' | 'document' = 'user') => store.importPresets(json, where),
+    /** Serialises the engine history and restores the blob into the same engine (the persistence path without TD). */
+    historyRoundTrip: () => {
+      const e = store.engine, before = e.history();
+      const blob = e.serializeHistory(50, 256 * 1024 * 1024);
+      const ok = e.restoreHistory(blob, e.docSpec().rev);
+      const after = e.history();
+      return { bytes: blob.length, ok, before: { length: before.entries.length, index: before.index }, after: { length: after.entries.length, index: after.index } };
+    },
+    history: () => { const h = store.engine.history(); return { length: h.entries.length, index: h.index, labels: h.entries.map((x) => x.label) }; },
+    undo: () => store.undo(),
+    /** TD renders shown instead of the Local preview: layers flagged by the planner and the page's state for each. */
+    layerPreviews: () => ({ layers: store.engine.tdPreviewLayers(), states: Object.fromEntries(store.layerPreviews.peek()) }),
+    bigDocNotice: () => store.bigDocNotice.peek(),
     /** The live engine, for instrumentation in validation scripts. */
     engine: () => store.engine,
     placeImageViaTd: () => (store.bridge?.placeImageViaTd ? store.bridge.placeImageViaTd() : Promise.reject(new Error('standalone'))),

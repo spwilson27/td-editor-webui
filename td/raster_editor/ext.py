@@ -61,6 +61,10 @@ EXPORT_FLASH_S = 10.0  # an export result stays in `Status` this long
 FILE_FLASH_S = 10.0
 INPUT_TRIM_S = 2.0  # a trailing spare In TOP beyond the one spare connector is removed this long after it became unneeded
 MAX_INPUTS = 8
+HISTORY_KEY = "raster_history"  # COMP storage: (rev, blob bytes), replaced as one object (v7)
+HISTORY_MAX_BYTES = 256 * 1024 * 1024  # POST /history body limit
+HINT_PAD = 32  # content-bounds hints are padded and rounded outward to HINT_GRID so a growing stroke re-plans rarely
+HINT_GRID = 64
 PNG_LEVEL = 3  # zlib level for PNG / .redoc surfaces (speed over size)
 PNG_READ_TIMEOUT_S = 10.0
 DEFAULT_LAYER = {"id": "input1", "kind": "input", "input": 1, "parentId": None, "name": "TD Input 1", "visible": True,
@@ -117,7 +121,7 @@ class _Notice:
 
 class _Client:
     __slots__ = ("id", "cid", "kind", "ready", "active", "seq", "fresh", "bases", "view", "view_msg", "view_td",
-                 "fid_pending", "fid_applied", "reloading")
+                 "fid_pending", "fid_applied", "reloading", "active_layer", "lp")
 
     def __init__(self, cid):
         self.id = cid  # socket peer string, used for webSocketSend*
@@ -134,6 +138,8 @@ class _Client:
         self.view_td = False  # external client subscribed to the VIEW stream
         self.fid_pending = None  # newest SURFACE frameId (FRAME_END) pasted from this client
         self.fid_applied = None  # newest one uploaded to its Script TOP (reported via `applied`)
+        self.active_layer = None  # v7: the layer id the editor named in `activeLayer`
+        self.lp = {}  # v7: layer id -> _Notice of its LAYER_PREVIEW stream
 
     def notice(self, n):
         return self.bases.setdefault(n, _Notice())
@@ -147,8 +153,9 @@ class _Pipe:
     """One budgeted TOP -> wire stream: delayed GPU readback, incremental conversion, one immutable
     message served over HTTP (BASE from in1, VIEW from doc/out). State only; logic lives in the extension."""
 
-    def __init__(self, name, mtype, stat, input=None):
-        self.name, self.type, self.stat, self.input = name, mtype, stat, input
+    def __init__(self, name, mtype, stat, input=None, layer=None):
+        self.name, self.type, self.stat, self.input, self.layer = name, mtype, stat, input, layer
+        self.src = None  # layer previews: the TOP this pipe reads (a replaced node restarts the stream)
         self.frame_id = 0  # never reset: clients compare frame ids across restarts
         self.wire = None  # conversion scratch (reused); published messages are immutable copies
         self.reset()
@@ -197,7 +204,7 @@ class RasterEditorExt:
         self._reset_state()
         self.stats = {k: collections.deque(maxlen=STAT_WINDOW) for k in (
             "pump", "paste", "cook", "convert", "publish", "readback", "vconvert", "vpublish", "vreadback",
-            "apply", "dump", "top")}
+            "apply", "dump", "top", "lpreadback", "lpconvert", "lppublish")}
 
     # ------------------------------------------------------------------ setup / lifecycle
 
@@ -241,6 +248,14 @@ class RasterEditorExt:
         self._files_sent = None
         self.mode_seen = None  # canvas mode ("input" | "fixed") the document size was last computed for
         self.guides = {"h": [], "v": []}  # stored with the document
+        self.brush_presets = []  # v7: DocSpec.brushPresets (stored with the document)
+        self.layer_pipes = {}  # v7: layer id -> _Pipe (LAYER_PREVIEW stream of a tdPreview layer)
+        self._lp_cursor = None
+        self._lp_ids = (None, ())  # (doc_layers object, flagged layer ids)
+        self._pbounds = {}  # v7: slot -> (x0, y0, x1, y1) painted bounds (layer pixels), None = known empty; absent = unknown
+        self._hint_boxes = {}  # slot -> the padded box last handed to the network
+        self._hints_sent = None
+        self._active_layer_sent = None
         self._wh_seen = None  # (Docw, Doch) as of the last _sync_doc_size
         self._client_canvas = False  # a setCanvas is being applied (not a Follow Input -> Fixed parameter flip)
         self._canvas_sender = None  # ...by this client: it does not get the docSize echo
@@ -712,6 +727,7 @@ class RasterEditorExt:
             for pipe in list(self.bases.values()):
                 self._invalidate(pipe)
             self._invalidate(self.out)
+            self._invalidate_previews()
         # Maxsendfps/Maxinputfps/Maxviewfps are read on use.
 
     def _view_url(self, url):
@@ -816,6 +832,10 @@ class RasterEditorExt:
             return self._serve_surface(request, response)
         if method == "GET" and path == "/top":
             return self._serve_top(request, response)
+        if method == "GET" and path == "/layer":
+            return self._serve_pipe(None, "layer", request, response, subscribed_only=True)
+        if path == "/history" and method in ("GET", "POST", "OPTIONS"):
+            return self._serve_history(method, request, response)
         if method == "GET" and path in ("/", "/index.html"):
             html = self._op("ui_html").text
             if html:
@@ -890,6 +910,8 @@ class RasterEditorExt:
             self._on_import_top(c, msg)
         elif t == "renderLayer":
             self._on_render_layer(c, msg)
+        elif t == "activeLayer":
+            self._on_active_layer(c, msg)
         elif t == "setCanvas":
             self._on_set_canvas(c, msg)
         elif t == "log":
@@ -920,6 +942,7 @@ class RasterEditorExt:
         t0 = self._now()
         self.frames.paste_band(buf, hdr.x, hdr.y, hdr.w, hdr.h, payload, self._slot_premult(hdr.slot))
         self.stats["paste"].append(self._now() - t0)
+        self._grow_bounds(hdr.slot, hdr.x, hdr.y, hdr.x + hdr.w, hdr.y + hdr.h)
         if hdr.frame_end:
             self._dirty.add(hdr.slot)
             c.fid_pending = hdr.frame_id
@@ -1045,20 +1068,25 @@ class RasterEditorExt:
             self._hold(c.id, ("doc", c.id, msg), 1024)
             return
         try:
-            rev, layers = self.protocol.parse_doc(msg)
+            rev, layers = self.protocol.parse_doc(msg, self._fx())
             guides, _canvas = self.protocol.doc_extras(msg)
         except self.protocol.ProtocolError as e:
             self._send(c.id, self.protocol.error(f"bad doc: {e}"))
             return
         # (the canvas mode of a doc is informational: the Docsizemode parameter is the single source of truth)
-        self._apply_doc(rev, layers, guides)
+        self._apply_doc(rev, layers, guides, self.protocol.brush_presets_of(msg) if "brushPresets" in msg else None)
 
     def _surface_sizes(self, layers):
         """{slot: (w, h)} for a layer stack (protocol.slot_sizes; a surface without a size in the spec keeps its buffer's)."""
         return self.protocol.slot_sizes(layers, self.doc_w, self.doc_h,
                                         {s: (b.shape[1], b.shape[0]) for s, b in self.surfaces.items()})
 
-    def _apply_doc(self, rev, layers, guides=None):
+    def _fx(self):
+        """The ``effects`` module DAT's module (filter specs / planner), None in an older COMP."""
+        op = self._opt("effects")
+        return op.module if op is not None else None
+
+    def _apply_doc(self, rev, layers, guides=None, brush_presets=None, unknown=()):
         """Apply a layer stack: allocate / revive / resize the surface buffers it names (each at its own surface
         size), diff-apply it to the generated network, remember it (stored to `doc_state` in the next pump)."""
         t0 = self._now()
@@ -1077,7 +1105,9 @@ class RasterEditorExt:
             if s in self._slot_set and old is not None and (old.shape[1], old.shape[0]) != sizes[s]:
                 resized[s] = self.frames.resize_buffer(old, sizes[s][0], sizes[s][1], s in masks)
         before = set(self.network.slots()) if self.network is not None else set()
+        self._track_bounds(slots, fresh, resized, unknown, masks)
         if self.network is not None and (layers != self.doc_layers or not self._net_applied):
+            self._push_hints(layers)
             self.network.apply(layers, self.doc_w, self.doc_h)
             self._network_applied()
         self.surfaces.update(fresh)
@@ -1095,10 +1125,15 @@ class RasterEditorExt:
             self._dirty.update(set(self.network.slots()) - before)  # new Script TOPs need their pixels
         self._dirty.update(fresh)
         self._dirty.update(resized)
-        self.doc_layers = layers
-        self.doc_rev = rev
         if guides is not None:
             self.guides = guides
+        if brush_presets is not None:
+            self.brush_presets = brush_presets
+        history = self._history_get()
+        if history is not None and isinstance(self.doc_rev, (int, float)) and isinstance(rev, (int, float)) and rev < history[0]:
+            self._history_drop()   # revisions only grow within a document: a lower one is a different (fresh) document
+        self.doc_layers = layers
+        self.doc_rev = rev
         self._doc_state_dirty = True
         self.stats["apply"].append(self._now() - t0)
         self._status_at = 0.0
@@ -1111,7 +1146,9 @@ class RasterEditorExt:
                 self._waiters.append(c.id)
             return
         self._send(c.id, self.protocol.doc_state(self.doc_rev, self._layers_with_sizes(self.doc_layers), self.doc_w, self.doc_h, self.guides,
-                                                 {"mode": self._mode()}))
+                                                 {"mode": self._mode()}, self.brush_presets))
+        for n in c.lp.values():   # the page drops its layer previews when it loads a document: announce the newest frames again
+            n.clear()
 
     def _layers_with_sizes(self, layers):
         """The stack for a client: every pixel / input layer has its surface size (the web engine requires it). Layers that
@@ -1133,7 +1170,8 @@ class RasterEditorExt:
             self._doc_state_dirty = False
             return
         self._op("doc_state").text = self.protocol.encode_json(
-            {"rev": self.doc_rev, "layers": self.doc_layers, "guides": self.guides, "canvas": {"mode": self._mode()}})
+            {"rev": self.doc_rev, "layers": self.doc_layers, "guides": self.guides, "canvas": {"mode": self._mode()},
+             "brushPresets": self.brush_presets})
         self._doc_state_dirty = False
 
     def _read_doc_state(self):
@@ -1147,10 +1185,11 @@ class RasterEditorExt:
                 if isinstance(l, dict) and l.get("kind") in ("text", "shape"):
                     l["slot"] = None
                     l.pop("rasterize", None)
-        msg = {"rev": data.get("rev"), "layers": layers, "guides": data.get("guides"), "canvas": data.get("canvas")}
-        rev, layers = self.protocol.parse_doc(msg)
+        msg = {"rev": data.get("rev"), "layers": layers, "guides": data.get("guides"), "canvas": data.get("canvas"),
+               "brushPresets": data.get("brushPresets")}
+        rev, layers = self.protocol.parse_doc(msg, self._fx())
         guides, canvas = self.protocol.doc_extras(msg)
-        return rev, layers, guides, canvas
+        return rev, layers, guides, canvas, self.protocol.brush_presets_of(msg)
 
     def _reencode_one(self):
         """After a `Premultiplied` toggle: re-encode one stale surface per pump and upload it again."""
@@ -1286,9 +1325,14 @@ class RasterEditorExt:
         self._saving = True
         try:
             self.Freeze()
+            kept = self._history_get()
+            if kept is not None:
+                self.o.unstore(HISTORY_KEY)   # an exported component carries the document, not the undo history
             try:
                 self.o.save(tmp)
             finally:
+                if kept is not None:
+                    self.o.store(HISTORY_KEY, kept)
                 self.Thaw()
             self._replace(tmp, path)
         except Exception:
@@ -1358,9 +1402,9 @@ class RasterEditorExt:
             self._drop_undo_caches()   # nothing to restore: a leftover cache of an earlier component here is unusable
             return False
         self._restore_doc_hash = self._text_hash(self._op("doc_state").text)
-        rev, layers, guides, canvas = stored
+        rev, layers, guides, canvas, presets = stored
         self._restore_pending = True
-        self.doc_layers, self.doc_rev, self.guides = layers, rev, guides
+        self.doc_layers, self.doc_rev, self.guides, self.brush_presets = layers, rev, guides, presets
         if canvas["mode"] != self._mode():  # the stored canvas mode wins over a stale parameter
             self.o.par.Docsizemode = canvas["mode"]
         self._slot_set = frozenset(self.protocol.layer_slots(layers))
@@ -1519,7 +1563,7 @@ class RasterEditorExt:
         except P.ProtocolError as e:
             self._send(c.id, P.error(f"bad {t}: {e}"))
             return
-        self._start_file_op(t, c, rid, given)
+        self._start_file_op(t, c, rid, given, msg.get("includeHistory") is not False)
 
     @_guard
     def SaveProject(self):
@@ -1533,9 +1577,9 @@ class RasterEditorExt:
     def ExportPng(self):
         self._start_file_op("exportPng", None, None, None)
 
-    def _start_file_op(self, op, c, rid, given):
+    def _start_file_op(self, op, c, rid, given, include_history=True):
         job = {"op": op, "client": c.id if c is not None else None, "rid": rid, "path": given or "", "stage": "start",
-               "started": self._now()}
+               "started": self._now(), "history": include_history}
         try:
             if not self._p("Active"):
                 raise RuntimeError("the editor is not active")
@@ -1594,6 +1638,7 @@ class RasterEditorExt:
         layers = self._layers_with_sizes(self.doc_layers if self.doc_layers is not None else self._default_layers())
         return self.protocol.encode_json({"rev": self.doc_rev if self.doc_rev is not None else 0, "layers": layers,
                                           "guides": self.guides, "canvas": {"mode": self._mode()},
+                                          "brushPresets": self.brush_presets,
                                           "width": self.doc_w, "height": self.doc_h})
 
     def _begin_save(self, job):
@@ -1603,6 +1648,10 @@ class RasterEditorExt:
         snap = {s: (self.surfaces[s].copy(), self._slot_premult(s)) for s in sorted(self._slot_set) if s in self.surfaces}
         meta = {"format": self.protocol.PROJECT_FORMAT, "app": "raster-editor", "version": self.protocol.APP_VERSION,
                 "slots": len(snap)}
+        hist = self._history_get()   # the undo history belongs to the document only when it is the stored revision's
+        blob = hist[2] if job.get("history", True) and hist is not None and hist[0] == self.doc_rev and hist[2] else None
+        if blob is not None:
+            meta["historyRev"] = hist[1]
         path, frames, replace = job["path"], self.frames, self._file_replace
 
         def write():
@@ -1610,7 +1659,7 @@ class RasterEditorExt:
                 for slot in sorted(snap):
                     buf, premult = snap.pop(slot)
                     yield slot, frames.buffer_to_straight(buf, premult)
-            frames.write_redoc(path, doc_json, surfaces(), meta, PNG_LEVEL, replace)
+            frames.write_redoc(path, doc_json, surfaces(), meta, PNG_LEVEL, replace, history=blob)
         self._run_worker(job, write)
 
     # --- open
@@ -1620,12 +1669,14 @@ class RasterEditorExt:
         premult = bool(self._p("Premultiplied"))
         job["premult"] = premult
         cur_w, cur_h = self.doc_w, self.doc_h
+        fx = self._fx()
 
         def read():
-            doc, meta, pngs = frames.read_redoc(path, P.PROJECT_FORMAT)
+            doc, meta, pngs, history = frames.read_redoc(path, P.PROJECT_FORMAT, True)
             try:
                 rev, layers = P.parse_doc({"rev": doc.get("rev", 0), "layers": doc.get("layers"),
-                                           "guides": doc.get("guides"), "canvas": doc.get("canvas")})
+                                           "guides": doc.get("guides"), "canvas": doc.get("canvas"),
+                                           "brushPresets": doc.get("brushPresets")}, fx)
             except P.ProtocolError as e:
                 raise RuntimeError(f"invalid document in project file: {e}") from None
             guides, canvas = P.doc_extras(doc)
@@ -1654,7 +1705,7 @@ class RasterEditorExt:
                 bufs[slot] = frames.straight_to_buffer(img, premult)
                 del img
             return {"rev": rev, "layers": layers, "guides": guides, "canvas": canvas, "w": w, "h": h, "bufs": bufs,
-                    "meta": meta}
+                    "meta": meta, "history": history, "presets": P.brush_presets_of(doc)}
         self._run_worker(job, read)
 
     def _finish_open(self, job, data):
@@ -1673,8 +1724,13 @@ class RasterEditorExt:
             self._sync_doc_size()
         finally:
             self._client_canvas = False
-        rev = max(self.doc_rev if isinstance(self.doc_rev, (int, float)) else 0, data["rev"]) + 1
-        self._apply_doc(rev, layers, data["guides"])
+        rev = max(self.doc_rev if isinstance(self.doc_rev, (int, float)) else 0, data["rev"]) + 1   # always monotonic
+        self._reset_previews()
+        self._apply_doc(rev, layers, data["guides"], data.get("presets") or [], unknown=tuple(bufs))
+        self._history_drop()   # (only after the document was replaced) the old history belonged to the old document
+        hist_rev = (data.get("meta") or {}).get("historyRev")
+        if data.get("history") and hist_rev is not None and hist_rev == data["rev"]:
+            self._history_set(rev, hist_rev, data["history"])   # served for the new doc rev; the blob keeps the rev it embeds
         convert = bool(self._p("Premultiplied")) != job["premult"]  # toggled while the worker ran: re-encode
         for slot, buf in bufs.items():
             if convert and slot not in self._mask_slots:
@@ -1754,8 +1810,10 @@ class RasterEditorExt:
 
     IMAGE_MAX_BYTES = 512 << 20
 
-    def _choose_dialog(self, purpose):  # pragma: no cover - needs TD (test seam)
+    def _choose_dialog(self, purpose, types=()):  # pragma: no cover - needs TD (test seam)
         P = self.protocol
+        if purpose == "readText":
+            return ui.chooseFile(load=True, fileTypes=list(types) or None, title="Open file")  # noqa: F821
         if purpose == "placeImage":
             return ui.chooseFile(load=True, fileTypes=list(P.IMAGE_EXTS), title="Place image")  # noqa: F821
         if purpose == "openProject":
@@ -1780,25 +1838,47 @@ class RasterEditorExt:
         if len(self._choose_queue) >= 4 or any(q[0] == c.id for q in self._choose_queue):
             self._send(c.id, P.file_chosen(rid, None))   # one dialog per client at a time
             return
-        self._choose_queue.append((c.id, rid, purpose, test))
+        self._choose_queue.append((c.id, rid, purpose, test, P.parse_choose_types(msg)))
 
     def _tick_choose(self):
         if not self._choose_queue:
             return
-        cid, rid, purpose, test = self._choose_queue.pop(0)
+        cid, rid, purpose, test, types = self._choose_queue.pop(0)
         P = self.protocol
         path = None
         try:
-            path = test if test is not False else self._choose_dialog(purpose)
+            path = test if test is not False else (self._choose_dialog(purpose, types) if types else self._choose_dialog(purpose))
         except Exception as e:  # noqa: BLE001 - no dialog available (headless): behave like cancel
             self._report("chooseFile", e)
         path = str(path) if path else None
         c = self.clients.get(cid)
         if c is None:
             return
+        if purpose == "readText" and path:
+            text, err = self._read_text_file(path)
+            self._send(cid, P.file_chosen(rid, path, text, err))
+            return
         self._send(cid, P.file_chosen(rid, path))
         if purpose == "placeImage" and path:
             self._place_image(c, rid, path)
+
+    def _read_text_file(self, path):
+        """(text, None) or (None, error): UTF-8 text up to MAX_TEXT_FILE_BYTES; larger, binary (NUL) or undecodable files are refused."""
+        limit = self.protocol.MAX_TEXT_FILE_BYTES
+        name = os.path.basename(path)
+        try:
+            with open(path, "rb") as f:
+                data = f.read(limit + 1)
+        except OSError as e:
+            return None, f"cannot read {name}: {e.strerror or e}"
+        if len(data) > limit:
+            return None, f"{name} is too large (limit {limit >> 20} MB)"
+        if b"\0" in data:
+            return None, f"{name} is a binary file"
+        try:
+            return data.decode("utf-8-sig"), None
+        except UnicodeDecodeError:
+            return None, f"{name} is not UTF-8 text"
 
     def _place_image(self, c, rid, path):
         P = self.protocol
@@ -1824,6 +1904,276 @@ class RasterEditorExt:
                 self._top_fail(job, f"cannot load {os.path.basename(path)}: {e}")
 
     # ------------------------------------------------------------------ viewport (view messages)
+
+    # ------------------------------------------------------------------ v7: activeLayer, content bounds, hints
+
+    def _on_active_layer(self, c, msg):
+        """`activeLayer {id}`: the active editor's active layer. A hint for the network (merged passes are split around it so an
+        edit recooks only the layer's own pass and what is above it); applied by ``_sync_hints`` at the next pump."""
+        try:
+            c.active_layer = self.protocol.parse_active_layer(msg)
+        except self.protocol.ProtocolError as e:
+            self._send(c.id, self.protocol.error(f"bad activeLayer: {e}"))
+
+    def _grow_bounds(self, slot, x0, y0, x1, y1):
+        """A SURFACE band was pasted into ``slot``: its rect joins the painted bounds (layer pixels). Unknown stays unknown."""
+        if slot not in self._pbounds:
+            return
+        b = self._pbounds[slot]
+        self._pbounds[slot] = (x0, y0, x1, y1) if b is None else (min(b[0], x0), min(b[1], y0), max(b[2], x1), max(b[3], y1))
+
+    def _track_bounds(self, slots, fresh, resized, unknown, masks=()):
+        """Painted bounds per slot (superset of the non-transparent pixels, from the SURFACE tiles): a slot that appears blank is
+        known empty (until a tile arrives); anything that fills a buffer by another route (restore, Open Project, a resized
+        surface, the undo cache) leaves its bounds unknown (no hint); a removed slot is forgotten."""
+        for s in [s for s in self._pbounds if s not in slots]:
+            del self._pbounds[s]
+            self._hint_boxes.pop(s, None)
+        for s in fresh:
+            self._hint_boxes.pop(s, None)
+            if self._restore_pending or s in unknown or s in masks:
+                self._pbounds.pop(s, None)
+            else:
+                self._pbounds[s] = None
+        for s in list(resized) + [u for u in unknown if u in slots]:
+            self._pbounds.pop(s, None)
+            self._hint_boxes.pop(s, None)
+
+    @staticmethod
+    def _transformed(l):
+        """Does the layer need a resample pass (anything but an integer offset at scale 1)?"""
+        return (l.get("sx", 1) != 1 or l.get("sy", 1) != 1 or l.get("rot", 0) != 0 or l.get("kx", 0) != 0 or l.get("ky", 0) != 0
+                or float(l.get("x", 0) or 0) != int(l.get("x", 0) or 0) or float(l.get("y", 0) or 0) != int(l.get("y", 0) or 0))
+
+    def _content_hints(self, layers):
+        """{layer id: box | None} for ``network.set_content_bounds``: a known-empty pixel layer (None: skipped by the network) and,
+        for a transformed layer, its padded painted box (grown only when the painted bounds leave it). Unknown layers: no hint."""
+        out = {}
+        for l in layers or ():
+            s = l.get("slot")
+            if l.get("kind") != "pixel" or s is None or s not in self._pbounds:
+                continue
+            b = self._pbounds[s]
+            if b is None:
+                out[l["id"]] = None
+                self._hint_boxes.pop(s, None)
+            elif self._transformed(l):
+                sw, sh = self._slot_size.get(s) or (self.doc_w, self.doc_h)
+                box = self._hint_boxes.get(s)
+                if box is None or b[0] < box[0] or b[1] < box[1] or b[2] > box[2] or b[3] > box[3]:
+                    g = HINT_GRID
+                    lo = [(v - HINT_PAD) // g * g for v in b[:2]]
+                    hi = [-(-(v + HINT_PAD) // g) * g for v in b[2:]]
+                    if box is not None:
+                        lo, hi = [min(lo[0], box[0]), min(lo[1], box[1])], [max(hi[0], box[2]), max(hi[1], box[3])]
+                    box = self._hint_boxes[s] = (max(0, lo[0]), max(0, lo[1]), min(sw, hi[0]), min(sh, hi[1]))
+                out[l["id"]] = box
+        return out
+
+    def _push_hints(self, layers):
+        """Hand the content bounds and the active layer to the network (it applies them at its next apply()); returns True when
+        either changed."""
+        net, changed = self.network, False
+        if net is None:
+            return False
+        fn = getattr(net, "set_content_bounds", None)
+        if fn is not None:
+            hints = self._content_hints(layers)
+            if hints != self._hints_sent:
+                fn(hints)
+                self._hints_sent = hints
+                changed = True
+        fn = getattr(net, "set_active_layer", None)
+        if fn is not None:
+            act = self.clients.get(self.active_id)
+            lid = act.active_layer if act is not None else None
+            if lid != self._active_layer_sent:
+                fn(lid)
+                self._active_layer_sent = lid
+                changed = True
+        return changed
+
+    def _sync_hints(self):
+        """Pump step: new painted bounds / a new active layer re-plan the network once (before the surfaces are uploaded)."""
+        if self.network is None or not self._net_applied or self.doc_layers is None or self._restore_pending or self._held:
+            return
+        if self._push_hints(self.doc_layers):
+            self.network.apply(self.doc_layers, self.doc_w, self.doc_h)
+
+    # ------------------------------------------------------------------ v7: history persistence (POST/GET /history)
+
+    def _history_get(self):
+        """(docRev, histRev, blob) stored in the COMP's storage (saved with the .toe), or None. ``docRev`` = the document rev the history is
+        served for (what the page compares with the rev it loaded); ``histRev`` = the rev embedded in the blob (what the page's restore checks)."""
+        try:
+            v = self.o.fetch(HISTORY_KEY, None)
+        except Exception:  # noqa: BLE001
+            return None
+        if isinstance(v, tuple) and len(v) == 3 and isinstance(v[2], (bytes, bytearray)):
+            return v
+        return None
+
+    def _history_set(self, doc_rev, hist_rev, blob):
+        self.o.store(HISTORY_KEY, (doc_rev, hist_rev, blob))   # one object: the replacement is atomic
+
+    def _history_drop(self):
+        if self._history_get() is not None:
+            self.o.unstore(HISTORY_KEY)
+
+    @staticmethod
+    def _body_bytes(data):
+        if isinstance(data, bytes):
+            return data
+        if isinstance(data, (bytearray, memoryview)):
+            return bytes(data)
+        if isinstance(data, str):
+            return data.encode("latin-1", "surrogateescape")
+        return b""
+
+    def _serve_history(self, method, request, response):
+        """`POST /history?token&client&rev` (body = the page's history blob, <= 256 MB, active editor) -> 204 (an empty body clears it);
+        `GET /history?token&client` -> 200 blob + `X-Doc-Rev`, or 404. The body is delivered by the HTTP server; storing the bytes
+        object is a reference assignment (no copy for a bytes body)."""
+        P = self.protocol
+        if method == "OPTIONS":   # CORS preflight of a page served from a dev origin
+            response["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response["Access-Control-Allow-Headers"] = "Content-Type"
+            response["Access-Control-Max-Age"] = "600"
+            return self._cors(request, self._reply(response, 204, "No Content"))
+        pars = request.get("pars") or {}
+        if not self._token_ok(pars.get("token")):
+            return self._cors(request, self._reply(response, 403, "Forbidden", "bad token"))
+        c = next((x for x in self.clients.values() if x.cid == pars.get("client") and x.ready), None)
+        if c is None:
+            return self._cors(request, self._reply(response, 403, "Forbidden", "unknown client"))
+        response["Access-Control-Expose-Headers"] = "X-Doc-Rev, X-History-Rev"
+        if method == "GET":
+            h = self._history_get()
+            if h is None or not h[2]:
+                return self._cors(request, self._reply(response, 404, "Not Found", "no history"))
+            response["X-Doc-Rev"] = str(h[0])
+            response["X-History-Rev"] = str(h[1])
+            response["Cache-Control"] = "no-store"
+            return self._cors(request, self._reply(response, 200, "OK", h[2], "application/octet-stream"))
+        if not c.active:
+            return self._cors(request, self._reply(response, 409, "Conflict", "only the active editor stores history"))
+        try:
+            rev = P.parse_history_rev(pars)
+        except P.ProtocolError as e:
+            return self._cors(request, self._reply(response, 400, "Bad Request", str(e)))
+        for k, v in request.items():   # refuse by the declared length when the server passes the headers on (the body is already read otherwise)
+            if str(k).lower() == "content-length":
+                try:
+                    if int(v) > HISTORY_MAX_BYTES:
+                        return self._cors(request, self._reply(response, 413, "Payload Too Large", "history too large"))
+                except (TypeError, ValueError):
+                    pass
+        data = request.get("data", b"")
+        if data is None or len(data) > HISTORY_MAX_BYTES:
+            return self._cors(request, self._reply(response, 413, "Payload Too Large", "history too large"))
+        if len(data) == 0:
+            self._history_drop()
+        else:
+            self._history_set(rev, rev, self._body_bytes(data))
+        return self._cors(request, self._reply(response, 204, "No Content"))
+
+    # ------------------------------------------------------------------ v7: tdPreview layer stream (GET /layer)
+
+    def _preview_layer_ids(self):
+        """Layers of the document whose effects / filter adjustment include a planner-flagged ``tdPreview`` effect (cached per stack)."""
+        layers = self.doc_layers
+        listed = getattr(self.network, "preview_layers", None)   # the network knows which chains are live
+        if listed is not None:
+            try:
+                live = set(listed())
+            except Exception as e:  # noqa: BLE001
+                self._report("preview layers", e)
+                live = set()
+            return tuple(l["id"] for l in layers or () if l["id"] in live and l.get("visible") is not False)
+        if self._lp_ids[0] is layers and layers is not None:
+            return self._lp_ids[1]
+        fx = self._fx()
+        ids = []
+        flag = getattr(fx, "effect_td_preview", None)
+        for l in layers or ():
+            if flag is None or l.get("visible") is False:
+                continue
+            effs = list(l.get("effects") or ())
+            a = l.get("adjustment")
+            if l.get("kind") == "adjustment" and isinstance(a, dict) and a.get("type") == "filter" and isinstance(a.get("effect"), dict):
+                effs.append(a["effect"])
+            for e in effs:
+                try:
+                    if isinstance(e, dict) and flag(e):
+                        ids.append(l["id"])
+                        break
+                except Exception:  # noqa: BLE001 - an effect the planner cannot read draws nothing
+                    pass
+        self._lp_ids = (layers, tuple(ids))
+        return self._lp_ids[1]
+
+    def _drop_layer_pipe(self, lid):
+        self.layer_pipes.pop(lid, None)
+        for c in self.clients.values():
+            c.lp.pop(lid, None)
+
+    def _reset_previews(self):
+        for lid in list(self.layer_pipes):
+            self._drop_layer_pipe(lid)
+        self._lp_ids = (None, ())
+
+    def _invalidate_previews(self):
+        for pipe in list(self.layer_pipes.values()):
+            self._invalidate(pipe)
+
+    def _poll_layer_previews(self, now):
+        """One LAYER_PREVIEW stream per flagged layer, only while an editor is active: change detection by the source TOP's cook count
+        (a static layer is never read back again), the same two-step delayed readback and budgeted conversion as VIEW (one layer
+        converts per pump, round robin), published as frame type 7 for GET /layer."""
+        net = self.network
+        fn = getattr(net, "layer_preview_source", None)
+        tokfn = getattr(net, "layer_preview_token", None)
+        active = any(c.ready and c.active for c in self.clients.values())
+        ids = self._preview_layer_ids() if active and net is not None and self._net_applied and fn is not None else ()
+        for lid in [l for l in self.layer_pipes if l not in ids]:
+            self._drop_layer_pipe(lid)
+        if not ids:
+            return
+        period = 1.0 / max(1, self._p("Maxviewfps"))
+        order = list(ids)
+        k = order.index(self._lp_cursor) + 1 if self._lp_cursor in order else 0
+        converting = False
+        for lid in order[k:] + order[:k]:
+            try:
+                top = fn(lid)
+            except Exception as e:  # noqa: BLE001
+                self._report("layer preview", e)
+                top = None
+            pipe = self.layer_pipes.get(lid)
+            if top is None:
+                if pipe is not None and (pipe.msg is not None or pipe.conv is not None or pipe.inflight is not None):
+                    pipe.reset()
+                continue
+            if pipe is None:
+                pipe = self.layer_pipes[lid] = _Pipe("layer", self.protocol.TYPE_LAYER_PREVIEW, "lp", layer=lid)
+            if pipe.src is not top:   # the node behind the layer was replaced: its readback state is void
+                pipe.src = top
+                pipe.cooks = None
+                pipe.conv = None
+                pipe.inflight = None
+                pipe.pending = True
+            was = pipe.conv is not None
+            key = None
+            if tokfn is not None:
+                try:
+                    key = tokfn(lid)
+                except Exception as e:  # noqa: BLE001
+                    self._report("layer preview token", e)
+            self._poll_pipe(pipe, top, now, period, True, (self.doc_w, self.doc_h), convert=not converting, key=key,
+                            rekey=(lambda lid=lid: tokfn(lid)) if tokfn is not None else None)
+            if not converting and (was or pipe.conv is not None):
+                converting = True
+                self._lp_cursor = lid
 
     def _on_view(self, c, msg):
         try:
@@ -1906,7 +2256,9 @@ class RasterEditorExt:
                 ("modules", lambda: self._check_modules(now)), ("reload", lambda: self._maybe_reload_panel(now)),
                 ("panel", self._keep_panel_cooking), ("mouse", self._flush_mouse),
                 ("doc", self._sync_doc_size), ("panelview", self._sync_panel_view),
+                ("hints", self._sync_hints),
                 ("input", lambda: self._poll_base(now)), ("output", lambda: self._poll_view(now)),
+                ("layers", lambda: self._poll_layer_previews(now)),
                 ("notify", lambda: self._notify_clients(now)), ("tops", lambda: self._tick_tops(now)),
                 ("surfaces", self._cook_surfaces), ("files", lambda: self._tick_files(now)), ("choose", self._tick_choose),
                 ("replay", self._replay_step), ("reencode", self._reencode_one), ("frozen", lambda: self._check_frozen(now)), ("network", lambda: self._tick_network(now)), ("docstate", self._flush_if_dirty),
@@ -2114,6 +2466,7 @@ class RasterEditorExt:
         self._sized = True
         if size_changed or first:
             self._invalidate(self.out)
+            self._invalidate_previews()
             self._panel_key = None
         for n in set(old_sizes) | set(sizes):  # a changed / (dis)connected input starts a fresh BASE stream
             if first or old_sizes.get(n) != sizes.get(n):
@@ -2616,10 +2969,11 @@ class RasterEditorExt:
 
     # --- TOP -> clients (BASE from in1, VIEW from doc/out): shared budgeted pipeline
 
-    def _poll_pipe(self, pipe, top, now, period, wanted, size, packed=False, convert=True):
+    def _poll_pipe(self, pipe, top, now, period, wanted, size, packed=False, convert=True, key=None, rekey=None):
         """Change detection, rate limit, two-step async readback (the first delayed call issues a GPU read,
-        the next returns it: one frame of latency, never a stall) and incremental conversion."""
-        cooks = top.totalCooks
+        the next returns it: one frame of latency, never a stall) and incremental conversion. ``key``: a change token
+        replacing the TOP's cook count (layer previews: the network's own token, the TOP may be cooked lazily)."""
+        cooks = top.totalCooks if key is None else key
         if cooks != pipe.cooks:
             pipe.cooks = cooks
             pipe.pending = True
@@ -2635,6 +2989,8 @@ class RasterEditorExt:
         t = self._now()
         arr = top.numpyArray(delayed=True)
         self.stats[pipe.stat + "readback"].append(self._now() - t)
+        if rekey is not None and pipe.cooks == cooks:
+            pipe.cooks = rekey()   # a lazily cooked chain counts the read itself as a cook: that is not a change
         prev = pipe.inflight
         if pipe.pending:
             pipe.inflight = (cooks, {c.cid: c.fid_applied for c in self.clients.values()})
@@ -2728,7 +3084,11 @@ class RasterEditorExt:
         pipe.reset()
         pipe.pending = True
         for c in self.clients.values():
-            (c.view if pipe is self.out else c.notice(pipe.input)).clear()
+            if pipe.layer is not None:
+                if pipe.layer in c.lp:
+                    c.lp[pipe.layer].clear()
+            else:
+                (c.view if pipe is self.out else c.notice(pipe.input)).clear()
 
     def _publish(self, pipe, wire, snap):
         """Store the converted image as the newest frame of the stream: one immutable message that
@@ -2751,7 +3111,8 @@ class RasterEditorExt:
         that stops reading cannot block TD's cook thread."""
         P = self.protocol
         for c in self.clients.values():
-            for kind, n in [(f"base {i}", nt) for i, nt in c.bases.items()] + [("view", c.view)]:
+            for kind, n in ([(f"base {i}", nt) for i, nt in c.bases.items()] + [("view", c.view)]
+                            + [(f"layer {i!r}", nt) for i, nt in c.lp.items()]):
                 if n.outstanding is not None and not n.stalled and now - n.sent_at > STALL_S:
                     n.stalled = True
                     self._status_at = 0.0
@@ -2767,6 +3128,21 @@ class RasterEditorExt:
                     continue
                 if msg is None:
                     msg = P.base_notice(pipe.fid, *pipe.size, i)
+                self._send(c.id, msg)
+                n.outstanding = pipe.fid
+                n.sent_at = now
+        for lid, pipe in sorted(self.layer_pipes.items()):
+            if pipe.msg is None:
+                continue
+            msg = None
+            for c in self.clients.values():
+                if not c.ready or not c.active:
+                    continue
+                n = c.lp.setdefault(lid, _Notice())
+                if n.outstanding is not None or n.stalled or n.fetched == pipe.fid:
+                    continue
+                if msg is None:
+                    msg = P.layer_preview_notice(lid, pipe.fid, *pipe.size)
                 self._send(c.id, msg)
                 n.outstanding = pipe.fid
                 n.sent_at = now
@@ -2788,13 +3164,25 @@ class RasterEditorExt:
             return self._cors(request, self._reply(response, 403, "Forbidden", "bad token"))
         c = next((x for x in self.clients.values() if x.cid == pars.get("client")), None)
         inp = None
+        if kind == "layer":   # v7: GET /layer?layerId=: the newest LAYER_PREVIEW frame of that tdPreview layer, active editor only
+            lid = self.protocol.parse_layer_request(pars)
+            pipe = self.layer_pipes.get(lid) if lid is not None else None
+            n = c.lp.setdefault(lid, _Notice()) if c is not None and c.active and pipe is not None else None
+            if n is None:
+                return self._cors(request, self._reply(response, 404, "Not Found", "not subscribed (only the active editor gets layer previews)"))
+            if pipe is None or pipe.msg is None:
+                n.outstanding = None
+                n.fetched = None
+                return self._cors(request, self._reply(response, 404, "Not Found", "no layer preview"))
+            subscribed_only = False
         if kind == "base":
             try:
                 inp = int(pars.get("input", 1))
             except (TypeError, ValueError):
                 inp = 0
             pipe = self.bases.get(inp)
-        n = None if c is None else (c.notice(inp) if kind == "base" and 1 <= inp <= MAX_INPUTS else (c.view if kind == "view" else None))
+        if kind != "layer":
+            n = None if c is None else (c.notice(inp) if kind == "base" and 1 <= inp <= MAX_INPUTS else (c.view if kind == "view" else None))
         if subscribed_only and (c is None or not c.view_td):
             return self._cors(request, self._reply(response, 404, "Not Found", "not subscribed (send view mode td)"))
         if pipe is None or pipe.msg is None or (kind == "base" and inp not in self.in_sizes):

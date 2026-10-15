@@ -60,8 +60,17 @@ def src(ref: str, name: str) -> str:
 
 
 def setup(ref: str, w: int, h: int, optimize: bool = True) -> None:
-    net_src, glsl_src, shape_src = src(ref, "network.py"), src(ref, "blend.glsl"), src(ref, "shape.glsl")
+    if ref == "WORKTREE":          # (network.py + effects.py exceed one td_call's 200 kB: TD reads the working tree itself)
+        ex = lambda n: "_rd(%r)" % os.path.join(ROOT, "td", "raster_editor", n)
+        net_src, glsl_src, shape_src = ex("network.py"), ex("blend.glsl"), ex("shape.glsl")
+    else:
+        net_src, glsl_src, shape_src = (repr(src(ref, n)) for n in ("network.py", "blend.glsl", "shape.glsl"))
     opt_arg = "" if optimize else ", optimize=False"        # (the v0.4.0 / v5 DocNetwork has no such argument: only pass it when off)
+    if ref == "WORKTREE":                                    # v6+: layer effects / filters need effects.py and the shader sources
+        fx_src = "_rd(%r)" % os.path.join(ROOT, "td", "raster_editor", "effects.py")
+        opt_arg += ", effects=fx_mod, effect_shaders=fx_mod.load_shader_texts(%r)" % os.path.join(ROOT, "shared", "effects")
+    else:
+        fx_src = repr("x = 1")
     td(f'''
 p = op("/project1")
 if p.op("_hard_perf"): p.op("_hard_perf").destroy()
@@ -89,12 +98,16 @@ c.initializeExtensions()
 def _load(name, src):
     m = types.ModuleType(name); m.__dict__["__name__"] = name
     exec(compile(src, name, "exec"), m.__dict__); sys.modules[name] = m; return m
-net_mod = _load("re_network", {net_src!r})
+def _rd(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+net_mod = _load("re_network", {net_src})
+fx_mod = _load("re_effects", {fx_src})
 st = types.ModuleType("hp_state"); sys.sys = sys; sys.modules["hp_state"] = st
 st.buffers = {{}}
 st.comp = c
 st.t = 100.0
-st.net = net_mod.DocNetwork(c, {glsl_src!r}, shape_glsl={shape_src!r}, clock=lambda: st.t{opt_arg})
+st.net = net_mod.DocNetwork(c, {glsl_src}, shape_glsl={shape_src}, clock=lambda: st.t{opt_arg})
 st.w, st.h = {w}, {h}
 st.prev = {{}}
 _emit("ok")
@@ -369,9 +382,14 @@ def sec_position(ctx):
     settle()
     ids = [l["id"] for l in ls]
     pick = [i for i in ("p0", "p5", "p10", "p15", "p20", "a_lev", "s0", "s3", "t3") if i in ids]
-    for lid in pick:
-        pos = ids.index(lid)
-        act = f"""
+    if ids[-1] not in pick:
+        pick.append(ids[-1])
+    for active in (False, True):
+        for lid in pick:
+            pos = ids.index(lid)
+            act_call = f"net.set_active_layer({lid!r})" if active else "pass"
+            act = f"""
+        {act_call}
         cur = json.loads({json.dumps(json.dumps(ls))})
         for l in cur:
             if l["id"] == {lid!r}:
@@ -380,9 +398,13 @@ def sec_position(ctx):
         net.apply(cur, st.w, st.h)
         net.output().cook(force=True)
         """
-        td("st = _st(); st.tog = getattr(st, 'tog', 0); _emit(1)")
-        r = sample(act, 22)
-        print(f"EDIT opacity of {lid:6s} (stack position {pos + 1:2d}/{len(ids)}): {fmt(r)}")
+            td("st = _st(); st.tog = getattr(st, 'tog', 0); _emit(1)")
+            if active:
+                td(f"_st().net.set_active_layer({lid!r}); _st().net.apply(json.loads({json.dumps(json.dumps(ls))}), _st().w, _st().h); _emit(1)")
+                settle()
+            r = sample(act, 22)
+            print(f"EDIT opacity of {lid:6s} (stack position {pos + 1:2d}/{len(ids)}){' WITH set_active_layer' if active else ''}: {fmt(r)}")
+        td("_st().net.set_active_layer(None); _emit(1)")
 
 
 def sec_firstuse(ctx):
@@ -522,7 +544,90 @@ def sec_offenders(ctx):
     print("per-layer GPU cost for the shape / text nodes: see 'heaviest nodes' list of the baseline gpu section")
 
 
-SECTIONS = ("build", "gpu", "idle", "update", "position", "firstuse", "apply", "memory", "offenders")
+def sec_filters(ctx):
+    """v7: filter adjustments, effects on groups / adjustments and displace-by-layer at 4K on top of the big document.  Full recook cost
+    with N filters, and the cost of editing a filter parameter (only the chain and everything above it recooks) vs editing the bottom layer."""
+    W, H = ctx["w"], ctx["h"]
+    base = [dict(l) for l in ctx["layers"]]
+    ids = [l["id"] for l in base]
+    top = len(base)
+
+    def flt(t, **kw):
+        return dict(type=t, enabled=True, **kw)
+
+    def fadj(id_, eff, **kw):
+        return layer(id_, "adjustment", adjustment={"type": "filter", "effect": eff}, **kw)
+
+    mid = ids.index("p10")
+    shadow = flt("dropShadow", blur=12.0, dx=20.0, dy=20.0, opacity=0.7, color={"r": 0, "g": 0, "b": 0, "a": 255})
+    variants = [
+        ("1 colour filter (posterize) on top", [fadj("f1", flt("posterize", levels=5))]),
+        ("1 blur filter r=24 on top", [fadj("f1", flt("blur", radius=24.0))]),
+        ("3 filters (blur 24, bloom, posterize) on top", [fadj("f1", flt("blur", radius=24.0)), fadj("f2", flt("bloom")), fadj("f3", flt("posterize", levels=5))]),
+        ("filter blur r=24 in the middle (below p10)", None),
+        ("drop shadow on a group of 3 layers", None),
+        ("effects (drop shadow) on the levels adjustment", None),
+        ("displace by layer p3 (filter adjustment on top)", None),
+    ]
+    ctx["fx_ms"] = {}
+    r0 = ctx.get("full_gpu")
+    apply(base, W, H)
+    settle()
+    r0 = sample(FORCE_ALL, 24)
+    print(f"baseline (no filters): {fmt(r0)}")
+    for label, extra in variants:
+        lay = [dict(l) for l in base]
+        if extra is not None:
+            lay += extra
+        elif label.startswith("filter blur r=24 in the middle"):
+            lay.insert(mid, fadj("f1", flt("blur", radius=24.0)))
+        elif label.startswith("drop shadow on a group"):
+            kids = [i for i, l in enumerate(lay) if l["id"] in ("p3", "p4", "p5")]
+            for i in kids:
+                lay[i] = dict(lay[i], parentId="g1")
+            lay.insert(kids[0], layer("g1", "group", effects=[shadow]))
+        elif label.startswith("effects (drop shadow) on the levels"):
+            lay = [dict(l, effects=[shadow]) if l["id"] == "a_lev" else l for l in lay]
+        else:
+            lay.append(fadj("f1", flt("displace", source="aux", strengthX=30.0, strengthY=30.0, edge="clamp", auxSource="layer:p3")))
+        r = apply(lay, W, H)
+        settle()
+        g = sample(FORCE_ALL, 24)
+        err = td("_emit(str(_st().net.fx_error))")
+        print(f"{label}: {fmt(g)}  | +{g['gpu_med'] - r0['gpu_med']:.2f} ms vs baseline, nodes {r['stats']['nodes']}, fx_error {err}")
+        print(f"  heaviest nodes: {top_by(g['by'], 5)}")
+        ctx["fx_ms"][label] = g["gpu_med"]
+    # edit costs with 3 filters on top: the filter parameter vs a layer below
+    lay = base + [fadj("f1", flt("blur", radius=24.0)), fadj("f2", flt("bloom")), fadj("f3", flt("posterize", levels=5))]
+    apply(lay, W, H)
+    settle()
+    td("net=_st().net; net.surface_top(1).cook(force=True); net.output().cook(force=True); _emit(1)")
+
+    def edit_param(k):
+        lay2 = [dict(l) for l in lay]
+        lay2[-1] = fadj("f3", flt("posterize", levels=3 + k % 5))
+        return lay2
+    import json as _j
+    acts = []
+    for k in range(24):
+        lj = _j.dumps(_j.dumps(edit_param(k)))
+        acts.append(f"net.apply(json.loads({lj}), {W}, {H}); net.output().cook(force=True)")
+    rows = []
+    for a_ in acts:
+        rows.append(td(SAMPLE.format(action=a_)))
+    g = np.array([r["gpu"] for r in rows[4:]])
+    print(f"EDIT the top filter's parameter (posterize levels): gpu median {np.median(g):.2f} ms (apply+cook {np.median([r['action_ms'] for r in rows[4:]]):.1f} ms)")
+    r = sample("""
+        b = st.buffers[6]
+        b[100:356, 100:356, 0] ^= 1
+        net.surface_top(6).cook(force=True)
+        net.output().cook(force=True)
+        """, 24)
+    print(f"EDIT full-size layer p5 (slot 6) with 3 filters above: {fmt(r)}")
+    print(f"  heaviest nodes: {top_by(r['by'], 6)}")
+
+
+SECTIONS = ("build", "gpu", "idle", "update", "position", "firstuse", "apply", "memory", "offenders", "filters")
 
 
 def main() -> int:

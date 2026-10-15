@@ -20,7 +20,8 @@ export function createEffectsSlice(ctx: SliceCtx) {
       effectsFor.value = id;
       ctx.setLayerTab('fx');
     },
-    canHaveEffects(kind?: string): boolean { return kind === 'pixel' || kind === 'text' || kind === 'shape' || kind === 'input'; },
+    /** v6: groups (applied to the group composite) and adjustment layers (applied to the adjusted result) take effects too. */
+    canHaveEffects(kind?: string): boolean { return kind === 'pixel' || kind === 'text' || kind === 'shape' || kind === 'input' || kind === 'group' || kind === 'adjustment'; },
     /** Live effect edits: latest wins, at most one engine.setEffects per animation frame. */
     editEffects(id: string, effects: Effect[]) {
       draftSig.value = new Map(draftSig.peek()).set(id, effects);

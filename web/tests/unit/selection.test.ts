@@ -292,9 +292,10 @@ describe('perf (node)', () => {
     const d = new Uint8ClampedArray(w * h * 4);
     for (let i = 0; i < w * h; i++) d.set([(i * 7) & 3, 10, 20, 255], i * 4); // noise within tolerance
     wandSelect(d, w, h, 5, 5, 8, true); // warm
-    let t = performance.now();
-    const s = wandSelect(d, w, h, 5, 5, 8, true);
-    const wand = performance.now() - t;
+    let t = 0;
+    // best of 5: a loaded machine slows some runs, a real regression slows every one
+    let s = wandSelect(d, w, h, 5, 5, 8, true), wand = Infinity;
+    for (let k = 0; k < 5; k++) { t = performance.now(); s = wandSelect(d, w, h, 5, 5, 8, true); wand = Math.min(wand, performance.now() - t); }
     expect(s.rect).toEqual({ x: 0, y: 0, w, h });
     // complex mask: concentric rings + dots
     const a = new Uint8Array(w * h);

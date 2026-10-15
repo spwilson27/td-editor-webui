@@ -47,7 +47,7 @@ class FakeSocket {
 }
 
 const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({
-  t: 'hello', protocol: 6, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
+  t: 'hello', protocol: 7, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
 });
 
 interface TestStatus {
@@ -91,13 +91,13 @@ beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(100000); FakeSocket.all 
 afterEach(() => { bridge?.dispose(); vi.useRealTimers(); });
 
 describe('tdBridge session', () => {
-  it('sends ready{protocol 6, fresh} after open', () => {
+  it('sends ready{protocol 7, fresh} after open', () => {
     start();
     expect(status.conn).toEqual(['reconnecting']);
     expect(sock().url).toBe('ws://td:9980/ws');
     expect(sock().binaryType).toBe('arraybuffer');
     sock().open();
-    expect(sock().json()).toEqual([{ t: 'ready', protocol: 6, client: 'panel', version: '0.1.0', token: 'tok-123', fresh: true }]);
+    expect(sock().json()).toEqual([{ t: 'ready', protocol: 7, client: 'panel', version: '0.1.0', token: 'tok-123', fresh: true }]);
   });
 
   it('becomes linked on hello and pushes doc + every surface in full when TD has no document', () => {
@@ -191,12 +191,14 @@ describe('tdBridge document load', () => {
     await flushP();
     expect(fm!.calls.length).toBe(5);
     for (let k = 1; k < 6; k++) { fm!.calls[k].settle(okBytes(dump([2, 3, 4, 5, 6][k - 1], 64, 48, 5))); await flushP(); }
-    expect(fm!.calls.map((c) => Number(new URL(c.url).searchParams.get('slot'))).sort()).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(fm!.calls.filter((c) => c.url.includes('/surface')).map((c) => Number(new URL(c.url).searchParams.get('slot'))).sort()).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(fm!.calls.filter((c) => c.url.includes('/history')).map((c) => c.url)).toEqual(['http://td:9980/history?token=tok-123&client=c1']); // v7: history after the load
     expect(engine.surfaceWrites.map((w) => w.slot).sort()).toEqual([1, 2, 3, 4, 5, 6]);
     expect(engine.surfaceCommits).toBe(1);
     expect(engine.surfaceWrites[0]).toMatchObject({ rect: { x: 0, y: 0, w: 64, h: 48 }, len: 64 * 48 * 4 });
     vi.advanceTimersByTime(500);
-    expect(sock().sent.length).toBe(2); // loading writes were not echoed back to TD
+    expect(sock().json().map((m) => m.t)).toEqual(['ready', 'requestDoc', 'activeLayer']); // loading writes were not echoed back to TD (v7: only the active layer)
+    expect(sock().frames()).toHaveLength(0);
     // editing afterwards works
     engine.fillSurface(1, { x: 1, y: 1, w: 2, h: 2 }, [1, 2, 3, 255]);
     vi.advanceTimersByTime(100);

@@ -1,11 +1,12 @@
-import type { Rect, ToolPointer } from '../types';
+import type { BrushDynamics, Rect, ToolPointer } from '../types';
 import type { EditTarget } from '../model';
 import { createSurface, releaseSurface, type Ctx2D, type Surface } from '../surface';
 import { luminance } from '../adjustments';
 import { clipToSize, intersect, union } from '../rect';
-import { clipDocRect, innerLayerRect as innerRect, invMat, isAxis, layerRectToDoc, matOf, toLayer, type Xf } from '../xform';
+import { clipDocRect, innerLayerRect as innerRect, invMat, isAxis, layerRectToDoc, mapCorners, matOf, mulMat, toLayer, type Mat, type Xf } from '../xform';
 import type { Host, Tool } from './host';
 import { TileBackup } from '../tiles';
+import { alphaSurface, DabSampler, isPlainTip, jitterColor, tipAlpha, TIP_RES } from './tips';
 
 export type PaintMode = 'brush' | 'pencil' | 'eraser';
 
@@ -152,6 +153,12 @@ export function renderTip(s: Surface, t: Xf, size: number, hardness: number, col
  * inverse layer transform for every dab, spacing is measured in document pixels (so it matches what is seen), and the brush
  * tip is an ellipse of (size / sx) x (size / sy) layer pixels, i.e. exactly a circle of `size` document pixels. A pencil
  * dab is max(1, round(size / s)) layer pixels per axis.
+ *
+ * v6 textured path (brush and eraser only): unless the tip is 'round' with default dynamics (then the circle stamp above is
+ * used unchanged, keeping its throughput), every dab draws the tinted tip bitmap into the stroke buffer under the matrix
+ * `tip -> layer` = A^-1 . T(dab) . R(angle) . S(size, size * roundness) (A = layer -> document), so size and angle are in
+ * document px / degrees and correct on scaled / rotated / skewed layers and masks. Scatter offsets are in document space.
+ * Pencil and the retouch tools (smudge, blur, dodge, clone) ignore the tip and dynamics.
  */
 export class StrokeTool implements Tool {
   private layer: EditTarget | null = null;
@@ -168,6 +175,8 @@ export class StrokeTool implements Tool {
   private stampH = 0;
   private drawW = 0; // size of one dab in layer pixels
   private drawH = 0;
+  private tex: { w: number; h: number; sampler: DabSampler; dyn: BrushDynamics; alpha: Uint8Array } | null = null; // textured path state
+  private tints = new Map<string, Surface>(); // tip bitmap per (quantised) colour for this stroke (textured path)
 
   constructor(private host: Host, private mode: PaintMode) {}
 
@@ -181,10 +190,11 @@ export class StrokeTool implements Tool {
     if (!this.layer) return;
     this.tb = new TileBackup(this.layer);
     this.buf = null;
-    if (this.mode !== 'pencil') this.prepareStamp();
+    this.tex = this.mode === 'pencil' ? null : this.prepareTexture();
+    if (this.mode !== 'pencil' && !this.tex) this.prepareStamp();
     this.acc = null;
     const { u, v } = this.map(p.x, p.y);
-    this.accumulate(this.dab(u, v));
+    this.accumulate(this.tex ? this.texDab(p.x, p.y) : this.dab(u, v));
     this.lx = p.x;
     this.ly = p.y;
     this.lu = u;
@@ -203,8 +213,13 @@ export class StrokeTool implements Tool {
       let pos = this.toNext;
       while (pos <= dist) {
         const t = pos / dist;
-        const { u, v } = this.map(this.lx + (p.x - this.lx) * t, this.ly + (p.y - this.ly) * t);
-        this.accumulate(this.dab(u, v));
+        const x = this.lx + (p.x - this.lx) * t;
+        const y = this.ly + (p.y - this.ly) * t;
+        if (this.tex) this.accumulate(this.texDab(x, y));
+        else {
+          const { u, v } = this.map(x, y);
+          this.accumulate(this.dab(u, v));
+        }
         pos += step;
       }
       this.toNext = pos - dist;
@@ -226,6 +241,7 @@ export class StrokeTool implements Tool {
     this.tb = null;
     if (this.buf) releaseSurface(this.buf);
     this.buf = null;
+    this.freeTints();
     commitPatches(this.host, layer, tb, this.mode === 'eraser' ? 'Eraser' : this.mode === 'pencil' ? 'Pencil' : 'Brush');
   }
 
@@ -246,6 +262,80 @@ export class StrokeTool implements Tool {
     this.drawH = tip.drawH;
     this.stampW = tip.stampW;
     this.stampH = tip.stampH;
+  }
+
+  /** Textured path state for this stroke, or null when the legacy circle stamp applies. */
+  private prepareTexture(): StrokeTool['tex'] {
+    const { shape, dynamics, custom, stroke } = this.host.brushTip();
+    if (isPlainTip(shape, dynamics)) return null;
+    this.freeTints();
+    const c = shape === 'custom' ? custom : null;
+    return { w: c ? c.w : TIP_RES, h: c ? c.h : TIP_RES, sampler: new DabSampler(dynamics, stroke), dyn: dynamics, alpha: c ? c.alpha : tipAlpha(shape, this.host.context().brush.hardness) };
+  }
+
+  /** One spacing step of the textured path at document position (x, y): `scatterCount` dabs. Returns the editable layer rect touched. */
+  private texDab(x: number, y: number): Rect | null {
+    const layer = this.layer as EditTarget;
+    const tx = this.tex as NonNullable<StrokeTool['tex']>;
+    const { brush, primary } = this.host.context();
+    const dyn = tx.dyn;
+    const inv = invMat(matOf(layer.tf));
+    const tintable = !layer.isMask && this.mode !== 'eraser';
+    let out: Rect | null = null;
+    for (let n = 0; n < dyn.scatterCount; n++) {
+      const s = tx.sampler.next(brush.size); // always draws the same numbers, whether or not the dab ends up visible
+      let col = this.color();
+      if (tintable && (dyn.hueJitter || dyn.satJitter || dyn.valJitter)) {
+        const q = (n: number): number => Math.min(255, Math.round(n / 8) * 8); // quantised so the tinted tips can be reused
+        const [r, g, b] = jitterColor(primary.r, primary.g, primary.b, s.dh, s.ds, s.dv);
+        col = `rgb(${q(r)},${q(g)},${q(b)})`;
+      }
+      const k = s.size / Math.max(tx.w, tx.h);
+      const a = (s.angle * Math.PI) / 180;
+      const cs = Math.cos(a) * k;
+      const sn = Math.sin(a) * k;
+      const rho = dyn.roundness;
+      // tip pixel -> document: T(dab) . R(angle) . S(k, k * roundness) . T(-w/2, -h/2)
+      const doc: Mat = { a: cs, b: sn, c: -sn * rho, d: cs * rho, e: x + s.ox - (cs * tx.w - sn * rho * tx.h) / 2, f: y + s.oy - (sn * tx.w + cs * rho * tx.h) / 2 };
+      const m = mulMat(inv, doc);
+      const cr = mapCorners(m, { x: 0, y: 0, w: tx.w, h: tx.h });
+      const r = { x: Math.min(...cr.map((p) => p.x)), y: Math.min(...cr.map((p) => p.y)), w: 0, h: 0 };
+      r.w = Math.max(...cr.map((p) => p.x)) - r.x;
+      r.h = Math.max(...cr.map((p) => p.y)) - r.y;
+      const lr = clipToSize({ x: Math.floor(r.x) - 2, y: Math.floor(r.y) - 2, w: Math.ceil(r.w) + 5, h: Math.ceil(r.h) + 5 }, layer.surface.width, layer.surface.height);
+      if (!lr) continue;
+      const tip = this.tint(col);
+      const sc = this.ensure(lr);
+      sc.save();
+      sc.imageSmoothingEnabled = true;
+      sc.imageSmoothingQuality = 'medium';
+      sc.globalAlpha = brush.flow;
+      sc.setTransform(m.a, m.b, m.c, m.d, m.e - this.win.x, m.f - this.win.y);
+      sc.drawImage(tip.canvas as CanvasImageSource, 0, 0);
+      sc.restore();
+      out = union(out, editableRegion(this.host, layer, lr));
+    }
+    return out;
+  }
+
+  /** The tip bitmap filled with `col` through the tip's alpha mask (cached per colour; the cache is bounded by pixel count). */
+  private tint(col: string): Surface {
+    const tx = this.tex as NonNullable<StrokeTool['tex']>;
+    const hit = this.tints.get(col);
+    if (hit) return hit;
+    if (this.tints.size >= Math.max(4, Math.floor(4_000_000 / (tx.w * tx.h)))) this.freeTints();
+    const s = createSurface(tx.w, tx.h);
+    s.ctx.fillStyle = col;
+    s.ctx.fillRect(0, 0, tx.w, tx.h);
+    s.ctx.globalCompositeOperation = 'destination-in';
+    s.ctx.drawImage(alphaSurface(tx.alpha, tx.w, tx.h).canvas as CanvasImageSource, 0, 0);
+    this.tints.set(col, s);
+    return s;
+  }
+
+  private freeTints(): void {
+    this.tints.forEach(releaseSurface);
+    this.tints.clear();
   }
 
   /** Make the stroke buffer cover `r` (layer space, inside the surface); grows geometrically so a long stroke reallocates rarely. */

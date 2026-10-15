@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
+import { effectLabel } from '../state/effectDefaults';
+import { filterDoc, filterGroups } from '../state/filterSchema';
 import { store, type Store } from '../state/store';
 import { MODES } from '../state/tools';
 import { formatZoom } from '../state/view';
 import { Icon, NOT_IN_VERSION } from './Icon';
 
-type Item = 'sep' | { label: string; hint?: string; run?: (s: Store) => void; checked?: (s: Store) => boolean; enabled?: (s: Store) => boolean; title?: (s: Store) => string | undefined };
+type Item = 'sep' | { label: string; hint?: string; flyout?: 'filters'; run?: (s: Store) => void; checked?: (s: Store) => boolean; enabled?: (s: Store) => boolean; title?: (s: Store) => string | undefined };
 interface MenuDef { label: string; items: Item[] | ((s: Store) => Item[]) }
 
 const off = (label: string, hint?: string): Item => ({ label, hint });
@@ -14,7 +16,8 @@ const MENUS: MenuDef[] = [
   { label: 'File', items: [
     { label: 'Save Project…', run: (s) => s.openFileDialog('saveProject'), enabled: (s) => s.canUseFiles(), title: (s) => s.fileTitle() },
     { label: 'Open Project…', run: (s) => s.openFileDialog('openProject'), enabled: (s) => s.canUseFiles(), title: (s) => s.fileTitle() },
-    { label: 'Export PNG…', run: (s) => s.openFileDialog('exportPng'), enabled: (s) => s.canUseFiles(), title: (s) => s.fileTitle() }, 'sep',
+    { label: 'Export PNG…', run: (s) => s.openFileDialog('exportPng'), enabled: (s) => s.canUseFiles(), title: (s) => s.fileTitle() },
+    { label: 'Clear stored undo history', run: (s) => void s.clearStoredHistory(), enabled: (s) => s.canUseFiles(), title: (s) => s.fileTitle() ?? 'Removes the undo history TouchDesigner keeps with the document' }, 'sep',
     { label: 'Place Image…', run: (s) => s.placeImage(), title: (s) => s.placeImageTitle() },
     { label: 'Import from TouchDesigner…', run: (s) => { s.topDialog.value = true; }, enabled: (s) => s.connection.value === 'linked' }, 'sep',
     { label: 'New layer', run: (s) => s.addLayer() }, { label: 'Flatten to new layer', run: (s) => s.flatten() }] },
@@ -25,6 +28,7 @@ const MENUS: MenuDef[] = [
     { label: 'Follow Input Size', run: (s) => s.followInput(), checked: (s) => s.canvasMode.value === 'input', title: () => 'The document size tracks the TouchDesigner Input resolution' }, off('Rotate…')] },
   { label: 'Layer', items: (s) => [off('Duplicate'), off('Merge down'), off('Layer properties…'), 'sep',
     { label: 'Layer Effects…', run: (x) => x.openEffects(), enabled: (x) => x.canHaveEffects(x.activeLayer()?.kind) },
+    { label: 'New Filter Adjustment ▸', flyout: 'filters', run: () => {}, enabled: (x) => x.hasEngine() },
     ...(s.connectedInputs().length
       ? s.connectedInputs().map((i): Item => ({ label: `Add Input Layer ▸ Input ${i.input}`, run: (x) => void x.addInputLayer(i.input) }))
       : [{ label: 'Add Input Layer ▸ (no connected inputs)', run: () => {}, enabled: () => false } as Item]), 'sep',
@@ -59,7 +63,9 @@ const MENUS: MenuDef[] = [
 
 function MenuBar() {
   const [open, setOpen] = useState(-1);
+  const [fly, setFly] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => { if (open < 0) setFly(false); }, [open]);
   useEffect(() => {
     if (open < 0) return;
     const away = (e: PointerEvent) => { if (!ref.current?.contains(e.target as Node)) setOpen(-1); };
@@ -85,6 +91,36 @@ function MenuBar() {
                 if (it === 'sep') return <div key={k} style="height:1px;background:#444;margin:4px 2px" />;
                 const usable = !!it.run && (!it.enabled || it.enabled(store));
                 const check = it.checked?.(store);
+                if (it.flyout && it.enabled && !it.enabled(store)) {
+                  return <button key={it.label} role="menuitem" class="mi" aria-disabled="true" data-flyout={it.flyout} style="display:flex;width:100%;box-sizing:border-box;align-items:center;height:26px;padding:0 10px;border-radius:4px;text-align:left;color:#707070">{it.label}</button>;
+                }
+                if (it.flyout) {
+                  return (
+                    <div key={it.label} style="position:relative">
+                      <button role="menuitem" class="mi" aria-haspopup="menu" aria-expanded={fly} data-flyout={it.flyout} onClick={() => setFly(true)} onPointerEnter={() => setFly(true)}
+                        style="display:flex;width:100%;box-sizing:border-box;align-items:center;gap:24px;height:26px;padding:0 10px;border-radius:4px;text-align:left;color:#e3e3e3">
+                        <span style="flex:1 1 auto">{it.label}</span>
+                      </button>
+                      {fly && (
+                        <div role="menu" aria-label="New Filter Adjustment" style="position:absolute;left:100%;top:-4px;z-index:60;min-width:210px;max-height:min(520px,80vh);overflow-y:auto;padding:4px;background:#2f2f2f;border:1px solid #161616;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,0.55)">
+                          {filterGroups().map((g, gi) => (
+                            <div key={g.id} role="group" aria-label={g.label}>
+                              {gi > 0 && <div role="separator" style="height:1px;background:#444;margin:4px 2px" />}
+                              <div style="padding:3px 10px 2px;font-size:10px;letter-spacing:0.04em;text-transform:uppercase;color:#8f8f8f">{g.label}</div>
+                              {g.types.map((t) => (
+                                <button key={t} role="menuitem" class="mi" data-new-filter-adjustment={t} title={filterDoc(t)}
+                                  onClick={() => { setOpen(-1); store.addFilterAdjustment(t); }}
+                                  style="display:flex;width:100%;box-sizing:border-box;align-items:center;height:26px;padding:0 10px;border-radius:4px;text-align:left;color:#e3e3e3">
+                                  {effectLabel(t)}
+                                </button>
+                              ))}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                }
                 return (
                   <button key={it.label} role="menuitem" class="mi" aria-disabled={!usable} aria-checked={check} title={it.run ? it.title?.(store) : NOT_IN_VERSION}
                     onClick={() => { if (!usable) return; setOpen(-1); it.run!(store); }}

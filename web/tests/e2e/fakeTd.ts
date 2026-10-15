@@ -3,10 +3,10 @@ import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { resolve } from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
-  FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, FRAME_VIEW, decodeFrame, decodeWebMessage, encodeFrame, encodeMessage, isStale,
+  FRAME_BASE, FRAME_LAYER_PREVIEW, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, FRAME_VIEW, decodeFrame, decodeWebMessage, encodeFrame, encodeMessage, isStale,
   type Frame, type TdMessage, type WebMessage,
 } from '../../src/bridge/codec';
-import type { CanvasMode, Guides, LayerSpec } from '../../src/engine/types';
+import type { BrushPreset, CanvasMode, Guides, LayerSpec } from '../../src/engine/types';
 
 export interface FakeTdOptions {
   token?: string; w: number; h: number; active?: boolean; hasInput?: boolean; maxSendFps?: number; fonts?: string[];
@@ -15,9 +15,13 @@ export interface FakeTdOptions {
   projectFile?: string; pngFile?: string;
 }
 
+/** The stored document (the last `doc` of the active client; v7 adds the document brush presets). */
+export interface FakeDoc { rev: number; layers: LayerSpec[]; guides: Guides; canvas: { mode: CanvasMode }; brushPresets?: BrushPreset[] }
+
 /** A saved project in the fake TD's in-memory file system (`saveProject` stores it, `openProject` restores it). */
 export interface FakeFile {
-  doc: { rev: number; layers: LayerSpec[]; guides: Guides; canvas: { mode: CanvasMode } };
+  doc: FakeDoc;
+  history: Uint8Array | null;
   surfaces: Map<number, Uint8ClampedArray>;
   slotSizes: Map<number, { w: number; h: number }>;
   w: number; h: number; mode: CanvasMode;
@@ -28,7 +32,7 @@ interface FakeInput { w: number; h: number; connected: boolean; stored: { id: nu
 export interface FakeTop { path: string; w: number; h: number; rgba: Uint8Array }
 
 /**
- * A stand-in for the TouchDesigner web server DAT (protocol v6: several inputs with BASE frames per input, `inputs`, effects/transforms stored verbatim in the doc, `saveProject`/`openProject`/`exportPng` with an in-memory file map + `reload`/`files`, plus the v5 `setCanvas`/`renderLayer` features): WebSocket for JSON and SURFACE tiles (stored per
+ * A stand-in for the TouchDesigner web server DAT (protocol v7: `activeLayer` log, `POST/GET /history` (blob + `X-Doc-Rev`), `layerPreview` notices + `GET /layer` (frame type 7), `brushPresets` in the doc; protocol v6: several inputs with BASE frames per input, `inputs`, effects/transforms stored verbatim in the doc, `saveProject`/`openProject`/`exportPng` with an in-memory file map + `reload`/`files`, plus the v5 `setCanvas`/`renderLayer` features): WebSocket for JSON and SURFACE tiles (stored per
  * slot with the last `doc`), HTTP `GET /base` / `/surface` / `/view` / `/top`; `fonts` after `hello`; `listTops` / `importTop` over a registry of fake TOPs; `applied` replies per finished SURFACE frame.
  */
 export class FakeTd {
@@ -36,7 +40,7 @@ export class FakeTd {
   frames: Frame[] = [];
   frameEnds = 0;
   /** Stored document (last `doc` from the active client) and surface buffers (straight RGBA, doc sized). */
-  doc: { rev: number; layers: LayerSpec[]; guides: Guides; canvas: { mode: CanvasMode } } | null = null;
+  doc: FakeDoc | null = null;
   docMessages = 0;
   surfaces = new Map<number, Uint8ClampedArray>();
   /** Drop the `applied` reply (to test missing latency data). */
@@ -56,6 +60,23 @@ export class FakeTd {
   /** v6 files: in-memory 'disk' by path, parameter values, and logs of the requests. */
   savedFiles = new Map<string, FakeFile>();
   exportedPngs: string[] = [];
+  /** v7: `activeLayer` ids received from the active client, in order. */
+  activeLayers: Array<string | null> = [];
+  /** v7: the stored undo history (COMP storage) and a log of the requests; `historyPostStatus` forces the POST answer (e.g. 500). */
+  historyBlob: { rev: number; bytes: Uint8Array } | null = null;
+  historyPosts: { rev: number; size: number; client: string }[] = [];
+  historyGets: { status: number }[] = [];
+  /** `includeHistory` of every saveProject request (undefined = field absent). */
+  saveHistoryFlags: Array<boolean | undefined> = [];
+  historyPostStatus: number | null = null;
+  /** Ordered log of interesting requests ('history POST', 'saveProject', ...), to assert sequencing. */
+  events: string[] = [];
+  /** v7: LAYER_PREVIEW frames by layer id, the notice/fetch bookkeeping. */
+  layerFrames = new Map<string, { id: number; bytes: Uint8Array }>();
+  layerFetches: { layerId: string; frameId: number; status: number }[] = [];
+  layerNotices: { layerId: string; frameId: number }[] = [];
+  private layerPending = new Set<string>();
+  private nextLayerFrame = 1;
   /** Real TD behaviour: after `reload` the client's `doc` / SURFACE are ignored until it has sent `requestDoc`. */
   awaitingRequestDoc = false;
   ignoredAfterReload = { docs: 0, frames: 0 };
@@ -154,6 +175,19 @@ export class FakeTd {
       res.end(body ? Buffer.from(body) : undefined);
       return;
     }
+    if (u.pathname === '/history') { this.onHistoryHttp(req, res, u, cors); return; }
+    if (u.pathname === '/layer') {
+      if (q.get('token') !== this.token || q.get('client') !== this.clientId) { this.badFetches++; res.writeHead(403, cors).end(); return; }
+      const layerId = q.get('layerId') ?? '';
+      const stored = this.layerFrames.get(layerId);
+      this.layerFetches.push({ layerId, frameId: Number(q.get('frameId')), status: stored && this.active ? 200 : 404 });
+      this.layerPending.delete(layerId);
+      if (!stored || !this.active) { res.writeHead(404, cors).end(); return; }
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/octet-stream' });
+      res.end(Buffer.from(stored.bytes));
+      if (this.layerFrames.get(layerId)!.id > stored.id) this.announceLayer(layerId);
+      return;
+    }
     if (u.pathname === '/surface' || u.pathname === '/view') {
       if (q.get('token') !== this.token || q.get('client') !== this.clientId) { this.badFetches++; res.writeHead(403, cors).end(); return; }
       const send = (status: number, body?: Uint8Array) => { res.writeHead(status, { ...cors, 'Content-Type': 'application/octet-stream' }); res.end(body ? Buffer.from(body) : undefined); };
@@ -194,6 +228,58 @@ export class FakeTd {
     }, this.baseDelayMs);
   }
 
+  /** v7 history endpoint: POST stores the blob with its `rev`, GET serves it with `X-Doc-Rev` (404 when none); OPTIONS answers the CORS preflight like TD. */
+  private onHistoryHttp(req: IncomingMessage, res: import('node:http').ServerResponse, u: URL, cors: Record<string, string>) {
+    const q = u.searchParams;
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, { ...cors, 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type', 'Access-Control-Max-Age': '600' }).end();
+      return;
+    }
+    if (q.get('token') !== this.token || q.get('client') !== this.clientId) { this.badFetches++; res.writeHead(403, cors).end(); return; }
+    const expose = { ...cors, 'Access-Control-Expose-Headers': 'X-Doc-Rev, X-History-Rev' };
+    if (req.method === 'GET') {
+      if (!this.historyBlob) { this.historyGets.push({ status: 404 }); res.writeHead(404, expose).end(); return; }
+      this.historyGets.push({ status: 200 });
+      res.writeHead(200, { ...expose, 'Content-Type': 'application/octet-stream', 'X-Doc-Rev': String(this.doc?.rev ?? this.historyBlob.rev), 'X-History-Rev': String(this.historyBlob.rev), 'Cache-Control': 'no-store' });
+      res.end(Buffer.from(this.historyBlob.bytes));
+      return;
+    }
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => {
+      const body = new Uint8Array(Buffer.concat(chunks));
+      this.events.push('history POST');
+      this.historyPosts.push({ rev: Number(q.get('rev')), size: body.length, client: q.get('client') ?? '' });
+      if (!this.active) { res.writeHead(409, expose).end(); return; }
+      if (this.historyPostStatus !== null) { res.writeHead(this.historyPostStatus, expose).end(); return; }
+      this.historyBlob = body.length ? { rev: Number(q.get('rev')), bytes: body } : null;
+      res.writeHead(204, expose).end();
+    });
+  }
+
+  /** v7: TD's render of one tdPreview layer (doc sized, straight RGBA; default = a deterministic gradient). Announced to the active client (one outstanding notice per layer). */
+  setLayerPreview(layerId: string, rgba?: Uint8Array) {
+    const px = rgba ?? FakeTd.syntheticLayerImage(this.w, this.h);
+    const id = this.nextLayerFrame++;
+    this.layerFrames.set(layerId, { id, bytes: encodeFrame({ type: FRAME_LAYER_PREVIEW, frameEnd: true, slot: 0, frameId: id, docW: this.w, docH: this.h, x: 0, y: 0, w: this.w, h: this.h }, px) });
+    this.announceLayer(layerId);
+  }
+
+  /** A recognisable image: opaque, red ramps with x, green with y, blue constant 200. */
+  static syntheticLayerImage(w: number, h: number): Uint8Array {
+    const px = new Uint8Array(w * h * 4);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) px.set([Math.round((x / Math.max(1, w - 1)) * 255), Math.round((y / Math.max(1, h - 1)) * 255), 200, 255], (y * w + x) * 4);
+    return px;
+  }
+
+  private announceLayer(layerId: string) {
+    const f = this.layerFrames.get(layerId);
+    if (!this.client || !f || !this.active || this.layerPending.has(layerId)) return;
+    this.layerPending.add(layerId);
+    this.layerNotices.push({ layerId, frameId: f.id });
+    this.send({ t: 'layerPreview', layerId, frameId: f.id });
+  }
+
   private announce(input: number) {
     const inp = this.inputs.get(input);
     if (!this.client || !inp || !inp.stored) return;
@@ -210,6 +296,7 @@ export class FakeTd {
     this.awaitingRequestDoc = false;
     for (const i of this.inputs.values()) i.pending = false;
     this.viewPending = false;
+    this.layerPending.clear();
     this.viewSubscribed = false;
     this.clientId = `client-${++this.clientSeq}`;
     ws.on('message', (data, isBinary) => {
@@ -233,7 +320,8 @@ export class FakeTd {
         if (m.t === 'chooseFile') this.onChooseFile(m);
         if (m.t === 'saveProject' || m.t === 'openProject' || m.t === 'exportPng') this.onFileRequest(m);
         if (m.t === 'doc' && this.awaitingRequestDoc) { this.ignoredAfterReload.docs++; return; }
-        if (m.t === 'doc' && this.active) { this.doc = { rev: m.rev, layers: m.layers, guides: m.guides, canvas: m.canvas }; this.docMessages++; this.syncSlots(m.layers); }
+        if (m.t === 'doc' && this.active) { this.doc = { rev: m.rev, layers: m.layers, guides: m.guides, canvas: m.canvas, ...(m.brushPresets ? { brushPresets: m.brushPresets } : {}) }; this.docMessages++; this.syncSlots(m.layers); }
+        if (m.t === 'activeLayer' && this.active) this.activeLayers.push(m.id);
         if (m.t === 'setCanvas' && this.active) this.onSetCanvas(m);
         if (m.t === 'renderLayer') this.onRenderLayer(m);
         if (m.t === 'requestDoc') { this.requestDocs++; this.awaitingRequestDoc = false; }
@@ -249,7 +337,7 @@ export class FakeTd {
         }
         if (m.t === 'requestDoc' && this.doc) {
           const doc = this.doc;
-          setTimeout(() => this.send({ t: 'docState', rev: doc.rev, layers: doc.layers, docW: this.w, docH: this.h, guides: doc.guides, canvas: doc.canvas }), this.docStateDelayMs);
+          setTimeout(() => this.send({ t: 'docState', rev: doc.rev, layers: doc.layers, docW: this.w, docH: this.h, guides: doc.guides, canvas: doc.canvas, ...(doc.brushPresets ? { brushPresets: doc.brushPresets } : {}) }), this.docStateDelayMs);
         }
         if (m.t === 'view') {
           this.lastView = m;
@@ -283,7 +371,7 @@ export class FakeTd {
 
   hello(): TdMessage {
     return {
-      t: 'hello', protocol: 6, doc: { w: this.w, h: this.h, mode: this.mode }, hasInput: this.opts.hasInput ?? false, maxSendFps: this.opts.maxSendFps ?? 30,
+      t: 'hello', protocol: 7, doc: { w: this.w, h: this.h, mode: this.mode }, hasInput: this.opts.hasInput ?? false, maxSendFps: this.opts.maxSendFps ?? 30,
       inputs: this.inputList(),
       active: this.active, clientId: this.clientId, hasDocument: this.doc !== null, rev: this.doc?.rev ?? null,
     };
@@ -308,8 +396,11 @@ export class FakeTd {
     if (m.path) { this.projectFile = m.path; this.send({ t: 'files', projectFile: this.projectFile, pngFile: this.pngFile }); }
     if (m.t === 'saveProject') {
       if (!this.doc) { reply(false, path, 'No document to save'); return; }
+      this.events.push('saveProject');
+      this.saveHistoryFlags.push(m.includeHistory);
       this.savedFiles.set(path, {
-        doc: JSON.parse(JSON.stringify(this.doc)), surfaces: new Map([...this.surfaces].map(([k, v]) => [k, new Uint8ClampedArray(v)])),
+        doc: JSON.parse(JSON.stringify(this.doc)),
+        history: m.includeHistory !== false && this.historyBlob && this.historyBlob.rev === this.doc.rev ? this.historyBlob.bytes : null, surfaces: new Map([...this.surfaces].map(([k, v]) => [k, new Uint8ClampedArray(v)])),
         slotSizes: new Map(this.slotSizes), w: this.w, h: this.h, mode: this.mode,
       });
       reply(true, path);
@@ -319,6 +410,7 @@ export class FakeTd {
     if (!file) { reply(false, path, `File not found: ${path}`); return; }
     const rev = (this.doc?.rev ?? 0) + 1;
     this.doc = { ...JSON.parse(JSON.stringify(file.doc)), rev };
+    this.historyBlob = file.history ? { rev, bytes: file.history } : null; // the file's history belongs to the opened document (now at its new rev)
     this.w = file.w; this.h = file.h; this.mode = file.mode;
     this.slotSizes = new Map(file.slotSizes);
     this.surfaces = new Map([...file.surfaces].map(([k, v]) => [k, new Uint8ClampedArray(v)]));
@@ -336,8 +428,12 @@ export class FakeTd {
   placeColor: [number, number, number, number] = [40, 90, 220, 255];
   placeFails: string | null = null;
 
+  /** v7 `readText` answer: {path, text}, {path, error} or null (cancelled). */
+  readTextAnswer: { path: string; text?: string; error?: string } | null = { path: '/tmp/grade.cube', text: 'LUT_3D_SIZE 2\n' + Array.from({ length: 8 }, () => '0.5 0.5 0.5').join('\n') + '\n' };
+
   private onChooseFile(m: Extract<WebMessage, { t: 'chooseFile' }>) {
     this.chooseRequests.push(m);
+    if (m.purpose === 'readText') { this.send({ t: 'fileChosen', requestId: m.requestId, path: this.readTextAnswer?.path ?? null, ...(this.readTextAnswer?.text !== undefined ? { text: this.readTextAnswer.text } : {}), ...(this.readTextAnswer?.error !== undefined ? { error: this.readTextAnswer.error } : {}) }); return; }
     const path = this.choice[m.purpose] ?? null;
     this.send({ t: 'fileChosen', requestId: m.requestId, path });
     if (m.purpose !== 'placeImage' || path === null) return;
@@ -390,14 +486,14 @@ export class FakeTd {
   }
 
   /** Pre-load a stored document as if TouchDesigner had restored it from its .toe (for the fresh-page load flow). */
-  seedDocument(layers: LayerSpec[], rev = 1, fill: Record<number, [number, number, number, number]> = {}, guides: Guides = { h: [], v: [] }, canvas: { mode: CanvasMode } = { mode: 'input' }) {
+  seedDocument(layers: LayerSpec[], rev = 1, fill: Record<number, [number, number, number, number]> = {}, guides: Guides = { h: [], v: [] }, canvas: { mode: CanvasMode } = { mode: 'input' }, brushPresets?: BrushPreset[]) {
     // like TD's own specs: pixel / base layers always state their surface size (default: the document size)
     layers = layers.map((l) => {
       if (l.surfaceW != null || (l.kind !== 'pixel' && l.kind !== 'input')) return l;
       const inp = l.kind === 'input' ? this.inputs.get(l.input ?? 1) : undefined;
       return { ...l, surfaceW: inp?.w ?? this.baseW, surfaceH: inp?.h ?? this.baseH };
     });
-    this.doc = { rev, layers, guides, canvas };
+    this.doc = { rev, layers, guides, canvas, ...(brushPresets ? { brushPresets } : {}) };
     this.syncSlots(layers);
     for (const [slot, rgba] of Object.entries(fill)) {
       const buf = this.surfaces.get(Number(slot))!;

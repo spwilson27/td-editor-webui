@@ -284,3 +284,39 @@ Further v5 details (TD implementation):
 - `{t:"activeLayer", id}` web → TD (active client; drives `set_active_layer`).
 - History: `POST /history?token&client&rev` (body: history blob, ≤ 256 MB) → `204`; `GET /history?token&client` → `200`
   blob with header `X-Doc-Rev`, or `404`. Stored in COMP storage and in `.redoc` (`history.bin`).
+- **tdPreview stream (TD side).** One stream per layer the network lists in `preview_layers()` (planner-flagged `tdPreview` effect /
+  filter adjustment; visible layers only), only while an editor is active and only to the active client. TD reads
+  `network.layer_preview_source(id)` back with the budgeted delayed readback (as VIEW; one layer converts per pump), re-reading only when
+  `network.layer_preview_token(id)` changes (a static layer costs nothing). `layerPreview` carries `docW/docH` too; `GET /layer?...&layerId=`
+  always serves the NEWEST frame of that layer (404 = no frame: not flagged / not active client / no source). When TD answers `requestDoc`
+  it forgets what it announced (the page drops its previews while loading), so the newest frames are announced again.
+- **History** (details). `POST /history` needs the active editor (`409` otherwise), `rev` = non-negative integer (`400`), body <= 256 MB
+  (`413`; measured: 256 MB takes ~4 s end to end, the main thread stalls < 0.4 s), an empty body clears it. The blob is stored with `rev`
+  in COMP storage (`raster_history`) as ONE object (atomic replace). It is dropped when a `doc` arrives with a lower rev than the stored
+  history (a fresh document) and on Open Project (the file's `history.bin`, if any, is stored at the new rev). Save Project writes
+  `history.bin` (+ `meta.historyRev`) only when the stored history belongs to the saved rev. `OPTIONS /history` answers the CORS preflight
+  for loopback dev origins; `X-Doc-Rev` is exposed.
+- **`activeLayer {id|null}`**: only the active client's value is used; TD calls `network.set_active_layer` (and re-plans once) when it changes.
+  TD also tracks the painted bounds of every pixel slot from SURFACE tiles and calls `network.set_content_bounds` (empty layer -> `None`;
+  transformed layers get a padded 64-px-grid box that grows only when the paint leaves it; restored / opened surfaces: no hint).
+- **`DocSpec.brushPresets`**: validated (<= 64 presets, <= 16 custom tips, PNG data URLs <= 2 MB, tips <= 512 px), stored with the document,
+  returned in `docState` (always, `[]` when none), written to `doc.json` of a `.redoc`. A `doc` without the field keeps the stored list.
+- **`chooseFile` purpose `readText`** (for `.cube` LUTs): `{t:"chooseFile", requestId, purpose:"readText", fileTypes?:["cube"]}`; TD opens its
+  file dialog, reads the file as UTF-8 and answers `fileChosen {requestId, path, text}`; failure (> 12 MB, binary, not UTF-8, unreadable)
+  -> `fileChosen {requestId, path, error}` (no `text`); cancel -> `path: null`. Same one-dialog-per-client rule and `testPath` stub as the
+  other purposes.
+- **`saveProject.includeHistory`** (default true when absent): `false` writes the `.redoc` without `history.bin` / `meta.historyRev`; the history
+  stored in the COMP is untouched. An empty `POST /history` body clears the stored history (`GET /history` then answers `404`).
+- **Open Project rev / history revs.** The document rev is always monotonic: Open Project sets `max(TD rev, file rev) + 1`, so a stale page
+  that was disconnected during the Open cannot win (its `hello.rev` differs: reload). History is stored as `(docRev, histRev, blob)`:
+  `docRev` = the document rev it is served for, `histRev` = the rev embedded in the blob. `GET /history` answers `X-Doc-Rev: <docRev>`
+  and `X-History-Rev: <histRev>` (the page loads the history when `X-Doc-Rev` equals the rev it loaded and passes `X-History-Rev` to its
+  restore). `POST /history?rev=R` stores `(R, R, blob)`. Open Project stores the file's `history.bin` as `(newRev, meta.historyRev, blob)`
+  ONLY when `meta.historyRev` equals the file's document rev, and drops the previous history only after the document was replaced.
+  Save Project writes `history.bin` + `meta.historyRev = histRev` only when `docRev` equals the saved document's rev.
+- **Export with Document / SaveTox** never embeds the stored history (it is unstored around the save and restored). The `.toe` project
+  save does keep it (that is the point). Memory: a 256 MB upload peaks at about the body once (the server's bytes object is the stored object);
+  replacing an existing history holds both until the old one is released (~2x). An oversize body is refused by `Content-Length` when the
+  server passes the header on, otherwise after it was read (`413`). `readText` decodes `utf-8-sig`. Brush preset names that are missing,
+  empty or too long are normalised by TD (`"Brush preset"`, 256 chars) instead of rejecting the document. Layer-preview notice records are
+  created only for layers that have a stream.

@@ -3,6 +3,8 @@ import type { AdjustmentType, LayerInfo } from '../engine/types';
 import { computeDrop, dropZone, type DropZone } from '../state/layerDrop';
 import { capture } from './capture';
 import { store } from '../state/store';
+import { effectLabel } from '../state/effectDefaults';
+import { filterDoc, filterGroups } from '../state/filterSchema';
 import { BLEND_LABELS, BLEND_MODES, TOOLS, shapeKind } from '../state/tools';
 import { Icon, NOT_IN_VERSION } from './Icon';
 
@@ -23,7 +25,7 @@ const ADJUSTMENTS: { type: AdjustmentType; label: string }[] = [
   { type: 'invert', label: 'Invert' },
   { type: 'threshold', label: 'Threshold' },
 ];
-export const adjustmentLabel = (t: AdjustmentType) => ADJUSTMENTS.find((a) => a.type === t)?.label ?? t;
+export const adjustmentLabel = (t: AdjustmentType) => ADJUSTMENTS.find((a) => a.type === t)?.label ?? (t === 'filter' ? 'Filter' : t);
 
 function Thumb({ layer }: { layer: LayerInfo }) {
   const ref = useRef<HTMLCanvasElement>(null);
@@ -33,7 +35,7 @@ function Thumb({ layer }: { layer: LayerInfo }) {
   }, [layer.id, layer.kind, tick]);
   const bg = 'background-color:#ffffff;background-image:repeating-conic-gradient(#cfcfcf 0 25%,#ffffff 0 50%);background-size:8px 8px';
   if (layer.kind === 'adjustment') {
-    return <span aria-hidden="true" data-adjust-icon title={layer.adjustment ? adjustmentLabel(layer.adjustment.type) : 'Adjustment'} style="width:34px;height:24px;flex:none;border-radius:2px;box-shadow:0 0 0 1px #111111;background:#3a3a3a;display:flex;align-items:center;justify-content:center;color:#d4d4d4"><Icon d={ADJUST_ICON} size={14} sw={1.6} /></span>;
+    return <span aria-hidden="true" data-adjust-icon title={layer.adjustment ? (layer.adjustment.type === 'filter' ? effectLabel(layer.adjustment.effect.type) : adjustmentLabel(layer.adjustment.type)) : 'Adjustment'} style="width:34px;height:24px;flex:none;border-radius:2px;box-shadow:0 0 0 1px #111111;background:#3a3a3a;display:flex;align-items:center;justify-content:center;color:#d4d4d4"><Icon d={ADJUST_ICON} size={14} sw={1.6} /></span>;
   }
   if (layer.kind === 'text' || layer.kind === 'shape') {
     const d = layer.kind === 'text' ? TOOLS.find((t) => t.id === 'text')!.d : shapeKind(layer.shape?.type ?? 'rect').d;
@@ -83,8 +85,8 @@ function NameField({ layer, onDone }: { layer: LayerInfo; onDone: () => void }) 
 
 interface DragState { id: string; target: string | null; zone: DropZone }
 
-function LayerRow({ layer, layers, selected, maskTarget, editing, onEdit, drag }: {
-  layer: LayerInfo; layers: LayerInfo[]; selected: boolean; maskTarget: boolean; editing: boolean; onEdit: (id: string | null) => void; drag: DragState | null;
+function LayerRow({ layer, layers, selected, maskTarget, editing, onEdit, drag, tdPreview }: {
+  tdPreview: boolean; layer: LayerInfo; layers: LayerInfo[]; selected: boolean; maskTarget: boolean; editing: boolean; onEdit: (id: string | null) => void; drag: DragState | null;
 }) {
   const e = store.engine;
   const group = layer.kind === 'group';
@@ -131,6 +133,15 @@ function LayerRow({ layer, layers, selected, maskTarget, editing, onEdit, drag }
           <span data-disconnected title={`TD input ${layer.input} is not connected - placement is kept`} aria-label={`TD input ${layer.input} is not connected`}
             style="flex:none;display:flex;color:#d9a441"><Icon d="M12 4l9 16H3zM12 10v4M12 17v1" size={13} sw={1.8} /></span>
         )}
+        {tdPreview && (() => {
+          const pending = layer.previewPending ?? store.layerPreviewState(layer.id) !== 'ready';
+          return (
+            <span data-td-render data-pending={pending || undefined} title={pending ? "This layer's effects are shown from TouchDesigner's render; it has not arrived yet" : "This layer's effects are shown from TouchDesigner's render"}
+              style={`flex:none;font-size:9px;font-weight:600;letter-spacing:0.02em;padding:1px 4px;border-radius:3px;white-space:nowrap;color:${pending ? '#d9a441' : '#7fd9a0'};border:1px solid ${pending ? '#6b5320' : '#2f6b45'}`}>
+              {pending ? 'TD render · pending' : 'TD render'}
+            </span>
+          );
+        })()}
         {canFx && fxCount > 0 && <span data-fx-badge title={`${fxCount} effect${fxCount === 1 ? '' : 's'}${fxOn ? '' : ' (all disabled)'}`} style={`flex:none;font-size:10px;font-style:italic;font-weight:600;color:#7fb2f0;opacity:${fxOn ? 1 : 0.4}`}>fx</span>}
         <span data-meta style={`flex:none;font-size:11px;color:${selected ? '#e6eefa' : '#a8a8a8'}`}>{meta}</span>
       </div>
@@ -193,6 +204,8 @@ export function LayersPanel() {
   const paint = e.paintTarget();
   const [editing, setEditing] = useState<string | null>(null);
   const [drag, setDrag] = useState<DragState | null>(null);
+  const tdLayers = new Set(e.tdPreviewLayers());
+  store.layerPreviews.value;
   const list = useRef<HTMLDivElement>(null);
   const press = useRef<{ id: string; x: number; y: number; started: boolean } | null>(null);
   const dragRef = useRef<DragState | null>(null);
@@ -246,7 +259,7 @@ export function LayersPanel() {
         style="flex:1 1 auto;min-height:0;overflow-y:auto;padding:4px 0;user-select:none">
         {layers.map((l) => (
           <LayerRow key={l.id} layer={l} layers={layers} selected={l.id === activeId} maskTarget={paint.layerId === l.id && paint.target === 'mask'} editing={editing === l.id}
-            onEdit={setEditing} drag={drag} />
+            onEdit={setEditing} drag={drag} tdPreview={tdLayers.has(l.id)} />
         ))}
       </div>
       <Footer canDelete={canDelete} canMask={store.canAddMask()} canFx={canFx} />
@@ -283,13 +296,25 @@ function Footer({ canDelete, canMask, canFx }: { canDelete: boolean; canMask: bo
         </button>
       ))}
       {menu && (
-        <div role="menu" aria-label="New adjustment" style="position:absolute;left:50%;bottom:100%;z-index:50;min-width:190px;padding:4px;background:#2f2f2f;border:1px solid #161616;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,0.55)">
+        <div role="menu" aria-label="New adjustment" style="position:absolute;left:50%;bottom:100%;z-index:50;min-width:190px;max-height:min(480px,70vh);overflow-y:auto;padding:4px;background:#2f2f2f;border:1px solid #161616;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,0.55)">
           {ADJUSTMENTS.map((a) => (
             <button key={a.type} role="menuitem" class="mi" data-adjustment={a.type}
               onClick={() => { setMenu(false); store.addAdjustment(a.type); }}
               style="display:flex;width:100%;box-sizing:border-box;align-items:center;height:26px;padding:0 10px;border-radius:4px;text-align:left;color:#e3e3e3">
               {a.label}
             </button>
+          ))}
+          {filterGroups().map((g) => (
+            <div key={g.id} role="group" aria-label={`${g.label} filters`}>
+              <div role="separator" style="height:1px;margin:4px 6px;background:#161616" />
+              <div style="padding:3px 10px 2px;font-size:10px;letter-spacing:0.04em;text-transform:uppercase;color:#8f8f8f">{g.label}</div>
+              {g.types.map((t) => (
+                <button key={t} role="menuitem" class="mi" data-adjustment-filter={t} title={filterDoc(t)} onClick={() => { setMenu(false); store.addFilterAdjustment(t); }}
+                  style="display:flex;width:100%;box-sizing:border-box;align-items:center;height:26px;padding:0 10px;border-radius:4px;text-align:left;color:#e3e3e3">
+                  {effectLabel(t)}
+                </button>
+              ))}
+            </div>
           ))}
         </div>
       )}

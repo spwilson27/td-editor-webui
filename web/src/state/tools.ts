@@ -1,4 +1,4 @@
-import type { BlendMode, BrushSettings, ShapeType, ToolId } from '../engine/types';
+import type { BlendMode, BrushDynamics, BrushSettings, ShapeType, TipShape, ToolId } from '../engine/types';
 
 export interface ToolInfo {
   id: ToolId; name: string; key: string; hint: string; d: string; sep?: boolean; enabled: boolean;
@@ -45,7 +45,8 @@ export const GREYS = Array.from({ length: 16 }, (_, i) => {
   return '#' + v + v + v;
 });
 
-export interface BrushPreset extends Omit<BrushSettings, 'spacing'> { id: string; name: string; sw: number; op: number }
+/** Built-in brush preset (UI list): settings + the v6 tip / dynamics (`dyn` overrides DEFAULT_DYNAMICS). */
+export interface BrushPreset extends Omit<BrushSettings, 'spacing'> { id: string; name: string; sw: number; op: number; spacing?: number; tip?: TipShape; dyn?: Partial<BrushDynamics> }
 export const BRUSHES: BrushPreset[] = [
   { id: 'round', name: 'Round — soft', size: 64, opacity: 1, flow: 0.72, hardness: 0.4, sw: 6, op: 0.55 },
   { id: 'hard', name: 'Round — hard', size: 24, opacity: 1, flow: 1, hardness: 1, sw: 4, op: 1 },
@@ -53,6 +54,15 @@ export const BRUSHES: BrushPreset[] = [
   { id: 'chalk', name: 'Dry chalk', size: 48, opacity: 0.8, flow: 0.4, hardness: 0.6, sw: 7, op: 0.4 },
   { id: 'gouache', name: 'Gouache', size: 96, opacity: 0.9, flow: 0.8, hardness: 0.7, sw: 9, op: 0.8 },
   { id: 'airbrush', name: 'Airbrush', size: 200, opacity: 1, flow: 0.25, hardness: 0, sw: 12, op: 0.25 },
+];
+/** v6 textured / scatter / colour-jitter built-ins (below the six classic presets in the panel). */
+export const TEXTURED_BRUSHES: BrushPreset[] = [
+  { id: 'chalk-tip', name: 'Chalk stick', size: 56, opacity: 0.9, flow: 0.6, hardness: 1, sw: 7, op: 0.5, tip: 'chalk', spacing: 0.1 },
+  { id: 'bristle', name: 'Bristle', size: 60, opacity: 1, flow: 0.85, hardness: 1, sw: 8, op: 0.7, tip: 'bristle', spacing: 0.08, dyn: { angleJitter: 8 } },
+  { id: 'spatter', name: 'Spatter', size: 70, opacity: 1, flow: 1, hardness: 1, sw: 6, op: 0.6, tip: 'spatter', spacing: 0.4, dyn: { scatter: 1.2, scatterCount: 6, sizeJitter: 0.5 } },
+  { id: 'grain', name: 'Noise grain', size: 90, opacity: 0.8, flow: 0.7, hardness: 1, sw: 9, op: 0.45, tip: 'noise', spacing: 0.12 },
+  { id: 'stars', name: 'Scatter stars', size: 40, opacity: 1, flow: 1, hardness: 1, sw: 5, op: 0.9, tip: 'star', spacing: 0.6, dyn: { scatter: 1.5, scatterCount: 4, angleJitter: 360, sizeJitter: 0.4, hueJitter: 0.1 } },
+  { id: 'confetti', name: 'Colour confetti', size: 36, opacity: 1, flow: 1, hardness: 1, sw: 5, op: 0.9, tip: 'square', spacing: 0.7, dyn: { scatter: 2.5, scatterCount: 6, angleJitter: 360, hueJitter: 0.5, satJitter: 0.2, valJitter: 0.2 } },
 ];
 
 export const BLEND_LABELS: Record<BlendMode, string> = {

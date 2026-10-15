@@ -31,13 +31,18 @@
  *      lum = 0.2126 R + 0.7152 G + 0.0722 B  (straight, 0..1, Rec.709)
  *      out = lum >= level ? white : black      (alpha untouched)
  *
+ *  filter {effect}                              (v6) a filter-library Effect run by the effects module on the accumulated result below (document
+ *      space, compositor.ts); like every adjustment layer it may carry effects[] (run on the adjusted result, before the mix).
+ *
  * Mixing (all types): result = mix(below, adjusted, opacity * mask) in premultiplied RGBA, where `below` is the
  * accumulated result under the adjustment within its parent, and mask = 1 without an (enabled) mask.
  * Mask values from a paint colour use the same Rec.709 luminance.
  * Known 8-bit differences: the preview rounds to 8 bits after each adjustment, TD stays in 16-bit float.
  */
-import type { AdjustmentSpec, AdjustmentType, Rect } from './types';
+import type { AdjustmentSpec, AdjustmentType, Effect, Rect } from './types';
 import type { Ctx2D, Surface } from './surface';
+import { sanitizeEffect } from './effectsSanitize';
+import { effectsReach, hasEffects } from './effectsAdapter';
 
 /** A drawing surface with the document position (ox, oy) of its top-left pixel. */
 export interface AdjTarget {
@@ -48,11 +53,11 @@ export interface AdjTarget {
   k: number; // canvas pixels per document pixel (1 except thumbnails)
 }
 
-export const ADJUSTMENT_TYPES: AdjustmentType[] = ['levels', 'brightnessContrast', 'hueSaturation', 'blur', 'invert', 'threshold'];
+export const ADJUSTMENT_TYPES: AdjustmentType[] = ['levels', 'brightnessContrast', 'hueSaturation', 'blur', 'invert', 'threshold', 'filter'];
 
 export const ADJUSTMENT_NAMES: Record<AdjustmentType, string> = {
   levels: 'Levels', brightnessContrast: 'Brightness/Contrast', hueSaturation: 'Hue/Saturation',
-  blur: 'Blur', invert: 'Invert', threshold: 'Threshold',
+  blur: 'Blur', invert: 'Invert', threshold: 'Threshold', filter: 'Filter',
 };
 
 export const DEFAULT_BLUR_RADIUS = 4;
@@ -74,6 +79,7 @@ export function defaultAdjustment(type: AdjustmentType): AdjustmentSpec {
     case 'blur': return { type, radius: DEFAULT_BLUR_RADIUS };
     case 'invert': return { type };
     case 'threshold': return { type, level: 0.5 };
+    case 'filter': return { type, effect: { enabled: true, type: 'blur', radius: 10 } as unknown as Effect };
   }
 }
 
@@ -97,10 +103,12 @@ export function clampAdjustment(s: AdjustmentSpec): AdjustmentSpec {
     case 'blur': return { type: 'blur', radius: clamp(v.radius, 0, 200) };
     case 'invert': return { type: 'invert' };
     case 'threshold': return { type: 'threshold', level: clamp(v.level, 0, 1) };
+    case 'filter': return { type: 'filter', effect: sanitizeEffect(v.effect) ?? (d.effect as unknown as Effect) };
   }
 }
 
 export function sameAdjustment(a: AdjustmentSpec, b: AdjustmentSpec): boolean {
+  if (a.type === 'filter' || b.type === 'filter') return a.type === b.type && JSON.stringify(a) === JSON.stringify(b);
   const x = a as unknown as Record<string, unknown>;
   const y = b as unknown as Record<string, unknown>;
   const kx = Object.keys(x);
@@ -114,12 +122,14 @@ export function isIdentity(s: AdjustmentSpec): boolean {
     case 'brightnessContrast': return s.brightness === 0 && s.contrast === 0;
     case 'hueSaturation': return s.hue === 0 && s.saturation === 1 && s.value === 1;
     case 'blur': return s.radius < 0.05;
+    case 'filter': return !hasEffects([s.effect]);
     default: return false;
   }
 }
 
 /** Extra pixels around a changed rect that an adjustment can influence (blur only). */
 export function adjustmentReach(s: AdjustmentSpec): number {
+  if (s.type === 'filter') return effectsReach([s.effect]);
   return s.type === 'blur' && !isIdentity(s) ? Math.ceil(3 * s.radius) : 0;
 }
 

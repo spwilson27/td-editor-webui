@@ -16,7 +16,7 @@ const hook = <T,>(page: Page, fn: string, ...args: unknown[]) =>
 test('connects, says ready as the panel client and shows the linked state', async ({ page }) => {
   await open(page);
   await td.waitFor(() => td.messages.length > 0);
-  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 6, client: 'panel', token: td.token, fresh: true });
+  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 7, client: 'panel', token: td.token, fresh: true });
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   expect((await hook<any>(page, 'state')).doc).toEqual({ w: 160, h: 90 });
 });

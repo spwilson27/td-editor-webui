@@ -49,8 +49,9 @@ class FakePars:
 
     def __getattr__(self, name):
         v = object.__getattribute__(self, "_v")
-        if name in v:
-            return _Val(v[name])
+        menus = getattr(self._op, "menus", {})
+        if name in v or name in menus:
+            return _Val(v.get(name), menus.get(name, ()))
         raise AttributeError(name)
 
     def value(self, name):
@@ -58,8 +59,9 @@ class FakePars:
 
 
 class _Val:
-    def __init__(self, v):
+    def __init__(self, v, menu=()):
         self.v = v
+        self.menuNames = list(menu)          # (FakeOp.menus[par]: the menu entries of a menu parameter)
 
     def eval(self):
         return self.v
@@ -112,6 +114,7 @@ class FakeOp:
         self.inputConnectors = [FakeConnector(self, 0)]
         self.pixels = None
         self.cooks = 0
+        self.menus = {}
 
     # -- identity
     @property
@@ -203,6 +206,10 @@ class FakeOp:
     # -- TOP api
     def numpyArray(self):
         return self.pixels
+
+    @property
+    def totalCooks(self):
+        return self.cooks
 
     def cook(self, force=False):
         self.cooks += 1

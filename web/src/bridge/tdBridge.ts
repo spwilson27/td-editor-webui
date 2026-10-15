@@ -2,7 +2,7 @@ import type { CanvasMode, EditorEngine, LayerSpec, Rect } from '../engine/types'
 import type { FileResult } from '../state/filesSlice';
 import type { InputItem } from '../state/inputsSlice';
 import {
-  FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, FRAME_VIEW, MAX_BAND_PAYLOAD, PROTOCOL_VERSION,
+  FRAME_BASE, FRAME_LAYER_PREVIEW, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, FRAME_VIEW, MAX_BAND_PAYLOAD, PROTOCOL_VERSION,
   decodeFrame, decodeTdMessage, encodeBands, encodeMessage, isStale, type ChoosePurpose, type TdMessage, type TopItem, type ViewMode, type ViewRect, type WebMessage,
 } from './codec';
 
@@ -32,6 +32,10 @@ export interface BridgeStatus {
   setFiles?(f: { projectFile: string; pngFile: string }): void;
   /** v6: a `fileResult` that no dialog request is waiting for (TD pulses). */
   onFileResult?(r: FileResult): void;
+  /** v7: state of a tdPreview layer's TD render: 'pending' (announced, not fetched yet) or 'ready' (the engine shows TD's image). */
+  setLayerPreview?(layerId: string, state: 'pending' | 'ready'): void;
+  /** v7: all TD layer renders are void (document reload). */
+  clearLayerPreviews?(): void;
 }
 export type { FileResult, FileOp } from '../state/filesSlice';
 export type { InputItem } from '../state/inputsSlice';
@@ -52,11 +56,15 @@ export interface Bridge {
   /** v5: tell TD the canvas size / mode (active, loaded page only). Returns false when nothing was sent. */
   setCanvas(w: number, h: number, mode: CanvasMode): boolean;
   /** v6 files (written/read by TD). `path` omitted = the TD parameter value. Reject when not linked / on timeout; resolve with TD's `fileResult` (ok may be false). */
-  saveProject(path?: string): Promise<FileResult>;
+  saveProject(path?: string, opts?: { includeHistory?: boolean }): Promise<FileResult>;
+  /** v7: remove the undo history TD stores (empty POST /history). The page uploads again after its next history change. */
+  clearStoredHistory(): Promise<void>;
   openProject(path?: string): Promise<FileResult>;
   exportPng(path?: string): Promise<FileResult>;
   /** v6: TD shows a file chooser (panel clients have no file input). Resolves with the chosen path, null when cancelled. */
-  chooseFile(purpose: Exclude<ChoosePurpose, 'placeImage'>): Promise<string | null>;
+  chooseFile(purpose: Exclude<ChoosePurpose, 'placeImage' | 'readText'>): Promise<string | null>;
+  /** v7: TD shows a file chooser and reads the picked file as UTF-8 text (.cube LUTs in panel clients). null = cancelled; rejects with TD's reason (too large, binary, unreadable). */
+  readTextFile(fileTypes?: string[]): Promise<{ path: string; text: string } | null>;
   /** v6 Place Image through TD's chooser: resolves the new layer id (named after the file), null when cancelled. Rejects on topError / disconnect / 5 min timeout. */
   placeImageViaTd(): Promise<string | null>;
 }
@@ -82,6 +90,9 @@ const LATENCY_WINDOW = 60, SENT_KEEP = 512;
 export const RENDER_LAYER_TIMEOUT_MS = 30000;
 export const FILE_OP_TIMEOUT_MS = 60000;
 export const CHOOSE_FILE_TIMEOUT_MS = 300000, PLACE_IMAGE_TIMEOUT_MS = 300000; // the user is picking a file
+export const HISTORY_UPLOAD_DELAY_MS = 2000; // v7: debounce after the last history change
+export const HISTORY_MAX_FAILURES = 3; // consecutive failed uploads before TD's stored history is cleared
+export const HISTORY_MAX_STEPS = 50, HISTORY_MAX_BYTES = 256 * 1024 * 1024;
 export const LIST_TOPS_TIMEOUT_MS = 10000, IMPORT_TOP_TIMEOUT_MS = 30000;
 
 export function resolveWsUrl(search: string, loc: { protocol: string; host: string }): string {
@@ -192,16 +203,27 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   // view
   let viewState: ViewState | null = null, viewQueued = false, viewDirty = false;
   let viewFetching = false, viewRefetch = false, viewNotice: { frameId: number; applied: number; at: number } | null = null;
+  // v7: layer previews (per layer single flight, newest notice wins), active layer, history persistence
+  interface PreviewState { frameId: number; fetching: boolean; refetch: boolean; attempts: number }
+  const previews = new Map<string, PreviewState>();
+  const previewReady = new Set<string>();
+  let activeSent: string | null | undefined, activeQueued = false; // undefined = nothing sent yet (a null id is sent too)
+  let historyDirty = false, historyTouched = false, restoring = false, historyTimer: ReturnType<typeof setTimeout> | null = null;
+  let historyChain: Promise<void> = Promise.resolve();
+  let uploadedKey = '', uploadedRev = -1, uploadFailures = 0, lastBlobBytes = 0;
   // v4 TOP import
   let requestSeq = 0;
   const pendingTops = new Map<string, { resolve: (items: TopItem[]) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   const pendingImports = new Map<string, { resolve: (w: number, h: number) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   const pendingFiles = new Map<string, { resolve: (r: FileResult) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   const pendingChoose = new Map<string, { resolve: (p: string | null) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  const pendingRead = new Map<string, { resolve: (r: { path: string; text: string } | null) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   const placeWatch = new Map<string, (path: string | null) => void>(); // placeImageViaTd: fileChosen listeners
   const failPending = (msg: string) => {
     for (const p of pendingChoose.values()) { clearTimeout(p.timer); p.reject(new Error(msg)); }
     pendingChoose.clear();
+    for (const p of pendingRead.values()) { clearTimeout(p.timer); p.reject(new Error(msg)); }
+    pendingRead.clear();
     placeWatch.clear();
     for (const p of pendingFiles.values()) { clearTimeout(p.timer); p.reject(new Error(msg)); }
     pendingFiles.clear();
@@ -212,6 +234,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   };
   // latency
   const sentAt = new Map<number, number>();
+  const unacked = new Map<number, number>(); // slot -> newest SURFACE frameId sent and not yet reported by TD's `applied`
   const samples: number[] = [], viewSamples: number[] = [];
 
   const isOpen = () => ws !== null && ws.readyState === 1;
@@ -244,7 +267,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     if (spec.rev === lastDocRev) return;
     lastDocRev = spec.rev;
     tdRev = spec.rev;
-    sendJson({ t: 'doc', rev: spec.rev, layers: spec.layers, guides: spec.guides, canvas: spec.canvas });
+    sendJson({ t: 'doc', rev: spec.rev, layers: spec.layers, guides: spec.guides, canvas: spec.canvas, brushPresets: spec.brushPresets ?? [] });
   }
 
   function queueDoc() {
@@ -285,6 +308,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       const id = frameId;
       frameId = (frameId + 1) >>> 0;
       sentAt.set(id, now());
+      unacked.set(slot, id);
       if (sentAt.size > SENT_KEEP) sentAt.delete(sentAt.keys().next().value!);
       for (const band of encodeBands({ type: FRAME_SURFACE, slot, frameId: id, docW: sz.w, docH: sz.h, rect, pixels, maxPayload: MAX_BAND_PAYLOAD })) {
         ws!.send(band as BufferSource);
@@ -300,10 +324,211 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         if (canSend() && !unsafe.has(e.slot)) { dirty.set(e.slot, unionRect(dirty.get(e.slot), e.rect)); schedule(); }
         break;
       case 'docspec': if (canSend()) { queueDoc(); syncCanvas(); } break;
+      case 'structure': queueActiveLayer(); break;
+      case 'history':
+        if (restoring) break;
+        historyTouched = true;
+        historyDirty = true;
+        scheduleHistoryUpload();
+        break;
       case 'resize': if (canSend()) { queueDoc(); syncCanvas(); } break; // v5: the canvas size never reallocates surfaces
       default: break;
     }
   });
+
+  // ---- v7: active layer ----
+
+  /** The active client tells TD which layer is being edited (TD's set_active_layer); coalesced to one message per frame, only changes. */
+  function queueActiveLayer() {
+    if (activeQueued || !canSend()) return;
+    activeQueued = true;
+    raf(() => {
+      activeQueued = false;
+      if (disposed || !canSend() || !isOpen()) return;
+      const id = engine.activeLayerId();
+      if (id === activeSent || (id === null && activeSent === undefined)) return;
+      if (docPending) sendDocNow(); // TD must know a just-created layer before it is named active
+      activeSent = id;
+      sendJson({ t: 'activeLayer', id });
+    });
+  }
+
+  // ---- v7: history persistence ----
+
+  const needsHistoryUpload = (beforeSave: boolean) => canSend() && isOpen() && !!clientId && (historyDirty || (beforeSave && engine.docSpec().rev !== uploadedRev && uploadedRev !== -1));
+
+  /** Debounce: 2 s, plus 100 ms per MB of the last blob (a large history is quieter), at most 10 s. */
+  const historyDelay = () => HISTORY_UPLOAD_DELAY_MS + Math.min(8000, Math.floor(lastBlobBytes / 1048576) * 100);
+
+  function scheduleHistoryUpload(delay = historyDelay()) {
+    if (historyTimer) clearTimeout(historyTimer);
+    historyTimer = null;
+    if (disposed || !canSend()) return;
+    historyTimer = setTimeout(() => { historyTimer = null; void uploadHistory(false); }, delay);
+  }
+
+  const historyVersion = (): string | null => {
+    const v = engine.historyVersion?.();
+    return v === undefined ? null : String(v);
+  };
+
+  /** Stale history must never be restorable: when the current one cannot be sent, TD's stored copy is cleared (empty body). Best effort, once. */
+  async function dropStaleHistory(rev: number, sock: WebSocket | null) {
+    uploadedKey = ''; uploadedRev = -1;
+    const ctrl = new AbortController();
+    aborts.add(ctrl);
+    try {
+      await doFetch(`${httpBase}/history?${query(`&rev=${rev}`)}`, { method: 'POST', body: new Uint8Array(0) as BufferSource, headers: { 'Content-Type': 'application/octet-stream' }, signal: ctrl.signal });
+    } catch { /* offline: TD drops history of older revisions itself */ } finally {
+      aborts.delete(ctrl);
+      if (ws !== sock) historyDirty = false;
+    }
+  }
+
+  /** Cheap fingerprint of a blob (length + FNV-1a over at most ~1 MB of strided samples): unchanged history is not sent again. */
+  function blobKey(rev: number, b: Uint8Array): string {
+    let h = 2166136261;
+    const stride = Math.max(1, Math.floor(b.length / 262144));
+    for (let i = 0; i < b.length; i += stride) h = Math.imul(h ^ b[i], 16777619) >>> 0;
+    return `${rev}:${b.length}:${h}`;
+  }
+
+  /** POST /history?…&rev= with engine.serializeHistory(50, 256 MB). Serialised; skipped when nothing changed; never while loading / standby. */
+  function uploadHistory(beforeSave: boolean): Promise<void> {
+    historyChain = historyChain.then(async () => {
+      if (disposed || !needsHistoryUpload(beforeSave)) return;
+      if (docPending || lastDocRev !== engine.docSpec().rev) sendDocNow(); // TD stores the history with the revision it belongs to
+      const rev = engine.docSpec().rev;
+      const sock = ws;
+      // change detection: the engine's history version when it has one (exact), else a sampled fingerprint of the blob
+      const ver = historyVersion();
+      if (ver !== null && `${rev}:v${ver}` === uploadedKey) { historyDirty = false; return; }
+      let blob: Uint8Array;
+      try { blob = engine.serializeHistory(HISTORY_MAX_STEPS, HISTORY_MAX_BYTES); } catch {
+        historyDirty = false;
+        await dropStaleHistory(rev, sock); // cannot serialise: the stored history is stale now
+        return;
+      }
+      if (blob.byteLength > HISTORY_MAX_BYTES) { historyDirty = false; await dropStaleHistory(rev, sock); return; }
+      lastBlobBytes = blob.byteLength;
+      const key = ver !== null ? `${rev}:v${ver}` : blobKey(rev, blob);
+      historyDirty = false;
+      if (key === uploadedKey) return;
+      const ctrl = new AbortController();
+      aborts.add(ctrl);
+      try {
+        const res = await doFetch(`${httpBase}/history?${query(`&rev=${rev}`)}`, { method: 'POST', body: blob as BufferSource, headers: { 'Content-Type': 'application/octet-stream' }, signal: ctrl.signal });
+        if (res.status === 403) { rejectToken(); return; }
+        if (res.ok) { uploadedKey = key; uploadedRev = rev; uploadFailures = 0; } else throw new Error(`HTTP ${res.status}`);
+      } catch {
+        if (disposed || ws !== sock) return; // disconnected: the next session starts clean
+        if (++uploadFailures >= HISTORY_MAX_FAILURES) { uploadFailures = 0; historyDirty = false; await dropStaleHistory(rev, sock); return; }
+        historyDirty = true; // retry later (back off, the change is still unsent)
+        scheduleHistoryUpload(HISTORY_UPLOAD_DELAY_MS * 5);
+      } finally {
+        aborts.delete(ctrl);
+      }
+    }).catch(() => {});
+    return historyChain;
+  }
+
+  /** After a complete document load: GET /history; restore it when its rev is the loaded document's. Silent on 404 / mismatch / corrupt blobs. */
+  async function restoreHistory(loadedRev: number, my: number) {
+    const sock = ws, epoch = docEpoch;
+    historyTouched = false;
+    const ctrl = new AbortController();
+    aborts.add(ctrl);
+    const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS * 3);
+    try {
+      const res = await doFetch(`${httpBase}/history?${query()}`, { cache: 'no-store', signal: ctrl.signal });
+      if (res.status === 404) return;
+      if (res.status === 403) { rejectToken(); return; }
+      if (!res.ok) return;
+      const hdr = res.headers.get('X-Doc-Rev');
+      const buf = await res.arrayBuffer();
+      if (disposed || ws !== sock || epoch !== docEpoch || my !== loadToken || loading || historyTouched || !active || !authoritative) return;
+      const num = (v: string | null) => (v === null || v.trim() === '' ? NaN : Number(v));
+      const docRev = num(hdr);
+      if (!Number.isFinite(docRev) || docRev !== loadedRev) return; // TD's document is not the one that was loaded
+      // X-History-Rev = the revision embedded in the blob (differs from X-Doc-Rev after Open Project rebased the revision)
+      const histRev = num(res.headers.get('X-History-Rev'));
+      const rev = Number.isFinite(histRev) ? histRev : docRev;
+      restoring = true;
+      let ok = false;
+      try { ok = engine.restoreHistory(new Uint8Array(buf), rev); } catch { ok = false; } finally { restoring = false; }
+      if (ok) { historyDirty = false; uploadedRev = loadedRev; uploadedKey = ''; }
+      else sendJson({ t: 'log', level: 'warn', msg: 'undo history from TouchDesigner could not be restored' });
+    } catch {
+      /* no history: start empty */
+    } finally {
+      clearTimeout(timeout);
+      aborts.delete(ctrl);
+    }
+  }
+
+  // ---- v7: layer previews (GET /layer) ----
+
+  function pullPreview(layerId: string, frameId: number) {
+    let st = previews.get(layerId);
+    if (!st) previews.set(layerId, (st = { frameId, fetching: false, refetch: false, attempts: 0 }));
+    st.frameId = frameId;
+    if (!previewReady.has(layerId)) status.setLayerPreview?.(layerId, 'pending');
+    if (st.fetching) { st.refetch = true; return; }
+    st.fetching = true;
+    st.attempts = 0;
+    void fetchPreview(layerId, st).finally(() => {
+      st.fetching = false;
+      if (st.refetch && !disposed && previews.get(layerId) === st) { st.refetch = false; pullPreview(layerId, st.frameId); }
+    });
+  }
+
+  /** True while TD may still lack pixels the page painted on the layer (sent but unacknowledged, or not sent yet): a TD render fetched now would be older than the page's own pixels. */
+  function surfacesPending(layerId: string): boolean {
+    if (!unacked.size && !dirty.size) return false;
+    const l = engine.docSpec().layers.find((x) => x.id === layerId);
+    const busy = (slot: number) => unacked.has(slot) || dirty.has(slot);
+    if (!l || l.kind === 'adjustment' || l.kind === 'group') return [...unacked.keys(), ...dirty.keys()].length > 0; // their result depends on every layer below / inside
+    return (l.slot != null && busy(l.slot)) || (!!l.mask && busy(l.mask.slot));
+  }
+
+  async function fetchPreview(layerId: string, st: PreviewState): Promise<void> {
+    const sock = ws, epoch = docEpoch;
+    const ctrl = new AbortController();
+    aborts.add(ctrl);
+    const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const res = await doFetch(`${httpBase}/layer?${query(`&layerId=${encodeURIComponent(layerId)}&frameId=${st.frameId}`)}`, { cache: 'no-store', signal: ctrl.signal });
+      if (res.status === 404) { previews.delete(layerId); return; } // not rendered (any more): a later notice follows
+      if (res.status === 403) { rejectToken(); return; }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const buf = await res.arrayBuffer();
+      if (disposed || ws !== sock || epoch !== docEpoch) return;
+      const r = decodeFrame(buf);
+      if (!r.ok || r.frame.type !== FRAME_LAYER_PREVIEW || isStale(r.frame, engine.width, engine.height)) return;
+      if (!engine.layers().some((l) => l.id === layerId)) return;
+      if (surfacesPending(layerId)) return; // older than the page's pixels: TD announces a newer render once it applied them
+      if (!engine.tdPreviewLayers().includes(layerId)) return; // the engine would ignore it (layer no longer needs TD's render)
+      engine.setLayerPreview(layerId, r.frame.payload);
+      previewReady.add(layerId);
+      status.setLayerPreview?.(layerId, 'ready');
+    } catch {
+      if (disposed || ws !== sock) return;
+      if (st.attempts++ === 0) {
+        await new Promise<void>((resolve) => { retryTimer = setTimeout(() => { retryTimer = null; resolve(); }, FETCH_RETRY_MS); });
+        if (!disposed && ws === sock && epoch === docEpoch) await fetchPreview(layerId, st);
+      }
+    } finally {
+      clearTimeout(timeout);
+      aborts.delete(ctrl);
+    }
+  }
+
+  function clearPreviews() {
+    previews.clear();
+    for (const id of previewReady) { try { engine.setLayerPreview(id, null); } catch { /* layer gone */ } }
+    previewReady.clear();
+    status.clearLayerPreviews?.();
+  }
 
   /** Tell TD about a canvas size / mode change that did not come from TD (undo / redo / jumpTo, the dialog). */
   function syncCanvas() {
@@ -330,12 +555,18 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     lastDocRev = -1;
     if (isOpen()) sendDocNow();
     markFull();
+    activeSent = undefined;
+    queueActiveLayer();
   }
 
   function setActive(a: boolean) {
     active = a;
     status.setActive(a);
     if (!a) {
+      unacked.clear();
+      activeSent = undefined;
+      historyDirty = false;
+      if (historyTimer) { clearTimeout(historyTimer); historyTimer = null; }
       dirty.clear();
       docPending = false;
       if (sendTimer) { clearTimeout(sendTimer); sendTimer = null; }
@@ -361,6 +592,9 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     loadPending = true;
     loadIncomplete = true;
     authoritative = false;
+    unacked.clear();
+    historyDirty = false;
+    if (historyTimer) { clearTimeout(historyTimer); historyTimer = null; }
     dirty.clear();
     docPending = false;
     if (sendTimer) { clearTimeout(sendTimer); sendTimer = null; }
@@ -399,11 +633,13 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     loading = true;
     docEpoch++;
     dirty.clear();
+    unacked.clear();
     unsafe.clear();
     const sock = ws;
     let complete = false;
     try {
-      engine.loadDocument({ rev: m.rev, width: m.docW, height: m.docH, layers: m.layers, guides: m.guides, canvas: m.canvas });
+      clearPreviews();
+      engine.loadDocument({ rev: m.rev, width: m.docW, height: m.docH, layers: m.layers, guides: m.guides, canvas: m.canvas, ...(m.brushPresets ? { brushPresets: m.brushPresets } : {}) });
       const slots: number[] = [];
       const sizes = slotSizesOf(m.layers, m.docW, m.docH);
       for (const l of m.layers) {
@@ -453,6 +689,9 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
           endLoadState();
           // Layers that setInputs auto-created differ from TD's stored document: TD must get them.
           if (isOpen() && active) { const now2 = engine.docSpec(); if (now2.rev !== revLoaded && specKey(now2) !== keyLoaded) sendDocNow(); }
+          activeSent = undefined;
+          queueActiveLayer();
+          if (isOpen() && active) void restoreHistory(m.rev, my);
         } else if (loadPending && !disposed) {
           armLoadRetry(); // stay non-authoritative; ask TD again
           status.setNotice('Loading document from TouchDesigner… (retrying)');
@@ -515,9 +754,11 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         authoritative = false;
         tdHasDocument = m.hasDocument;
         adoptCanvas(m.doc.w, m.doc.h, m.doc.mode ?? engine.canvasMode());
-        // Another client edited TD's document while this page was away: reload instead of overwriting.
-        const newer = synced && m.rev !== null && tdRev !== null && m.rev > tdRev;
-        const needsLoad = m.hasDocument && (!synced || loadIncomplete || newer);
+        // TD's document is another revision than the one this page last synced (another client edited it, or Open Project replaced it while we
+        // were away): load it instead of overwriting. The page's offline edits are kept (and pushed) only when TD still has the revision we synced.
+        const moved = synced && m.rev !== null && tdRev !== null && m.rev !== tdRev;
+        if (moved && m.hasDocument && engine.docSpec().rev !== lastDocRev) status.setNotice('Document changed in TouchDesigner while you were offline; your offline edits were discarded');
+        const needsLoad = m.hasDocument && (!synced || loadIncomplete || moved);
         setActive(m.active);
         if (m.inputs) {
           docEpoch++;
@@ -536,6 +777,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         break;
       case 'docSize':
         docEpoch++;
+        clearPreviews();
         if (loading || loadPending) { pendingTd.size = m; break; } // never adopt mid-load: applied when the load completes
         adoptCanvas(m.w, m.h, m.mode);
         break;
@@ -555,6 +797,16 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         onReload();
         break;
       case 'fileChosen': {
+        const r = pendingRead.get(m.requestId);
+        if (r) {
+          pendingRead.delete(m.requestId);
+          clearTimeout(r.timer);
+          if (m.error !== undefined) r.reject(new Error(m.error));
+          else if (m.path === null) r.resolve(null);
+          else if (m.text !== undefined) r.resolve({ path: m.path, text: m.text });
+          else r.reject(new Error('TouchDesigner returned no file contents'));
+          break;
+        }
         const c = pendingChoose.get(m.requestId);
         if (c) { pendingChoose.delete(m.requestId); clearTimeout(c.timer); c.resolve(m.path); break; }
         placeWatch.get(m.requestId)?.(m.path);
@@ -569,11 +821,15 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         if (p) { pendingFiles.delete(m.requestId!); clearTimeout(p.timer); p.resolve(r); } else status.onFileResult?.(r);
         break;
       }
+      case 'layerPreview':
+        pullPreview(m.layerId, m.frameId);
+        break;
       case 'view':
         viewNotice = { frameId: m.frameId, applied: m.appliedFrameId, at: now() };
         pullView();
         break;
       case 'applied': {
+        for (const [slot, id] of unacked) if (((m.frameId - id) >>> 0) < 0x80000000) unacked.delete(slot);
         const t = takeSent(m.frameId);
         if (t !== undefined) recordLatency(samples, now() - t, (x) => status.setLatency?.(x));
         break;
@@ -655,9 +911,11 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   /** TD replaced its stored document (Open Project): drop ours and load TD's again. */
   function onReload() {
     loadToken++; // cancels an in-flight load
+    clearPreviews();
     loading = false;
     docEpoch++;
     dirty.clear();
+    unacked.clear();
     unsafe.clear();
     docPending = false;
     if (sendTimer) { clearTimeout(sendTimer); sendTimer = null; }
@@ -677,13 +935,23 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     flush(true);
   }
 
-  function chooseFile(purpose: Exclude<ChoosePurpose, 'placeImage'>): Promise<string | null> {
+  function chooseFile(purpose: Exclude<ChoosePurpose, 'placeImage' | 'readText'>): Promise<string | null> {
     if (!isOpen() || !clientId) return Promise.reject(new Error('Not connected to TouchDesigner'));
     const requestId = `c${++requestSeq}`;
     return new Promise<string | null>((resolve, reject) => {
       const timer = setTimeout(() => { pendingChoose.delete(requestId); reject(new Error('TouchDesigner did not answer')); }, CHOOSE_FILE_TIMEOUT_MS);
       pendingChoose.set(requestId, { resolve, reject, timer });
       sendJson({ t: 'chooseFile', requestId, purpose });
+    });
+  }
+
+  function readTextFile(fileTypes?: string[]): Promise<{ path: string; text: string } | null> {
+    if (!isOpen() || !clientId) return Promise.reject(new Error('Not connected to TouchDesigner'));
+    const requestId = `x${++requestSeq}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { pendingRead.delete(requestId); reject(new Error('TouchDesigner did not answer')); }, CHOOSE_FILE_TIMEOUT_MS);
+      pendingRead.set(requestId, { resolve, reject, timer });
+      sendJson({ t: 'chooseFile', requestId, purpose: 'readText', ...(fileTypes ? { fileTypes } : {}) });
     });
   }
 
@@ -712,15 +980,40 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     return engine.importImage(frame.payload, frame.w, frame.h, name);
   }
 
-  function fileOp(op: FileResult['op'], path?: string): Promise<FileResult> {
+  function fileOp(op: FileResult['op'], path?: string, opts?: { includeHistory?: boolean }): Promise<FileResult> {
     if (!isOpen() || !clientId) return Promise.reject(new Error('Not connected to TouchDesigner'));
     const requestId = `f${++requestSeq}`;
     if (op !== 'openProject') syncForFile();
-    return new Promise<FileResult>((resolve, reject) => {
+    const send = () => new Promise<FileResult>((resolve, reject) => {
       const timer = setTimeout(() => { pendingFiles.delete(requestId); reject(new Error('TouchDesigner did not answer')); }, FILE_OP_TIMEOUT_MS);
       pendingFiles.set(requestId, { resolve, reject, timer });
-      sendJson({ t: op, requestId, ...(path !== undefined ? { path } : {}) });
+      sendJson({ t: op, requestId, ...(path !== undefined ? { path } : {}), ...(op === 'saveProject' && opts?.includeHistory !== undefined ? { includeHistory: opts.includeHistory } : {}) } as WebMessage);
     });
+    // v7: the undo history goes to TD before it writes the project, so the file carries the current history
+    if (op === 'saveProject' && opts?.includeHistory !== false && needsHistoryUpload(true)) return uploadHistory(true).then(() => { if (!isOpen()) throw new Error('Disconnected from TouchDesigner'); return send(); });
+    return send();
+  }
+
+  /** File ▸ Clear stored undo history: TD forgets the blob (it would keep erased content recoverable in shared .toe / .redoc files). */
+  function clearStoredHistory(): Promise<void> {
+    if (!isOpen() || !clientId) return Promise.reject(new Error('Not connected to TouchDesigner'));
+    if (!canSend()) return Promise.reject(new Error('Only the active editor can clear the stored history'));
+    const run = historyChain.then(async () => {
+      if (historyTimer) { clearTimeout(historyTimer); historyTimer = null; }
+      historyDirty = false;
+      const ctrl = new AbortController();
+      aborts.add(ctrl);
+      try {
+        const res = await doFetch(`${httpBase}/history?${query(`&rev=${engine.docSpec().rev}`)}`, { method: 'POST', body: new Uint8Array(0) as BufferSource, headers: { 'Content-Type': 'application/octet-stream' }, signal: ctrl.signal });
+        if (res.status === 403) { rejectToken(); throw new Error(TOKEN_EXPIRED_MESSAGE); }
+        if (!res.ok) throw new Error(`TouchDesigner answered HTTP ${res.status}`);
+        uploadedKey = ''; uploadedRev = -1;
+      } finally {
+        aborts.delete(ctrl);
+      }
+    });
+    historyChain = run.catch(() => {});
+    return run;
   }
 
   function listTops(): Promise<TopItem[]> {
@@ -935,6 +1228,11 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       loadToken++;
       pendingTd = {};
       baseStates.clear();
+      previews.clear();
+      unacked.clear();
+      activeSent = undefined;
+      historyDirty = false;
+      if (historyTimer) { clearTimeout(historyTimer); historyTimer = null; }
       knownInputs = [];
       tdCanvas = null;
       endLoadState();
@@ -973,10 +1271,12 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     importTop,
     renderLayer,
     setCanvas,
-    saveProject: (path) => fileOp('saveProject', path),
+    saveProject: (path, opts) => fileOp('saveProject', path, opts),
+    clearStoredHistory,
     openProject: (path) => fileOp('openProject', path),
     exportPng: (path) => fileOp('exportPng', path),
     chooseFile,
+    readTextFile,
     placeImageViaTd,
     dispose() {
       disposed = true;
@@ -989,6 +1289,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       if (loadRetry) clearTimeout(loadRetry);
       if (retryTimer) clearTimeout(retryTimer);
       if (requestTimer) clearTimeout(requestTimer);
+      if (historyTimer) clearTimeout(historyTimer);
       const s = ws;
       ws = null;
       s?.close();

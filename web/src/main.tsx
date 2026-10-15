@@ -24,6 +24,7 @@ function boot() {
     setLoading: store.setLoading, setLatency: store.setLatency, setViewLatency: store.setViewLatency, setViewFrame: store.setViewFrame,
     setFonts: store.setFonts, docName: store.docName,
     setInputs: store.setInputs, setFiles: store.setFiles, onFileResult: store.onFileResult,
+    setLayerPreview: store.setLayerPreview, clearLayerPreviews: store.clearLayerPreviews,
   };
   store.clientKind.value = resolveClient(location.search);
   let bridge: Bridge;

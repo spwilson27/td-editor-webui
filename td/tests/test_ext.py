@@ -215,7 +215,7 @@ def test_first_client_becomes_active_and_gets_hello(env):
     env.pump()
     a = env.connect("external")
     (hello,) = env.s.messages(a, "hello")
-    assert hello["protocol"] == 6 and hello["active"] is True and hello["hasInput"] is False
+    assert hello["protocol"] == 7 and hello["active"] is True and hello["hasInput"] is False
     assert hello["doc"] == {"w": 64, "h": 32, "mode": "input"} and hello["inputs"] == [IN(1)] and "baseSize" not in hello and hello["maxSendFps"] == 30
     assert hello["hasDocument"] is False and hello["rev"] is None
 
@@ -628,7 +628,8 @@ def test_doc_is_applied_to_the_network_and_stored_in_doc_state(env):
     assert env.o.doc_state.text == ""  # written once per pump, not per message
     env.pump()
     stored = json.loads(env.o.doc_state.text)
-    assert stored == {"rev": 5, "layers": DOC, "guides": {"h": [], "v": []}, "canvas": {"mode": "input"}}
+    assert stored == {"rev": 5, "layers": DOC, "guides": {"h": [], "v": []}, "canvas": {"mode": "input"},
+                      "brushPresets": []}
 
 
 def test_doc_state_written_once_per_pump_with_the_newest_doc(env):
@@ -774,7 +775,7 @@ def test_fresh_load_flow_request_doc_then_surface_per_slot(env):
     env.send(b, {"t": "requestDoc"})
     (st,) = env.s.messages(b, "docState")
     assert st == {"t": "docState", "rev": 3, "layers": DOC_SIZED, "docW": 64, "docH": 32, "guides": {"h": [], "v": []},
-                  "canvas": {"mode": "input"}}
+                  "canvas": {"mode": "input"}, "brushPresets": []}
     for s, im in imgs.items():
         h, got = env.dump(b, s)
         assert (h.type, h.slot, h.frame_end, (h.x, h.y, h.w, h.h)) == (P.TYPE_SURFACE_DUMP, s, True, (0, 0, 64, 32))

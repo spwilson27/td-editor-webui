@@ -1,6 +1,6 @@
 import { remapShape, remapText, transformFor } from '../../src/state/transform';
 import type {
-  CloneOptions, DodgeBurnRange, Effect,
+  BrushDynamics, BrushPreset, CloneOptions, DodgeBurnRange, Effect, TipShape,
   AdjustmentSpec, AdjustmentType, Anchor, BlendMode, CanvasMode, DocSpec, EditorEngine, EngineEvent, Guides, HistoryEntry, LayerInfo, LayerSpec, LayerTransform,
   PaintTarget, Rect, SelectionOptions, ShapeSpec, ShapeType, SnapOptions, TextSpec, ToolContext, ToolId, ToolPointer,
 } from '../../src/engine/types';
@@ -21,6 +21,7 @@ export const DEFAULT_ADJUSTMENTS: Record<AdjustmentType, AdjustmentSpec> = {
   blur: { type: 'blur', radius: 8 },
   invert: { type: 'invert' },
   threshold: { type: 'threshold', level: 0.5 },
+  filter: { type: 'filter', effect: { type: 'blur', enabled: true, radius: 8 } as unknown as Effect },
 };
 
 /** Minimal in-memory EditorEngine for UI tests. Records calls; paints dabs into a lazily created canvas. */
@@ -170,7 +171,7 @@ export class FakeEngine implements EditorEngine {
       }
     };
     walk(null);
-    return { rev: this.rev, width: this.width, height: this.height, layers, guides: { h: [...this.guideLists.h], v: [...this.guideLists.v] }, canvas: { mode: this.mode } };
+    return { rev: this.rev, width: this.width, height: this.height, layers, guides: { h: [...this.guideLists.h], v: [...this.guideLists.v] }, canvas: { mode: this.mode }, brushPresets: this.presets.map((p) => JSON.parse(JSON.stringify(p)) as BrushPreset) };
   }
   surfaceSlots() { return this.store.flatMap((l) => [...(l.slot !== null ? [l.slot] : []), ...(l.mask ? [l.mask.slot] : [])]); }
   /** Surface size of a slot: its layer's surface; a mask has its layer's surface size; document size otherwise. */
@@ -210,6 +211,7 @@ export class FakeEngine implements EditorEngine {
     this.nextSlot = Math.max(0, ...this.surfaceSlots()) + 1;
     this.active = this.store[this.store.length - 1]?.id ?? 'base';
     this.rev = spec.rev;
+    this.presets = (spec.brushPresets ?? []).map((p) => JSON.parse(JSON.stringify(p)) as BrushPreset);
     this.entries = []; this.index = -1;
     this.calls.push('loadDocument');
     this.emit({ type: 'structure' }); this.emit({ type: 'docspec' }); this.emit({ type: 'history' });
@@ -583,5 +585,77 @@ export class FakeEngine implements EditorEngine {
   }
   writeInput(input: number, rect: Rect, rgba: Uint8Array | Uint8ClampedArray) { this.inputWrites.push({ input, rect, len: rgba.length }); }
   commitInput(input: number) { this.inputCommits.push(input); }
+
+  // ---- v6 (phase B): brushes, history persistence, tdPreview layers ----
+  tip: TipShape = 'round';
+  dynamics: BrushDynamics | null = null;
+  customTip: { w: number; h: number; alpha: Uint8Array } | null = null;
+  /** What tipFromSelection() answers (null = no selection). */
+  selectionTip: { w: number; h: number; alpha: Uint8Array } | null = { w: 4, h: 4, alpha: new Uint8Array(16).fill(255) };
+  presets: BrushPreset[] = [];
+  /** Effect / filter types that need TD's render (tdPreviewLayers()). */
+  previewTypes = new Set<string>();
+  /** Layer ids that always need TD's render (tests that do not care which filter causes it). */
+  previewIds = new Set<string>();
+  /** historyVersion() answer (null = the engine has none: the method is absent). */
+  historyVer: number | null = null;
+  /** Make serializeHistory throw. */
+  serializeFails = false;
+  layerPreviews = new Map<string, Uint8Array | null>();
+  /** serializeHistory / restoreHistory bookkeeping. */
+  serialized: { maxSteps: number; maxBytes: number }[] = [];
+  restored: { rev: number; len: number }[] = [];
+  /** Make restoreHistory refuse (corrupt blob) or throw. */
+  restoreResult: 'ok' | 'refuse' | 'throw' = 'ok';
+  setBrushTip(tip: TipShape, dynamics: BrushDynamics, customTip?: { w: number; h: number; alpha: Uint8Array }) {
+    this.tip = tip; this.dynamics = { ...dynamics }; this.customTip = customTip ?? null;
+    this.calls.push(`setBrushTip:${tip}:${JSON.stringify(dynamics)}${customTip ? `:custom${customTip.w}x${customTip.h}` : ''}`);
+  }
+  tipFromSelection() { return this.selectionTip; }
+  brushPresets(): BrushPreset[] { return this.presets.map((p) => JSON.parse(JSON.stringify(p)) as BrushPreset); }
+  setBrushPresets(presets: BrushPreset[]) {
+    this.presets = presets.map((p) => JSON.parse(JSON.stringify(p)) as BrushPreset);
+    this.calls.push(`setBrushPresets:${presets.length}`);
+    this.rev++;
+    this.emit({ type: 'docspec' });
+  }
+  /** Versioned blob: magic "FHST", u8 version, then JSON {rev, entries, index}. */
+  serializeHistory(maxSteps: number, maxBytes: number): Uint8Array {
+    this.serialized.push({ maxSteps, maxBytes });
+    if (this.serializeFails) throw new Error('cannot serialise');
+    const body = new TextEncoder().encode(JSON.stringify({ rev: this.rev, entries: this.entries.slice(-maxSteps), index: this.index }));
+    const out = new Uint8Array(5 + body.length);
+    out.set([0x46, 0x48, 0x53, 0x54, 1], 0);
+    out.set(body, 5);
+    return out;
+  }
+  restoreHistory(blob: Uint8Array, rev: number): boolean {
+    this.restored.push({ rev, len: blob.length });
+    this.calls.push(`restoreHistory:${rev}`);
+    if (this.restoreResult === 'throw') throw new Error('corrupt history');
+    if (this.restoreResult === 'refuse' || rev !== this.rev || blob.length < 5 || blob[0] !== 0x46 || blob[4] !== 1) return false;
+    try {
+      const j = JSON.parse(new TextDecoder().decode(blob.subarray(5))) as { entries: HistoryEntry[]; index: number };
+      this.entries = j.entries; this.index = j.index;
+    } catch { return false; }
+    this.emit({ type: 'history' });
+    return true;
+  }
+  /** v6: single-call creation (a test can delete the method to exercise the add + set + rename fallback). */
+  addFilterAdjustment(effect: Effect, name?: string): string {
+    this.calls.push(`addFilterAdjustment:${effect.type}`);
+    const id = this.add('adjustment', name ?? 'Filter', { type: 'filter', effect: JSON.parse(JSON.stringify(effect)) as Effect });
+    this.changed();
+    return id;
+  }
+  historyVersion(): number { return this.historyVer ?? this.entries.length * 1000 + this.index; }
+  tdPreviewLayers(): string[] {
+    const hit = (e: Effect) => this.previewTypes.has(e.type);
+    return this.store.filter((l) => this.previewIds.has(l.id) || l.effects.some(hit) || (l.adjustment?.type === 'filter' && hit(l.adjustment.effect))).map((l) => l.id);
+  }
+  setLayerPreview(layerId: string, rgba: Uint8Array | Uint8ClampedArray | null) {
+    this.layerPreviews.set(layerId, rgba ? new Uint8Array(rgba) : null);
+    this.calls.push(`setLayerPreview:${layerId}:${rgba ? rgba.length : 'null'}`);
+  }
   dispose() { this.listeners.clear(); }
 }

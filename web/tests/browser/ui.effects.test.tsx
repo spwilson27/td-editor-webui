@@ -37,13 +37,16 @@ describe('Effects tab', () => {
     expect(document.querySelector('[data-effects-panel]')).toBeTruthy();
     store.addGroup();
     await settle();
-    expect(q('[data-effects-hint]').textContent).toBe('Effects are available for pixel, text, shape and input layers.');
+    // v6: effects on groups (the group composite) and adjustment layers (the adjusted result)
+    expect(document.querySelector('[data-effects-hint]')).toBeNull();
+    expect(q('[data-effects-panel]')).toBeTruthy();
     store.addAdjustment('blur');
     await settle();
     // adjustment layers switch to the Adjustment tab; choose Effects again
     q('[role=tab]:nth-child(4)', q('[aria-label="Layer panels"]')).click();
     await settle();
-    expect(document.querySelector('[data-effects-hint]')).toBeTruthy();
+    expect(document.querySelector('[data-effects-hint]')).toBeNull();
+    expect(q('[data-effects-panel]')).toBeTruthy();
   });
 
   it('adds each of the 10 types with its default shape; experimental ones are labelled', async () => {
@@ -188,13 +191,13 @@ describe('Layer row fx button and badge', () => {
     expect(q('[data-layer="L1"] [data-fx-badge]').style.opacity).toBe('0.4');
   });
 
-  it('groups and adjustments get no fx button', async () => {
+  it('groups and adjustments get an fx button (v6)', async () => {
     store.addGroup();
     store.addAdjustment('invert');
     q('[role=tab]:nth-child(1)', q('[aria-label="Layer panels"]')).click();
     await settle();
-    expect(document.querySelectorAll('[data-layer] [data-act=fx]').length).toBe(2); // L1 + base
-    expect(store.canHaveEffects('group')).toBe(false);
-    expect(store.canHaveEffects('adjustment')).toBe(false);
+    expect(document.querySelectorAll('[data-layer] [data-act=fx]').length).toBe(4); // L1 + base + group + adjustment
+    expect(store.canHaveEffects('group')).toBe(true);
+    expect(store.canHaveEffects('adjustment')).toBe(true);
   });
 });

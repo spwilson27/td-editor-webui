@@ -1,5 +1,6 @@
 // v5 layer effects: defaults and the parameter schema that drives the Effects panel.
 import type { Effect, EffectType, RGBA } from '../engine/types';
+import { defaultFilter, filterLabel } from './filterSchema';
 
 export const EFFECT_ORDER: EffectType[] = [
   'dropShadow', 'outerGlow', 'innerGlow', 'stroke', 'bevel', 'colorOverlay',
@@ -41,7 +42,13 @@ export const EFFECT_FIELDS: Record<EffectType, EffectField[]> = {
 const BLACK: RGBA = { r: 0, g: 0, b: 0, a: 255 };
 const WHITE: RGBA = { r: 255, g: 255, b: 255, a: 255 };
 
-export function defaultEffect(type: EffectType): Effect {
+/** Display name of any effect or filter type. */
+export const effectLabel = (type: string): string => (type in EFFECT_LABELS ? EFFECT_LABELS[type as EffectType] : filterLabel(type));
+
+/** Default parameters of a v5 effect or a v6 library filter (spec defaults). */
+export function defaultEffect(name: string): Effect {
+  if (!(name in EFFECT_LABELS)) return defaultFilter(name);
+  const type = name as EffectType;
   switch (type) {
     case 'dropShadow': return { type, enabled: true, dx: 4, dy: 4, blur: 8, color: { ...BLACK }, opacity: 0.75 };
     case 'outerGlow': return { type, enabled: true, size: 8, color: { r: 255, g: 255, b: 190, a: 255 }, opacity: 0.75 };

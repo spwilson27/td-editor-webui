@@ -315,3 +315,19 @@ Extension (`ext.py`), all on the main thread, bounded per pump, nothing large on
   builds from the repo (common + each shader's include libraries + the shader; a missing DAT is reported and effects stay off). Filter parameters
   are not validated by `parse_doc` beyond `type` (name pattern) / `enabled`: TD clamps them with `effects.norm_params` (a COMP without them lets the network look for the repo files; `Status` shows `effects unavailable: ...` when it cannot).
 - **chooseFile.** See PROTOCOL.md §8.1; `ext._choose_dialog` / `ext._make_movie` are the TD-only seams.
+
+## 10. Protocol v7 additions (DESIGN_V6 phase B): `ext.py`, `protocol.py`, `frames.py`
+
+See `PROTOCOL.md` section 9 for the wire details. Extension behaviour:
+
+- **Documents.** `parse_doc(msg, fx)` accepts filter-library types in `effects[]`, `adjustment: {type:"filter", effect}`, effects on group /
+  adjustment layers and `brushPresets`; filter parameters are checked for JSON sanity and run through `effects.norm_params` (never range-rejected).
+  The stored document (`doc_state`, `.redoc` `doc.json`) carries `brushPresets`.
+- **tdPreview layer streams** (`_poll_layer_previews`): per flagged layer a `_Pipe` (frame type 7) fed from `network.layer_preview_source`,
+  change token `network.layer_preview_token`; notices per client + layer (`_Client.lp`), `GET /layer`. Pipes exist only while an editor is
+  active; stats `lpreadback / lpconvert / lppublish`.
+- **History**: COMP storage key `raster_history` = `(rev, bytes)`; see PROTOCOL.md. `.redoc` gets `history.bin` and `meta.historyRev`.
+- **Hints**: `_sync_hints` (pump step before the uploads) forwards `activeLayer` and the content bounds tracked from SURFACE tiles to
+  `network.set_active_layer` / `set_content_bounds` and re-applies the stack once when either changed.
+- **`chooseFile readText`**: file dialog + UTF-8 read (<= 12 MB) in the pump, `fileChosen.text`.
+- Tests: `td/tests/test_ext_v7.py`, `test_protocol_v7.py`; live: `scripts/validate_td.py` steps 39-47.

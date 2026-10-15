@@ -143,7 +143,8 @@ describe('SwatchesPanel and BrushesPanel', () => {
 
   it('brush presets set the brush parameters', async () => {
     await mount(<BrushesPanel />, 'width:290px');
-    expect(document.querySelectorAll('[data-brush]').length).toBe(6);
+    expect(document.querySelectorAll('[data-brush-source=builtin]').length).toBe(12); // 6 classic + 6 textured / scatter (v6)
+    expect(document.querySelectorAll('[data-brush]').length).toBe(12);
     q('[data-brush=airbrush]').click();
     await settle();
     expect(store.brush.value).toMatchObject({ size: 200, hardness: 0, flow: 0.25 });

@@ -110,13 +110,13 @@ describe('layer masks UI', () => {
 });
 
 describe('adjustment menu', () => {
-  it('opens from the footer, lists the six adjustments and adds one above the active layer', async () => {
+  it('opens from the footer, lists the six adjustments (filters have their own entries) and adds one above the active layer', async () => {
     store.addLayer();
     await settle();
     expect(document.querySelector('[role=menu][aria-label="New adjustment"]')).toBeNull();
     q('[aria-label="New adjustment"]').click();
     await settle();
-    const items = [...document.querySelectorAll('[role=menu][aria-label="New adjustment"] [role=menuitem]')].map((e) => e.textContent);
+    const items = [...document.querySelectorAll('[role=menu][aria-label="New adjustment"] [data-adjustment]')].map((e) => e.textContent);
     expect(items).toEqual(['Levels', 'Brightness/Contrast', 'Hue/Saturation', 'Blur', 'Invert', 'Threshold']);
     q('[data-adjustment=hueSaturation]').click();
     await settle();

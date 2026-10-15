@@ -1,4 +1,4 @@
-import type { EngineEvent, Rect, RGBA, SelectionOptions, ShapeSpec, TextSpec, ToolContext, ToolPointer } from '../types';
+import type { BrushDynamics, EngineEvent, Rect, RGBA, SelectionOptions, ShapeSpec, TextSpec, TipShape, ToolContext, ToolPointer } from '../types';
 import type { Document, EditTarget, PixelLayer, StructureSnapshot, VectorLayer } from '../model';
 import type { SelState } from '../selection';
 import type { Surface } from '../surface';
@@ -20,6 +20,8 @@ export interface Host {
   readonly doc: Document;
   readonly scratch: Scratch;
   context(): ToolContext;
+  /** v6: the current brush tip, dynamics and (for 'custom') the tip alpha. */
+  brushTip(): { shape: TipShape; dynamics: BrushDynamics; custom: { w: number; h: number; alpha: Uint8Array } | null; stroke: number };
   emit(e: EngineEvent): void;
   /** What the paint tools edit now (pixels or mask of the active layer); otherwise emits a notice and returns null. */
   editableLayer(): EditTarget | null;

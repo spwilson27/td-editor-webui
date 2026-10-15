@@ -149,12 +149,12 @@ describe('LayersPanel settings and footer', () => {
     await settle();
     expect(engine.layers().some((l) => l.kind === 'group')).toBe(false);
 
-    // the footer effects button is enabled for the active pixel/input layer, disabled for groups
+    // the footer effects button is enabled for the active pixel/input layer, enabled for groups since v6
     const fx = q('[aria-label="Layer effects"][aria-disabled]');
     expect(fx.getAttribute('aria-disabled')).toBe('false');
     store.addGroup();
     await settle();
-    expect(q('[aria-label="Layer effects"][aria-disabled]').getAttribute('aria-disabled')).toBe('true');
+    expect(q('[aria-label="Layer effects"][aria-disabled]').getAttribute('aria-disabled')).toBe('false'); // v6: groups take effects too
   });
 
   it('deletes an input layer like any other (no special base case)', async () => {

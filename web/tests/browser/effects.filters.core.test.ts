@@ -229,3 +229,41 @@ describe('parseCube rules (same as effects.py parse_cube)', () => {
     expect(parseCube('LUT_3D_SIZE 2\n' + '0 0 0\n'.repeat(64 ** 3 + 5))).toBeNull(); // stops early beyond 64^3 values
   });
 });
+
+describe.skipIf(!effectsAvailable())('data-texture filters keep alpha (transparent + translucent pixels, identity and non-identity)', () => {
+  // columns: transparent | translucent | opaque
+  const img = makeSurface(W, H, (x): Px => (x < 20 ? [0, 0, 0, 0] : x < 40 ? [200, 100, 50, 100] : [200, 100, 50, 255]));
+  const cubeBody = (f: (r: number, g: number, b: number) => number[]) => {
+    const lines: string[] = ['LUT_3D_SIZE 2'];
+    for (const b of [0, 1]) for (const g of [0, 1]) for (const r of [0, 1]) lines.push(f(r, g, b).join(' '));
+    return lines.join('\n') + '\n';
+  };
+  const cases: [string, Record<string, unknown>, boolean][] = [
+    ['curves', {}, true],
+    ['curves', { master: [[0, 0], [0.3, 0.6], [1, 1]] }, false],
+    ['curves', { master: [[0, 1], [1, 0]], red: [[0, 0], [1, 0.5]] }, false],
+    ['gradientMap', {}, false],
+    ['gradientMap', { stops: [{ pos: 0, color: { r: 255, g: 0, b: 0, a: 255 } }, { pos: 0.5, color: { r: 0, g: 255, b: 0, a: 40 } }, { pos: 1, color: { r: 0, g: 0, b: 255, a: 255 } }] }, false],
+    ['lut', { cube: cubeBody((r, g, b) => [r, g, b]), intensity: 100 }, true],
+    ['lut', { cube: cubeBody((r, g, b) => [b, g, r]), intensity: 100 }, false],
+    ['lut', {}, true], // no cube: no-op
+    ['selectiveColor', {}, true],
+    ['selectiveColor', { adjust: [0.5, -0.3, 0.2, 0.1, ...new Array(32).fill(0)] }, false],
+  ];
+  cases.forEach(([type, params, identity], i) => {
+    it(`${type} #${i}${identity ? ' (identity)' : ''}: alpha unchanged, transparent stays transparent, premultiplied`, () => {
+      const out = run(img, [F(type, params)]).out;
+      const a = allPremult(out);
+      const s = allPremult(img);
+      for (let y = 0; y < H; y += 7) for (let x = 0; x < W; x += 3) {
+        const o = (y * W + x) * 4;
+        expect(a[o + 3], `${type} #${i} alpha at ${x},${y}`).toBe(s[o + 3]);
+        if (x < 20) expect([a[o], a[o + 1], a[o + 2]]).toEqual([0, 0, 0]);
+        for (let k = 0; k < 3; k++) {
+          expect(a[o + k]).toBeLessThanOrEqual(a[o + 3] + 1); // premultiplied: colour never exceeds alpha
+          if (identity) near(a[o + k], s[o + k], 2);
+        }
+      }
+    });
+  });
+});

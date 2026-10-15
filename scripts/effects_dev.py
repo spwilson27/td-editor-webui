@@ -255,14 +255,34 @@ _emit("ok")
 ''')
 
 
-def td_render(effects, perf=False):
+def td_render(effects, perf=False, pool=False):
     """Builds the chain for ``effects`` in TD and returns (premultiplied float (h,w,4) top row first, info)."""
     outp = os.path.join(WORK, "td_out.npy")
+    pool = pool or bool(os.environ.get("FXDEV_POOL"))      # FXDEV_POOL=1: nodes from a network.py-like spare pool (warmed on a constant)
     r = td(PRELUDE + f'''
 st = sys.modules["fxdev_state"]
 c = op("{SCRATCH}")
 if st.chain is not None: st.chain.destroy()
-st.chain = st.fx.EffectChain(c, "fx", st.texts)
+if {pool!r}:
+    # network.py's spare pool: GLSL TOPs created ahead with blend.glsl pars, warmed (cooked) on 3 inputs wired to a constant (DocNetwork._warm_one)
+    w = c.op("warm_in") or c.create(constantTOP, "warm_in")
+    w.par.outputresolution = "custom"; w.par.resolutionw = 16; w.par.resolutionh = 16; w.par.format = "rgba8fixed"
+    w.par.colorr = 0.7; w.par.colorg = 0.0; w.par.colorb = 0.0; w.par.alpha = 1.0
+    cnt = [0]
+    def _acq(optype):
+        cnt[0] += 1
+        n = c.create(glslTOP, "g%d" % (cnt[0] + 100))
+        for k, v in {{"pixeldat": "probe_px", "format": "rgba16fixed", "vec0name": "uParams", "vec1name": "uXform", "vec2name": "uA", "vec3name": "uB"}}.items():
+            setattr(n.par, k, v)
+        for i in range(3): n.inputConnectors[i].connect(w)
+        n.cook(force=True)
+        return n
+    def _rel(op):
+        for cc in op.inputConnectors: cc.disconnect()
+        op.destroy()
+    st.chain = st.fx.EffectChain(c, "fx", st.texts, acquire=_acq, release=_rel, adopt=False)
+else:
+    st.chain = st.fx.EffectChain(c, "fx", st.texts)
 src = c.op("src")
 t0 = time.perf_counter()
 out = st.chain.apply(json.loads({json.dumps(json.dumps(effects))}), src, 0, 0, aux=c.op("aux"))
@@ -478,6 +498,16 @@ STRESS += [("stress dither ordered L%d m%d" % (lv, m), [{"enabled": True, "type"
 STRESS += [("stress kuwahara r%d" % r, [{"enabled": True, "type": "kuwahara", "radius": r}]) for r in (2, 6, 10, 16)]
 STRESS += [("stress halftone %s %d" % (sh, cs), [{"enabled": True, "type": "halftone", "cellSize": cs, "angle": 25, "shape": sh}]) for sh in ("dot", "line") for cs in (3, 8, 20)]
 STRESS += [("stress pixelate %s %d" % (sm, sz), [{"enabled": True, "type": "pixelate", "size": sz, "sample": sm}]) for sm in ("mean", "centre") for sz in (7, 33, 100)]
+STRESS += [("stress data curves default", [{"enabled": True, "type": "curves"}]),
+           ("stress data curves master", [{"enabled": True, "type": "curves", "master": [[0, 0], [0.3, 0.6], [1, 1]]}]),
+           ("stress data curves invert", [{"enabled": True, "type": "curves", "master": [[0, 1], [1, 0]], "red": [[0, 0], [1, 0.5]]}]),
+           ("stress data gradientMap default", [{"enabled": True, "type": "gradientMap"}]),
+           ("stress data gradientMap 3 stops", [{"enabled": True, "type": "gradientMap", "stops": [{"pos": 0, "color": C(255, 0, 0)}, {"pos": 0.5, "color": C(0, 255, 0, 40)}, {"pos": 1, "color": C(0, 0, 255)}]}]),
+           ("stress data selectiveColor default", [{"enabled": True, "type": "selectiveColor"}]),
+           ("stress data selectiveColor reds", [{"enabled": True, "type": "selectiveColor", "adjust": [0.5, -0.3, 0.2, 0.1] + [0.0] * 32}]),
+           ("stress data lut default", [{"enabled": True, "type": "lut"}]),
+           ("stress data curves then blur", [{"enabled": True, "type": "curves"}, {"enabled": True, "type": "blur", "radius": 5}]),
+           ("stress data blur then curves", [{"enabled": True, "type": "blur", "radius": 5}, {"enabled": True, "type": "curves", "master": [[0, 0], [0.3, 0.6], [1, 1]]}])]
 STRESS += [("stress grain film", [{"enabled": True, "type": "grain", "amount": 80, "size": 3, "kind": "film", "colour": True, "seed": 7}]),
            ("stress pixelSort", [{"enabled": True, "type": "pixelSort", "direction": "h", "low": 0.2, "high": 0.8, "key": "luma"}]),
            ("stress blur 200", [{"enabled": True, "type": "blur", "radius": 200}]), ("stress blur 33", [{"enabled": True, "type": "blur", "radius": 33}]),

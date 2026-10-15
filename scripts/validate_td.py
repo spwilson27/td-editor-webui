@@ -1,4 +1,4 @@
-"""Live validation of the raster_editor COMP (protocol v6) against a running TouchDesigner
+"""Live validation of the raster_editor COMP (protocol v7) against a running TouchDesigner
 (docs/TESTING.md section 3, docs/DESIGN_V2.md section 7).
 
     .venv/bin/python scripts/validate_td.py                  # every step (the real UI drives the UI steps)
@@ -6,7 +6,7 @@
     .venv/bin/python scripts/validate_td.py --fake-client    # same, but keeps the UI steps that tolerate it
     .venv/bin/python scripts/validate_td.py --only 5,7,9     # run chosen steps (numbers below)
 
-The fake client speaks protocol v6 over a stdlib WebSocket: it sends `doc` + SURFACE tiles like the web
+The fake client speaks protocol v7 over a stdlib WebSocket: it sends `doc` + SURFACE tiles like the web
 app, pulls BASE / VIEW / SURFACE over HTTP and measures `applied` latency.
 
 Flags: --no-build (reuse the COMP that exists), --port N, --only. Only operators inside
@@ -263,6 +263,8 @@ class Editor:
         self.texts = []
         self.bases, self.view_log = [], []   # BASE messages; (t_recv, header, appliedFrameId, bytes)
         self.notices = {"base": 0, "view": 0}
+        self.previews = []          # v7 `layerPreview` notices
+        self.preview_frames = {}    # layerId -> [(header, payload bytes)] fetched with GET /layer
         self.sent, self.applied = {}, {}     # frameId -> send time / `applied` receive time
         self.doc_state = None
         self.doc_w = self.doc_h = None
@@ -317,6 +319,13 @@ class Editor:
                     if body is not None:
                         self.bases.append(body)
                         self.bases_by_input.setdefault(msg.get("input", 1), []).append(body)
+            elif t == "layerPreview":
+                self.previews.append(msg)
+                if self.autofetch:
+                    st, body = http_get(self.port, f"/layer?token={self.token}&client={self.client_id}&layerId={msg['layerId']}&frameId={msg['frameId']}")
+                    if st == 200:
+                        hdr, payload = P.decode_frame(body)
+                        self.preview_frames.setdefault(msg["layerId"], []).append((hdr, bytes(payload)))
             elif t == "view":
                 self.notices["view"] += 1
                 t_notice = now
@@ -378,6 +387,23 @@ class Editor:
 
     def close(self):
         self.ws.close()
+
+    def history_post(self, blob, rev):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=300)
+        c.request("POST", f"/history?token={self.token}&client={self.client_id}&rev={rev}", blob, {"Content-Type": "application/octet-stream"})
+        r = c.getresponse()
+        r.read()
+        c.close()
+        return r.status
+
+    def history_get(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=300)
+        c.request("GET", f"/history?token={self.token}&client={self.client_id}")
+        r = c.getresponse()
+        body = r.read()
+        rev = r.getheader("X-Doc-Rev")
+        c.close()
+        return r.status, rev, body
 
 
 def td_rect(path, x, y, w, h):
@@ -1493,7 +1519,7 @@ def rgba(r, g, b, a=255):
 
 
 def pick_font(avail):
-    for f in ("Arial", "Georgia", "Times New Roman"):  # (bold/italic do not work for TTC fonts such as Helvetica)
+    for f in ("Arial", "Georgia", "Times New Roman"):
         if f in avail:
             return f
     return avail[0] if avail else "Arial"
@@ -3135,6 +3161,517 @@ print(json.dumps({'n': n, 'bad': dict(list(bad.items())[:6]), 'nbad': len(bad), 
     return ok, f"{len(names)} shader types ({len([n for n in names if n in EF.FILTER_SPECS])} filters), {res['n']} GLSL TOPs cooked, {res['nbad']} with errors {res['bad']}, fx_error={res['fx_error']}"
 
 
+# --------------------------------------------------------------------------- v7 steps (DESIGN_V6 section 5): filters, tdPreview, history, fonts, hints
+
+
+def v7_disc(n=64):
+    yy, xx = np.mgrid[0:n, 0:n]
+    img = np.zeros((n, n, 4), np.uint8)
+    r = np.hypot(xx - (n - 1) / 2, yy - (n - 1) / 2)
+    img[..., :3] = np.stack([60 + xx * 3, 200 - yy * 2, np.full_like(xx, 120)], axis=2)
+    img[..., 3] = np.clip((n * 0.375 - r) * 255, 0, 255)
+    return img
+
+
+def v7_defaults(EF, name):
+    return {k: v["default"] for k, v in (EF.FILTER_SPECS.get(name) or {}).get("params", {}).items() if "default" in v}
+
+
+def load_scene(args, W, H, layers, surfaces, rev, need_page=True, timeout=40):
+    """A fake client sends a fixed W x H canvas, the layer stack and the surfaces ({slot: (img, (w, h))}) and leaves; then the real
+    page (if ``need_page``) loads TD's document. Returns an error string, or None."""
+    ed = Editor(args.port)
+    try:
+        take_over(ed)
+        ed.send_canvas(W, H, "fixed")
+        wait_for(lambda: out1_size() == [W, H], 6)
+        ed.send_doc(layers, rev)
+        fids = [ed.send_surface(sl, (0, 0, sz[0], sz[1]), img, sz) for sl, (img, sz) in surfaces.items()]
+        if fids and not wait_applied(ed, fids[-1], timeout):
+            return f"no `applied` for {fids[-1]}; status={status()!r}"
+        if not fids:
+            wait_for(lambda: td("print(comp.ext.RasterEditorExt.doc_rev)").strip() == str(rev), 10)
+            ed.run(1.0)
+    finally:
+        ed.close()
+    time.sleep(1.5)
+    if need_page and (not ui_ready() or not settle_page(timeout)):
+        return "real page did not become active / load the document (page and TD never agreed on the layer stack)"
+    return None
+
+
+def only_failures(notes):
+    bad = [n for n in notes if "FAIL" in n]
+    return bad, f"{len(notes) - len(bad)}/{len(notes)} regions ok"
+
+
+def s39_ui_filters_parity(args):
+    """Real UI: every filter of the library as a per-layer effect (default parameters) -- TD chain vs the browser preview (<= 3/255);
+    layers the planner flags `tdPreview` show TD's own render in the page (compared equal) and the page reports them ready."""
+    import effects as EF
+    if not ensure_test_hook():
+        return None, "test hook not reachable"
+    reset_canvas(args, 800, 600)
+    names_all = sorted(EF.FILTER_SPECS)
+    eff = {n: {"type": n, "enabled": True, **v7_defaults(EF, n)} for n in names_all}
+    disc = v7_disc()
+    flagged, bad, ok_all, not_ready = [], [], True, []
+    for j, n in enumerate(names_all):     # one scene per filter: a filter that misbehaves (fills the document) must not spoil the others
+        flag = EF.effect_td_preview(eff[n])
+        e1 = load_scene(args, 160, 120, [L("g0", slot=1, size=(64, 64), x=48, y=28, effects=[eff[n]])], {1: (disc, (64, 64))}, 100 + j)
+        if e1:
+            bad.append(f"{n}: FAIL {e1}")
+            ok_all = False
+            continue
+        o2, n2 = compare_page_td([(n, (0, 0, 160, 120), 3, 2.0, 0.02)])
+        ok_all &= o2
+        bad += [x for x in n2 if "FAIL" in x]
+        if flag:
+            flagged.append(n)
+            st = ((hook_call("layerPreviews()") or {}).get("states") or {}).get("g0")
+            if st != "ready":
+                not_ready.append(n)
+                ok_all = False
+    fx_err = td_json("n = comp.ext.RasterEditorExt.network; print(json.dumps(getattr(n, 'fx_error', None)))")
+    return bool(ok_all and not fx_err), (f"{len(names_all)} filters, one scene each; tdPreview layers {flagged}; {len(names_all) - len(bad)}/{len(names_all)} ok; "
+                                         f"page preview not ready: {not_ready}; fx_error={fx_err}" + "".join("\n        " + b_ for b_ in bad))
+
+
+def s40_ui_filter_adjust_group_fx(args):
+    """Real UI: filter adjustment layers (inside groups), effects on adjustment layers and on groups -- TD vs the browser preview."""
+    import effects as EF
+    if not ensure_test_hook():
+        return None, "test hook not reachable"
+    reset_canvas(args, 800, 600)
+    cell, cols = 100, 6
+    W, H = cols * cell, 3 * cell
+    yy, xx = np.mgrid[0:64, 0:64]
+    grad = np.zeros((64, 64, 4), np.uint8)
+    grad[..., 0], grad[..., 1], grad[..., 2], grad[..., 3] = 30 + xx * 3, 220 - yy * 3, 90 + (xx ^ yy) * 2, 255
+    grad[:8], grad[-8:], grad[:, :8], grad[:, -8:] = 0, 0, 0, 0     # transparent border so the effects have room
+    pick = lambda want: [n for n in want if n in EF.FILTER_SPECS][:cols]    # noqa: E731
+    fa = pick(["posterize", "blur", "edgeDetect", "pixelate", "duotone", "emboss", "colorBalance", "vibrance"])
+    blur = {"type": "blur", "enabled": True, **v7_defaults(EF, "blur")}
+    col = lambda r_, g, b: {"r": r_, "g": g, "b": b, "a": 255}      # noqa: E731
+    fx5 = [{"type": "dropShadow", "enabled": True, "dx": 4, "dy": 5, "blur": 5, "color": col(0, 0, 0), "opacity": 0.8},
+           {"type": "outerGlow", "enabled": True, "size": 8, "color": col(255, 200, 0), "opacity": 0.9},
+           {"type": "stroke", "enabled": True, "width": 3, "color": col(255, 0, 0), "position": "outside", "opacity": 1},
+           blur,
+           {"type": "chromaticAberration", "enabled": True, "amount": 3, "angle": 30},
+           {"type": "colorOverlay", "enabled": True, "color": col(0, 128, 255), "opacity": 0.5}]
+    layers, grid, surfaces, slot = [], {}, {}, 0
+
+    def cell_group(name, c, r, group_fx=None, adj=None, adj_fx=None, gopacity=1.0):
+        nonlocal slot
+        slot += 1
+        grid[name] = (c * cell, r * cell, cell, cell)
+        layers.append(L(f"g_{name}", "group", effects=group_fx or [], opacity=gopacity))
+        layers.append(L(f"p_{name}", slot=slot, size=(64, 64), parentId=f"g_{name}", x=c * cell + 18, y=r * cell + 18))
+        surfaces[slot] = (grad, (64, 64))
+        if adj is not None:
+            layers.append(L(f"a_{name}", "adjustment", parentId=f"g_{name}", adjustment=adj, effects=adj_fx or []))
+    for c, n in enumerate(fa):                                                   # row 0: filter adjustments
+        cell_group(f"fa_{n}", c, 0, adj={"type": "filter", "effect": {"type": n, "enabled": True, **v7_defaults(EF, n)}})
+    for c, e in enumerate(fx5):                                                  # row 1: effects on an adjustment layer
+        cell_group(f"ae_{e['type']}", c, 1, adj={"type": "hueSaturation", "hue": 40, "saturation": 1.3, "value": 1.0}, adj_fx=[e])
+    for c, e in enumerate(fx5):                                                  # row 2: effects on a group (+ opacity)
+        cell_group(f"ge_{e['type']}", c, 2, group_fx=[e], gopacity=0.8 if c % 2 else 1.0)
+    err = load_scene(args, W, H, layers, surfaces, 91)
+    if err:
+        return None, err
+    ok, notes = compare_page_td([(n, g, 3, 2.0, 0.02) for n, g in grid.items()])
+    bad, summary = only_failures(notes)
+    return bool(ok), f"{len(grid)} cells (filter adjustments {fa}); {summary}" + "".join("\n        " + b for b in bad)
+
+
+def s41_ui_selection_adjustment(args):
+    """Real UI: an adjustment (classic and filter) added while a selection exists gets a mask from the selection -- TD out1 changes only
+    inside it, the selection stays, the page composite equals TD's."""
+    W, H = 320, 200
+    err = ui_doc(args, W, H)
+    if err:
+        return None, err
+    notes, ok_all = [], True
+
+    def chk(label, cond, extra=""):
+        nonlocal ok_all
+        ok_all &= bool(cond)
+        notes.append(f"{label}: {'ok' if cond else 'FAIL'} {extra}".rstrip())
+    hook_call("addLayer()")
+    paint_all(W, H, "#3060c0")
+    base = wait_for(lambda: px_at(150, 100)[3] > 250, 6) and px_at(150, 100)
+    chk("document painted blue", base and px_near(base, (48, 96, 192, 255), 4), f"{base}")
+    hook_call("selectRect(100, 60, 120, 80)")
+    sel = lambda: hook_call("selectionPath()") is not None or hook_call("selectionMask()") is not None    # noqa: E731
+    sel0 = sel()
+    aid = hook_call("addAdjustment('invert')")
+    sel1 = sel()
+    notes.append(f"(selection exists before addAdjustment: {sel0}, after: {sel1})")
+    inside = wait_for(lambda: px_at(150, 100)[0] > 150, 6) and px_at(150, 100)
+    outside = px_at(20, 20)
+    chk("invert limited to the selection", inside and px_near(inside, (207, 159, 63, 255), 6) and px_near(outside, (48, 96, 192, 255), 4),
+        f"inside {inside}, outside {outside}")
+    lay = next((l for l in (hook_call("layers()") or []) if l["id"] == aid), None)
+    chk("the adjustment layer has a mask and the selection is kept", bool(lay and lay.get("mask")) and sel0 and sel1, f"mask={lay and lay.get('mask')}")
+    hook_call("selectRect(10, 10, 60, 40)")
+    fid = hook_call("addFilterAdjustment('posterize')") if not hook_missing("addFilterAdjustment") else None
+    if fid:
+        wait_for(lambda: td_layer(fid) is not None, 5)
+        flay = next((l for l in (hook_call("layers()") or []) if l["id"] == fid), None)
+        chk("filter adjustment limited to the selection too", bool(flay and flay.get("mask")), f"mask={flay and flay.get('mask')}")
+    hook_call("deselect()")
+    time.sleep(1.0)
+    ok, n = compare_page_td([("whole canvas", (0, 0, W, H), 3, 2.0, 0.02)])
+    ok_all &= ok
+    return ok_all, "\n        ".join(notes + n)
+
+
+def s42_ui_brush_tips_presets(args):
+    """Real UI: textured tips (+ jitter / scatter) reach TD identically to the page, a custom tip from a selection works, presets save /
+    rename / delete, the document presets travel in `brushPresets` through TD (and survive a page reload)."""
+    W, H = 400, 360
+    err = ui_doc(args, W, H)
+    if err:
+        return None, err
+    if hook_missing("setBrushTip", "saveBrushPreset", "brushPresets"):
+        return None, "test hook lacks the brush functions (rebuild the web UI)"
+    notes, ok_all = [], True
+
+    def chk(label, cond, extra=""):
+        nonlocal ok_all
+        ok_all &= bool(cond)
+        notes.append(f"{label}: {'ok' if cond else 'FAIL'} {extra}".rstrip())
+    hook_call("addLayer()")
+    hook_call("setPrimary('#e02020')")
+    hook_call("setTool('brush')")
+    tips = ["round", "chalk", "bristle", "spatter", "noise", "square", "star"]
+    rows = {}
+    for i, tip in enumerate(tips):
+        y = 25 + i * 45
+        rows[tip] = (0, y - 22, W, 44)
+        hook_call(f"setBrushTip({tip!r}, {{scatter: 0.5, scatterCount: 3, sizeJitter: 0.2, angleJitter: 90, hueJitter: 0.05, seed: {i + 1}}})")
+        hook_call(f"stroke('brush', [[40, {y}], [200, {y}], [360, {y}]])")
+    last = rows["star"]
+    wait_for(lambda: td_rect(COMP + "/out1", last[0], last[1], last[2], last[3])[..., 3].max() > 0, 8)
+    time.sleep(1.0)
+    ok, n = compare_page_td([(t, r, 2, 1.5, 0.02) for t, r in rows.items()])
+    bad, summary = only_failures(n)
+    chk("page composite equals TD's output for every tip", ok, summary + "".join("\n          " + b for b in bad))
+    alphas = {t: td_rect(COMP + "/out1", *r)[..., 3].astype(float) for t, r in rows.items()}
+    same = [(a, b) for a in tips for b in tips if a < b and np.abs(alphas[a] - alphas[b]).mean() < 1.0]
+    chk("the tips look different from each other in TD", not same, f"identical pairs {same}")
+    hook_call("selectRect(30, 3, 60, 40)")
+    ct = hook_call("setBrushTip('custom')")
+    bs = hook_call("brushState()") or {}
+    chk("custom tip from the selection", (bs.get("custom") or {}).get("w", 0) > 0, f"{bs.get('custom')}")
+    hook_call("deselect()")
+    key = hook_call("saveBrushPreset('v7 doc preset', 'document')")
+    stored = wait_for(lambda: td_json("p = comp.ext.RasterEditorExt.brush_presets; print(json.dumps([[q['name'], q['tip'], bool(q.get('customTip'))] for q in p]))"), 8)
+    has = bool(stored) and any(q[0] == "v7 doc preset" for q in stored)
+    chk("document preset reaches TD (brushPresets in the document)", has, f"{stored}")
+    keyu = hook_call("saveBrushPreset('v7 user preset', 'user')")
+    lst = hook_call("brushPresets()") or []
+    chk("presets listed (document + user)", {e["source"] for e in lst if e["name"].startswith("v7")} >= {"document", "user"}, f"{[(e['name'], e['source']) for e in lst if e['name'].startswith('v7')]}")
+    hook_call(f"renameBrushPreset({key!r}, 'v7 renamed')") if key else None
+    renamed = wait_for(lambda: any(q[0] == "v7 renamed" for q in (td_json("p = comp.ext.RasterEditorExt.brush_presets; print(json.dumps([[q['name']] for q in p]))") or [])), 8)
+    chk("rename reaches TD", renamed)
+    td("comp.op('webrender').par.reloadsrc.pulse()")
+    time.sleep(2.0)
+    if ui_ready(30):
+        lst2 = hook_call("brushPresets()") or []
+        chk("document preset survives a page reload (loaded from TD)", any(e["name"] == "v7 renamed" and e["source"] == "document" for e in lst2), f"{[(e['name'], e['source']) for e in lst2 if e['name'].startswith('v7')]}")
+        hook_call(f"deleteBrushPreset({key!r})") if key else None
+        gone = wait_for(lambda: not any(q[0] == "v7 renamed" for q in (td_json("p = comp.ext.RasterEditorExt.brush_presets; print(json.dumps([[q['name']] for q in p]))") or [])), 8)
+        chk("delete reaches TD", gone)
+    else:
+        chk("page active after reload", False)
+    if keyu:
+        hook_call(f"deleteBrushPreset({keyu!r})")
+    return ok_all, "\n        ".join(notes)
+
+
+def s43_layer_preview(args):
+    """tdPreview stream: a pixel-sort layer is read back, announced (`layerPreview`), served as frame type 7 equal to TD's own render of the
+    layer; a static layer is not read back again; an edit makes one new frame; unflagged layers 404; with the real page the page shows it."""
+    import effects as EF
+    reset_canvas(args, 800, 600)
+    W, H = 200, 100
+    px = v7_disc()
+    px[..., :3] = np.random.RandomState(4).randint(0, 256, (64, 64, 3), dtype=np.uint8)     # noise: sorting visibly changes it
+    sort = {"type": "pixelSort", "enabled": True, "direction": "h", "low": 0.2, "high": 0.9, "key": "luma"}
+    flagged = EF.effect_td_preview(sort)
+    layers = [L("ps", slot=1, size=(64, 64), x=20, y=10, effects=[sort]), L("plain", slot=2, size=(64, 64), x=110, y=10, effects=[])]
+    ed = Editor(args.port)
+    notes, ok_all = [], True
+
+    def chk(label, cond, extra=""):
+        nonlocal ok_all
+        ok_all &= bool(cond)
+        notes.append(f"{label}: {'ok' if cond else 'FAIL'} {extra}".rstrip())
+    try:
+        take_over(ed)
+        ed.send_canvas(W, H, "fixed")
+        wait_for(lambda: out1_size() == [W, H], 6)
+        ed.send_doc(layers, 92)
+        f1, f2 = ed.send_surface(1, (0, 0, 64, 64), px, (64, 64)), ed.send_surface(2, (0, 0, 64, 64), px, (64, 64))
+        wait_applied(ed, f2, 10)
+        chk("pixelSort is flagged tdPreview by the planner", flagged)
+        got = ed.wait(lambda: ed.previews and "ps" in ed.preview_frames, 8)
+        chk("layerPreview notice + GET /layer", got, f"notices {[(m['layerId'], m['frameId']) for m in ed.previews]}")
+        if got:
+            hdr, payload = ed.preview_frames["ps"][-1][0], ed.preview_frames["ps"][-1][1]
+            chk("frame type 7, document sized, slot 0", (hdr.type, hdr.slot, hdr.doc_w, hdr.doc_h, hdr.w, hdr.h) == (7, 0, W, H, W, H), f"{hdr}")
+            pv = np.frombuffer(payload, np.uint8).reshape(H, W, 4)
+            ppath = td_json("print(json.dumps(comp.ext.RasterEditorExt.network.layer_preview_source('ps').path))")
+            td_img = {"shape": [H, W]}
+            ref = unpremultiply_np(td_rect(ppath, 0, 0, W, H))
+            d = np.abs(pv.astype(int) - ref.astype(int))
+            vis = ref[..., 3] > 8
+            chk("served image equals TD's render of the layer (straight alpha)", td_img["shape"] == [H, W] and vis.any() and d[vis].max() <= 3,
+                f"worst {int(d[vis].max()) if vis.any() else 'n/a'} over {int(vis.sum())} visible px")
+            raw = pv[10:74, 20:84].astype(int)
+            m_ = px[..., 3] > 250
+            chk("the pixel sort changed the layer's colours (it is TD's effect, not the raw surface)", float(np.abs(raw[..., :3] - px[..., :3].astype(int))[m_].mean()) > 2.0,
+                f"mean colour change {float(np.abs(raw[..., :3] - px[..., :3].astype(int))[m_].mean()):.1f}")
+        ed.run(2.0)      # (the first frames settle: the surfaces arrive after the layer was first rendered)
+        n0 = len(ed.previews)
+        stat0 = td_json("x = comp.ext.RasterEditorExt; p = x.layer_pipes.get('ps'); print(json.dumps([p.frame_id if p else None, len(x.stats['lpreadback'])]))")
+        ed.run(2.5)
+        stat1 = td_json("x = comp.ext.RasterEditorExt; p = x.layer_pipes.get('ps'); print(json.dumps([p.frame_id if p else None, len(x.stats['lpreadback'])]))")
+        chk("a static layer is not read back or announced again", len(ed.previews) == n0 and stat1[0] == stat0[0] and stat1[1] - stat0[1] <= 2, f"{stat0} -> {stat1}, notices {n0} -> {len(ed.previews)}")
+        px2 = px.copy()
+        px2[..., 0] = 255 - px2[..., 0]
+        ed.send_surface(1, (0, 0, 64, 64), px2, (64, 64))
+        again = ed.wait(lambda: len(ed.previews) > n0, 6)
+        chk("an edit of the layer's pixels produces a new frame", again, f"notices {n0} -> {len(ed.previews)}")
+        st, _ = http_get(args.port, f"/layer?token={ed.token}&client={ed.client_id}&layerId=plain")
+        chk("an unflagged layer has no preview (404)", st == 404, f"status {st}")
+        st, _ = http_get(args.port, f"/layer?token=bad&client={ed.client_id}&layerId=ps")
+        chk("bad token -> 403", st == 403, f"status {st}")
+    finally:
+        ed.close()
+    time.sleep(1.5)
+    if ui_ready(15) and settle_page(30):
+        lp = hook_call("layerPreviews()") or {}
+        chk("the page lists the layer and has its TD render", "ps" in (lp.get("layers") or []) and (lp.get("states") or {}).get("ps") == "ready", f"{lp}")
+        ok, n = compare_page_td([("pixel-sort layer (page shows TD's render)", (0, 0, 100, 100), 3, 1.0, 0.02)])
+        ok_all &= ok
+        notes += n
+    else:
+        notes.append("(real page not available: page half skipped)")
+    return ok_all, "\n        ".join(notes)
+
+
+def td_history():
+    return td_json("h = comp.fetch('raster_history', None); print(json.dumps([h[0], h[1], len(h[2])] if h else None))")
+
+
+def v7_paint_three(W, H):
+    hook_call("addLayer()")
+    hook_call("setPrimary('#ff2020')")
+    hook_call("setTool('brush')")
+    for i, y in enumerate((40, 100, 160)):
+        hook_call(f"stroke('brush', [[40, {y}], [{120 + 30 * i}, {y}]])")
+        time.sleep(0.3)
+
+
+def stroke_present(x, y):
+    return px_at(x, y)[3] > 200
+
+
+def s44_ui_history_reload(args):
+    """Undo across a page reload: strokes -> history blob uploaded (POST /history) and stored with the document rev -> page reload -> history
+    restored (GET /history) -> undo removes the last strokes in TD's output. A history of another revision is ignored."""
+    W, H = 320, 200
+    err = ui_doc(args, W, H)
+    if err:
+        return None, err
+    if hook_missing("history", "undo", "historyRoundTrip"):
+        return None, "test hook lacks history()/undo() (rebuild the web UI)"
+    td("comp.unstore('raster_history')")
+    notes, ok_all = [], True
+
+    def chk(label, cond, extra=""):
+        nonlocal ok_all
+        ok_all &= bool(cond)
+        notes.append(f"{label}: {'ok' if cond else 'FAIL'} {extra}".rstrip())
+    v7_paint_three(W, H)
+    wait_for(lambda: stroke_present(100, 160), 6)
+    h0 = hook_call("history()") or {}
+    stored = wait_for(td_history, 10)
+    rev = td("print(comp.ext.RasterEditorExt.doc_rev)").strip()
+    chk("the page uploaded its history (debounced) and TD stored it with the document rev", bool(stored) and str(stored[0]) == rev and stored[0] == stored[1], f"history {h0.get('length')} entries -> stored {stored}, TD rev {rev}")
+    rt = hook_call("historyRoundTrip()") or {}
+    # (restoreHistory refuses a non-empty history by design, so `ok` is False here: only the serialisation is checked)
+    chk("the page serialises its history", rt.get("bytes", 0) > 1000 and rt["before"] == rt["after"], f"{rt}")
+    td("comp.op('webrender').par.reloadsrc.pulse()")
+    time.sleep(2.5)
+    if not ui_ready(40) or not settle_page(40):
+        return False, "page did not come back after the reload\n        " + "\n        ".join(notes)
+    time.sleep(1.0)
+    h1 = hook_call("history()") or {}
+    chk("history restored after the reload", h1.get("length") == h0.get("length") and h1.get("index") == h0.get("index"), f"before {h0.get('length')}/{h0.get('index')}, after {h1.get('length')}/{h1.get('index')}")
+    for _ in range(2):
+        hook_call("undo()")
+        time.sleep(0.3)
+    gone = wait_for(lambda: not stroke_present(100, 160) and not stroke_present(100, 100), 6)
+    chk("undo after the reload removes the last two strokes in TD's output, the first stays", gone and stroke_present(60, 40), f"y160 {px_at(100, 160)}, y100 {px_at(100, 100)}, y40 {px_at(60, 40)}")
+    # a history that belongs to another revision is not restored
+    ed = Editor(args.port)
+    try:
+        take_over(ed)
+        st = ed.history_post(b"x" * 1000, 1)
+        got = ed.history_get()
+    finally:
+        ed.close()
+    chk("POST/GET /history with an explicit rev", st == 204 and got[0] == 200 and got[1] == "1" and len(got[2]) == 1000, f"post {st}, get {got[0]} rev {got[1]}")
+    time.sleep(1.0)
+    td("comp.op('webrender').par.reloadsrc.pulse()")
+    time.sleep(2.5)
+    if ui_ready(40):
+        h2 = hook_call("history()") or {}
+        chk("a stored history of another rev (or a corrupt blob) is ignored: the page starts clean", h2.get("length", 99) <= 1, f"{h2.get('length')} entries")
+    return ok_all, "\n        ".join(notes)
+
+
+def s45_ui_redoc_history(args):
+    """.redoc round trip with history: save contains history.bin (+ historyRev), a later change is undone by opening the file, whose history
+    is restored in the page; a project saved without a matching history has none."""
+    import zipfile
+    W, H = 320, 200
+    err = ui_doc(args, W, H)
+    if err:
+        return None, err
+    if hook_missing("saveProject", "openProject", "history"):
+        return None, "test hook lacks saveProject/openProject"
+    os.makedirs(OUT_DIR, exist_ok=True)
+    path = os.path.join(OUT_DIR, "v7_history.redoc")
+    notes, ok_all = [], True
+
+    def chk(label, cond, extra=""):
+        nonlocal ok_all
+        ok_all &= bool(cond)
+        notes.append(f"{label}: {'ok' if cond else 'FAIL'} {extra}".rstrip())
+    td("comp.unstore('raster_history')")
+    v7_paint_three(W, H)
+    wait_for(lambda: stroke_present(100, 160), 6)
+    h0 = hook_call("history()") or {}
+    wait_for(td_history, 10)
+    res = js_result(f"(function(){{window.__saveRes=null;window.__editorTest.saveProject({json.dumps(path)}).then(function(r){{window.__saveRes=r}},function(e){{window.__saveRes={{error:String(e)}}}});return true}})()")
+    r = wait_for(lambda: js_result("window.__saveRes"), 15)
+    chk("saveProject ok", bool(r) and r.get("ok") is not False and not r.get("error"), f"{r}")
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        meta = json.loads(z.read("meta.json"))
+        hist_size = z.getinfo("history.bin").file_size if "history.bin" in names else 0
+    rev = int(td("print(comp.ext.RasterEditorExt.doc_rev)").strip())
+    chk("the file holds history.bin and meta.historyRev = the document rev", hist_size > 0 and meta.get("historyRev") == rev, f"history.bin {hist_size} bytes, meta {meta}")
+    hook_call("stroke('brush', [[200, 40], [280, 40]])")
+    wait_for(lambda: stroke_present(240, 40), 6)
+    js_result(f"(function(){{window.__openRes=null;window.__editorTest.openProject({json.dumps(path)}).then(function(r){{window.__openRes=r}},function(e){{window.__openRes={{error:String(e)}}}});return true}})()")
+    wait_for(lambda: js_result("window.__openRes"), 20)
+    time.sleep(2.5)
+    if not ui_ready(40) or not settle_page(40):
+        return False, "page did not come back after the open\n        " + "\n        ".join(notes)
+    time.sleep(1.0)
+    gone = not stroke_present(240, 40) and stroke_present(100, 160)
+    chk("opening the file restores the saved pixels", gone, f"y40/x240 {px_at(240, 40)}, y160 {px_at(100, 160)}")
+    h1 = hook_call("history()") or {}
+    chk("history restored from the file", h1.get("length") == h0.get("length") and h1.get("length", 0) > 1, f"saved {h0.get('length')} entries, restored {h1.get('length')}")
+    hook_call("undo()")
+    chk("undo after open works", wait_for(lambda: not stroke_present(100, 160), 6), f"y160 {px_at(100, 160)}")
+    return ok_all, "\n        ".join(notes)
+
+
+def s46_ttc_fonts(args):
+    """Bold / italic of font-collection (TTC) families in TD's Text TOP: Helvetica (and Menlo) regular, bold, italic, bold italic render
+    different glyphs; bold has visibly more ink."""
+    reset_canvas(args, 800, 600)
+    W, H, rowh = 420, 320, 80
+    notes, ok_all = [], True
+    for fam in ("Helvetica", "Menlo"):
+        layers = []
+        for i, (b, it) in enumerate(((False, False), (True, False), (False, True), (True, True))):
+            layers.append(L(f"t{i}", "text", text={"text": "Hamburgefons", "font": fam, "size": 40, "color": rgba(255, 255, 255), "align": "left",
+                                                  "bold": b, "italic": it, "lineHeight": 1.2, "x": 10, "y": i * rowh + 10, "boxWidth": None}))
+        err = load_scene(args, W, H, layers, {}, 93, need_page=False)
+        if err:
+            return None, err
+        time.sleep(2.5)    # text measurement finishes over a few ticks
+        imgs = [td_rect(COMP + "/out1", 0, i * rowh, W, rowh)[..., 3].astype(float) for i in range(4)]
+        ink = [float(a.sum()) / 255 for a in imgs]
+        diff = lambda a, b: float(np.abs(a - b).sum()) / max(1.0, ink[0] * 255)    # noqa: E731
+        ok_ink = min(ink) > 50
+        ok_bold = ink[1] > ink[0] * 1.04 and ink[3] > ink[2] * 1.04
+        ok_it = diff(imgs[2], imgs[0]) > 0.3 and diff(imgs[3], imgs[1]) > 0.3
+        ok_all &= ok_ink and ok_bold and ok_it
+        notes.append(f"{fam}: ink regular/bold/italic/bold-italic {[round(v) for v in ink]} (bold > regular x1.04: {ok_bold}); "
+                     f"italic differs from regular by {diff(imgs[2], imgs[0]):.2f} / {diff(imgs[3], imgs[1]):.2f} of its ink (> 0.3): {ok_it}"
+                     + ("" if ok_ink else " -- NO INK (font not found?)"))
+        if fam == "Helvetica" and not (ok_ink and ok_bold and ok_it):
+            ok_all = False
+    return ok_all, "\n        ".join(notes)
+
+
+def s47_active_layer_hint(args):
+    """`activeLayer` reaches the network (set_active_layer) and the top layer's edit recooks fewer nodes / less GPU time than without it
+    (a stack of full-size plain layers merges into one run; the active layer gets its own pass)."""
+    reset_canvas(args, 800, 600)
+    W, H, n = 1920, 1080, 14
+    img = np.zeros((H, W, 4), np.uint8)
+    img[..., 0], img[..., 3] = 40, 255
+    layers = [L(f"p{i}", slot=i + 1, size=(W, H), opacity=0.9 if i % 2 else 1.0) for i in range(n)]
+    tile = np.full((64, 64, 4), 200, np.uint8)
+    ed = Editor(args.port)
+    try:
+        take_over(ed)
+        ed.send_canvas(W, H, "fixed")
+        wait_for(lambda: out1_size() == [W, H], 8)
+        ed.send_doc(layers, 94)
+        fids = [ed.send_surface(i + 1, (0, 0, W, H), img, (W, H)) for i in range(n)]
+        if not wait_applied(ed, fids[-1], 60):
+            return False, f"no `applied`; status={status()!r}"
+        ed.run(1.5)
+
+        def edits(count=10):
+            rows = []
+            for k in range(count):
+                tile[..., 1] = 50 + k * 10
+                td("""
+import sys
+store = sys.modules.setdefault('_v7_store', type(sys)('_v7_store'))
+store.prev = {c.name: c.totalCooks for c in comp.op('doc').children if c.isTOP}
+""")
+                f = ed.send_surface(n, (100 + k, 100, 64, 64), tile, (W, H))
+                wait_applied(ed, f, 5)
+                td("comp.op('out1').cook(force=True)")     # nothing pulls the output in this session: cook it like a viewer would
+                ed.run(0.1)
+                rec = td_json("""
+import sys
+store = sys.modules['_v7_store']
+d = comp.op('doc'); ts = [c for c in d.children if c.isTOP]
+ch = [c for c in ts if c.totalCooks != store.prev.get(c.name, -1)]
+print(json.dumps({'n': len(ch), 'gpu': sum(c.gpuCookTime for c in ch)}))
+""")
+                rows.append(rec)
+            return rows[2:]
+        ed.send(json.dumps({"t": "activeLayer", "id": None}))
+        ed.run(0.5)
+        without = edits()
+        ed.send(json.dumps({"t": "activeLayer", "id": f"p{n - 1}"}))
+        ed.run(0.8)
+        act = td_json("print(json.dumps(getattr(comp.ext.RasterEditorExt.network, '_active', 'n/a')))")
+        with_ = edits()
+    finally:
+        ed.close()
+    med = lambda rows, k: float(np.median([r[k] for r in rows]))      # noqa: E731
+    nw, ng, aw, ag = med(without, "n"), med(without, "gpu"), med(with_, "n"), med(with_, "gpu")
+    ok = act == f"p{n - 1}" and aw <= nw and ag <= ng * 1.15 + 0.05
+    return ok, (f"network._active = {act!r}; top-layer edit, {n} full-size layers at {W}x{H}: nodes cooked {nw:.0f} -> {aw:.0f}, "
+                f"GPU {ng:.2f} ms -> {ag:.2f} ms (without -> with activeLayer)")
+
+
+
 EF_V5 = {
     "dropShadow": {"dx": 4, "dy": 4, "blur": 4, "color": {"r": 0, "g": 0, "b": 0, "a": 255}, "opacity": 0.6},
     "outerGlow": {"size": 6, "color": {"r": 255, "g": 200, "b": 0, "a": 255}, "opacity": 0.8},
@@ -3187,6 +3724,15 @@ STEPS = [
     (36, "real UI: quick mask, clone, floating commit, crop reflected in TD", "uitools", True),
     (37, "chooseFile plumbing (test stub): fileChosen, placeImage -> topReady + GET /top, errors", "choose", False),
     (38, "every effect + filter shader of the built component compiles in TD (includes embedded)", "filters", False),
+    (39, "real UI: every filter as a layer effect -- TD vs browser preview (<= 3/255); tdPreview layers show TD's render", "uifilters", True),
+    (40, "real UI: filter adjustments, effects on adjustment layers and on groups -- TD vs browser preview", "uigroupfx", True),
+    (41, "real UI: adjustments added with a selection are limited by it (mask), classic and filter", "uiselectadj", True),
+    (42, "real UI: brush tips / jitter / scatter / custom tip in TD, presets save/rename/delete, document presets through TD + reload", "uibrush", True),
+    (43, "tdPreview stream: notice + GET /layer frame type 7 equals TD's render, static layers are not re-read, 404s, page shows it", "layerpreview", False),
+    (44, "undo across a page reload: POST/GET /history, restored history, undo in TD's output", "uihistory", True),
+    (45, ".redoc with history.bin round trip (save, change, open, undo)", "uiredoc", True),
+    (46, "TTC fonts: Helvetica / Menlo bold + italic render different glyphs than regular", "ttc", False),
+    (47, "activeLayer reaches the network; top-layer edit recooks fewer nodes with it", "active", False),
     (99, "deleting the COMP with clients connected does not freeze TD; undo of the delete restores the pixels (run last)", "delete", False),
 ]
 FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinput": "s4_no_input", "scene": "s5_scene",
@@ -3198,7 +3744,10 @@ FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinp
          "xform": "s23_transforms_td", "uixform": "s24_ui_transform_parity", "uipaintscaled": "s25_ui_paint_scaled",
          "canvas": "s26_canvas_td", "uicanvas": "s27_ui_canvas", "renderlayer": "s28_render_layer", "export": "s29_export", "delete": "s30_delete_component",
          "inputs": "s31_inputs", "uiinputs": "s32_ui_inputs", "files": "s33_files", "uiaffine": "s34_ui_affine_parity",
-         "uieffects": "s35_ui_effects_parity", "uitools": "s36_ui_tools", "choose": "s37_choose_file", "filters": "s38_filters_compile"}
+         "uieffects": "s35_ui_effects_parity", "uitools": "s36_ui_tools", "choose": "s37_choose_file", "filters": "s38_filters_compile",
+         "uifilters": "s39_ui_filters_parity", "uigroupfx": "s40_ui_filter_adjust_group_fx", "uiselectadj": "s41_ui_selection_adjustment",
+         "uibrush": "s42_ui_brush_tips_presets", "layerpreview": "s43_layer_preview", "uihistory": "s44_ui_history_reload",
+         "uiredoc": "s45_ui_redoc_history", "ttc": "s46_ttc_fonts", "active": "s47_active_layer_hint"}
 
 
 def main():

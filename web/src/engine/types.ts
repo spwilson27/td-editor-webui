@@ -134,6 +134,8 @@ export interface LayerInfo {
   effects: Effect[]; // v5
   surfaceW: number | null; // v4: pixel/base surface size
   surfaceH: number | null;
+  /** v6: the layer's effects need TD's render for the Local preview (tdPreviewLayers) and it has not arrived yet (setLayerPreview). */
+  previewPending?: boolean;
 }
 
 export type ToolId =
@@ -229,6 +231,8 @@ export interface EditorEngine {
 
   // v2: masks, adjustments, surfaces, document I/O (docs/DESIGN_V2.md §3)
   addAdjustment(type: AdjustmentType): string; // above the active layer, default params
+  /** v6: filter adjustment layer with its initial effect, one history entry (selection-limited like addAdjustment). */
+  addFilterAdjustment?(effect: Effect, name?: string): string;
   setAdjustment(id: string, spec: AdjustmentSpec): void; // coalesced history like opacity
   addMask(layerId: string): number; // returns mask slot; white (fully visible)
   deleteMask(layerId: string): void;
@@ -304,6 +308,7 @@ export interface EditorEngine {
   brushPresets(): BrushPreset[];
   setBrushPresets(presets: BrushPreset[]): void; // document presets (docspec event)
   serializeHistory(maxSteps: number, maxBytes: number): Uint8Array; // versioned blob
+  historyVersion?(): number; // optional: monotonic counter that changes with every undo/redo stack change
   restoreHistory(blob: Uint8Array, rev: number): boolean; // true if restored (rev must equal the loaded doc rev)
   tdPreviewLayers(): string[]; // layers whose effects need TD's render in the Local preview
   setLayerPreview(layerId: string, rgba: Uint8Array | Uint8ClampedArray | null): void; // doc-sized straight RGBA from TD (null = clear)

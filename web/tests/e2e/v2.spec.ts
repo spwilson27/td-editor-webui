@@ -56,7 +56,7 @@ test('painting sends SURFACE tiles; adjustment + mask edits round-trip into the 
   // mask on Layer 1 via the UI, then an adjustment via the footer menu
   await page.getByRole('button', { name: 'Add mask' }).click();
   await page.getByRole('button', { name: 'New adjustment' }).click();
-  await page.getByRole('menuitem', { name: 'Blur' }).click();
+  await page.getByRole('menuitem', { name: 'Blur', exact: true }).click();
   await expect(page.getByRole('tab', { name: 'Adjustment' })).toHaveAttribute('aria-selected', 'true');
   await page.getByLabel('Radius').fill('25');
   await td.waitFor(() => td.doc?.layers.some((l) => l.adjustment?.type === 'blur' && (l.adjustment as any).radius === 25) ?? false);

@@ -98,6 +98,11 @@ export function cloneEffect(e: Effect): Effect {
   return structuredClone(e);
 }
 
+/** Copy of an adjustment spec (a filter adjustment holds a nested effect). */
+export function cloneAdjustment(a: AdjustmentSpec): AdjustmentSpec {
+  return a.type === 'filter' ? { type: 'filter', effect: cloneEffect(a.effect) } : { ...a };
+}
+
 export const BASE_ID = 'base'; // id of the default TD Input 1 layer (v5 migrates a 'base' layer to input 1 and keeps this id)
 export const MAX_INPUTS = 8;
 
@@ -155,10 +160,11 @@ export function layerExtent(l: Layer, docRect: Rect): Rect | null {
   if (l.kind === 'adjustment') return docRect;
   if (isVector(l)) return grow(specBounds(l), effectsReach(l.effects));
   if (l.kind !== 'group') return grow(outerRect(surfaceDocBounds(l)), effectsReach(l.effects));
-  return l.children.reduce<Rect | null>((acc, c) => union(acc, layerExtent(c, docRect)), null);
+  const u = l.children.reduce<Rect | null>((acc, c) => union(acc, layerExtent(c, docRect)), null);
+  return u && grow(u, effectsReach(l.effects)); // v6: a group's effects paint beyond its children
 }
 
-interface NodeSnap {
+export interface NodeSnap {
   layer: Layer;
   rot: number;
   kx: number;
@@ -321,7 +327,7 @@ export class Document {
           effects: c.effects.map(cloneEffect),
           slot: c.kind === 'pixel' ? c.slot : null,
           mask: c.kind !== 'group' && c.mask ? { slot: c.mask.slot, enabled: c.mask.enabled } : null,
-          adjustment: c.kind === 'adjustment' ? { ...c.adjustment } : null,
+          adjustment: c.kind === 'adjustment' ? cloneAdjustment(c.adjustment) : null,
           text: c.kind === 'text' ? cloneText(c.spec) : null,
           shape: c.kind === 'shape' ? cloneShape(c.spec) : null,
           surfaceW: px ? px.surface.width : null, surfaceH: px ? px.surface.height : null,
@@ -353,7 +359,7 @@ export class Document {
           opacity: c.opacity, blend: c.blend, depth, parentId: g === this.root ? null : g.id,
           slot: c.kind === 'pixel' ? c.slot : null,
           mask: c.kind !== 'group' && c.mask ? { slot: c.mask.slot, enabled: c.mask.enabled } : null,
-          adjustment: c.kind === 'adjustment' ? { ...c.adjustment } : null,
+          adjustment: c.kind === 'adjustment' ? cloneAdjustment(c.adjustment) : null,
           text: c.kind === 'text' ? cloneText(c.spec) : null,
           shape: c.kind === 'shape' ? cloneShape(c.spec) : null,
           transform: px ? { x: px.x, y: px.y, sx: px.sx, sy: px.sy, rot: px.rot, kx: px.kx, ky: px.ky } : { x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 },
@@ -392,7 +398,7 @@ export class Document {
     const apply = (n: NodeSnap): void => {
       const l = n.layer;
       l.name = n.name; l.visible = n.visible; l.locked = n.locked; l.opacity = n.opacity; l.blend = n.blend;
-      if (l.kind !== 'group' && l.kind !== 'adjustment') l.effects = n.effects;
+      l.effects = n.effects;
       if (l.kind === 'group' && n.children) {
         l.children = n.children.map((c) => c.layer);
         n.children.forEach(apply);

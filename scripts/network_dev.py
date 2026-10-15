@@ -1,6 +1,6 @@
 """Live harness for td/raster_editor/network.py (blend.glsl + DocNetwork) inside TouchDesigner.
 
-    .venv/bin/python scripts/network_dev.py [all|blend|adjust|misc|perf|view|persist|shapes|shapes-gl|text|v3perf|v6] [--keep]
+    .venv/bin/python scripts/network_dev.py [all|blend|adjust|misc|perf|view|persist|shapes|shapes-gl|text|v3perf|v6|v7|fonts] [--keep]
 
 Works only inside the scratch COMP ``/project1/_netdev`` (created and destroyed here).  A stand-in
 for the extension (``Stub.OnSurfaceCook``) serves surface buffers that this script uploads.  Nothing
@@ -20,6 +20,8 @@ Checks (each prints PASS/FAIL with numbers):
   text    v3 text layers vs Chromium Canvas 2D (textShape.ts conventions): bbox +-2 px, coverage IoU
   v3perf  apply() timings for text/shape edits, GPU cost per layer @1080p
   v6      v6 performance network (merged passes, bounding boxes, skip rules, 8 bit, blur pyramid) vs the v5 network
+  fonts   bold / italic of font-collection (.ttc) families vs Regular (glyph coverage, stem slant)
+  v7      filter adjustments, effects on groups / adjustments, aux images, tdPreview layers vs an independent EffectChain reference
 """
 
 from __future__ import annotations
@@ -2731,6 +2733,287 @@ def test_v6():
 
 
 
+def ref_chain(effects, inp, aux=None):
+    """Reference for the filter / effect wiring: an EffectChain of its own (scratch COMP ``ref``) fed with the premultiplied float image
+    ``inp`` (h, w, 4, document order) and the optional aux image; returns the chain output (premultiplied float, document order)."""
+    pi, pa, po = (os.path.join(WORK, n) for n in ("ref_in.npy", "ref_aux.npy", "ref_out.npy"))
+    np.save(pi, np.ascontiguousarray(inp[::-1].astype(np.float32)))
+    if aux is not None:
+        np.save(pa, np.ascontiguousarray(aux[::-1].astype(np.float32)))
+    h, w = inp.shape[:2]
+    td(PRELUDE + f"""
+st = _st()
+c = st.comp
+r = c.op("ref")
+if r is not None: r.destroy()
+r = c.create(baseCOMP, "ref")
+def mk(name, path):
+    s = r.create(scriptTOP, name)
+    s.par.outputresolution = "custom"; s.par.resolutionw = {w}; s.par.resolutionh = {h}
+    cb = r.create(textDAT, name + "_cb")
+    cb.text = "import numpy as np\\ndef onCook(scriptOp):\\n    scriptOp.copyNumpyArray(np.load(" + repr(path) + "))\\n"
+    s.par.callbacks = cb
+    s.cook(force=True)
+    return s
+si = mk("rin", {pi!r})
+sa = mk("raux", {pa!r}) if {aux is not None!r} else None
+ch = st.fx_mod.EffectChain(r, "rc", st.fx_shaders)
+out = ch.apply(json.loads({json.dumps(json.dumps(effects))}), si, {w}, {h}, aux=sa)
+out.cook(force=True)
+np.save({po!r}, out.numpyArray().astype(np.float32))
+_emit("ok")
+""")
+    return np.load(po)[::-1].copy()
+
+
+def test_v7():
+    """v7 network kinds on the live GPU, the v6 network and the v5 network against a reference built from an independent EffectChain +
+    numpy mixing: filter adjustments (alone, in a group, masked), effects on groups and adjustments, aux images (layer, input),
+    tdPreview layers (preview source / token)."""
+    S = 96
+    setup(S, S)
+    setup_legacy()
+    yy, xx = np.mgrid[0:S, 0:S]
+
+    def img(seed, w=S, h=S):
+        g = np.random.default_rng(seed)
+        a = np.zeros((h, w, 4), np.uint8)
+        y2, x2 = np.mgrid[0:h, 0:w]
+        a[..., 0] = 127 + 120 * np.sin(x2 / 9.0 + seed)
+        a[..., 1] = 127 + 120 * np.cos(y2 / 7.0)
+        a[..., 2] = g.integers(0, 256, (h, w))
+        a[..., 3] = np.clip(255 * (1.2 - np.hypot(x2 - w / 2, y2 - h / 2) / (0.5 * max(w, h))), 0, 255)
+        return a
+
+    a1, a2 = img(1), img(2, 60, 50)
+    upload2(1, a1)
+    upload2(2, a2)
+    mk = np.zeros((S, S, 4), np.uint8)
+    mk[..., :3] = (255 * (xx / S))[..., None]
+    mk[..., 3] = 255
+    upload2(5, mk)
+    maskf = (mk[..., 0] / 255.0)
+
+    def both(layers):
+        info = apply_both(layers, S, S)
+        a, b = read_both()
+        return a, b, info
+
+    def render(layers):
+        a, b, _ = both(layers)
+        return a
+
+    BASE = [layer("a", slot=1, surfaceW=S, surfaceH=S), layer("b", slot=2, x=20, y=15, surfaceW=60, surfaceH=50, blend="multiply", opacity=0.9)]
+    below_a = render(BASE)
+
+    def mix(below, x, k):
+        return below + (x - below) * k
+
+    def cmp(label, layers, ref, tol=3.0, extra="", v5=True):
+        a, b, info = both(layers)
+        d6 = np.abs(a - ref).max() * 255.0
+        d5 = np.abs(b - ref).max() * 255.0 if v5 else 0.0          # (the legacy COMP has no In TOPs)
+        check(f"v7 {label}: v6 {d6:.2f}, v5 {d5:.2f} vs reference <= {tol:g}/255", d6 <= tol and d5 <= tol,
+              f"v6 mean {np.abs(a - ref).mean() * 255:.3f}, v5 mean {np.abs(b - ref).mean() * 255:.3f} {extra}")
+        return info
+
+    def chain_errors():
+        return td(PRELUDE + """
+errs = []
+for n in (_st().net, _st().net2):
+    for lid, ch in n._chains.items():
+        for o in ch.nodes:
+            o.cook(force=True)
+            e = o.errors(recurse=False)
+            if e: errs.append([lid, o.name, e])
+_emit(errs)
+""")
+
+    blur = {"type": "blur", "enabled": True, "radius": 3.0}
+    post = {"type": "posterize", "enabled": True, "levels": 3}
+    ovl = {"type": "colorOverlay", "enabled": True, "opacity": 0.7, "color": {"r": 255, "g": 40, "b": 0, "a": 255}}
+    shadow = {"type": "dropShadow", "enabled": True, "blur": 3.0, "dx": 6.0, "dy": 5.0, "opacity": 0.8, "color": {"r": 0, "g": 0, "b": 0, "a": 255}}
+
+    # 1. filter adjustments
+    for nm, eff in (("blur 3 px", blur), ("posterize", post)):
+        ref = mix(below_a, ref_chain([eff], below_a), 0.6)
+        cmp(f"filter adjustment {nm}, opacity 0.6", BASE + [layer("f", "adjustment", opacity=0.6, adjustment={"type": "filter", "effect": eff})], ref)
+    ref = mix(below_a, ref_chain([blur], below_a), 0.8 * maskf[..., None])
+    cmp("filter adjustment blur, masked, opacity 0.8", BASE + [layer("f", "adjustment", opacity=0.8, mask={"slot": 5, "enabled": True},
+                                                                    adjustment={"type": "filter", "effect": blur})], ref)
+    # stacked on top of another adjustment and a normal layer
+    lv = {"type": "levels", "inLow": 0.1, "inHigh": 0.9, "gamma": 1.5, "outLow": 0.05, "outHigh": 0.95}
+    st1 = BASE + [layer("lv", "adjustment", adjustment=lv), layer("f", "adjustment", adjustment={"type": "filter", "effect": blur}),
+                  layer("c", slot=2, x=30, y=30, surfaceW=60, surfaceH=50, opacity=0.5)]
+    r1 = ref_adjust(lv, below_a.astype(np.float64), 1.0, None)
+    r1 = ref_chain([blur], r1.astype(np.float32))
+    c_pre = np.zeros_like(r1)
+    hh, ww = min(50, S - 30), min(60, S - 30)
+    c_pre[30:30 + hh, 30:30 + ww] = (premul_f(a2).astype(np.float64) * 0.5)[:hh, :ww]
+    ref = _over(r1, c_pre)
+    cmp("filter adjustment between an adjustment and a Normal layer", st1, ref, 3.5)
+    # in a group: only the group's own content is filtered
+    sg = [layer("a", slot=1, surfaceW=S, surfaceH=S), layer("g", "group"),
+          layer("b", slot=2, x=20, y=15, surfaceW=60, surfaceH=50, parentId="g"),
+          layer("f", "adjustment", parentId="g", adjustment={"type": "filter", "effect": blur})]
+    gin = np.zeros((S, S, 4), np.float32)
+    bb = premul_f(a2)
+    gin[15:65, 20:80] = bb
+    gref = mix(gin, ref_chain([blur], gin), 1.0)
+    cmp("filter adjustment inside a group", sg, _over(premul_f(a1), gref))
+    check("v7 filter chains compile without GPU errors", chain_errors() == [], str(chain_errors()))
+
+    # 2. effects on groups
+    kids = [layer("b", slot=2, x=20, y=15, surfaceW=60, surfaceH=50, parentId="g"), layer("c", slot=1, x=-30, y=-30, surfaceW=S, surfaceH=S, parentId="g", opacity=0.5)]
+    gcomp = np.zeros((S, S, 4), np.float32)
+    gcomp[15:65, 20:80] = bb
+    cc = premul_f(a1) * 0.5
+    cc2 = np.zeros((S, S, 4), np.float32)
+    cc2[0:S - 30, 0:S - 30] = cc[30:, 30:]            # c sits at (-30, -30): the visible part is surface[30:, 30:]
+    gcomp = _over(gcomp, cc2)
+    for blend, op_ in (("normal", 1.0), ("multiply", 0.7)):
+        gfx = ref_chain([shadow, ovl], gcomp)
+        lay = [layer("a", slot=1, surfaceW=S, surfaceH=S), layer("g", "group", effects=[shadow, ovl], blend=blend, opacity=op_)] + kids
+        ref = w3c_over(blend, _straight(premul_f(a1)), _straight(gfx), op_)
+        cmp(f"effects on a group ({blend}, opacity {op_})", lay, ref, 3.5)
+    # masked group: the mask is applied before the effects
+    lay = [layer("a", slot=1, surfaceW=S, surfaceH=S), layer("g", "group", effects=[shadow], mask={"slot": 5, "enabled": True})] + kids
+    gm = gcomp * maskf[..., None]
+    ref = _over(premul_f(a1), ref_chain([shadow], gm))
+    cmp("effects on a masked group (mask first)", lay, ref, 3.5)
+    check("v7 group chains compile without GPU errors", chain_errors() == [], str(chain_errors()))
+
+    # 3. effects on adjustments
+    lay = BASE + [layer("lv", "adjustment", adjustment=lv, effects=[shadow], opacity=0.75, mask={"slot": 5, "enabled": True})]
+    adjusted = ref_adjust(lv, below_a.astype(np.float64), 1.0, None).astype(np.float32)
+    ref = mix(below_a, ref_chain([shadow], adjusted), 0.75 * maskf[..., None])
+    cmp("effects on a levels adjustment (before the opacity x mask mix)", lay, ref, 3.5)
+    lay = BASE + [layer("bl", "adjustment", adjustment={"type": "blur", "radius": 12.0}, effects=[ovl], opacity=0.9)]
+    adjusted = ref_adjust({"type": "blur", "radius": 12.0}, below_a.astype(np.float64), 1.0, None).astype(np.float32)
+    ref = mix(below_a, ref_chain([ovl], adjusted), 0.9)
+    cmp("effects on a pyramid blur adjustment", lay, ref, 12.0)
+    check("v7 adjustment chains compile without GPU errors", chain_errors() == [], str(chain_errors()))
+
+    # 4. aux images
+    mlay = layer("m", slot=2, x=10, y=20, surfaceW=60, surfaceH=50)
+    maux = np.zeros((S, S, 4), np.float32)
+    maux[20:70, 10:70] = bb
+    disp = {"type": "displace", "enabled": True, "source": "aux", "strengthX": 14.0, "strengthY": -9.0, "edge": "clamp", "auxSource": "layer:m"}
+    ref = ref_chain([disp], premul_f(a1), maux)
+    moved = np.abs(ref - premul_f(a1)).max() * 255
+    check("v7 reference displacement is visible (test is meaningful)", moved > 20, f"max change {moved:.1f}")
+    lay = [layer("a", slot=1, surfaceW=S, surfaceH=S, effects=[disp]), mlay]
+    # (m is on top of a in the document: compare the displaced a alone by making m invisible)
+    lay[1] = dict(mlay, visible=False)
+    cmp("displace by another layer (layer:m, hidden source)", lay, ref, 3.0)
+    ref_nm = ref_chain([dict(disp, auxSource="layer:nope")], premul_f(a1))
+    cmp("displace with an unresolvable aux reference = no displacement", [layer("a", slot=1, surfaceW=S, surfaceH=S, effects=[dict(disp, auxSource="layer:nope")])], ref_nm, 1.5)
+    # filter adjustment displaced by a layer's POST-effects content
+    lay = [layer("a", slot=1, surfaceW=S, surfaceH=S), layer("m", slot=2, x=10, y=20, surfaceW=60, surfaceH=50, visible=False, effects=[ovl]),
+           layer("f", "adjustment", adjustment={"type": "filter", "effect": disp})]
+    aux_fx = ref_chain([ovl], maux)
+    ref = mix(premul_f(a1), ref_chain([disp], premul_f(a1), aux_fx), 1.0)
+    cmp("filter adjustment displaced by a layer with effects (post-effects aux)", lay, ref, 3.0)
+    check("v7 aux chains compile without GPU errors", chain_errors() == [], str(chain_errors()))
+    # input aux
+    inp_img = img(7, 70, 60)
+    pre_inp = (premul_f(inp_img)[::-1]).astype(np.float32)
+    _input_script(1, pre_inp[:8, :8].copy())          # (the COMP gets its connectors by creating in1, in2)
+    _input_script(2, pre_inp)
+    _connect_input(2, True)
+    aux_in = np.zeros((S, S, 4), np.float32)
+    aux_in[:60, :70] = premul_f(inp_img)
+    dispi = dict(disp, auxSource="input:2")
+    ref = ref_chain([dispi], premul_f(a1), aux_in)
+    cmp("displace by input 2 (identity placement at the top-left)", [layer("a", slot=1, surfaceW=S, surfaceH=S, effects=[dispi])], ref, 3.0, v5=False)
+    _connect_input(2, False)
+    ref = ref_chain([dispi], premul_f(a1), np.zeros((S, S, 4), np.float32))
+    cmp("displace by a disconnected input = transparent aux", [layer("a", slot=1, surfaceW=S, surfaceH=S, effects=[dispi])], ref, 3.0)
+
+    # 5. tdPreview layers
+    ps = {"type": "pixelSort", "enabled": True}
+    lay = [layer("a", slot=1, surfaceW=S, surfaceH=S, effects=[ps]), layer("b", slot=2, x=20, y=15, surfaceW=60, surfaceH=50, effects=[ovl]),
+           layer("f", "adjustment", opacity=0.5, adjustment={"type": "filter", "effect": ps})]
+    apply_both(lay, S, S)
+    pv = td(PRELUDE + f"""
+n = _st().net
+ids = n.preview_layers()
+t0 = n.layer_preview_token("a")
+o = n.layer_preview_source("a"); o.cook(force=True)
+np.save({os.path.join(WORK, "prev_a.npy")!r}, o.numpyArray().astype(np.float32))
+of = n.layer_preview_source("f"); of.cook(force=True)
+src_in = n._chains["f"].nodes[0].inputs[0]; src_in.cook(force=True)
+np.save({os.path.join(WORK, "prev_fin.npy")!r}, src_in.numpyArray().astype(np.float32))
+np.save({os.path.join(WORK, "prev_f.npy")!r}, of.numpyArray().astype(np.float32))
+t1 = n.layer_preview_token("a")
+_emit({{"ids": ids, "b": n.layer_preview_source("b") is None, "same": repr(t0) == repr(t1), "wh": [o.width, o.height]}})
+""")
+    pa = np.load(os.path.join(WORK, "prev_a.npy"))[::-1]
+    pf = np.load(os.path.join(WORK, "prev_f.npy"))[::-1]
+    pfin = np.load(os.path.join(WORK, "prev_fin.npy"))[::-1]
+    ref_a = ref_chain([ps], premul_f(a1))
+    d = np.abs(pa - ref_a).max() * 255
+    check("v7 preview layers: [a, f] (pixelSort), b without a flagged effect has none", pv["ids"] == ["a", "f"] and pv["b"] and pv["wh"] == [S, S], json.dumps(pv))
+    check("v7 layer_preview_source = the layer's post-effects content in document space (premultiplied) == reference chain", d <= 1.0, f"max {d:.2f}")
+    # the filter adjustment's preview is the filter applied to the composite below it
+    below_f = render(lay[:2])
+    d_in = np.abs(pfin - below_f).max() * 255
+    d = np.abs(pf - ref_chain([ps], pfin)).max() * 255
+    check("v7 filter adjustment preview = filter(composite below), before the opacity mix (chain input == composite below; output == "
+          "reference chain on that input; pixelSort is order-sensitive so the reference is fed the exact input)", d_in <= 1.5 and d <= 1.0,
+          f"input diff {d_in:.2f}, output diff {d:.2f}")
+    t_before = td(PRELUDE + "_emit(repr(_st().net.layer_preview_token('a')))")
+    apply_both([dict(lay[0]), lay[1], dict(lay[2], opacity=0.3)], S, S)
+    t_same = td(PRELUDE + "_emit(repr(_st().net.layer_preview_token('a')))")
+    apply_both([dict(lay[0], effects=[dict(ps, direction="v")]), lay[1], lay[2]], S, S)
+    t_diff = td(PRELUDE + "_emit(repr(_st().net.layer_preview_token('a')))")
+    check("v7 preview token: unchanged by an opacity edit of another layer, changed by the layer's own effect edit",
+          t_before != t_diff and (t_before.split(',')[0] == t_same.split(',')[0]), f"{t_before} | {t_same} | {t_diff}")
+    check("v7 preview chains compile without GPU errors", chain_errors() == [], str(chain_errors()))
+
+
+def _straight(pre):
+    a = pre[..., 3:4].astype(np.float64)
+    return np.concatenate([np.where(a > 0, pre[..., :3] / np.maximum(a, 1e-9), 0.0), a], -1)
+
+
+def test_fonts_ttc():
+    """v7: bold / italic of font-collection families (Helvetica, Menlo, Avenir: .ttc) and of one-file families (Arial) in the Text TOP.
+    Glyph coverage of Bold must exceed Regular (bold strokes), Italic slants the vertical stems, the measured width tracks the face."""
+    W_, H_ = 560, 90
+    setup(W_, H_)
+    cases = ("Helvetica", "Menlo", "Avenir", "Arial", "Futura")
+
+    def render(font, bold, italic, text="Hamburgefons ill"):
+        apply([text_layer("t", text_spec(font=font, text=text, size=48.0, bold=bold, italic=italic, x=8.0, y=6.0))], W_, H_)
+        # a few frames of the text measurement refinement (tick) so the final layout is shown
+        for _ in range(3):
+            td(PRELUDE + "_st().net.tick(); _emit(1)")
+            apply([text_layer("t", text_spec(font=font, text=text, size=48.0, bold=bold, italic=italic, x=8.0, y=6.0))], W_, H_)
+        return read_out(True)[..., 3]
+
+    def slant(a):
+        ys, xs = np.nonzero(a > 0.5)
+        rows = np.unique(ys)
+        cx = np.array([np.average(np.nonzero(a[y] > 0.5)[0]) for y in rows])
+        return float(np.polyfit(rows, cx, 1)[0]) if len(rows) > 5 else 0.0
+
+    for font in cases:
+        reg = render(font, False, False)
+        bold = render(font, True, False)
+        ital = render(font, False, True)
+        both = render(font, True, True)
+        cr, cb, ci, cbi = (float(x.sum()) for x in (reg, bold, ital, both))
+        bar = (render(font, False, False, "IIIIIIII"), render(font, False, True, "IIIIIIII"))
+        sr, si = slant(bar[0]), slant(bar[1])
+        check(f"fonts {font}: Bold has more glyph coverage than Regular (x{cb / max(cr, 1):.2f}); Bold Italic too (x{cbi / max(cr, 1):.2f})",
+              cb > 1.12 * cr and cbi > 1.12 * cr, f"regular {cr:.0f} bold {cb:.0f} italic {ci:.0f} bold-italic {cbi:.0f}")
+        diff = float(np.abs(ital - reg).sum()) / max(cr, 1)
+        check(f"fonts {font}: Italic differs from Regular (pixel difference {diff:.2f} of the ink) and slants the stems "
+              f"(dx/dy {sr:+.3f} -> {si:+.3f})", diff > 0.3 and abs(si - sr) > 0.05)
+    td(PRELUDE + "_emit(1)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("what", nargs="?", default="all")
@@ -2771,6 +3054,10 @@ def main() -> int:
             test_v3perf()
         if which in ("all", "v6"):
             test_v6()
+        if which in ("all", "v7"):
+            test_v7()
+        if which in ("all", "fonts"):
+            test_fonts_ttc()
         if which == "wrap-fixture":
             make_wrap_fixture()
         if which == "shapes-chromium":

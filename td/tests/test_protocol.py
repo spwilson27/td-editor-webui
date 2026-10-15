@@ -32,7 +32,7 @@ def test_header_layout_matches_spec():
 
 def test_slot_field_at_offset_6_roundtrips_for_every_valid_type():
     for typ in P.VALID_TYPES:
-        slot = 8 if typ == P.TYPE_BASE else 0xBEEF  # BASE: the input index (1..8)
+        slot = 8 if typ == P.TYPE_BASE else 0 if typ == P.TYPE_LAYER_PREVIEW else 0xBEEF  # BASE: the input index (1..8); LAYER_PREVIEW: 0
         raw = P.encode_message(hdr(type=typ, slot=slot, w=1, h=1), bytes(4))
         assert struct.unpack_from("<H", raw, 6)[0] == slot
         got, _ = P.decode_frame(raw)
@@ -52,7 +52,7 @@ def test_base_frame_slot_must_be_an_input_index(slot):
 def test_type_2_is_invalid_to_encode_and_decode():
     with pytest.raises(P.ProtocolError):
         P.encode_header(hdr(type=2))
-    assert 2 not in P.VALID_TYPES and set(P.VALID_TYPES) == {1, 3, 4, 5, 6}
+    assert 2 not in P.VALID_TYPES and set(P.VALID_TYPES) == {1, 3, 4, 5, 6, 7}
 
 
 def test_slot_out_of_range_rejected():
@@ -91,7 +91,7 @@ def test_frame_id_wraps():
     lambda b: b + b"\0",
     lambda b: b[:4] + bytes([0]) + b[5:],  # type 0
     lambda b: b[:4] + bytes([2]) + b[5:],  # type 2 = v1/v2 COMPOSITE, invalid in v3
-    lambda b: b[:4] + bytes([7]) + b[5:],
+    lambda b: b[:4] + bytes([8]) + b[5:],
     lambda b: b"",
 ])
 def test_invalid_frames_rejected(mutate):
@@ -221,7 +221,7 @@ def test_json_decode_rejects(bad):
 
 def test_json_builders():
     assert json.loads(P.hello(10, 20, True, 30, False, "abc")) == {
-        "t": "hello", "protocol": 6, "doc": {"w": 10, "h": 20, "mode": "input"}, "inputs": [],
+        "t": "hello", "protocol": 7, "doc": {"w": 10, "h": 20, "mode": "input"}, "inputs": [],
         "hasInput": True, "maxSendFps": 30, "active": False, "clientId": "abc", "hasDocument": False, "rev": None}
     items = [{"input": 2, "w": 5, "h": 6, "connected": True}, {"input": 1, "w": 640, "h": 480, "connected": True},
              {"input": 3, "w": 9, "h": 9, "connected": False}]
@@ -255,7 +255,7 @@ def test_json_builders():
 
 def test_web_side_builders_roundtrip_through_decode():
     m = P.decode_json(P.ready("panel", "tok", True, "v1"))
-    assert (m["t"], m["protocol"], m["client"], m["token"], m["fresh"]) == ("ready", 6, "panel", "tok", True)
+    assert (m["t"], m["protocol"], m["client"], m["token"], m["fresh"]) == ("ready", 7, "panel", "tok", True)
     assert P.decode_json(P.request_doc()) == {"t": "requestDoc"}
     d = P.decode_json(P.doc(4, [LAYER]))
     assert P.parse_doc(d) == (4, [LAYER])
@@ -388,7 +388,7 @@ def parse(*layers):
 
 
 def test_version_and_new_frame_type():
-    assert P.PROTOCOL_VERSION == 6 and P.TYPE_TOP_IMAGE == 6 and 6 in P.VALID_TYPES
+    assert P.PROTOCOL_VERSION == 7 and P.TYPE_TOP_IMAGE == 6 and 6 in P.VALID_TYPES and P.TYPE_LAYER_PREVIEW == 7
 
 
 def test_top_image_frame_uses_the_tops_own_size_as_doc_size():
@@ -653,8 +653,6 @@ def test_base_layer_is_migrated_to_input_1_everything_else_kept():
     {"kind": "pixel", "effects": [{**EFFECTS[6], "high": 1.5}]},
     {"kind": "pixel", "effects": [{**EFFECTS[4], "depth": 101}]},
     {"kind": "pixel", "effects": [EFFECTS[5]] * 33},
-    {"kind": "group", "effects": [EFFECTS[5]]},
-    {"kind": "adjustment", "effects": [EFFECTS[5]]},
 ])
 def test_parse_doc_rejects_bad_v6_fields(bad):
     with pytest.raises(P.ProtocolError):

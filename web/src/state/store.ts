@@ -4,7 +4,7 @@ import { NO_LATENCY, type Bridge, type LatencyStats } from '../bridge/tdBridge';
 import { decodeImage } from './importImage';
 import { DEFAULT_SHAPE_OPTIONS, DEFAULT_TEXT_OPTIONS, newTextSpec, type ShapeOptions, type TextOptions } from './specs';
 import { hsvToRgb, parseHex, rgbToHsl, rgbToHsv, toHex, type Hsv, type Rgb } from './colour';
-import { BRUSHES, FALLBACK_FONTS, RECENT_DEFAULT, toolInfo } from './tools';
+import { FALLBACK_FONTS, RECENT_DEFAULT, toolInfo } from './tools';
 import { fitView, screenToDoc, zoomAbout, clampZoom, type View } from './view';
 import { IDENTITY, isIdentity, remapShape, remapText, sameRect, transformFor } from './transform';
 import type { SliceCtx } from './slice';
@@ -12,12 +12,17 @@ import { createToolsSlice } from './toolsSlice';
 import { createEffectsSlice } from './effectsSlice';
 import { createFilesSlice } from './filesSlice';
 import { createInputsSlice } from './inputsSlice';
+import { createBrushesSlice } from './brushesSlice';
+import { BIG_DOC_KEY } from './brushes';
+import { defaultEffect, effectLabel } from './effectDefaults';
 
 /** Per-viewer view toggles (v4). Guides themselves live in the document. */
 export const RULERS_KEY = 'raster-editor.view.rulers';
 export const GUIDES_KEY = 'raster-editor.view.guides';
 export const SNAP_KEY = 'raster-editor.view.snap';
 export const SNAP_THRESHOLD = 6; // screen px
+/** One-time "try the TD view" notice above this many pixels (v6; never an automatic switch). */
+export const BIG_DOC_PIXELS = 8_000_000;
 
 function loadFlag(key: string, dflt = true): boolean {
   try { const v = localStorage.getItem(key); return v === null ? dflt : v === '1'; } catch { return dflt; }
@@ -30,7 +35,7 @@ function saveFlag(key: string, on: boolean) {
 export interface GuideDrag { axis: 'h' | 'v'; index: number | null; pos: number; remove: boolean }
 
 /** What the store needs from the bridge; Flatten / canvas calls are optional (standalone, tests). */
-export type StoreBridge = Pick<Bridge, 'listTops' | 'importTop'> & Partial<Pick<Bridge, 'renderLayer' | 'setCanvas' | 'saveProject' | 'openProject' | 'exportPng' | 'chooseFile' | 'placeImageViaTd'>>;
+export type StoreBridge = Pick<Bridge, 'listTops' | 'importTop'> & Partial<Pick<Bridge, 'renderLayer' | 'setCanvas' | 'saveProject' | 'openProject' | 'exportPng' | 'chooseFile' | 'readTextFile' | 'clearStoredHistory' | 'placeImageViaTd'>>;
 
 export const SHAPE_RENDERER_KEY = 'raster-editor.shapeRenderer';
 export type ShapeRenderer = 'sdf' | 'canvas';
@@ -87,6 +92,10 @@ export function createStore() {
   const cursorPos = signal<{ x: number; y: number } | null>(null); // viewport-local CSS px, for the ruler markers
   const aspectLock = signal(true);
   const flattening = signal<string | null>(null);
+
+  // v6: big-document notice (dismissal remembered per viewer), TD renders of tdPreview layers
+  const bigDocDismissed = signal(loadFlag(BIG_DOC_KEY, false));
+  const layerPreviews = signal<ReadonlyMap<string, 'pending' | 'ready'>>(new Map());
 
   const colorTab = signal<'color' | 'swatches' | 'brushes'>('color');
   const layerTab = signal<'layers' | 'history' | 'adjust' | 'fx'>('layers');
@@ -148,6 +157,7 @@ export function createStore() {
 
   const store = {
     ...createToolsSlice(ctx), ...createEffectsSlice(ctx), ...createFilesSlice(ctx), ...createInputsSlice(ctx),
+    ...createBrushesSlice(ctx, { brush, brushPreset, setBrush: (p) => store.setBrush(p) }),
     tool, hsv, primary, secondary, alpha, recent, customSwatches, brush, brushPreset, fillTolerance,
     selOpts, textOpts, shapeOpts, fonts, textEdit, topDialog, shapeRenderer,
     /** Shape antialiasing: 'sdf' = same maths as TouchDesigner, 'canvas' = browser Canvas 2D. Persisted per viewer. */
@@ -167,7 +177,7 @@ export function createStore() {
     /** Set by the App: opens the Place Image file chooser. */
     openPlace: null as (() => void) | null,
     colorTab, layerTab, viewMode, clientKind, viewRect, latency, viewLatency, viewAge, tdViewTick, adjDraft, loadingDoc,
-    view, zoom, spaceHeld, docSize, docName, connection, active, notice, fatal,
+    view, zoom, spaceHeld, docSize, docName, connection, active, notice, fatal, layerPreviews,
     docVersion, historyVersion, selectionVersion, thumbTick,
     takeover: null as (() => void) | null,
     /** TD view is only possible while linked to TouchDesigner. */
@@ -190,7 +200,7 @@ export function createStore() {
       docSize.value = { w: e.width, h: e.height };
       offEngine = e.on((ev) => {
         switch (ev.type) {
-          case 'docspec': docspecVersion.value++; canvasMode.value = e.canvasMode(); break;
+          case 'docspec': docspecVersion.value++; canvasMode.value = e.canvasMode(); store.syncDocPresets(); break;
           case 'structure': {
             docVersion.value++; thumbTick.value++;
             const id = e.activeLayerId();
@@ -228,6 +238,7 @@ export function createStore() {
       e.setShapeRenderer(shapeRenderer.peek());
       e.setPreviewEnabled(viewMode.peek() === 'local');
       lastActiveId = e.activeLayerId();
+      store.startBrushSync(e);
       stopContextSync = effect(() => {
         e.setToolContext({
           primary: toRgba(primary.value, alpha.value),
@@ -252,6 +263,7 @@ export function createStore() {
       if (stopSnapSync) stopSnapSync();
       if (stopZoomSync) stopZoomSync();
       if (stopRetouchSync) stopRetouchSync();
+      store.stopBrushSync();
       stopSelSync = stopSnapSync = stopZoomSync = stopRetouchSync = null;
       textEdit.value = null;
       if (thumbTimer) clearTimeout(thumbTimer);
@@ -315,12 +327,6 @@ export function createStore() {
       b.size = Math.round(Math.min(1000, Math.max(1, b.size)));
       brush.value = b;
     },
-    applyPreset(id: string) {
-      const p = BRUSHES.find((x) => x.id === id);
-      if (!p) return;
-      brushPreset.value = id;
-      store.setBrush({ size: p.size, opacity: p.opacity, flow: p.flow, hardness: p.hardness });
-    },
     nudgeSize(dir: 1 | -1) {
       const s = brush.peek().size;
       const step = s >= 100 ? 10 : s >= 20 ? 5 : s >= 10 ? 2 : 1;
@@ -374,8 +380,29 @@ export function createStore() {
     setLatency: (s: LatencyStats) => { latency.value = s; },
     setViewLatency: (s: LatencyStats) => { viewLatency.value = s; },
     addAdjustment: (type: AdjustmentType) => store.engine.addAdjustment(type),
+    /** Layer ▸ New Filter Adjustment: an adjustment layer {type:'filter'} holding a library filter with its default parameters. */
+    addFilterAdjustment(filterType: string): string {
+      const e = store.engine, fx = defaultEffect(filterType), name = effectLabel(filterType);
+      if (e.addFilterAdjustment) return e.addFilterAdjustment(fx, name); // one history entry
+      const id = e.addAdjustment('filter');
+      e.setAdjustment(id, { type: 'filter', effect: fx });
+      e.setLayerProps(id, { name });
+      return id;
+    },
+    // v6: big-document notice, TD layer renders
+    /** The document is larger than ~8 MP in the Local preview and the notice was not dismissed on this viewer. */
+    bigDocNotice: computed(() => !bigDocDismissed.value && viewMode.value === 'local' && docSize.value.w * docSize.value.h > BIG_DOC_PIXELS),
+    dismissBigDocNotice() { bigDocDismissed.value = true; saveFlag(BIG_DOC_KEY, true); },
+    /** Forget the dismissal on this viewer (tests; a future "show tips again" setting). */
+    resetBigDocNotice() { bigDocDismissed.value = false; saveFlag(BIG_DOC_KEY, false); },
+    /** The notice's button: switch to the TD view (only while linked), which also ends the notice. */
+    acceptBigDocNotice() { if (connection.peek() !== 'linked') return; store.setViewMode('td'); store.dismissBigDocNotice(); },
+    setLayerPreview(id: string, state: 'pending' | 'ready') { layerPreviews.value = new Map(layerPreviews.peek()).set(id, state); },
+    clearLayerPreviews() { layerPreviews.value = new Map(); },
+    layerPreviewState(id: string): 'pending' | 'ready' { return layerPreviews.value.get(id) ?? 'pending'; },
     activeLayer() {
-      const e = store.engine, id = e.activeLayerId();
+      if (!engine) return undefined;
+      const e = engine, id = e.activeLayerId();
       return e.layers().find((l) => l.id === id);
     },
     canAddMask() {

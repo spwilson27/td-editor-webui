@@ -1,4 +1,5 @@
 import type { HistoryEntry } from './types';
+import type { Ser } from './historyBlob';
 
 export interface HistoryItem {
   label: string;
@@ -9,6 +10,8 @@ export interface HistoryItem {
   coalesceKey?: string;
   /** Marks entries a later step may discard again (quick mask strokes), see discardTrailing. */
   tag?: string;
+  /** v6: the step as data, for persistence (serializeHistory); entries without it end the persisted window. */
+  ser?: Ser;
 }
 
 interface Stored extends HistoryItem {
@@ -27,6 +30,8 @@ export class History {
   private items: Stored[] = [];
   private cur = -1;
   private nextId = 1;
+  /** Bumped by every change of the stacks (push, undo, redo, jump, clear, load, discard): cheap change detection for persistence. */
+  version = 0;
   private total = 0;
   private readonly maxSteps: number;
   private readonly maxBytes: number;
@@ -54,12 +59,17 @@ export class History {
 
   /** The item is already applied; this only records how to undo/redo it. */
   push(item: HistoryItem): void {
+    this.version++;
     this.dropRedoTail();
     const t = this.now();
     const top = this.items[this.cur];
     if (item.coalesceKey && top && top.coalesceKey === item.coalesceKey && t - top.time < this.coalesceMs) {
       this.total += item.bytes - top.bytes;
       top.redo = item.redo;
+      // the merged step goes from the first `before` to the latest `after`
+      if (top.ser && item.ser && top.ser.k === 'struct' && item.ser.k === 'struct') top.ser = { k: 'struct', before: top.ser.before, after: item.ser.after };
+      else if (top.ser && item.ser && top.ser.k === 'guides' && item.ser.k === 'guides') top.ser = { k: 'guides', before: top.ser.before, after: item.ser.after };
+      else top.ser = undefined;
       top.bytes = item.bytes;
       top.label = item.label;
       top.time = t;
@@ -77,6 +87,7 @@ export class History {
 
   undo(): boolean {
     if (this.cur < 0) return false;
+    this.version++;
     this.items[this.cur].undo();
     this.cur--;
     return true;
@@ -84,6 +95,7 @@ export class History {
 
   redo(): boolean {
     if (this.cur >= this.items.length - 1) return false;
+    this.version++;
     this.cur++;
     this.items[this.cur].redo();
     return true;
@@ -98,6 +110,7 @@ export class History {
 
   /** Remove every entry carrying `tag`, wherever it is (the redo tail and the other entries are kept; returns how many went). */
   discardTagged(tag: string): number {
+    this.version++;
     let removed = 0;
     let cur = this.cur;
     this.items = this.items.filter((it, i) => {
@@ -111,7 +124,21 @@ export class History {
     return removed;
   }
 
+  /** The stored steps, oldest first (`cur` = index of the last applied one). */
+  stored(): ReadonlyArray<{ label: string; bytes: number; tag?: string; ser?: Ser }> {
+    return this.items;
+  }
+
+  /** Replace everything with restored steps (none of them can be coalesced into); `cur` = last applied index. */
+  load(items: HistoryItem[], cur: number): void {
+    this.version++;
+    this.items = items.map((it) => ({ ...it, id: this.nextId++, time: Number.NEGATIVE_INFINITY }));
+    this.cur = Math.max(-1, Math.min(this.items.length - 1, cur));
+    this.total = this.items.reduce((n, it) => n + it.bytes, 0);
+  }
+
   clear(): void {
+    this.version++;
     this.items = [];
     this.cur = -1;
     this.total = 0;

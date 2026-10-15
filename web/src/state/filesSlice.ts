@@ -10,7 +10,9 @@ export function createFilesSlice(ctx: SliceCtx) {
   /** Current TD `files` message values. */
   const files = signal<{ projectFile: string; pngFile: string }>({ projectFile: '', pngFile: '' });
   /** The open dialog (null = closed). `busy` while a request is in flight; `result` the last outcome. */
-  const fileDialog = signal<{ op: FileOp; path: string; busy: boolean; result: FileResult | null } | null>(null);
+  const fileDialog = signal<{ op: FileOp; path: string; busy: boolean; result: FileResult | null; includeHistory: boolean } | null>(null);
+  /** Per session: the last choice of the Save dialog's "Include undo history" box (default on). */
+  let includeHistory = true;
   return {
     files, fileDialog,
     setFiles(f: { projectFile: string; pngFile: string }) { files.value = f; },
@@ -20,7 +22,14 @@ export function createFilesSlice(ctx: SliceCtx) {
     openFileDialog(op: FileOp) {
       if (!ctx.linked()) return;
       const f = files.peek();
-      fileDialog.value = { op, path: op === 'exportPng' ? f.pngFile : f.projectFile, busy: false, result: null };
+      fileDialog.value = { op, path: op === 'exportPng' ? f.pngFile : f.projectFile, busy: false, result: null, includeHistory };
+    },
+    setIncludeHistory(on: boolean) { includeHistory = on; const d = fileDialog.peek(); if (d) fileDialog.value = { ...d, includeHistory: on }; },
+    /** File ▸ Clear stored undo history. */
+    async clearStoredHistory(): Promise<boolean> {
+      const b = ctx.bridge();
+      if (!b?.clearStoredHistory || !ctx.linked()) return false;
+      try { await b.clearStoredHistory(); ctx.setNotice('Stored undo history cleared'); return true; } catch (err) { ctx.setNotice(`Could not clear the stored history: ${err instanceof Error ? err.message : String(err)}`); return false; }
     },
     closeFileDialog() { fileDialog.value = null; },
     setFilePath(path: string) { const d = fileDialog.peek(); if (d) fileDialog.value = { ...d, path }; },
@@ -39,7 +48,7 @@ export function createFilesSlice(ctx: SliceCtx) {
       fileDialog.value = { ...d, busy: true, result: null };
       let result: FileResult;
       try {
-        result = await call(d.path.trim() || undefined);
+        result = d.op === 'saveProject' ? await b.saveProject!(d.path.trim() || undefined, { includeHistory: d.includeHistory }) : await call(d.path.trim() || undefined);
       } catch (err) {
         result = { op: d.op, ok: false, path: d.path, msg: err instanceof Error ? err.message : String(err) };
       }

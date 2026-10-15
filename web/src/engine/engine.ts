@@ -1,13 +1,16 @@
 import type {
-  AdjustmentSpec, AdjustmentType, Anchor, BlendMode, BrushSettings, CanvasMode, CloneOptions, DocSpec, Effect, EditorEngine, EngineEvent,
+  AdjustmentSpec, AdjustmentType, Anchor, BlendMode, BrushDynamics, BrushPreset, BrushSettings, TipShape, CanvasMode, CloneOptions, DocSpec, Effect, EditorEngine, EngineEvent,
   Guides, HistoryEntry, LayerInfo, LayerTransform, PaintTarget, Rect, RGBA, SelectionOptions, ShapeSpec, ShapeType, SnapOptions, TextSpec,
   ToolContext, ToolId, ToolPointer,
 } from './types';
 import { ADJUSTMENT_NAMES, clampAdjustment, defaultAdjustment, isIdentity, sameAdjustment } from './adjustments';
 import { Compositor } from './compositor';
-import { History } from './history';
+import { sanitizeEffects, sameEffects } from './effectsSanitize';
+import { effectIsTdPreview, tdPreviewFlag } from './effectsAdapter';
+export { sanitizeEffect } from './effectsSanitize';
+import { History, type HistoryItem } from './history';
 import {
-  BASE_ID, cloneEffect, Document, floatingBounds, isPixel, isVector, layerBox, layerExtent, layerXf, MAX_INPUTS, snapshotSurfaces, specBounds,
+  BASE_ID, Document, floatingBounds, isPixel, isVector, layerBox, layerExtent, layerXf, MAX_INPUTS, snapshotSurfaces, specBounds,
   specSame, surfaceDocBounds,
   type AdjustmentLayer, type EditTarget, type GroupLayer, type InputState, type Layer, type Mask, type PixelLayer,
   type ShapeLayer, type StructureSnapshot, type TextLayer, type VectorLayer,
@@ -21,6 +24,7 @@ import {
 } from './textShape';
 import { clearShapeCache, drawShapeWith, setShapeCacheBudget } from './shapeSdf';
 import type { Patch } from './tiles';
+import { hashString, readBlob, surfaceHash, writeBlob, type CanvasState, type Ser, type SerEntry } from './historyBlob';
 import { clipToSize, equal, intersect, isEmpty, union } from './rect';
 import { createSurface, releaseSurface, resampled, type Surface } from './surface';
 
@@ -30,6 +34,7 @@ import {
   mulMat, outerRect, sameXf, toDoc, type Xf,
 } from './xform';
 import type { Host, Scratch, Tool } from './tools/host';
+import { DEFAULT_DYNAMICS, sanitizeBrushPresets, sanitizeCustomTip, sanitizeDynamics, BUILTIN_TIPS, type CustomTip } from './tools/tips';
 import { StrokeTool } from './tools/paint';
 import { FillTool, GradientTool, MoveTool, PickerTool } from './tools/others';
 import { BlurTool, CloneTool, DEFAULT_RETOUCH, DodgeTool, SmudgeTool, type RetouchOptions } from './tools/retouch';
@@ -37,13 +42,14 @@ import { TileBackup } from './tiles';
 import { LassoTool, MarqueeTool, WandTool } from './tools/select';
 
 const MAX_BRUSH = 1000;
+const MAX_TIP_SIZE = 512;
 const MAX_DIM = 16384;
 const MAX_IMPORT = 8192; // longest side of an imported image kept at native resolution
 const MAX_PIXELS = 8192 * 8192; // largest surface a bake (applyTransform) may produce
 const MAX_GUIDES = 512;
 const PAINT_TOOLS: ToolId[] = ['brush', 'pencil', 'eraser', 'fill', 'gradient'];
 const SELECT_TOOLS: ToolId[] = ['marquee', 'lasso', 'wand'];
-const MAX_EFFECTS = 32;
+const STROKE_TOOLS: ToolId[] = ['brush', 'pencil', 'eraser', 'smudge', 'blur', 'dodge', 'clone']; // dab tools: the composite below the layer is cached while they stroke
 const BLENDS: ReadonlySet<string> = new Set<BlendMode>([
   'normal', 'multiply', 'screen', 'overlay', 'soft-light', 'hard-light', 'darken', 'lighten',
   'color-dodge', 'color-burn', 'difference', 'exclusion', 'hue', 'saturation', 'color', 'luminosity',
@@ -93,70 +99,6 @@ function newInputLayer(id: string, input: number, surface: Surface): PixelLayer 
   return newPixelLayer(id, `TD Input ${input}`, surface, { kind: 'input', input, locked: true });
 }
 
-const EFFECT_NAME = /^[A-Za-z][A-Za-z0-9]{0,47}$/;
-const fnum = (v: unknown, lo: number, hi: number, def: number): number => {
-  const n = typeof v === 'number' ? v : Number.NaN;
-  return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : def;
-};
-const fint = (v: unknown, lo: number, hi: number, def: number): number => Math.round(fnum(v, lo, hi, def));
-const fpick = <T extends string>(v: unknown, ok: readonly T[], def: T): T => (ok.includes(v as T) ? (v as T) : def);
-function frgba(c: unknown, def: RGBA): RGBA {
-  const o = c && typeof c === 'object' ? (c as Record<string, unknown>) : {};
-  return { r: fnum(o.r, 0, 255, def.r), g: fnum(o.g, 0, 255, def.g), b: fnum(o.b, 0, 255, def.b), a: fnum(o.a, 0, 255, def.a) };
-}
-const BLACK: RGBA = { r: 0, g: 0, b: 0, a: 255 };
-const WHITE: RGBA = { r: 255, g: 255, b: 255, a: 255 };
-
-/**
- * One effect with every field present and inside the ranges TouchDesigner accepts (td/raster_editor/protocol.py _EFFECT_FIELDS):
- * missing / non-finite values take defaults, numbers are clamped. A type outside the ten v5 effects (a v6 filter) is kept verbatim
- * (opaque parameters, deep copy, `enabled` as a boolean): TD owns its parameters. null = not an effect (no valid type name).
- */
-export function sanitizeEffect(e: unknown): Effect | null {
-  if (!e || typeof e !== 'object') return null;
-  const o = e as Record<string, unknown>;
-  const type = o.type;
-  if (typeof type !== 'string' || !EFFECT_NAME.test(type)) return null;
-  const enabled = o.enabled !== false;
-  switch (type) {
-    case 'dropShadow':
-      return { enabled, type, dx: fnum(o.dx, -4096, 4096, 4), dy: fnum(o.dy, -4096, 4096, 4), blur: fnum(o.blur, 0, 512, 6), color: frgba(o.color, BLACK), opacity: fnum(o.opacity, 0, 1, 0.75) };
-    case 'outerGlow':
-    case 'innerGlow':
-      return { enabled, type, size: fnum(o.size, 0, 512, 8), color: frgba(o.color, WHITE), opacity: fnum(o.opacity, 0, 1, 0.75) };
-    case 'stroke':
-      return { enabled, type, width: fnum(o.width, 0, 512, 2), color: frgba(o.color, BLACK), position: fpick(o.position, ['inside', 'center', 'outside'] as const, 'outside'), opacity: fnum(o.opacity, 0, 1, 1) };
-    case 'bevel':
-      return { enabled, type, depth: fnum(o.depth, 0, 100, 50), size: fnum(o.size, 0, 512, 4), angle: fnum(o.angle, -3600, 3600, 120), highlight: frgba(o.highlight, WHITE), shadow: frgba(o.shadow, BLACK) };
-    case 'colorOverlay':
-      return { enabled, type, color: frgba(o.color, { r: 255, g: 0, b: 0, a: 255 }), opacity: fnum(o.opacity, 0, 1, 1) };
-    case 'pixelSort':
-      return { enabled, type, direction: fpick(o.direction, ['h', 'v'] as const, 'h'), low: fnum(o.low, 0, 1, 0.25), high: fnum(o.high, 0, 1, 0.75), key: fpick(o.key, ['luma', 'hue'] as const, 'luma') };
-    case 'glitch':
-      return { enabled, type, amount: fnum(o.amount, 0, 100, 30), blockSize: fnum(o.blockSize, 1, 4096, 16), seed: fint(o.seed, 0, 2 ** 31, 1), rgbShift: fnum(o.rgbShift, -1000, 1000, 4) };
-    case 'chromaticAberration':
-      return { enabled, type, amount: fnum(o.amount, -1000, 1000, 4), angle: fnum(o.angle, -3600, 3600, 0) };
-    case 'halftone':
-      return { enabled, type, cellSize: fnum(o.cellSize, 1, 512, 8), angle: fnum(o.angle, -3600, 3600, 45), shape: fpick(o.shape, ['dot', 'line'] as const, 'dot') };
-    default: {
-      const c = cloneEffect(o as unknown as Effect) as unknown as Record<string, unknown>;
-      c.enabled = enabled;
-      return c as unknown as Effect;
-    }
-  }
-}
-
-/** Validated copy of an effect stack (entries without a valid type name are dropped, see sanitizeEffect). */
-function sanitizeEffects(list: unknown): Effect[] {
-  if (!Array.isArray(list)) return [];
-  const out: Effect[] = [];
-  for (const e of list.slice(0, MAX_EFFECTS)) {
-    const c = sanitizeEffect(e);
-    if (c) out.push(c);
-  }
-  return out;
-}
-const sameEffects = (a: Effect[], b: Effect[]): boolean => a.length === b.length && JSON.stringify(a) === JSON.stringify(b);
 
 /** Content equality of two selection states of a document `w` wide (alpha arrays are compared by value, a rect-only state is full coverage). */
 function selEqual(a: SelState, b: SelState, w: number): boolean {
@@ -176,7 +118,6 @@ const copyGuides = (g: Guides): Guides => ({ h: g.h.slice(), v: g.v.slice() });
 const sameGuides = (a: Guides, b: Guides): boolean =>
   a.h.length === b.h.length && a.v.length === b.v.length && a.h.every((n, i) => n === b.h[i]) && a.v.every((n, i) => n === b.v[i]);
 
-interface CanvasState { w: number; h: number; mode: CanvasMode; guides: Guides; sel: SelState }
 
 export class Engine implements EditorEngine, Host {
   readonly doc: Document;
@@ -185,6 +126,11 @@ export class Engine implements EditorEngine, Host {
   private hist = new History();
   private listeners = new Set<(e: EngineEvent) => void>();
   private ctx = defaultContext();
+  private tip: { shape: TipShape; dynamics: BrushDynamics; custom: CustomTip | null } = { shape: 'round', dynamics: { ...DEFAULT_DYNAMICS }, custom: null }; // v6
+  private presets: BrushPreset[] = []; // v6 document brush presets
+  private presetVer = 0;
+  private tipStrokes = 0; // textured strokes since setBrushTip (mixed into the seed)
+  private presetCache: { v: number; list: BrushPreset[] } | null = null;
   private toolId: ToolId = 'brush';
   private tools: Partial<Record<ToolId, Tool>>;
   private active: Tool | null = null;
@@ -272,6 +218,8 @@ export class Engine implements EditorEngine, Host {
 
   context(): ToolContext { return this.ctx; }
 
+  brushTip(): { shape: TipShape; dynamics: BrushDynamics; custom: CustomTip | null; stroke: number } { return { ...this.tip, stroke: this.tipStrokes++ }; }
+
   editableLayer(): EditTarget | null {
     if (this.qm) return this.qmTarget(this.qm);
     const l = this.doc.active();
@@ -314,9 +262,9 @@ export class Engine implements EditorEngine, Host {
     };
   }
 
-  changed(r: Rect): void {
+  changed(r: Rect, activeOnly = false): void {
     this.version++;
-    this.compositor.invalidate(r);
+    this.compositor.invalidate(r, false, activeOnly);
     const c = clipToSize(r, this.doc.width, this.doc.height);
     if (c) this.emit({ type: 'pixels', rect: c });
   }
@@ -329,7 +277,7 @@ export class Engine implements EditorEngine, Host {
       return;
     }
     if (target.layer.kind === 'pixel') target.layer.pristine = false;
-    this.changed(dirtyDoc(target.tf, layerRect));
+    this.changed(dirtyDoc(target.tf, layerRect), target.layer.id === this.compositor.held); // (a stroke on the held layer keeps the below cache)
     if (target.slot === null) return;
     const lr = clipToSize(layerRect, target.surface.width, target.surface.height);
     if (lr) this.emit({ type: 'surface', slot: target.slot, rect: lr });
@@ -341,15 +289,7 @@ export class Engine implements EditorEngine, Host {
   }
 
   pushPatch(label: string, target: EditTarget, patches: Patch[]): void {
-    const apply = (which: 'before' | 'after') => () => {
-      if (target.quick && this.qm?.layer !== target.layer) return; // that quick mask session is over
-      for (const p of patches) {
-        target.surface.ctx.putImageData(p[which], p.rect.x, p.rect.y);
-        this.paintChanged(target, p.rect);
-      }
-    };
-    const bytes = patches.reduce((n, p) => n + p.before.data.length + p.after.data.length, 0);
-    this.hist.push({ label, bytes, undo: apply('before'), redo: apply('after'), tag: target.quick ? 'qm' : undefined });
+    this.hist.push(this.item(label, { k: 'patch', target, patches }, { tag: target.quick ? 'qm' : undefined }));
     this.emit({ type: 'history' });
   }
 
@@ -364,18 +304,7 @@ export class Engine implements EditorEngine, Host {
    */
   commitStructure(label: string, before: StructureSnapshot, coalesceKey?: string, dirty: Rect | null | false = null): void {
     const after = this.doc.snapshot();
-    const apply = (s: StructureSnapshot) => () => {
-      const prev = this.doc.snapshot();
-      this.doc.restore(s);
-      this.structureChanged(null, !specSame(prev, this.doc.snapshot()));
-    };
-    // Surfaces only history keeps alive (deleted layers, replaced by a bake / flatten) are held in memory.
-    const a = snapshotSurfaces(before);
-    const b = snapshotSurfaces(after);
-    let bytes = 256;
-    a.forEach((sf) => { if (!b.has(sf)) bytes += sf.width * sf.height * 4; });
-    b.forEach((sf) => { if (!a.has(sf)) bytes += sf.width * sf.height * 4; });
-    this.hist.push({ label, bytes, undo: apply(before), redo: apply(after), coalesceKey });
+    this.hist.push(this.item(label, { k: 'struct', before, after }, { coalesceKey }));
     const announced = this.liveSpec; // a move drag sent these offsets already
     this.liveSpec = false;
     this.structureChanged(dirty, !announced && !specSame(before, after));
@@ -489,26 +418,7 @@ export class Engine implements EditorEngine, Host {
   private canvasEntry(label: string, sBefore: StructureSnapshot, cBefore: CanvasState): void {
     const sAfter = this.doc.snapshot();
     const cAfter = this.canvasState();
-    const go = (snap: StructureSnapshot, cs: CanvasState) => () => {
-      const prev = { w: this.doc.width, h: this.doc.height, sel: this.sel };
-      this.doc.restore(snap);
-      this.doc.width = cs.w;
-      this.doc.height = cs.h;
-      this.doc.canvasMode = cs.mode;
-      this.doc.guides = copyGuides(cs.guides);
-      this.dropSelCaches();
-      this.sel = cs.sel;
-      this.doc.selection = cs.sel.rect;
-      if (prev.w !== cs.w || prev.h !== cs.h) this.compositor.resize();
-      else this.compositor.invalidate(null);
-      this.announceCanvas(prev);
-    };
-    let bytes = 256 + (cBefore.sel.alpha?.length ?? 0) + (cAfter.sel.alpha?.length ?? 0);
-    const a = snapshotSurfaces(sBefore);
-    const b = snapshotSurfaces(sAfter);
-    a.forEach((sf) => { if (!b.has(sf)) bytes += sf.width * sf.height * 4; });
-    b.forEach((sf) => { if (!a.has(sf)) bytes += sf.width * sf.height * 4; });
-    this.hist.push({ label, bytes, undo: go(sBefore, cBefore), redo: go(sAfter, cAfter) });
+    this.hist.push(this.item(label, { k: 'canvas', sBefore, sAfter, cBefore, cAfter }));
     this.emit({ type: 'history' });
   }
 
@@ -770,11 +680,7 @@ export class Engine implements EditorEngine, Host {
   private commitGuides(label: string, before: Guides, key?: string): void {
     const after = copyGuides(this.doc.guides);
     if (sameGuides(before, after)) return;
-    const go = (g: Guides) => () => {
-      this.doc.guides = copyGuides(g);
-      this.bumpSpec();
-    };
-    this.hist.push({ label, bytes: 64 + 8 * (before.h.length + before.v.length + after.h.length + after.v.length), undo: go(before), redo: go(after), coalesceKey: key });
+    this.hist.push(this.item(label, { k: 'guides', before, after }, { coalesceKey: key }));
     this.bumpSpec();
     this.emit({ type: 'history' });
   }
@@ -870,7 +776,15 @@ export class Engine implements EditorEngine, Host {
     return { dx: s.dx, dy: s.dy };
   }
 
-  layers(): LayerInfo[] { return this.doc.list(); }
+  layers(): LayerInfo[] {
+    const list = this.doc.list();
+    const flagged = this.tdPreviewLayers();
+    if (flagged.length) {
+      const f = new Set(flagged);
+      for (const i of list) if (f.has(i.id) && !this.compositor.hasPreview(i.id)) i.previewPending = true;
+    }
+    return list;
+  }
   activeLayerId(): string | null { return this.doc.activeId; }
 
   setActiveLayer(id: string): void {
@@ -890,12 +804,29 @@ export class Engine implements EditorEngine, Host {
   }
 
   addAdjustment(type: AdjustmentType): string {
-    const adjustment = defaultAdjustment(type);
+    return this.addAdj(defaultAdjustment(type), ADJUSTMENT_NAMES[type]);
+  }
+
+  /** v6: a filter adjustment layer with its initial effect in one history entry (selection-limited like addAdjustment). Returns the layer id. */
+  addFilterAdjustment(effect: Effect, name?: string): string {
+    const spec = clampAdjustment({ type: 'filter', effect });
+    return this.addAdj(spec, name ?? ADJUSTMENT_NAMES.filter);
+  }
+
+  private addAdj(adjustment: AdjustmentSpec, name: string): string {
+    // v6: with a selection the layer starts with a mask holding its coverage (document sized, feathered as the selection is); the selection stays
+    const sel = this.sel.rect ? this.sel : null;
+    let mask: Mask | null = null;
+    if (sel && sel.rect) {
+      const surface = createSurface(this.doc.width, this.doc.height, true);
+      surface.ctx.putImageData(this.coverageImage(sel), sel.rect.x, sel.rect.y);
+      mask = { slot: this.doc.newSlot(), surface, enabled: true };
+    }
     const layer: AdjustmentLayer = {
-      id: this.doc.newId(), kind: 'adjustment', name: ADJUSTMENT_NAMES[type], visible: true, locked: false,
-      opacity: 1, blend: 'normal', adjustment, mask: null, effects: [],
+      id: this.doc.newId(), kind: 'adjustment', name, visible: true, locked: false,
+      opacity: 1, blend: 'normal', adjustment, mask, effects: [],
     };
-    this.insertAboveActive('Add adjustment', layer, isIdentity(adjustment) ? false : null);
+    this.insertAboveActive('Add adjustment', layer, isIdentity(adjustment) ? false : sel ? sel.rect : null);
     return layer.id;
   }
 
@@ -1124,6 +1055,7 @@ export class Engine implements EditorEngine, Host {
     return {
       rev: this.rev, width: this.doc.width, height: this.doc.height, layers: this.doc.layerSpecs(),
       guides: copyGuides(this.doc.guides), canvas: { mode: this.doc.canvasMode },
+      brushPresets: this.presetClone(), // always present: an empty list tells TD the last preset was deleted
     };
   }
 
@@ -1264,7 +1196,7 @@ export class Engine implements EditorEngine, Host {
       const common = {
         id: sp.id, name: String(sp.name), visible: !!sp.visible, locked: isInput,
         opacity: clamp01(Number(sp.opacity)), blend: (BLENDS.has(sp.blend) ? sp.blend : 'normal') as BlendMode,
-        effects: sp.kind === 'group' || sp.kind === 'adjustment' ? [] : sanitizeEffects(sp.effects),
+        effects: sanitizeEffects(sp.effects),
       };
       const xf = cleanXf({ x: sp.x, y: sp.y, sx: sp.sx ?? 1, sy: sp.sy ?? 1, rot: sp.rot ?? 0, kx: sp.kx ?? 0, ky: sp.ky ?? 0 }) as Xf;
       let layer: Layer;
@@ -1300,6 +1232,8 @@ export class Engine implements EditorEngine, Host {
     attach(this.doc.root.children);
     this.doc.reseed(maxId, maxSlot);
     this.doc.guides = copyGuides(spec.guides ?? { h: [], v: [] });
+    this.presets = sanitizeBrushPresets(spec.brushPresets);
+    this.presetVer++;
     this.doc.canvasMode = spec.canvas?.mode === 'fixed' ? 'fixed' : 'input';
     this.announced.clear(); // TD's next inputs list creates layers for connected inputs the document lacks
     this.placePending.clear(); // the document says where the TD Inputs sit
@@ -1560,8 +1494,7 @@ export class Engine implements EditorEngine, Host {
   commitSelection(label: string, before: SelState): void {
     const after = this.sel;
     if (sameSel(before, after)) return;
-    const go = (s: SelState) => () => { this.setSel(s); };
-    this.hist.push({ label, bytes: 64 + (before.alpha?.length ?? 0) + (after.alpha?.length ?? 0), undo: go(before), redo: go(after) });
+    this.hist.push(this.item(label, { k: 'sel', before, after }));
     this.emit({ type: 'history' });
   }
 
@@ -2022,6 +1955,88 @@ export class Engine implements EditorEngine, Host {
     };
   }
 
+  // ---- v6 brush tips and presets ----
+
+  setBrushTip(tip: TipShape, dynamics: BrushDynamics, customTip?: { w: number; h: number; alpha: Uint8Array }): void {
+    const custom = tip === 'custom' ? sanitizeCustomTip(customTip) : null;
+    const shape: TipShape = tip === 'custom' ? (custom ? 'custom' : 'round') : BUILTIN_TIPS.includes(tip) ? tip : 'round';
+    this.finishStroke(false);
+    this.tip = { shape, dynamics: sanitizeDynamics(dynamics), custom };
+    this.tipStrokes = 0; // setting the tip restarts the stroke sequence
+  }
+
+  /** Active pixel layer luminance (Rec.709) x alpha x selection coverage inside the selection bounds, <= 512 x 512 (area-averaged down). */
+  tipFromSelection(): { w: number; h: number; alpha: Uint8Array } | null {
+    const l = this.doc.active();
+    const sel = this.selectionMask();
+    const why = !sel ? 'Make a selection first' : !l || l.kind !== 'pixel' ? 'Select a pixel layer to define a brush tip' : null;
+    if (why || !sel || !l || l.kind !== 'pixel') {
+      this.emit({ type: 'notice', message: why ?? 'Select a pixel layer to define a brush tip' });
+      return null;
+    }
+    const W = this.doc.width;
+    const r = intersect(sel.rect, this.docRect());
+    const px = l.surface.ctx.getImageData(0, 0, l.surface.width, l.surface.height).data;
+    const d = r ? this.inDocSpace(px, l.surface.width, l.surface.height, layerXf(l)) : null;
+    if (!r || !d) {
+      this.emit({ type: 'notice', message: 'The selection is empty' });
+      return null;
+    }
+    if (r.w * r.h > 4096 * 4096) {
+      this.emit({ type: 'notice', message: 'The selection is too large for a brush tip' });
+      return null;
+    }
+    const v = new Float32Array(r.w * r.h);
+    for (let y = 0; y < r.h; y++) {
+      for (let x = 0; x < r.w; x++) {
+        const i = (( r.y + y) * W + r.x + x);
+        v[y * r.w + x] = ((0.2126 * d[i * 4] + 0.7152 * d[i * 4 + 1] + 0.0722 * d[i * 4 + 2]) / 255) * (d[i * 4 + 3] / 255) * (sel.alpha[i] / 255);
+      }
+    }
+    const f = Math.max(1, Math.max(r.w, r.h) / MAX_TIP_SIZE);
+    const w = Math.max(1, Math.min(MAX_TIP_SIZE, Math.round(r.w / f)));
+    const h = Math.max(1, Math.min(MAX_TIP_SIZE, Math.round(r.h / f)));
+    const alpha = new Uint8Array(w * h);
+    let any = false;
+    for (let y = 0; y < h; y++) {
+      const y0 = (y * r.h) / h;
+      const y1 = ((y + 1) * r.h) / h;
+      for (let x = 0; x < w; x++) {
+        const x0 = (x * r.w) / w;
+        const x1 = ((x + 1) * r.w) / w;
+        let sum = 0;
+        for (let sy = Math.floor(y0); sy < Math.ceil(y1); sy++) {
+          const wy = Math.min(y1, sy + 1) - Math.max(y0, sy);
+          for (let sx = Math.floor(x0); sx < Math.ceil(x1); sx++) sum += v[sy * r.w + sx] * wy * (Math.min(x1, sx + 1) - Math.max(x0, sx));
+        }
+        const a = Math.round((255 * sum) / ((x1 - x0) * (y1 - y0)));
+        if (a > 0) any = true;
+        alpha[y * w + x] = Math.min(255, a);
+      }
+    }
+    if (!any) {
+      this.emit({ type: 'notice', message: 'The selected pixels are empty or black' });
+      return null;
+    }
+    return { w, h, alpha };
+  }
+
+  brushPresets(): BrushPreset[] { return structuredClone(this.presets); }
+
+  /** Shared read-only copy of the presets for docSpec(), rebuilt only when they changed. */
+  private presetClone(): BrushPreset[] {
+    if (!this.presetCache || this.presetCache.v !== this.presetVer) this.presetCache = { v: this.presetVer, list: structuredClone(this.presets) };
+    return this.presetCache.list;
+  }
+
+  setBrushPresets(presets: BrushPreset[]): void {
+    const next = sanitizeBrushPresets(presets);
+    if (JSON.stringify(next) === JSON.stringify(this.presets)) return;
+    this.presets = next;
+    this.presetVer++;
+    this.bumpSpec();
+  }
+
   pointerDown(p: ToolPointer): void {
     this.finishStroke();
     this.last = p;
@@ -2031,6 +2046,8 @@ export class Engine implements EditorEngine, Host {
       return;
     }
     this.active = (p.alt && PAINT_TOOLS.includes(this.toolId) ? this.tools.picker : this.tools[this.toolId]) ?? null;
+    const al = this.doc.active();
+    if (this.active && this.active !== this.tools.picker && STROKE_TOOLS.includes(this.toolId) && al && al.kind !== 'group') this.compositor.holdBelow(al.id); // v6: cache the composite below the stroke's layer
     this.active?.down(p);
   }
 
@@ -2044,6 +2061,7 @@ export class Engine implements EditorEngine, Host {
     this.active = null;
     this.last = null;
     t?.up(p);
+    this.compositor.holdBelow(null);
     this.liveSpec = false;
   }
 
@@ -2105,7 +2123,7 @@ export class Engine implements EditorEngine, Host {
 
   setEffects(id: string, effects: Effect[]): void {
     const l = this.doc.find(id);
-    if (!l || l.kind === 'group' || l.kind === 'adjustment') return;
+    if (!l) return;
     const next = sanitizeEffects(effects);
     if (sameEffects(next, l.effects)) return;
     this.finishStroke();
@@ -2114,6 +2132,43 @@ export class Engine implements EditorEngine, Host {
     l.effects = next;
     const ext = union(old, layerExtent(l, this.docRect()));
     this.commitStructure('Layer effects', before, `fx:${id}`, l.visible && l.opacity > 0 ? ext : false);
+  }
+
+  // ---- v6: layers shown from TouchDesigner's render (tdPreview) ----
+
+  tdPreviewLayers(): string[] {
+    const out: string[] = [];
+    for (const l of this.doc.all()) {
+      if (tdPreviewFlag(l.effects) || (l.kind === 'adjustment' && l.adjustment.type === 'filter' && effectIsTdPreview(l.adjustment.effect))) out.push(l.id);
+    }
+    return out;
+  }
+
+  /**
+   * TD's render of a tdPreview layer after its effects (doc sized, straight RGBA; masked for pixel / text / shape layers, group composite for
+   * groups, the adjusted + filtered result before the opacity x mask mix for adjustment layers). null clears it. Images of other layers or
+   * of the wrong size are ignored.
+   */
+  setLayerPreview(layerId: string, rgba: Uint8Array | Uint8ClampedArray | null): void {
+    const l = this.doc.find(layerId);
+    if (!l) return;
+    const had = this.compositor.hasPreview(layerId);
+    if (rgba === null) {
+      if (!had) return;
+      this.compositor.setPreview(layerId, null);
+    } else {
+      const W = this.doc.width;
+      const H = this.doc.height;
+      const need = W * H * 4;
+      if (rgba.length !== need || !this.tdPreviewLayers().includes(layerId)) return;
+      const surface = createSurface(W, H, true);
+      surface.ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba.buffer as ArrayBuffer, rgba.byteOffset, need), W, H), 0, 0);
+      this.compositor.setPreview(layerId, surface);
+    }
+    this.version++;
+    this.thumbs.clear();
+    this.emit({ type: 'pixels', rect: this.docRect() });
+    this.emit({ type: 'structure' });
   }
 
   // ---- v5: retouch options ----
@@ -2306,16 +2361,7 @@ export class Engine implements EditorEngine, Host {
     releaseSurface(f.buf);
     releaseSurface(f.cov);
     const target = this.makeTarget(l, false);
-    const selBefore = f.selBefore;
-    const apply = (which: 'before' | 'after') => () => {
-      for (const p of patches) {
-        target.surface.ctx.putImageData(p[which], p.rect.x, p.rect.y);
-        this.paintChanged(target, p.rect);
-      }
-      this.setSel(which === 'before' ? selBefore : selAfter);
-    };
-    const bytes = patches.reduce((n, p) => n + p.before.data.length + p.after.data.length, 0) + (selAfter.alpha?.length ?? 0) + (selBefore.alpha?.length ?? 0);
-    this.hist.push({ label: 'Transform selection', bytes, undo: apply('before'), redo: apply('after') });
+    this.hist.push(this.item('Transform selection', { k: 'fsel', target, patches, before: f.selBefore, after: selAfter }));
     for (const p of patches) this.paintChanged(target, p.rect);
     this.changed(union(outerRect(floatingBounds(f)), dirtyDoc(l, f.rect)) as Rect);
     if (!selEqual(selAfter, this.sel, this.doc.width)) this.setSel(selAfter);
@@ -2400,6 +2446,166 @@ export class Engine implements EditorEngine, Host {
     this.changeSelection(`${op[0].toUpperCase()}${op.slice(1)} selection`, modifySel(this.sel, op as SelOp, px, this.doc.width, this.doc.height));
   }
 
+  // ---- v6: history steps as data, persistence ----
+
+  /** The undo / redo closures of a step described as data (the same ones are rebuilt after restoreHistory). */
+  private item(label: string, ser: Ser, o: { coalesceKey?: string; tag?: string } = {}): HistoryItem {
+    const pair = (bytes: number, undo: () => void, redo: () => void, persist = true): HistoryItem =>
+      ({ label, bytes, undo, redo, coalesceKey: o.coalesceKey, tag: o.tag, ser: persist ? ser : undefined });
+    const surfDiff = (a: StructureSnapshot, b: StructureSnapshot): number => {
+      // Surfaces only history keeps alive (deleted layers, replaced by a bake / flatten) are held in memory.
+      const x = snapshotSurfaces(a);
+      const y = snapshotSurfaces(b);
+      let n = 0;
+      x.forEach((sf) => { if (!y.has(sf)) n += sf.width * sf.height * 4; });
+      y.forEach((sf) => { if (!x.has(sf)) n += sf.width * sf.height * 4; });
+      return n;
+    };
+    const patchBytes = (ps: Patch[]): number => ps.reduce((n, p) => n + p.before.data.length + p.after.data.length, 0);
+    const selBytes = (...ss: SelState[]): number => ss.reduce((n, x) => n + (x.alpha?.length ?? 0), 0);
+    switch (ser.k) {
+      case 'patch': {
+        const { target, patches } = ser;
+        const apply = (which: 'before' | 'after') => () => {
+          if (target.quick && this.qm?.layer !== target.layer) return; // that quick mask session is over
+          for (const p of patches) {
+            target.surface.ctx.putImageData(p[which], p.rect.x, p.rect.y);
+            this.paintChanged(target, p.rect);
+          }
+        };
+        return pair(patchBytes(patches), apply('before'), apply('after'), !target.quick);
+      }
+      case 'struct': {
+        const apply = (sn: StructureSnapshot) => () => {
+          const prev = this.doc.snapshot();
+          this.doc.restore(sn);
+          this.structureChanged(null, !specSame(prev, this.doc.snapshot()));
+        };
+        return pair(256 + surfDiff(ser.before, ser.after), apply(ser.before), apply(ser.after));
+      }
+      case 'guides': {
+        const go = (g: Guides) => () => {
+          this.doc.guides = copyGuides(g);
+          this.bumpSpec();
+        };
+        const { before, after } = ser;
+        return pair(64 + 8 * (before.h.length + before.v.length + after.h.length + after.v.length), go(before), go(after));
+      }
+      case 'sel': {
+        const go = (s: SelState) => () => { this.setSel(s); };
+        return pair(64 + selBytes(ser.before, ser.after), go(ser.before), go(ser.after));
+      }
+      case 'fsel': {
+        const { target, patches } = ser;
+        const apply = (which: 'before' | 'after') => () => {
+          for (const p of patches) {
+            target.surface.ctx.putImageData(p[which], p.rect.x, p.rect.y);
+            this.paintChanged(target, p.rect);
+          }
+          this.setSel(ser[which]);
+        };
+        return pair(patchBytes(patches) + selBytes(ser.before, ser.after), apply('before'), apply('after'));
+      }
+      case 'canvas': {
+        const go = (snap: StructureSnapshot, cs: CanvasState) => () => {
+          const prev = { w: this.doc.width, h: this.doc.height, sel: this.sel };
+          this.doc.restore(snap);
+          this.doc.width = cs.w;
+          this.doc.height = cs.h;
+          this.doc.canvasMode = cs.mode;
+          this.doc.guides = copyGuides(cs.guides);
+          this.dropSelCaches();
+          this.sel = cs.sel;
+          this.doc.selection = cs.sel.rect;
+          if (prev.w !== cs.w || prev.h !== cs.h) this.compositor.resize();
+          else this.compositor.invalidate(null);
+          this.announceCanvas(prev);
+        };
+        return pair(256 + selBytes(ser.cBefore.sel, ser.cAfter.sel) + surfDiff(ser.sBefore, ser.sAfter), go(ser.sBefore, ser.cBefore), go(ser.sAfter, ser.cAfter));
+      }
+    }
+  }
+
+  /** Content hash of every pixel and mask surface (by slot): a history only restores over the very pixels it was saved with (strokes do not bump the revision). */
+  private surfaceHashes(): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [slot, s] of this.slotSurfaces()) out[String(slot)] = surfaceHash(s);
+    return out;
+  }
+
+  /** Changes whenever the undo / redo stacks change (push, undo, redo, jump, clear, restore): cheap trigger for persistence. */
+  historyVersion(): number { return this.hist.version; }
+
+  /** Hash of everything docSpec() says except the revision: identifies the document a persisted history belongs to. */
+  private layoutSig(): string {
+    const d = this.docSpec();
+    return hashString(JSON.stringify([d.width, d.height, d.layers, d.guides, d.canvas]));
+  }
+
+  /**
+   * The undo / redo stacks as a versioned binary blob (see historyBlob.ts): the last `maxSteps` applied steps (plus up to as many redo
+   * steps) whose size stays within `maxBytes`; oldest steps go first. A step the format cannot express (a quick mask stroke) ends the window.
+   * Does not touch the document. A floating selection or a history too large for even one step gives a blob without steps.
+   */
+  serializeHistory(maxSteps: number, maxBytes: number): Uint8Array {
+    const steps = Math.max(0, Math.min(1000, Math.trunc(Number(maxSteps)) || 0));
+    const cap = Math.max(1024, Number(maxBytes) || 0);
+    const st = this.hist.stored();
+    const cur = this.hist.index;
+    const rev = this.rev;
+    const sig = this.layoutSig();
+    const hashes = this.surfaceHashes();
+    if (this.doc.floating || this.qm || !steps) return writeBlob(this.doc, rev, sig, [], -1, hashes);
+    let lo = cur + 1;
+    let hi = cur;
+    let bytes = 0;
+    for (let i = cur; i >= 0 && cur - i < steps; i--) {
+      if (!st[i].ser || bytes + st[i].bytes > cap) break;
+      bytes += st[i].bytes;
+      lo = i;
+    }
+    for (let i = cur + 1; i < st.length && i - cur <= steps; i++) {
+      if (!st[i].ser || bytes + st[i].bytes > cap) break;
+      bytes += st[i].bytes;
+      hi = i;
+    }
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const entries: SerEntry[] = [];
+      for (let i = lo; i <= hi; i++) entries.push({ label: st[i].label, ser: st[i].ser as Ser });
+      const blob = writeBlob(this.doc, rev, sig, entries, cur - lo, hashes);
+      if (blob.length <= cap || lo > hi) return blob;
+      // too big (orphan surfaces, selections, header): drop the oldest quarter, then the redo tail
+      if (lo <= cur) lo = Math.min(cur + 1, lo + Math.max(1, Math.ceil((cur + 1 - lo) / 4)));
+      else hi = Math.max(cur, hi - Math.max(1, Math.ceil((hi - cur) / 4)));
+    }
+    return writeBlob(this.doc, rev, sig, [], -1, hashes);
+  }
+
+  /**
+   * Restore a serializeHistory blob into an EMPTY history after the matching document was loaded (same `rev`, same layout, surfaces
+   * written): undo / redo then work as before the save. Returns false (document and history untouched) for another revision or layout,
+   * an unknown version, a corrupt blob, or when history already has steps / a floating selection or quick mask is active. Never throws.
+   */
+  restoreHistory(blob: Uint8Array, rev: number): boolean {
+    try {
+      if (this.doc.floating || this.qm || this.hist.stored().length || !(blob instanceof Uint8Array)) return false;
+      const r = readBlob(blob, this.doc, rev, this.layoutSig(), this.surfaceHashes());
+      let items: HistoryItem[];
+      try {
+        items = r.entries.map((e) => this.item(e.label, e.ser));
+      } catch (err) {
+        r.created.forEach(releaseSurface);
+        throw err;
+      }
+      r.deadInputLayers.forEach((l) => this.doc.inputLayers.add(l));
+      this.hist.load(items, r.cur);
+      this.emit({ type: 'history' });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   // ---- internals ----
 
   /** Tool scratch: stroke / backup start tiny and grow to the surface being edited (reserveScratch); the tip is fixed size. */
@@ -2417,11 +2623,13 @@ export class Engine implements EditorEngine, Host {
     this.active = null;
     this.last = null;
     if (t && p) t.up(p);
+    this.compositor.holdBelow(null);
     this.liveSpec = false;
   }
 
   private structureChanged(dirty: Rect | null | false, specChanged: boolean): void {
     this.version++;
+    if (dirty === false && this.compositor.hasAux()) dirty = null; // an edit of a hidden layer may change a layer that displaces by it
     if (dirty !== false) this.compositor.invalidate(dirty, true); // layer properties / transforms: layer contents are unchanged
     this.emit({ type: 'structure' });
     this.syncSpec(specChanged);

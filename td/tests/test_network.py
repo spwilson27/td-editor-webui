@@ -2445,13 +2445,6 @@ def test_input_layer_effects(env):
     assert "i2" not in net._chains and "xf_L_i2" not in net._ops
 
 
-def test_groups_and_adjustments_ignore_effects(env):
-    net, comp, log, _ = env
-    net.apply([base(), L("g", "group", effects=[overlay()]), px("c", 1, parentId="g", surfaceW=8, surfaceH=8),
-               adj("adj", {"type": "invert"}, effects=[overlay()])], W, H)
-    assert not net._chains
-
-
 def test_effect_param_edit_is_par_sets_only(env):
     net, comp, log, _ = env
     mk = lambda **kw: [base(), px("a", 1, x=2, surfaceW=16, surfaceH=8, effects=[shadow(**kw)])]
@@ -3856,3 +3849,707 @@ def test_adopted_and_leftover_nodes_get_the_canonical_vector_names_and_every_pla
     pa = net2._ops["xf_L_a"].par.value
     bx = net2.content_box("a")
     assert (pa("vec2valuex"), pa("vec2valuey")) == (5.5 - bx[0], 3.25 - bx[1])  # the (crop-relative) translation reaches uA
+
+
+# =========================================================================== v7 (phase B): filter adjustments, group / adjustment effects,
+# aux images, tdPreview layers (docs/DESIGN_V6.md 5)
+
+
+def flt(**kw):
+    return dict({"type": "blur", "enabled": True, "radius": 4.0}, **kw)
+
+
+def fadj(id_, effect=None, **kw):
+    return adj(id_, {"type": "filter", "effect": effect if effect is not None else flt()}, **kw)
+
+
+def psort(**kw):
+    return dict({"type": "pixelSort", "enabled": True}, **kw)
+
+
+def disp(ref=None, **kw):
+    e = dict({"type": "displace", "enabled": True, "source": "aux", "strengthX": 10.0, "strengthY": 4.0}, **kw)
+    if ref is not None:
+        e["auxSource"] = ref
+    return e
+
+
+def chain_in(net, lid, i=0):
+    return source_op_name(net, fx_chain_nodes(net, lid)[0].inputConnectors[i].source)
+
+
+def chain_aux(net, lid):
+    nodes = fx_chain_nodes(net, lid)
+    return source_op_name(net, nodes[0].inputConnectors[2].source)
+
+
+@pytest.fixture(params=[False, True], ids=["v5", "v6"])
+def both(request):
+    clock = fakenet.Clock()
+    comp, log = fakenet.make_comp()
+    net = DocNetwork(comp, GLSL, clock=clock, optimize=request.param)
+    return net, comp, log, clock
+
+
+def test_filter_adjustment_runs_the_chain_on_the_accumulated_image(both):
+    net, comp, log, _ = both
+    net.apply([base(), px("a", 1, surfaceW=8, surfaceH=8), fadj("f", opacity=0.5, mask={"slot": 7, "enabled": True})], W, H)
+    nodes = fx_chain_nodes(net, "f")
+    assert len(nodes) == 2                                                    # blur = 2 passes
+    below = "blend_L_a" if not net._opt else "mrg_L_base"
+    assert chain_in(net, "f") == below
+    # chain output is the SOURCE of a uAdjust-1 mix pass carrying opacity x mask
+    pv = net._ops["blend_L_f"].par.value
+    assert (pv("vec0valuew"), pv("vec0valuey"), pv("vec0valuez")) == (float(network.ADJ_PREMULT), 0.5, 1.0)
+    assert ins(net, "blend_L_f")[0] == below and net._ops["blend_L_f"].inputConnectors[1].source is nodes[-1]
+    assert source_of(net, "blend_L_f", 2) == "s7"
+    assert not [n for n in net._ops if n.startswith("adj_L_f")]               # no helper nodes
+    if net._opt:                                                              # the input of a non-Normal pass keeps 16 bit
+        assert fmt(net, below) == network.FMT_BLEND and fmt(net, "blend_L_f") == network.FMT8
+
+
+def test_filter_adjustment_that_draws_nothing_shows_the_image_below(both):
+    net, comp, log, _ = both
+    lay = [base(), px("a", 1, surfaceW=8, surfaceH=8), fadj("f", flt(enabled=False)), fadj("g", {"type": "nope"}), adj("h", {"type": "filter"})]
+    net.apply(lay, W, H)
+    assert not net._chains
+    if net._opt:
+        assert plan(net)["skip_reasons"].get("noop") == 3 and "blend_L_f" not in net._ops
+    else:
+        # no skip rules: the pass mixes the (passthrough) accumulated image, never the transparent blank
+        for lid in "fgh":
+            n = net._ops["blend_L_" + lid]
+            src = n.inputConnectors[1].source
+            assert src is not net._ops["blank"] and src.OPType == "nullTOP", lid
+            assert source_of(net, "adj_L_" + lid, 0) in ("blend_L_a", "blend_L_f", "blend_L_g"), lid
+    # the effects module missing: same
+    net2 = DocNetwork(fakenet.make_comp()[0], GLSL, effects=object(), effect_shaders={}, optimize=False)
+    net2.apply([base(), fadj("f")], W, H)
+    assert net2._ops["blend_L_f"].inputConnectors[1].source.OPType == "nullTOP"
+
+
+def test_filter_adjustment_inside_a_group_sees_only_the_group(both):
+    net, comp, log, _ = both
+    net.apply([base(), px("a", 1, surfaceW=8, surfaceH=8), L("g", "group"), px("c", 2, parentId="g", surfaceW=8, surfaceH=8),
+               fadj("f", parentId="g")], W, H)
+    assert chain_in(net, "f") in ("blend_L_c", "blank") and chain_in(net, "f") != ("blend_L_a" if not net._opt else "mrg_L_base")
+    assert "f" in net._chains
+
+
+def test_effects_on_a_group_filter_its_isolated_composite(both):
+    net, comp, log, _ = both
+    net.apply([base(), L("g", "group", effects=[shadow()], blend="multiply", opacity=0.5),
+               px("c", 1, parentId="g", surfaceW=8, surfaceH=8), px("d", 2, parentId="g", surfaceW=8, surfaceH=8)], W, H)
+    nodes = fx_chain_nodes(net, "g")
+    assert len(nodes) == 2
+    inner = "blend_L_d" if not net._opt else "mrg_L_c"
+    assert chain_in(net, "g") == inner
+    if net._opt:                                      # base + group = one merged run; slot 1 = the group (multiply, 0.5)
+        assert net._ops["mrg_L_base"].inputConnectors[2].source is nodes[-1]
+        assert uL(net, "mrg_L_base", 1)[:2] == (1.0, 0.5)
+        assert fmt(net, inner) == network.FMT_BLEND                           # chain input: no 8 bit
+    else:
+        assert net._ops["blend_L_g"].inputConnectors[1].source is nodes[-1]
+        pv = net._ops["blend_L_g"].par.value
+        assert (pv("vec0valuex"), pv("vec0valuey"), pv("vec0valuez")) == (1.0, 0.5, 0.0)
+
+
+def test_group_mask_is_applied_before_the_group_effects(both):
+    net, comp, log, _ = both
+    net.apply([base(), L("g", "group", effects=[overlay()], mask={"slot": 6, "enabled": True}),
+               px("c", 1, parentId="g", surfaceW=8, surfaceH=8)], W, H)
+    assert "xf_L_g" in net._ops and source_of(net, "xf_L_g", 1) == "s6" and net._ops["xf_L_g"].par.value("vec0valuez") == 1.0
+    assert pvals(net, "xf_L_g", "vec1") == (1.0, 0.0, 0.0, 1.0) and net._ops["xf_L_g"].par.value("vec0valuew") == float(network.ADJ_RESAMPLE)
+    assert net._ops["xf_L_g"].par.value("resolutionw") == W
+    assert chain_in(net, "g") == "xf_L_g"
+    if net._opt:                                      # the group slot of the merged run has no mask index any more
+        assert uL(net, "mrg_L_base", 1)[0]== 0.0
+        assert "s6" not in ins(net, "mrg_L_base")
+    else:
+        assert net._ops["blend_L_g"].par.value("vec0valuez") == 0.0 and source_of(net, "blend_L_g", 2) == "blank"
+
+
+def test_group_effects_stay_in_a_merged_run_and_stop_the_8bit_tail(opt):
+    net, comp, log, _ = opt
+    net.apply([base(), px("a", 1, surfaceW=8, surfaceH=8), L("g", "group", effects=[shadow()]),
+               px("c", 2, parentId="g", surfaceW=8, surfaceH=8), px("d", 3, surfaceW=8, surfaceH=8)], W, H)
+    assert plan(net)["merged"] == 1 and "mrg_L_base" in net._ops
+    # ONE run: base, a, g (its source = the chain output), d; the group's own inner pass keeps 16 bit (chain input)
+    srcs = ins(net, "mrg_L_base")
+    assert srcs[0] == "blank" and net._ops["mrg_L_base"].inputConnectors[3].source is fx_chain_nodes(net, "g")[-1]
+    inner = [n for n in net._ops if n.startswith(("blend_L_c", "mrg_L_c"))]
+    assert inner and all(fmt(net, n) == network.FMT_BLEND for n in inner)
+    assert fmt(net, "mrg_L_base") == network.FMT8                               # everything above is plain Normal
+
+
+def test_group_without_effects_keeps_its_8bit_inner_pass(opt):
+    net, comp, log, _ = opt
+    net.apply([base(), L("g", "group"), px("c", 2, parentId="g", surfaceW=8, surfaceH=8), px("d", 3, surfaceW=8, surfaceH=8)], W, H)
+    assert fmt(net, [n for n in net._ops if n.startswith(("blend_L_c", "mrg_L_c"))][0]) == network.FMT8
+
+
+def test_effects_on_an_adjustment_apply_to_the_adjusted_image_before_the_mix(both):
+    net, comp, log, _ = both
+    net.apply([base(), px("a", 1, surfaceW=8, surfaceH=8),
+               adj("lv", LEVELS, effects=[shadow()], opacity=0.4, mask={"slot": 4, "enabled": True})], W, H)
+    below = "blend_L_a" if not net._opt else "mrg_L_base"
+    # helper pass: the plain adjustment at opacity 1 without mask
+    a = net._ops["adjx_L_lv"]
+    assert ins(net, "adjx_L_lv")[0] == below and a.par.value("vec0valuew") == float(network.ADJ_LEVELS)
+    assert (a.par.value("vec0valuey"), a.par.value("vec0valuez")) == (1.0, 0.0)
+    assert (a.par.value("vec2valuex"), a.par.value("vec2valuey"), a.par.value("vec2valuez")) == (0.1, 0.9, 2.0)
+    assert a.par.value("format") == network.FMT
+    assert chain_in(net, "lv") == "adjx_L_lv"
+    pv = net._ops["blend_L_lv"].par.value
+    assert (pv("vec0valuew"), pv("vec0valuey"), pv("vec0valuez")) == (float(network.ADJ_PREMULT), 0.4, 1.0)
+    assert net._ops["blend_L_lv"].inputConnectors[1].source is fx_chain_nodes(net, "lv")[-1]
+    assert source_of(net, "blend_L_lv", 2) == "s4" and ins(net, "blend_L_lv")[0] == below
+
+
+def test_effects_on_a_blur_adjustment_use_the_blur_result(both):
+    net, comp, log, _ = both
+    net.apply([base(), adj("b", {"type": "blur", "radius": 12.0}, effects=[overlay()])], W, H)
+    want = "adj_L_b_up" if net._opt else "adj_L_b"
+    assert chain_in(net, "b") == want and "adjx_L_b" not in net._ops
+    assert net._ops["blend_L_b"].par.value("vec0valuew") == float(network.ADJ_PREMULT)
+
+
+def test_noop_adjustment_with_effects_is_not_skipped(opt):
+    net, comp, log, _ = opt
+    net.apply([base(), adj("b", {"type": "blur", "radius": 0.0}, effects=[overlay()]), adj("u", {"type": "nope"})], W, H)
+    assert "blend_L_b" in net._ops and "b" in net._chains and "blend_L_u" not in net._ops
+
+
+def test_effects_toggle_on_adjustments_and_groups_leaves_no_nodes(both):
+    net, comp, log, _ = both
+    on = [base(), L("g", "group", effects=[shadow()]), px("c", 1, parentId="g", surfaceW=8, surfaceH=8),
+          adj("lv", LEVELS, effects=[shadow()]), fadj("f")]
+    off = [base(), L("g", "group"), px("c", 1, parentId="g", surfaceW=8, surfaceH=8), adj("lv", LEVELS), fadj("f", flt(enabled=False))]
+    net.apply(on, W, H)
+    settle(net)
+    assert set(net._chains) == {"g", "lv", "f"}
+    net.apply(off, W, H)
+    assert not net._chains and not net._fx_out and not any(n.startswith(("fx_", "adjx_L_lv")) for n in net._ops)
+    settle(net)
+    net.apply(on, W, H)
+    assert set(net._chains) == {"g", "lv", "f"}
+
+
+def test_filter_param_edit_touches_only_chain_nodes(opt):
+    net, comp, log, _ = opt
+    mk = lambda r: [base(), px("a", 1, surfaceW=8, surfaceH=8), fadj("f", flt(radius=r)), px("b", 2, surfaceW=8, surfaceH=8)]
+    net.apply(mk(4.0), W, H)
+    settle(net)
+    m = log.mark()
+    net.apply(mk(5.0), W, H)
+    d = log.since(m)
+    assert {n for n, k, v in d["par_sets"]} <= {o.name for o in fx_chain_nodes(net, "f")} and d["par_sets"]
+    assert not d["creates"] and not d["destroys"] and not d["connects"]
+
+
+# ---- aux images
+
+
+def test_displace_aux_from_a_layer_is_its_document_space_content(both):
+    net, comp, log, _ = both
+    net.apply([base(), px("m", 1, surfaceW=16, surfaceH=8, x=3, y=2), px("a", 2, surfaceW=8, surfaceH=8, effects=[disp("layer:m")])], W, H)
+    # the source layer gets a (full-size, uncropped) resample pass even without effects and a transform
+    assert "xf_L_m" in net._ops and net._ops["xf_L_m"].par.value("resolutionw") == W
+    assert net.content_box("m") is None
+    assert chain_aux(net, "a") == "xf_L_m"
+    assert chain_in(net, "a") == "xf_L_a"
+
+
+def test_displace_aux_from_a_filter_adjustment_and_the_layers_own_effects(both):
+    net, comp, log, _ = both
+    net.apply([base(), px("a", 1, surfaceW=8, surfaceH=8, effects=[overlay()]), fadj("f", disp("layer:a"))], W, H)
+    assert chain_aux(net, "f") == source_op_name(net, fx_chain_nodes(net, "a")[-1])      # POST-effects content of layer a
+
+
+def test_displace_aux_from_text_shape_and_mask(both):
+    net, comp, log, _ = both
+    net.apply([base(), shp("s", mask={"slot": 3, "enabled": True}), txt("t"),
+               fadj("f1", disp("layer:s")), fadj("f2", disp("layer:t"))], W, H)
+    assert chain_aux(net, "f1") == "xf_L_s" and source_of(net, "xf_L_s", 1) == "s3"       # masked content
+    assert chain_aux(net, "f2") == "text_t"
+
+
+def test_shape_used_as_aux_is_not_cropped_or_lazy(opt):
+    net, comp, log, _ = opt
+    net.apply([base(), shp("s"), fadj("f", disp("layer:s"))], W, H)
+    assert "shape_s" in net._ops and "shapec_s" not in net._ops and chain_aux(net, "f") == "shape_s"
+    net.apply([base(), shp("s"), fadj("f", disp())], W, H)                    # no reference any more: cropped again
+    assert "shapec_s" in net._ops
+
+
+def test_displace_aux_from_an_input(both):
+    net, comp, log, _ = both
+    connect_inputs(comp, 2)
+    net.apply([base(), px("a", 1, surfaceW=8, surfaceH=8, effects=[disp("input:2")])], W, H)
+    assert chain_aux(net, "a") == "auxin_2" and source_of(net, "auxin_2", 0) == "src_in2"
+    pv = net._ops["auxin_2"].par.value
+    assert (pv("resolutionw"), pv("resolutionh"), pv("vec0valuew")) == (W, H, float(network.ADJ_RESAMPLE))
+    assert pvals(net, "auxin_2", "vec1") == (1.0, 0.0, 0.0, 1.0)
+    net.apply([base(), px("a", 1, surfaceW=8, surfaceH=8, effects=[disp("input:3")])], W, H)     # disconnected input: transparent aux
+    assert source_of(net, "auxin_3", 0) == "src_in3" and net._ops["src_in3"].par.value("top") == "blank"
+    assert "auxin_2" not in net._ops
+
+
+def test_displace_without_a_resolvable_aux_has_no_aux_input(both):
+    net, comp, log, _ = both
+    for ref in (None, "layer:nope", "input:9", "bogus", "layer:", "input:x"):
+        net.apply([base(), px("a", 1, surfaceW=8, surfaceH=8, effects=[disp(ref)])], W, H)
+        # no aux: the dummy third input is the chain's own input
+        assert chain_aux(net, "a") == chain_in(net, "a"), ref
+    net.apply([base(), px("a", 1, surfaceW=8, surfaceH=8), px("m", 2, surfaceW=8, surfaceH=8, effects=[disp("layer:a", enabled=False)])], W, H)
+    assert "xf_L_a" not in net._ops                                          # a disabled displace references nothing
+
+
+def test_aux_chains_are_built_in_dependency_order_and_cycles_have_no_aux(both):
+    net, comp, log, _ = both
+    # b is displaced by a, a is displaced by c: c's chain must exist before a's, a's before b's
+    st = [base(), px("a", 1, surfaceW=8, surfaceH=8, effects=[disp("layer:c")]), px("b", 2, surfaceW=8, surfaceH=8, effects=[disp("layer:a")]),
+          px("c", 3, surfaceW=8, surfaceH=8, effects=[overlay()])]
+    net.apply(st, W, H)
+    assert chain_aux(net, "b") == source_op_name(net, fx_chain_nodes(net, "a")[-1])
+    assert chain_aux(net, "a") == source_op_name(net, fx_chain_nodes(net, "c")[-1])
+    cyc = [base(), px("a", 1, surfaceW=8, surfaceH=8, effects=[disp("layer:b")]), px("b", 2, surfaceW=8, surfaceH=8, effects=[disp("layer:a")])]
+    net.apply(cyc, W, H)                                                      # (no hang, no exception)
+    assert net.fx_error is None
+    assert chain_aux(net, "a") == chain_in(net, "a") and chain_aux(net, "b") == chain_in(net, "b")     # both sides: no aux
+    three = cyc + [px("c", 3, surfaceW=8, surfaceH=8, effects=[disp("layer:a")])]                      # a branch INTO the cycle is fine
+    net.apply(three, W, H)
+    assert chain_aux(net, "c") == source_op_name(net, fx_chain_nodes(net, "a")[-1])
+
+
+def test_aux_rewire_when_the_source_layer_changes_kind_of_staging(both):
+    net, comp, log, _ = both
+    net.apply([base(), px("m", 1, surfaceW=16, surfaceH=8), px("a", 2, surfaceW=8, surfaceH=8, effects=[disp("layer:m")])], W, H)
+    first = fx_chain_nodes(net, "a")[0].inputConnectors[2].source
+    net.apply([base(), px("m", 1, surfaceW=16, surfaceH=8, x=2.5, rot=10), px("a", 2, surfaceW=8, surfaceH=8, effects=[disp("layer:m")])], W, H)
+    assert fx_chain_nodes(net, "a")[0].inputConnectors[2].source is net._ops["xf_L_m"]
+    assert pvals(net, "xf_L_m", "vec1") != (1.0, 0.0, 0.0, 1.0)             # now a real affine
+    net.apply([base(), px("a", 2, surfaceW=8, surfaceH=8, effects=[disp("layer:m")])], W, H)                # source layer deleted
+    assert chain_aux(net, "a") == chain_in(net, "a") and first is not None
+
+
+# ---- tdPreview
+
+
+def test_preview_layers_and_source(both):
+    net, comp, log, _ = both
+    net.apply([base(), px("a", 1, surfaceW=8, surfaceH=8, effects=[psort()]), px("b", 2, surfaceW=8, surfaceH=8, effects=[overlay()]),
+               fadj("f", psort()), L("g", "group", effects=[psort()]), px("c", 3, parentId="g", surfaceW=8, surfaceH=8),
+               adj("lv", LEVELS, effects=[psort()]), px("n", 4, surfaceW=8, surfaceH=8, effects=[psort(enabled=False)])], W, H)
+    assert net.preview_layers() == ["a", "f", "g", "lv"]
+    assert net.layer_preview_source("a") is fx_chain_nodes(net, "a")[-1]
+    assert net.layer_preview_source("g") is fx_chain_nodes(net, "g")[-1]
+    assert net.layer_preview_source("f") is fx_chain_nodes(net, "f")[-1]
+    assert net.layer_preview_source("b") is None and net.layer_preview_source("n") is None and net.layer_preview_source("zz") is None
+    assert net.layer_preview_token("b") is None
+
+
+def test_preview_order_is_stack_order(opt):
+    net, comp, log, _ = opt
+    net.apply([base(), px("z", 1, surfaceW=8, surfaceH=8, effects=[psort()]), px("a", 2, surfaceW=8, surfaceH=8, effects=[psort()])], W, H)
+    assert net.preview_layers() == ["z", "a"]
+
+
+def test_preview_token_changes_only_for_the_layer_that_changed(opt):
+    net, comp, log, _ = opt
+    mk = lambda **kw: [base(), px("a", 1, surfaceW=8, surfaceH=8, effects=[psort(**kw)]), px("b", 2, surfaceW=8, surfaceH=8, effects=[psort()]),
+                       px("o", 3, surfaceW=8, surfaceH=8)]
+    net.apply(mk(), W, H)
+    ta, tb = net.layer_preview_token("a"), net.layer_preview_token("b")
+    assert ta is not None and hash(ta) is not None
+    net.apply(mk(), W, H)
+    assert (net.layer_preview_token("a"), net.layer_preview_token("b")) == (ta, tb)
+    net.apply(mk() + [px("x", 5, surfaceW=8, surfaceH=8)], W, H)                       # unrelated layer added
+    assert (net.layer_preview_token("a"), net.layer_preview_token("b")) == (ta, tb)
+    net.apply(mk(direction="v"), W, H)                                                 # effect parameter change
+    assert net.layer_preview_token("a") != ta and net.layer_preview_token("b") == tb
+    net.apply(mk(direction="v"), W + 8, H)                                             # document resized
+    assert net.layer_preview_token("b") != tb
+    src = net.layer_preview_source("b")
+    t0 = net.layer_preview_token("b")
+    src.cooks += 1                                                                      # the content was recooked (painting)
+    assert net.layer_preview_token("b") != t0
+
+
+def test_preview_is_none_while_the_chain_failed(opt, monkeypatch):
+    net, comp, log, _ = opt
+    monkeypatch.setattr(net._fx.EffectChain, "apply", lambda self, *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    net.apply([base(), px("a", 1, surfaceW=8, surfaceH=8, effects=[psort()])], W, H)
+    assert net.preview_layers() == [] and net.layer_preview_source("a") is None and net.layer_preview_token("a") is None
+
+
+def test_preview_state_follows_deleted_layers(opt):
+    net, comp, log, _ = opt
+    net.apply([base(), px("a", 1, surfaceW=8, surfaceH=8, effects=[psort()])], W, H)
+    assert net.preview_layers() == ["a"]
+    net.apply([base()], W, H)
+    assert net.preview_layers() == [] and net.layer_preview_source("a") is None
+
+
+# ---- adoption / rebuild
+
+
+def test_adopted_v7_nodes_get_canonical_names_and_values(opt):
+    """After a component rebuild a new DocNetwork adopts tagged nodes of the new kinds (adjusted-image helper pass, group mask
+    resample, aux input resample) and re-pools untagged spares that served as effect slots: their vector names must be canonical."""
+    net, comp, log, clock = opt
+    roles = ["adjx_L_lv", "xf_L_g", "auxin_2"]
+    for i, r in enumerate(roles):
+        _stale_node(comp, "g%d" % (300 + i), "glslTOP", tags=["role:" + r])
+    _stale_node(comp, "g400")
+    connect_inputs(comp, 2)
+    st = [base(), L("g", "group", effects=[overlay()], mask={"slot": 6, "enabled": True}), px("c", 1, parentId="g", surfaceW=8, surfaceH=8),
+          adj("lv", LEVELS, effects=[shadow()]), px("a", 2, surfaceW=8, surfaceH=8, effects=[disp("input:2")])]
+    net2 = DocNetwork(comp, GLSL, clock=clock)
+    net2.apply(st, W, H)
+    for _ in range(6):
+        net2.tick()
+    net2.apply(st[:3] + [adj("lv", dict(LEVELS, gamma=1.5), effects=[shadow()]), st[4]], W, H)
+    for name in roles:
+        assert name in net2._ops, name
+        pv = net2._ops[name].par.value
+        assert (pv("vec0name"), pv("vec1name"), pv("pixeldat")) == ("uParams", "uXform", "blend_glsl"), name
+        assert (pv("vec2name"), pv("vec3name")) == ("uA", "uB"), name
+        assert pv("inputfiltertype") == ("nearest" if name == "adjx_L_lv" else "linear"), name
+    for name, spec in net2._desired.items():
+        op_ = net2._ops[name]
+        if op_.OPType != "glslTOP":
+            continue
+        for k, v in spec.pars.items():
+            assert op_.par.value(k) == v, (name, k, op_.par.value(k), v)
+    assert net2._ops["adjx_L_lv"].par.value("vec2valuez") == 1.5
+    assert "lv" in net2._chains and "g" in net2._chains and "a" in net2._chains
+    assert chain_aux(net2, "a") == "auxin_2"
+    assert net2.fx_error is None
+
+
+def test_a_fresh_network_builds_the_same_wiring_as_an_incremental_one(opt):
+    net, comp, log, clock = opt
+    st = [base(), px("m", 1, surfaceW=8, surfaceH=8), L("g", "group", effects=[shadow()]), px("c", 2, parentId="g", surfaceW=8, surfaceH=8),
+          fadj("f", disp("layer:m")), adj("lv", LEVELS, effects=[overlay()], mask={"slot": 9, "enabled": True})]
+    net.apply(st[:2], W, H)
+    net.apply(st, W, H)
+    comp2, log2 = fakenet.make_comp()
+    net2 = DocNetwork(comp2, GLSL, clock=clock)
+    net2.apply(st, W, H)
+    def shape(n):
+        return {name: ins(n, name) for name in sorted(n._ops) if n._ops[name].OPType in ("glslTOP", "glslmultiTOP")}
+    assert shape(net) == shape(net2)
+    for lid in ("g", "f", "lv"):
+        assert len(fx_chain_nodes(net, lid)) == len(fx_chain_nodes(net2, lid))
+    assert chain_aux(net, "f") == chain_aux(net2, "f")
+
+
+# =========================================================================== v7: bold / italic of font-collection families (TTC)
+
+
+def _sfnt(family, sub, weight, italic, glyph=b"G"):
+    """A tiny sfnt: head (macStyle), OS/2 (usWeightClass, fsSelection), name (nid 1, 2, 4), and a dummy glyph table."""
+    import struct
+    head = bytearray(54)
+    struct.pack_into(">H", head, 44, (1 if weight >= 600 else 0) | (2 if italic else 0))
+    os2 = bytearray(96)
+    struct.pack_into(">H", os2, 4, weight)
+    struct.pack_into(">H", os2, 62, 1 if italic else 0)
+    recs = [(1, family), (2, sub), (4, family + " " + sub)]
+    strs = b""
+    ents = []
+    for nid, txt in recs:
+        raw = txt.encode("utf-16-be")
+        ents.append(struct.pack(">HHHHHH", 3, 1, 0x409, nid, len(raw), len(strs)))
+        strs += raw
+    name = struct.pack(">HHH", 0, len(recs), 6 + 12 * len(recs)) + b"".join(ents) + strs
+    return {b"OS/2": bytes(os2), b"glyf": glyph * 10, b"head": bytes(head), b"name": name}
+
+
+def make_ttc(path, faces):
+    """Writes a font collection of sfnt faces; every table is stored per face (no sharing)."""
+    import struct
+    n = len(faces)
+    pos = 12 + 4 * n
+    dirs, blobs = [], bytearray()
+    layout = []
+    for tabs in faces:
+        d = 12 + 16 * len(tabs)
+        layout.append(pos)
+        pos += d
+    data_start = pos
+    cur = data_start
+    face_bytes = []
+    for tabs in faces:
+        ents = []
+        body = bytearray()
+        for tag in sorted(tabs):
+            t = tabs[tag]
+            ents.append((tag, 0, cur + len(body), len(t)))
+            body += t + b"\0" * (-len(t) & 3)
+        cur += len(body)
+        hdr = struct.pack(">IHHHH", 0x00010000, len(tabs), 0, 0, 0) + b"".join(struct.pack(">4sIII", *e) for e in ents)
+        face_bytes.append((hdr, body))
+    out = b"ttcf" + struct.pack(">IiI", 0x00010000, 0, 0)[0:0] + struct.pack(">II", 0x00010000, n)
+    out += struct.pack(">%dI" % n, *layout)
+    for hdr, _ in face_bytes:
+        out += hdr
+    for _, body in face_bytes:
+        out += body
+    with open(path, "wb") as f:
+        f.write(out)
+
+
+@pytest.fixture
+def fonts(tmp_path):
+    d = tmp_path / "Fonts"
+    d.mkdir()
+    make_ttc(str(d / "Quux.ttc"), [_sfnt("Quux", "Regular", 400, False, b"R"), _sfnt("Quux", "Bold", 700, False, b"B"),
+                                   _sfnt("Quux", "Oblique", 400, True, b"I"), _sfnt("Quux", "Bold Oblique", 700, True, b"J"),
+                                   _sfnt("Quux", "Light", 300, False, b"L")])
+    return d
+
+
+def test_pick_typeface_handles_the_menus_of_real_families():
+    pick = network.pick_typeface
+    helv = ["Regular", "Oblique", "Light", "Light Oblique", "Bold", "Bold Oblique"]
+    assert [pick(helv, b, i) for b, i in ((0, 0), (0, 1), (1, 0), (1, 1))] == ["Regular", "Oblique", "Bold", "Bold Oblique"]
+    arial = ["Regular", "Italic", "Bold", "Bold Italic"]
+    assert [pick(arial, b, i) for b, i in ((0, 0), (0, 1), (1, 0), (1, 1))] == arial
+    futura = ["Medium", "Medium Italic", "Bold", "Condensed Medium", "Condensed ExtraBold"]
+    assert [pick(futura, b, i) for b, i in ((0, 0), (0, 1), (1, 0), (1, 1))] == ["Medium", "Medium Italic", "Bold", "Bold"]
+    avenir = ["Book", "Roman", "Book Oblique", "Oblique", "Light", "Light Oblique", "Medium", "Medium Oblique", "Heavy", "Heavy Oblique",
+              "Black", "Black Oblique"]
+    assert pick(avenir, 0, 0) in ("Book", "Roman") and pick(avenir, 0, 1) in ("Book Oblique", "Oblique") and pick(avenir, 1, 0) in ("Heavy", "Black")
+    assert pick([], 1, 0) is None
+
+
+def test_ttc_index_and_face_choice(fonts):
+    idx = network.ttc_index([str(fonts)])
+    assert set(idx) == {"quux"} and len(idx["quux"]) == 5
+    path = str(fonts / "Quux.ttc")
+    assert network.ttc_face("Quux", False, False, idx) == (path, 0)
+    assert network.ttc_face("quux", True, False, idx) == (path, 1)
+    assert network.ttc_face("Quux", False, True, idx) == (path, 2)
+    assert network.ttc_face("Quux", True, True, idx) == (path, 3)
+    assert network.ttc_face("Nope", True, False, idx) is None
+
+
+def test_extracted_face_is_a_valid_standalone_font(fonts, tmp_path):
+    out = network.extract_ttc_face(str(fonts / "Quux.ttc"), 1, str(tmp_path / "x"))
+    again = network.extract_ttc_face(str(fonts / "Quux.ttc"), 1, str(tmp_path / "x"))
+    assert out == again and out.endswith(".ttf")
+    with open(out, "rb") as f:
+        info = network._face_info(f, 0)
+        tabs = network._sfnt_tables(f, 0)
+        f.seek(tabs[b"glyf"][0])
+        glyph = f.read(tabs[b"glyf"][1])
+    assert info == ({"quux"}, 700, False, 5) and glyph == b"B" * 10                       # the Bold face's own tables
+    assert network.extract_ttc_face(str(fonts / "Quux.ttc"), 3, str(tmp_path / "x")) != out
+
+
+def text_node_pars(net, lid):
+    return net._desired["text_" + lid].pars
+
+
+def test_text_bold_italic_of_a_collection_family_use_the_extracted_face(env, fonts, tmp_path, monkeypatch):
+    net, comp, log, _ = env
+    idx = network.ttc_index([str(fonts)])
+    monkeypatch.setattr(network, "ttc_index", lambda dirs=None, refresh=False: idx)
+    monkeypatch.setattr(network, "extract_ttc_face", lambda p, i, d=None, _o=network.extract_ttc_face: _o(p, i, str(tmp_path / "ex")))
+    net._fontset = {"Quux", "Arial"}
+    mk = lambda **kw: [txt("t", dict(TEXT, font="Quux", **kw))]
+    net.apply(mk(), W, H)
+    p0 = text_node_pars(net, "t")
+    assert (p0["typeface"], p0["fontfile"]) == ("Regular", "")
+    net.apply(mk(bold=True), W, H)
+    pb = text_node_pars(net, "t")
+    assert pb["fontfile"].endswith(".ttf") and "_1_" in os.path.basename(pb["fontfile"])
+    assert net._ops["text_t"].par.value("fontfile") == pb["fontfile"]
+    net.apply(mk(bold=True, italic=True), W, H)
+    assert "_3_" in os.path.basename(text_node_pars(net, "t")["fontfile"])
+    net.apply(mk(italic=True), W, H)
+    assert "_2_" in os.path.basename(text_node_pars(net, "t")["fontfile"])
+    net.apply(mk(), W, H)                                                                 # back to Regular: the file is cleared
+    assert net._ops["text_t"].par.value("fontfile") == ""
+    # the measurement node uses the same face (widths of a bold face differ)
+    net.apply(mk(bold=True, align="center"), W, H)
+    m = net._ops["text_measure"].par.value
+    assert m("fontfile") == text_node_pars(net, "t")["fontfile"] and m("font") == "Quux"
+
+
+def test_text_bold_of_a_one_file_family_picks_its_menu_entry(env, monkeypatch):
+    net, comp, log, _ = env
+    monkeypatch.setattr(network, "ttc_index", lambda dirs=None, refresh=False: {})
+    net._fontset = {"Futura"}
+    m = net._measure_node()
+    m.menus["typeface"] = ["Medium", "Medium Italic", "Bold", "Condensed Medium", "Condensed ExtraBold"]
+    net.apply([txt("t", dict(TEXT, font="Futura", bold=True, italic=True))], W, H)
+    p = text_node_pars(net, "t")
+    assert (p["typeface"], p["fontfile"]) == ("Bold", "")
+    net.apply([txt("t", dict(TEXT, font="Futura", italic=True))], W, H)
+    assert text_node_pars(net, "t")["typeface"] == "Medium Italic"
+
+
+def test_text_face_failure_falls_back_to_the_plain_menu_entry(env, monkeypatch):
+    net, comp, log, _ = env
+    net._fontset = {"Arial"}
+    monkeypatch.setattr(network, "ttc_face", lambda *a, **k: (_ for _ in ()).throw(OSError("denied")))
+    net.apply([txt("t", dict(TEXT, font="Arial", bold=True))], W, H)
+    assert text_node_pars(net, "t")["typeface"] == "Bold" and "denied" in net.font_error
+
+
+@pytest.mark.skipif(not os.path.isfile("/System/Library/Fonts/Helvetica.ttc"), reason="macOS system fonts")
+def test_macos_helvetica_and_menlo_collections_are_indexed():
+    idx = network.ttc_index()
+    for fam, bold_name in (("helvetica", "Bold"), ("menlo", "Bold")):
+        assert fam in idx, fam
+        bold = network.ttc_face(fam, True, False)
+        reg = network.ttc_face(fam, False, False)
+        assert bold is not None and reg is not None and bold != reg
+        assert network.ttc_face(fam, True, True) not in (bold, reg) and network.ttc_face(fam, False, True) not in (bold, reg)
+
+
+def test_aux_source_object_form_is_the_canonical_one():
+    ref = network.effect_aux_ref
+    assert ref([{"source": "aux", "auxSource": {"kind": "layer", "id": "m"}}]) == ("layer", "m")
+    assert ref([{"source": "aux", "auxSource": {"kind": "input", "input": 3}}]) == ("input", 3)
+    assert ref([{"source": "aux", "auxSource": "layer:m"}]) == ("layer", "m")
+    for bad in ({"kind": "input", "input": 9}, {"kind": "layer"}, {"kind": "x"}, {"kind": "input", "input": "z"}):
+        assert ref([{"source": "aux", "auxSource": bad}]) is None
+    assert ref([{"source": "noise", "auxSource": {"kind": "layer", "id": "m"}}]) is None
+    assert ref([{"source": "aux", "enabled": False, "auxSource": {"kind": "layer", "id": "m"}}]) is None
+
+
+def test_object_aux_source_wires_like_the_string(opt):
+    net, comp, log, _ = opt
+    net.apply([base(), px("m", 1, surfaceW=16, surfaceH=8),
+               px("a", 2, surfaceW=8, surfaceH=8, effects=[disp({"kind": "layer", "id": "m"})])], W, H)
+    assert chain_aux(net, "a") == "xf_L_m"
+
+
+def test_hidden_aux_target_still_has_content(both):
+    net, comp, log, _ = both
+    net.apply([base(), px("m", 1, surfaceW=16, surfaceH=8, visible=False), px("a", 2, surfaceW=8, surfaceH=8, effects=[disp("layer:m")])], W, H)
+    assert chain_aux(net, "a") == "xf_L_m"
+
+
+def test_group_and_adjustment_aux_targets_give_no_aux(both):
+    net, comp, log, _ = both
+    for target in ("g", "adj"):
+        net.apply([base(), L("g", "group"), px("c", 1, parentId="g", surfaceW=8, surfaceH=8), adj("adj", {"type": "invert"}),
+                   px("a", 2, surfaceW=8, surfaceH=8, effects=[disp("layer:" + target)])], W, H)
+        assert chain_aux(net, "a") == chain_in(net, "a"), target
+
+
+def test_fx_failure_backoff_is_per_aux_reference(opt, monkeypatch):
+    net, comp, log, clock = opt
+    monkeypatch.setattr(net._fx.EffectChain, "apply", lambda self, *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    mk = lambda ref: [base(), px("m", 1, surfaceW=8, surfaceH=8), px("a", 2, surfaceW=8, surfaceH=8, effects=[disp(ref)])]
+    net.apply(mk("layer:m"), W, H)
+    assert "a" in net._fx_fail
+    key = net._fx_fail["a"][2]
+    net.apply(mk("input:2"), W, H)
+    assert net._fx_fail["a"][2] != key and net._fx_fail["a"][0] == 2                     # a different aux = a new key, retried at once
+
+
+def test_helper_node_name_cannot_collide_with_a_blur_adjustment_id(both):
+    net, comp, log, _ = both
+    net.apply([base(), adj("x", LEVELS, effects=[overlay()]), adj("x_a", {"type": "blur", "radius": 3.0})], W, H)
+    assert "adjx_L_x" in net._ops and "adj_L_x_a" in net._ops and net._ops["adjx_L_x"] is not net._ops["adj_L_x_a"]
+
+
+def test_preview_layers_are_the_same_in_every_optimize_mode(both):
+    net, comp, log, _ = both
+    net.apply([base(), px("a", 1, surfaceW=8, surfaceH=8, effects=[psort()]), fadj("f", psort(), visible=False),
+               L("g", "group", effects=[psort()], opacity=0.0), px("c", 2, parentId="g", surfaceW=8, surfaceH=8),
+               L("h", "group", visible=False), px("d", 3, parentId="h", surfaceW=8, surfaceH=8, effects=[psort()]),
+               adj("lv", LEVELS, effects=[psort()])], W, H)
+    assert net.preview_layers() == ["a", "lv"]
+
+
+def test_extraction_is_aligned_ordered_and_validated(fonts, tmp_path):
+    import struct
+    out = network.extract_ttc_face(str(fonts / "Quux.ttc"), 2, str(tmp_path / "e"))
+    data = open(out, "rb").read()
+    nt = struct.unpack(">H", data[4:6])[0]
+    tags = []
+    for i in range(nt):
+        tag, _cs, o, ln = struct.unpack(">4sIII", data[12 + 16 * i:28 + 16 * i])
+        assert o % 4 == 0 and o + ln <= len(data)
+        tags.append(tag)
+    assert tags == sorted(tags)
+    bad = tmp_path / "bad.ttc"
+    raw = bytearray(open(str(fonts / "Quux.ttc"), "rb").read())
+    struct.pack_into(">I", raw, 12 + 4 * 5 + 12 + 8, 0x7FFFFFF0)               # first table of face 0: offset far outside the file
+    bad.write_bytes(bytes(raw))
+    with pytest.raises(ValueError):
+        network.extract_ttc_face(str(bad), 0, str(tmp_path / "e2"))
+    with pytest.raises(ValueError):
+        network.extract_ttc_face(str(fonts / "Quux.ttc"), 9, str(tmp_path / "e3"))
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX ownership")
+def test_font_cache_dir_is_private_and_foreign_dirs_are_refused(tmp_path, monkeypatch):
+    d = network.font_cache_dir(str(tmp_path / "priv"))
+    assert (os.stat(d).st_mode & 0o777) == 0o700
+    monkeypatch.setattr(network, "_uid", lambda: os.getuid() + 1)
+    with pytest.raises(PermissionError):
+        network.font_cache_dir(d)
+    assert not network.font_file_ok(os.path.join(d, "none.ttf"))
+
+
+def test_text_face_failures_back_off_and_a_deleted_cache_file_is_recreated(env, fonts, tmp_path, monkeypatch):
+    net, comp, log, clock = env
+    idx = network.ttc_index([str(fonts)])
+    monkeypatch.setattr(network, "ttc_index", lambda dirs=None, refresh=False: idx)
+    calls = []
+    orig = network.extract_ttc_face
+
+    def ex(p, i, d=None):
+        calls.append(i)
+        if len(calls) <= 1:
+            raise OSError("disk full")
+        return orig(p, i, str(tmp_path / "ex"))
+    monkeypatch.setattr(network, "extract_ttc_face", ex)
+    net._fontset = {"Quux"}
+    spec = dict(TEXT, font="Quux", bold=True)
+    assert net.text_face(spec) == ("Bold", "") and calls == [1]
+    for _ in range(5):
+        net.text_face(spec)
+    assert calls == [1]                                                     # backed off: no re-extraction per apply / tick
+    clock.t += 31.0
+    face = net.text_face(spec)
+    assert face[1].endswith(".ttf") and calls == [1, 1]
+    os.unlink(face[1])                                                      # temp cleanup
+    again = net.text_face(spec)
+    assert again[1] == face[1] and os.path.isfile(again[1]) and calls == [1, 1, 1]
+
+
+def test_aux_cycle_guard_gives_neither_side_an_aux(opt):
+    net, comp, log, _ = opt
+    net.apply([base(), px("a", 1, surfaceW=8, surfaceH=8, effects=[disp("layer:b")]),
+               px("b", 2, surfaceW=8, surfaceH=8, effects=[disp("layer:a")])], W, H)
+    assert net._aux_cycle("fx_L_a") and net._aux_cycle("fx_L_b")
+    for lid in "ab":
+        assert chain_aux(net, lid) == chain_in(net, lid), lid
+    net.apply([base(), px("a", 1, surfaceW=8, surfaceH=8, effects=[disp("layer:b")]), px("b", 2, surfaceW=8, surfaceH=8)], W, H)
+    assert not net._aux_cycle("fx_L_a") and chain_aux(net, "a") == "xf_L_b"
+
+
+def test_extraction_uses_unique_temp_names_and_leaves_no_part_files(fonts, tmp_path, monkeypatch):
+    import tempfile
+    names, orig = [], tempfile.mkstemp
+
+    def spy(*a, **k):
+        fd, path = orig(*a, **k)
+        names.append(path)
+        return fd, path
+    monkeypatch.setattr(tempfile, "mkstemp", spy)
+    d = str(tmp_path / "ex")
+    first = network.extract_ttc_face(str(fonts / "Quux.ttc"), 1, d)
+    os.unlink(first)                                   # a second instance extracts the same face again
+    second = network.extract_ttc_face(str(fonts / "Quux.ttc"), 1, d)
+    assert first == second and len(names) == 2 and names[0] != names[1] and all(n.endswith(".part") for n in names)
+    assert not [f for f in os.listdir(d) if f.endswith(".part")]

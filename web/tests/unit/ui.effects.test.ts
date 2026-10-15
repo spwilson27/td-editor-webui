@@ -58,8 +58,8 @@ describe('store.editEffects', () => {
     expect(store.pendingEffects('base')).toBeNull();
   });
 
-  it('canHaveEffects covers pixel, text, shape and input only', () => {
-    expect(['pixel', 'text', 'shape', 'input', 'group', 'adjustment'].map((k) => store.canHaveEffects(k))).toEqual([true, true, true, true, false, false]);
+  it('canHaveEffects covers pixel, text, shape, input, and (v6) group and adjustment layers', () => {
+    expect(['pixel', 'text', 'shape', 'input', 'group', 'adjustment'].map((k) => store.canHaveEffects(k))).toEqual([true, true, true, true, true, true]);
     expect(store.canHaveEffects(undefined)).toBe(false);
   });
 

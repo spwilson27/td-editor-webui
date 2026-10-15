@@ -92,6 +92,11 @@ def main():
     (m,) = P.encode_frames(P.TYPE_TOP_IMAGE, 21, 7, 3, (0, 0, 7, 3), Pix(0, 0, 7, 3))
     write("top_image", m, "top_image")
 
+    # 5f. v7: LAYER_PREVIEW (GET /layer): one tdPreview layer's render, document-sized (5x4), one band, slot 0
+    (m,) = P.encode_frames(P.TYPE_LAYER_PREVIEW, 41, 5, 4, (0, 0, 5, 4), Pix(0, 0, 5, 4))
+    write("layer_preview", m, "layer_preview")
+    entries[-1]["note"] = "v7: type 7, docW/docH = the document size, slot 0"
+
     # 5c. v5: a BASE frame has the INPUT's size as docW/docH (here 6x3) which differs from the document (5x4)
     (m,) = P.encode_frames(P.TYPE_BASE, 31, 6, 3, (0, 0, 6, 3), Pix(0, 0, 6, 3), slot=2)
     write("base_input_size", m, "base_input_size")
@@ -144,6 +149,9 @@ def main():
           error="v6: a BASE frame's slot is its input index 1..8 (0 is invalid)")
     write("invalid_base_input9", good[:6] + struct.pack("<H", 9) + good[8:], "invalid", valid=False,
           error="v6: a BASE frame's slot is its input index 1..8 (9 is invalid)")
+    lp = P.encode_message(P.Header(P.TYPE_LAYER_PREVIEW, 1, 9, 4, 4, 0, 0, 2, 2, 0), rect_pixels(0, 0, 2, 2))
+    write("invalid_layer_preview_slot", lp[:6] + struct.pack("<H", 3) + lp[8:], "invalid", valid=False,
+          error="v7: a LAYER_PREVIEW frame's slot is 0")
 
     with open(os.path.join(OUT, "fixtures.json"), "w") as fh:
         json.dump({"pixel": "r=(x*7+y*3)&255 g=(x*13+y*5+40)&255 b=(x+y*11)&255 a=255-((x+y)&63)",

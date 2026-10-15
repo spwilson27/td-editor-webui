@@ -47,6 +47,13 @@ export function FileDialog() {
           )}
           </span>
         </label>
+        {d.op === 'saveProject' && (
+          <label style="display:flex;align-items:flex-start;gap:8px;color:#e3e3e3">
+            <input type="checkbox" data-file-history aria-label="Include undo history" checked={d.includeHistory} disabled={d.busy} style="accent-color:#4a8fe0;margin:2px 0 0"
+              onChange={(e) => store.setIncludeHistory((e.target as HTMLInputElement).checked)} />
+            <span>Include undo history<br /><span style="color:#8f8f8f;font-size:11px">Lets you undo after reopening. Erased or deleted content stays recoverable from the history, so turn this off before sharing the file.</span></span>
+          </label>
+        )}
         <div data-file-help style="color:#8f8f8f;font-size:11px">Written by TouchDesigner on its machine.</div>
         {d.op === 'openProject' && <div data-file-warning style="color:#d9a441;font-size:11px">Replaces the current document; history is cleared.</div>}
         {d.busy && <div data-file-busy style="color:#a8a8a8">Working…</div>}

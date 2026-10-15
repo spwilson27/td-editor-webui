@@ -127,3 +127,33 @@ adjustment effects.
   active layer + above over the cached below). Ext: call `network.set_active_layer` (active client's active layer, sent in a
   new `activeLayer {id}` message) and `set_content_bounds` (from per-slot painted bounds it tracks from SURFACE tiles).
   UI: one-time notice suggesting TD view above ~8 MP.
+
+### 5.1 TD network: implemented interface (phase B, `network.py`)
+
+Everything is reached through `DocNetwork`; the ext only needs the additions marked **ext**.
+
+* **Filter adjustment** `adjustment: {type:'filter', effect}`: `EffectChain([effect] + layer.effects)` on the accumulated image below (within the parent),
+  output mixed into it by opacity x mask (`blend.glsl` uAdjust 1, the same mix as a blur adjustment). No effect enabled / unknown effect = no-op (skipped).
+  The input pass keeps 16 bit (the adjustment is not a plain Normal blend); chain outputs are 8 bit like every effect chain.
+* **Effects on groups**: chain on the group's isolated composite, output is the source of the group's blend (which can still sit in a merged run).
+  A group MASK is applied BEFORE the effects (`xf_L_<id>` identity pass = composite x mask, like pixel / text / shape layers); the group's inner chain stays 16 bit.
+  **Effects on adjustments**: `adjx_L_<id>` (the plain adjustment at opacity 1, no mask; blur adjustments reuse their blur node, filter adjustments the
+  accumulated image) -> chain -> mix by opacity x mask. A no-op adjustment WITH effects is not skipped.
+* **Aux image (displace)**: the effect keeps `source: 'aux'` (filter library enum) and gains the field **`auxSource`**: canonical form `{kind:'layer', id} | {kind:'input', input}` (the string shorthand
+  `'layer:<id>'` / `'input:<n>'` is accepted too). `layer` (pixel / input / text / shape layer: its document-space content AFTER its mask, transform and its own effects, never opacity / blend;
+  the layer gets a full-size, uncropped resample pass even without effects) or `input` (1..8; the COMP input at 1:1 anchored top-left,
+  clipped / padded to the document, `auxin_<n>`; a disconnected input is transparent = no displacement). One aux per chain (the first enabled effect
+  with `source:'aux'` and a valid `auxSource` wins). Unresolvable references (missing / deleted layer, group or adjustment target, bad format; BOTH sides of a cycle A<->B) render without displacement. The web agent must write `auxSource` verbatim (the effects module keeps unknown params).
+* **tdPreview (ext)**: `preview_layers() -> [layer id]` (stack order; layers whose enabled effects / filter contain a type with `effect_td_preview`),
+  `layer_preview_source(id) -> TOP | None` (layer content AFTER its effects, document space and size, **premultiplied** RGBA, rgba8fixed, TD row order;
+  group: mask applied first; filter adjustment: the filter applied to the composite below, before the opacity x mask mix; `None` if the chain failed),
+  `layer_preview_token(id) -> hashable | None`: (chain generation, effect list + aux ref, document size, cook counters of the chain output and input).
+  Re-read the token after the readback and store THAT one (the readback itself cooks the chain); read back again only when it differs.
+  Hidden layers (themselves, an ancestor, or opacity 0) have no preview in any optimize mode.
+* **Fonts**: `TextSpec.bold/italic` of a font-collection family (.ttc: Helvetica, Menlo, Avenir, ...): the Text TOP lists the faces in `typeface` but always
+  draws face 0 (`bold` / `italic` toggles do nothing either), so the matching face (weight 700/400 + slant from OS/2 / head) is extracted to a standalone
+  `.ttf` (`<temp>/raster_editor_fonts_<uid>/ (mode 0700, ownership checked, re-extracted if the file vanished, 30 s back-off after a failure)`) and set as `fontfile`; other families pick the best entry of their own `typeface` menu ('Oblique', 'Medium Italic', ...).
+  `DocNetwork.text_face(spec) -> (typeface, fontfile)`; `font_error` reports failures (the plain menu entry is used then).
+* Merged-run / 8 bit / skip / crop rules: adjustments (incl. filters) still end runs; groups with effects stay plain items of a run but force 16 bit inside;
+  layers used as an aux source and layers with effects are never cropped; hidden / skipped layers' chains are not built (except a skipped pixel / text / shape
+  layer's own effect chain, which exists but is not cooked unless something reads it).

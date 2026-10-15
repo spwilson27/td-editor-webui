@@ -170,6 +170,28 @@
       "payloadSha256": "f2f47624973f09fa8e65f43f69b9cb4239f05fee6afbb257b7575b5bdb901933"
     },
     {
+      "name": "layer_preview",
+      "file": "layer_preview.bin",
+      "frame": "layer_preview",
+      "valid": true,
+      "size": 104,
+      "header": {
+        "type": 7,
+        "slot": 0,
+        "flags": 1,
+        "frameEnd": true,
+        "frameId": 41,
+        "docW": 5,
+        "docH": 4,
+        "x": 0,
+        "y": 0,
+        "w": 5,
+        "h": 4
+      },
+      "payloadSha256": "f029f014ccd21bcc30bdb1780e02b56211c93c4054cb1ce8245b2c00e81369bf",
+      "note": "v7: type 7, docW/docH = the document size, slot 0"
+    },
+    {
       "name": "base_input_size",
       "file": "base_input_size.bin",
       "frame": "base_input_size",
@@ -385,6 +407,14 @@
       "valid": false,
       "size": 40,
       "error": "v6: a BASE frame's slot is its input index 1..8 (9 is invalid)"
+    },
+    {
+      "name": "invalid_layer_preview_slot",
+      "file": "invalid_layer_preview_slot.bin",
+      "frame": "invalid",
+      "valid": false,
+      "size": 40,
+      "error": "v7: a LAYER_PREVIEW frame's slot is 0"
     }
   ]
 }

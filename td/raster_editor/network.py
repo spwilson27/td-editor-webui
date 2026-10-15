@@ -91,6 +91,11 @@ when it has a mask or a transform, the source node otherwise) through an effect 
 layer, owned by the network) whose output is the *source* of the layer's blend node.  Flatten is content only
 (``render_layer_source`` ignores effects).
 
+v7 (docs/DESIGN_V6.md 5.1): adjustments of type ``filter`` (an effect chain on the accumulated image, mixed by opacity x mask with uAdjust 1),
+effects on groups (chain on the isolated composite, mask first) and on adjustments (``adjx_L_<id>`` adjusted image -> chain -> mix), displace
+aux images (``auxSource`` 'layer:<id>' / 'input:<n>'), tdPreview layers (``preview_layers`` / ``layer_preview_source`` / ``layer_preview_token``)
+and bold / italic faces of font collections (``text_face``).
+
 Persistence (verified): a LOCKED Script TOP keeps its pixels in COMP.save()/loadTox (and so in a saved .toe).
 Locking resets the locked image, so ``freeze()`` does ``top.lock = True`` and then calls ``comp.OnSurfaceCook(top)``
 (the ext's promoted method, which must copy the whole surface buffer) to write the pixels INTO the locked TOP.
@@ -103,6 +108,9 @@ import math
 import collections
 import os
 import re
+import struct
+import sys
+import tempfile
 import time
 
 BLEND_MODES = (
@@ -553,6 +561,47 @@ def adjustment_is_noop(adj):
     return t not in ("levels", "brightnessContrast", "invert", "threshold", "hueSaturation")
 
 
+def adjustment_filter(adj):
+    """The filter effect of a ``{type: 'filter', effect}`` adjustment (a dict), else None."""
+    if isinstance(adj, dict) and adj.get("type") == "filter" and isinstance(adj.get("effect"), dict):
+        return adj["effect"]
+    return None
+
+
+def effect_aux_ref(effects):
+    """The aux-image reference of an effect list (v7): the first enabled effect with ``source: 'aux'`` and a string
+    ``auxSource`` of the form ``'layer:<layerId>'`` or ``'input:<n>'`` (n = 1..8).  Returns ``('layer', id)``,
+    ``('input', n)`` or None.  One aux image per chain: later references in the same list are ignored."""
+    for e in effects or ():
+        if not isinstance(e, dict) or e.get("enabled", True) is False or e.get("source") != "aux":
+            continue
+        ref = e.get("auxSource")
+        if isinstance(ref, dict):                       # canonical: {kind:'layer', id} | {kind:'input', input}
+            if ref.get("kind") == "layer" and isinstance(ref.get("id"), str) and ref["id"]:
+                return ("layer", ref["id"])
+            if ref.get("kind") == "input":
+                try:
+                    n = int(ref.get("input"))
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= n <= MAX_INPUTS:
+                    return ("input", n)
+            continue
+        if not isinstance(ref, str):
+            continue
+        kind, _, rest = ref.partition(":")        # shorthand 'layer:<id>' / 'input:<n>'
+        if kind == "layer" and rest:
+            return ("layer", rest)
+        if kind == "input":
+            try:
+                n = int(rest)
+            except ValueError:
+                continue
+            if 1 <= n <= MAX_INPUTS:
+                return ("input", n)
+    return None
+
+
 def opacity_value(v):
     """Layer opacity as a float (invalid -> 1.0); the blend shader clamps it to 0..1."""
     try:
@@ -611,7 +660,233 @@ TEXT_LINE_HEIGHT = (0.2, 10.0)   # clamp(lineHeight, 0.2, 10)
 TEXT_MAX = 20000
 
 
-def text_pars(spec, doc_w, doc_h, metrics=None):
+def default_typeface(bold, italic):
+    """The typeface menu entry of a one-file-per-face family (Arial, Times New Roman, ...): Regular / Italic / Bold / Bold Italic."""
+    return "Bold Italic" if bold and italic else "Bold" if bold else "Italic" if italic else "Regular"
+
+
+_WEIGHTS = {"thin": 100, "hairline": 100, "extralight": 200, "ultralight": 200, "light": 300, "book": 400, "regular": 400, "roman": 400,
+            "normal": 400, "medium": 500, "semibold": 600, "demibold": 600, "demi": 600, "bold": 700, "extrabold": 800, "heavy": 800,
+            "black": 900, "ultra": 900}
+_ODD_WIDTH = {"condensed", "narrow", "compressed", "extended", "expanded", "wide", "rounded", "cond"}
+
+
+def typeface_score(name, bold, italic):
+    """Distance of a typeface menu entry ('Bold Oblique', 'Medium Italic', 'Condensed ExtraBold') from the wanted style (lower =
+    better): 1.5 per 100 weight units from 400 / 700, 2 for a wrong slant, 5 for a condensed / extended cut."""
+    toks = re.findall(r"[a-z]+", name.lower())
+    weight = max([_WEIGHTS[t] for t in toks if t in _WEIGHTS] or [400])
+    ital = any(t in ("italic", "oblique", "slanted", "inclined") for t in toks)
+    odd = any(t in _ODD_WIDTH for t in toks)
+    return abs(weight - (700 if bold else 400)) / 100.0 * 1.5 + (0.0 if ital == bool(italic) else 2.0) + (5.0 if odd else 0.0)
+
+
+def pick_typeface(menu, bold, italic):
+    """The entry of a Text TOP ``typeface`` menu that best matches bold / italic (Helvetica: 'Oblique' / 'Bold Oblique' instead of
+    'Italic' / 'Bold Italic'; Futura: 'Medium Italic'; Avenir: 'Heavy'), or None for an empty menu."""
+    best, best_s = None, None
+    for n in menu or ():
+        sc = typeface_score(str(n), bold, italic)
+        if best_s is None or sc < best_s - 1e-9:
+            best, best_s = str(n), sc
+    return best
+
+
+# ---- font collections (.ttc): TouchDesigner's Text TOP lists every face of a collection in its typeface menu but always renders
+# face 0 (measured live: Helvetica / Menlo / Avenir -- Bold, Oblique, ... all give the Regular glyphs; `bold` / `italic` toggles
+# neither).  A single-face .ttf extracted from the collection and set as ``fontfile`` renders the right face.
+
+FONT_DIRS = {
+    "darwin": ("/System/Library/Fonts", "/System/Library/Fonts/Supplemental", "/Library/Fonts", "~/Library/Fonts"),
+    "win32": ("C:\\Windows\\Fonts", "~\\AppData\\Local\\Microsoft\\Windows\\Fonts"),
+    "linux": ("/usr/share/fonts", "/usr/local/share/fonts", "~/.fonts", "~/.local/share/fonts"),
+}
+_TTC_INDEX = None          # lower-case family -> [(path, face index, weight, italic)]
+
+
+def _sfnt_tables(f, off):
+    f.seek(off)
+    hdr = f.read(12)
+    if len(hdr) < 12:
+        return {}
+    nt = struct.unpack(">H", hdr[4:6])[0]
+    recs = f.read(16 * nt)
+    tabs = {}
+    for i in range(min(nt, len(recs) // 16)):
+        tag, _cs, o, ln = struct.unpack(">4sIII", recs[16 * i:16 * i + 16])
+        tabs[tag] = (o, ln)
+    return tabs
+
+
+def _face_info(f, off):
+    """({family names}, weight, italic) of the sfnt at ``off`` of an open binary file (name / OS/2 / head tables only)."""
+    tabs = _sfnt_tables(f, off)
+    if b"name" not in tabs:
+        return None
+    o, ln = tabs[b"name"]
+    f.seek(o)
+    data = f.read(min(ln, 1 << 20))
+    _fmt, cnt, so = struct.unpack(">HHH", data[:6])
+    names = {}
+    for i in range(cnt):
+        pid, _eid, lid, nid, nl, no = struct.unpack(">HHHHHH", data[6 + 12 * i:18 + 12 * i])
+        if nid not in (1, 16):
+            continue
+        raw = data[so + no:so + no + nl]
+        try:
+            txt = raw.decode("utf-16-be") if pid in (0, 3) else raw.decode("mac_roman")
+        except Exception:      # noqa: BLE001
+            continue
+        english = (pid == 3 and lid == 0x409) or (pid == 1 and lid == 0)
+        if (nid, ) not in names or english:
+            names[(nid, )] = txt
+    fams = {names[k].strip().lower() for k in names if names[k].strip()}
+    weight, italic, wclass = 400, False, 5
+    if b"head" in tabs:
+        f.seek(tabs[b"head"][0] + 44)
+        mac = struct.unpack(">H", f.read(2))[0]
+        weight, italic = (700 if mac & 1 else 400), bool(mac & 2)
+    if b"OS/2" in tabs and tabs[b"OS/2"][1] >= 64:
+        f.seek(tabs[b"OS/2"][0] + 4)
+        weight, wclass = struct.unpack(">HH", f.read(4))
+        weight, wclass = weight or 400, wclass or 5
+        f.seek(tabs[b"OS/2"][0] + 62)
+        sel = struct.unpack(">H", f.read(2))[0]
+        italic = italic or bool(sel & 1) or bool(sel & 0x200)
+    return fams, weight, italic, wclass
+
+
+def ttc_index(dirs=None, refresh=False):
+    """Index of the font collections installed on this machine: ``{lower-case family: [(path, face index, weight, italic)]}``
+    (built once, header reads only -- a collection can be hundreds of MB)."""
+    global _TTC_INDEX
+    if _TTC_INDEX is not None and not refresh and dirs is None:
+        return _TTC_INDEX
+    index = {}
+    plat = "darwin" if sys.platform == "darwin" else "win32" if sys.platform.startswith("win") else "linux"
+    for d in (dirs if dirs is not None else FONT_DIRS.get(plat, ())):
+        d = os.path.expanduser(d)
+        for root, subdirs, files in os.walk(d):
+            if root[len(d):].count(os.sep) >= 3:
+                subdirs[:] = []
+            for fn in files:
+                if not fn.lower().endswith((".ttc", ".otc")):
+                    continue
+                path = os.path.join(root, fn)
+                try:
+                    with open(path, "rb") as f:
+                        head = f.read(12)
+                        if head[:4] != b"ttcf":
+                            continue
+                        n = min(struct.unpack(">I", head[8:12])[0], 256)
+                        offs = struct.unpack(">%dI" % n, f.read(4 * n))
+                        for i, off in enumerate(offs):
+                            info = _face_info(f, off)
+                            if info:
+                                for fam in info[0]:
+                                    index.setdefault(fam, []).append((path, i, info[1], info[2], info[3]))
+                except Exception:      # noqa: BLE001 - unreadable / odd file: skip it
+                    continue
+    if dirs is None:
+        _TTC_INDEX = index
+    return index
+
+
+def ttc_face(family, bold, italic, index=None):
+    """(path, face index) of the face of a collection family closest to bold / italic (weight 700 / 400, slant), or None when
+    ``family`` is not in any installed collection."""
+    cands = (index if index is not None else ttc_index()).get(str(family).strip().lower())
+    if not cands:
+        return None
+    # same weights as typeface_score: 1.5 per 100 weight units, 2 for a wrong slant, 5 for a condensed / extended cut (OS/2 usWidthClass != 5)
+    best = min(enumerate(cands), key=lambda e: (abs(e[1][2] - (700 if bold else 400)) / 100.0 * 1.5 + (0.0 if e[1][3] == bool(italic) else 2.0)
+                                                + (0.0 if e[1][4] == 5 else 5.0), e[0]))
+    return best[1][0], best[1][1]
+
+
+def _uid():
+    return os.getuid() if hasattr(os, "getuid") else None
+
+
+def font_cache_dir(directory=None):
+    """The per-user font cache directory (``<temp>/raster_editor_fonts_<uid>``, mode 0700, created on demand).  Refuses a directory
+    that exists but is not owned by this user (another user could plant a font file there)."""
+    uid = _uid()
+    d = directory or os.path.join(tempfile.gettempdir(), "raster_editor_fonts_%s" % (uid if uid is not None else "user"))
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    if uid is not None:
+        st = os.stat(d)
+        if st.st_uid != uid:
+            raise PermissionError("font cache directory %s is not owned by this user" % d)
+        if st.st_mode & 0o077:
+            os.chmod(d, 0o700)
+    return d
+
+
+def font_file_ok(path):
+    """A cached extracted font: a non-empty regular file owned by this user."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return st.st_size > 0 and os.path.isfile(path) and (_uid() is None or st.st_uid == _uid())
+
+
+def extract_ttc_face(path, index, directory=None):
+    """Writes face ``index`` of the collection ``path`` as a standalone sfnt file (tables copied verbatim, each 4-byte aligned, directory
+    order kept) and returns its path (cached by file name / size / mtime in :func:`font_cache_dir`).  Offsets / lengths read from the file
+    are validated against its size; a damaged collection raises ``ValueError``."""
+    st = os.stat(path)
+    directory = font_cache_dir(directory)
+    stem = re.sub(r"[^A-Za-z0-9]+", "_", os.path.splitext(os.path.basename(path))[0])
+    dest = os.path.join(directory, "%s_%d_%d_%d.ttf" % (stem, index, st.st_size, int(st.st_mtime)))
+    if font_file_ok(dest):
+        return dest
+    size = st.st_size
+    with open(path, "rb") as f:
+        head = f.read(12)
+        if head[:4] != b"ttcf" or len(head) < 12:
+            raise ValueError("not a font collection")
+        n = struct.unpack(">I", head[8:12])[0]
+        if not 0 <= index < n or 12 + 4 * n > size:
+            raise ValueError("face index out of range")
+        offs = struct.unpack(">%dI" % n, f.read(4 * n))
+        off = offs[index]
+        f.seek(off)
+        sfnt = f.read(12)
+        if len(sfnt) < 12:
+            raise ValueError("truncated sfnt header")
+        nt = struct.unpack(">H", sfnt[4:6])[0]
+        if off + 12 + 16 * nt > size or nt > 512:
+            raise ValueError("bad table directory")
+        recs = [struct.unpack(">4sIII", f.read(16)) for _ in range(nt)]
+        out = bytearray(sfnt) + bytearray(16 * nt)
+        out += b"\0" * (((len(out) + 3) & ~3) - len(out))
+        ents = []
+        for tag, cs, o, ln in recs:
+            if o + ln > size or ln > (64 << 20):
+                raise ValueError("table %r outside the file" % tag)
+            f.seek(o)
+            ents.append((tag, cs, len(out), ln))
+            out += f.read(ln)
+            out += b"\0" * (-len(out) & 3)
+    for i, (tag, cs, o, ln) in enumerate(ents):
+        out[12 + 16 * i:28 + 16 * i] = struct.pack(">4sIII", tag, cs, o, ln)
+    fd, tmp = tempfile.mkstemp(suffix=".part", dir=directory)       # unique per process / instance: no cross-instance races
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(out)
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return dest
+
+
+def text_pars(spec, doc_w, doc_h, metrics=None, face=None):
     """TextSpec -> Text TOP parameters (document resolution, transparent background, premultiplied).  Pure.
 
     Conventions (web/src/engine/textShape.ts): the layout block has its top-left at (x, y); with ``boxWidth`` it is
@@ -630,6 +905,8 @@ def text_pars(spec, doc_w, doc_h, metrics=None):
       separated text (``metrics["text"]``, wordwrap off).  A word wider than the box overflows.
     * the block width ``bw`` (= boxWidth, or without a box the widest line measured) anchors centre / right
       alignment: ``positionx = x + bw/2 - W/2`` (centre), ``x + bw - W`` (right), ``x`` (left).
+    * ``face`` = ``(typeface menu entry, font file or "")`` (:meth:`DocNetwork.text_face`): a font-collection family's bold /
+      italic face is a standalone font file; default = the plain Regular / Italic / Bold / Bold Italic menu entry.
     """
     spec = spec or {}
     P = TEXT_PAR
@@ -655,8 +932,8 @@ def text_pars(spec, doc_w, doc_h, metrics=None):
         "fontsizexunit": "pixels", "fontsizeyunit": "pixels", P["size"]: size, "fontsizey": size,
         P["colorr"]: c[0], P["colorg"]: c[1], P["colorb"]: c[2], P["alpha"]: c[3],
         P["alignx"]: align, "alignxmode": "metrics", P["aligny"]: "top", "alignymode": "metrics",
-        "typeface": ("Bold Italic" if spec.get("bold") and spec.get("italic") else "Bold" if spec.get("bold")
-                     else "Italic" if spec.get("italic") else "Regular"),
+        "typeface": face[0] if face else default_typeface(spec.get("bold"), spec.get("italic")),
+        "fontfile": face[1] if face else "",
         P["spacing"]: size * lh - float(m["pitch"]),
         P["wrap"]: False, P["border"]: border,
         P["posx"]: posx, P["posy"]: -top,
@@ -787,6 +1064,9 @@ class DocNetwork:
         self._garbage = []    # disconnected operators waiting to be destroyed by tick()
         self._adopt = {}
         self._metrics = {}    # (resolved font, bold, italic, size) -> measured text metrics
+        self._faces = {}      # (resolved font, bold, italic) -> (typeface, font file)
+        self._face_fail = {}  # same key -> clock time before which a failed face is not retried
+        self.font_error = None
         self._budget = MEASURE_BUDGET
         self._text_nodes = {}  # text node name -> (spec, doc_w, doc_h)
         self._text_todo = set()     # text nodes laid out with the fallback metrics, finished by tick()
@@ -820,6 +1100,10 @@ class DocNetwork:
         self._fx_fail = {}     # layer id -> (consecutive failures, retry not before, effect-list key)
         self._fx_todo = {}     # planned effect chains: alias node name -> (layer id, source node name, effects, pos)
         self._fx_out = {}      # alias node name -> the chain's output operator
+        self._fx_aux = {}      # alias node name -> ('layer', id) | ('input', n): the chain's aux image reference
+        self._content = {}     # layer id -> node name of its doc-space content (post effects) for layers used as an aux source
+        self._preview = {}     # layer id -> alias node name of a tdPreview chain (the layer's post-effects content)
+        self._fx_keys = {}     # alias node name -> signature of the chain's effect list + aux reference
         self.fx_error = None   # why layer effects are unavailable / the last chain failure (None = fine)
         self._fx, self._fx_shaders = None, None
         self._init_effects(effects, effect_shaders)
@@ -969,7 +1253,7 @@ class DocNetwork:
             try:
                 metrics, complete = self._text_metrics(node[0], name)
                 pars0 = self._counters["par_sets"]
-                self._set_pars(name, op, text_pars(node[0], node[1], node[2], metrics))
+                self._set_pars(name, op, self._text_pars(node[0], node[1], node[2], metrics))
                 if self._counters["par_sets"] != pars0:           # a poll that changes nothing keeps the token
                     self._text_rev[name] = self._text_rev.get(name, 0) + 1
                 if complete:
@@ -1062,6 +1346,45 @@ class DocNetwork:
         """The document pixel box (x0, y0, x1, y1) of the cropped resample pass of the last apply() for ``layer_id``,
         or None when that layer is not cropped (exact placement, full-size, skipped, unknown)."""
         return self._boxes.get(layer_id)
+
+    # ---- tdPreview layers (docs/DESIGN_V6.md 5, PROTOCOL.md 9) -----------------------------------------------------------
+
+    def preview_layers(self):
+        """Ids (stack order, bottom -> top) of the layers of the last apply() whose effects / filter contain a planner-flagged
+        ``tdPreview`` type (``effects.effect_td_preview``) and whose chain is live.  The browser's Local preview shows TD's render of
+        these layers: the ext reads :meth:`layer_preview_source` back when :meth:`layer_preview_token` changed."""
+        order = [l.get("id") for l in (self._prev_stack or ())]
+        return [i for i in order if i in self._preview and self._preview_op(i) is not None]
+
+    def _preview_op(self, layer_id):
+        alias = self._preview.get(layer_id)
+        if alias is None or layer_id in self._fx_fail or layer_id not in self._live:
+            return None
+        op = self._fx_out.get(alias)
+        return op if op is not None and op.valid else None
+
+    def layer_preview_source(self, layer_id):
+        """The TOP with the layer's content AFTER its effects, in DOCUMENT space and document size, PREMULTIPLIED RGBA (TD row
+        order, rgba8fixed): for a pixel / input / text / shape layer its masked, transformed content through its effect chain; for
+        a group the isolated composite through its chain (its mask applied first); for an adjustment layer the adjusted result
+        through the chain (a filter adjustment: the filter applied to the composite below, i.e. before the opacity x mask mix).
+        Never includes the layer's opacity, blend mode or (except groups / pixel layers, where it is applied before the effects)
+        its mask.  ``None`` when the layer has no tdPreview effect, is hidden (itself or an ancestor; opacity 0 too), its chain failed (no effects would be shown) or it is gone."""
+        return self._preview_op(layer_id)
+
+    def layer_preview_token(self, layer_id):
+        """Opaque, comparable value that changes whenever :meth:`layer_preview_source` may show different pixels: the chain's
+        identity / effect list / aux reference, the document size, and the cook counters of the chain output and its input
+        (hidden layers have no preview, so every previewed layer is pulled by the document output and its counters follow its edits).
+        ``None`` = no preview for this layer."""
+        op = self._preview_op(layer_id)
+        if op is None:
+            return None
+        alias = self._preview[layer_id]
+        entry = self._fx_todo.get(alias)
+        src_op = self._ops.get(entry[1]) if entry else None
+        return (self._gen.get(alias), self._fx_keys.get(alias), self._prev_size, getattr(op, "totalCooks", 0),
+                getattr(src_op, "totalCooks", 0) if src_op is not None else 0)
 
     def freeze(self):
         """Lock every surface TOP so its pixels are stored with the file.
@@ -1235,6 +1558,47 @@ class DocNetwork:
                 return "Helvetica"
         return font
 
+    def text_face(self, spec):
+        """``(typeface, fontfile)`` of the Text TOP for a TextSpec's family / bold / italic (cached).  Regular: the plain menu entry
+        and no file.  Bold / italic: a family of an installed font COLLECTION (.ttc: Helvetica, Menlo, Avenir, ...) gets the matching
+        face extracted to a standalone font file (the Text TOP ignores ``typeface`` / ``bold`` / ``italic`` for collections and
+        always draws face 0); any other family gets the best entry of its own typeface menu (Helvetica-like menus say 'Oblique',
+        Futura has no 'Italic').  Failures fall back to the plain entry."""
+        bold, italic = bool(spec.get("bold")), bool(spec.get("italic"))
+        plain = default_typeface(bold, italic)
+        if not (bold or italic):
+            return plain, ""
+        font = self._resolve_font(str(spec.get("font", "")))
+        key = (font, bold, italic)
+        got = self._faces.get(key)
+        if got is not None and (not got[1] or font_file_ok(got[1])):        # (the temp file may have been cleaned up)
+            return got
+        face = (plain, "")
+        until = self._face_fail.get(key)
+        if until is not None and self._clock() < until:
+            return face                                                      # failed recently: no retry every apply / tick
+        try:
+            hit = ttc_face(font, bold, italic)
+            if hit is not None:
+                face = ("Regular", extract_ttc_face(*hit))
+            else:
+                m = self._measure_node()
+                self._set_pars("text_measure", m, {"font": font})
+                pick = pick_typeface(list(m.par.typeface.menuNames), bold, italic)
+                if pick:
+                    face = (pick, "")
+        except Exception as e:      # noqa: BLE001 - fonts are cosmetic: never break the document
+            self.font_error = "%s: %s" % (type(e).__name__, e)
+            self._face_fail[key] = self._clock() + 30.0
+            self._faces.pop(key, None)
+            return face
+        self._face_fail.pop(key, None)
+        self._faces[key] = face
+        return face
+
+    def _text_pars(self, spec, doc_w, doc_h, metrics=None):
+        return text_pars(spec, doc_w, doc_h, metrics, face=self.text_face(spec or {}))
+
     def _text_due(self):
         now = self._clock()
         return any(self._text_retry.get(n, (0, 0.0))[1] <= now for n in self._text_todo)
@@ -1261,9 +1625,9 @@ class DocNetwork:
 
             def prepare():
                 if not ready[0]:
+                    face = self.text_face(spec)
                     self._set_pars("text_measure", m, {
-                        "font": font, "typeface": "Bold Italic" if bold and italic else "Bold" if bold
-                        else "Italic" if italic else "Regular", "fontsizex": size, "fontsizey": size})
+                        "font": font, "typeface": face[0], "fontfile": face[1], "fontsizex": size, "fontsizey": size})
                     ready[0] = True
 
             def cook(s_):
@@ -1346,7 +1710,7 @@ class DocNetwork:
                 continue                                  # this layer is backing off; the others go on
             metrics, complete = self._text_metrics(spec, name)
             pars0 = self._counters["par_sets"]
-            self._set_pars(name, op, text_pars(spec, w, h, metrics))
+            self._set_pars(name, op, self._text_pars(spec, w, h, metrics))
             if self._counters["par_sets"] != pars0:
                 self._text_rev[name] = self._text_rev.get(name, 0) + 1
             if complete:
@@ -1359,6 +1723,20 @@ class DocNetwork:
     def _plan(self, layers, doc_w, doc_h, connected):
         d = {}
         self._fx_todo = {}
+        self._fx_aux = {}
+        self._content = {}
+        self._preview = {}
+        self._live = set()      # layers shown in the document (visible with opacity > 0, every ancestor too): the preview layers
+        byid = {l.get("id"): l for l in layers}
+        for l in layers:
+            cur, ok, n = l, True, 0
+            while cur is not None and n < 64:
+                if not cur.get("visible", True) or not opacity_value(cur.get("opacity", 1.0)) > 0.0:
+                    ok = False
+                    break
+                cur, n = byid.get(cur.get("parentId")), n + 1
+            if ok:
+                self._live.add(l.get("id"))
         self._text_nodes = {}
         self._text_todo = set()
         for gone in [n for n in self._text_retry if not n.startswith("text_")]:
@@ -1386,6 +1764,14 @@ class DocNetwork:
             children.setdefault(None, []).extend(children.pop(pid))
 
         res = {"outputresolution": "custom", "resolutionw": doc_w, "resolutionh": doc_h}
+        # v7: aux images of displace-like filters ('layer:<id>' / 'input:<n>'): layers used as a source keep a document-space,
+        # uncropped content node; inputs get an identity resample ``auxin_<n>`` (document sized, top-left anchored)
+        aux_targets, aux_inputs = set(), set()
+        if self._fx is not None:
+            for l in layers:
+                ref = effect_aux_ref(self._effect_list(l))
+                if ref is not None:
+                    (aux_targets if ref[0] == "layer" else aux_inputs).add(ref[1])
         add(_Node("blank", "constantTOP", dict(res, colorr=0.0, colorg=0.0, colorb=0.0, alpha=0.0,
                                                format="rgba8fixed"), pos=(-600, 0)))
 
@@ -1487,7 +1873,7 @@ class DocNetwork:
                         self._text_nodes[src] = (spec, doc_w, doc_h)
                         if not complete:
                             self._text_todo.add(src)
-                        add(_Node(src, "textTOP", text_pars(spec, doc_w, doc_h, metrics), (), pos=(bx - 350, y)))
+                        add(_Node(src, "textTOP", self._text_pars(spec, doc_w, doc_h, metrics), (), pos=(bx - 350, y)))
                         self._sources[l["id"]] = src
                         if opt and text_is_empty(spec):
                             skip_why = skip_why or "empty"
@@ -1523,18 +1909,27 @@ class DocNetwork:
                             skip_why = skip_why or "empty"
                 elif kind == "adjustment":
                     adj = l.get("adjustment") or {}
+                    # a filter adjustment is an unknown type for adjustment_plan = identity passthrough (an adjustment that draws
+                    # nothing must show the image below, also without the skip rules); with a chain _emit replaces the passthrough
                     plan = adjustment_plan(adj, sid, doc_w, doc_h, pyramid=opt)
                     adjust = plan.adjust
                     extra = plan.extra
                     plan_nodes = plan.nodes
                     src = "$plan" if plan.src == "$last" else plan.src
-                    if opt and adjustment_is_noop(adj):
-                        skip_why = skip_why or "noop"
                 else:
                     continue
                 # sTD2DInputs[] is sized by the number of wired inputs: always wire all three
                 has_mask = mask_name is not None
-                fx = self._layer_effects(l, kind) if src != "blank" and not no_fx else None
+                if kind in ("group", "adjustment"):
+                    fx = self._layer_effects(l, kind)
+                    if kind == "adjustment" and opt and adjustment_is_noop(l.get("adjustment") or {}) and not fx:
+                        skip_why = skip_why or "noop"
+                else:
+                    fx = self._layer_effects(l, kind) if src != "blank" and not no_fx else None
+                if kind == "adjustment" and fx and (l.get("adjustment") or {}).get("type") == "filter":
+                    adjust, extra, plan_nodes, src = ADJ_PREMULT, {}, (), "blank"        # the chain runs on the accumulated image
+                need_doc = l["id"] in aux_targets and kind in ("pixel", "input", "base", "text", "shape") and src != "blank" and not no_fx
+                docspace = bool(fx and kind not in ("group", "adjustment")) or need_doc
                 if kind in ("pixel", "input", "base") and aff.dead:
                     src, mask_name, has_mask, xf, mip = "blank", None, False, IDENTITY_XF, False       # singular matrix: no area
                     fx = None
@@ -1542,7 +1937,7 @@ class DocNetwork:
                     skip_why = skip_why or "empty"
                 staged = False
                 crop = None
-                if kind in ("pixel", "input", "base") and src != "blank" and (not aff.exact or fx):
+                if kind in ("pixel", "input", "base") and src != "blank" and (not aff.exact or docspace):
                     # non-integer position / scale, rotation or skew (or effects, which need the masked content in
                     # document space): a resample pass renders the layer (and its mask) into document space; it is the
                     # only node that reads through a mipmap filter, the blend below only fetches
@@ -1550,7 +1945,7 @@ class DocNetwork:
                     xp = blend_pars(0, 0.0, has_mask, ADJ_RESAMPLE, aff.inv, mip, filt="mipmap" if mip else "linear")
                     xp.update({"vec2valuex": float(aff.xf[0]), "vec2valuey": float(aff.xf[1]),
                                "vec2valuez": 0.0, "vec2valuew": 0.0})
-                    if opt and CROP_BOXES and kind == "pixel" and not fx:
+                    if opt and CROP_BOXES and kind == "pixel" and not docspace:
                         # v6 bounding box: the resample pass renders only the transformed surface rect (clipped to the
                         # canvas) into a custom-resolution texture; the blend places it at the box origin
                         sw, sh = self._surface_size(l, doc_w, doc_h)
@@ -1561,7 +1956,7 @@ class DocNetwork:
                     sw, sh = self._surface_size(l, doc_w, doc_h)
                     if layer_box(aff, sw, sh, doc_w, doc_h, self._hints.get(l["id"])) is None:
                         skip_why = skip_why or "outside"
-                elif kind in ("text", "shape") and fx and has_mask:
+                elif kind in ("text", "shape") and docspace and has_mask:
                     # the mask must be applied before the effects: identity resample (exact path) = source x mask
                     staged = True
                     xp = blend_pars(0, 0.0, True, ADJ_RESAMPLE, (1.0, 0.0, 0.0, 1.0), False, filt="linear")
@@ -1581,9 +1976,11 @@ class DocNetwork:
                         bxf = IDENTITY_XF
                     add(_Node(xname, "glslTOP", xp, [src, mask_name or src, src], pos=(bx - 175, y)))      # 3 inputs: sTD2DInputs[] is sized by the wired ones
                     src, mask_name, has_mask, xf, mip = xname, None, False, bxf, False
-                if fx:
+                if fx and kind not in ("group", "adjustment"):
                     src = self._plan_effects(add, l, sid, src, fx, doc_w, doc_h, (bx - 100, y))
-                if (opt and CROP_BOXES and kind == "shape" and sbox is not None and not fx and not has_mask and skip_why is None
+                if need_doc:
+                    self._content[l["id"]] = src
+                if (opt and CROP_BOXES and kind == "shape" and sbox is not None and not docspace and not has_mask and skip_why is None
                         and src == "shape_" + sid):
                     cx0, cy0, cx1, cy1 = sbox
                     # hysteresis: a shape enters the cropped state at <= 50 % of the canvas and leaves it above 65 %
@@ -1603,7 +2000,7 @@ class DocNetwork:
                 if shape_full is not None:
                     # the full-size node is the Flatten source and the input of effect chains; nothing else cooks it.  When the
                     # blend does not use it (cropped / skipped, no effects) it is built only when render_layer_source asks.
-                    unused = opt and not fx and (src != "shape_" + sid or skip_why is not None)
+                    unused = opt and not docspace and (src != "shape_" + sid or skip_why is not None)
                     if unused and l["id"] not in self._flat_want:
                         self._lazy[l["id"]] = shape_full
                     else:
@@ -1619,9 +2016,16 @@ class DocNetwork:
                               "mask": mask_name or "blank", "has_mask": has_mask, "mode": mode, "opacity": opacity,
                               "xf": xf, "mip": mip, "adjust": adjust, "extra": extra, "bypass": not visible,
                               "pos": (bx, y), "plan_nodes": plan_nodes, "kids": kids_items, "xpos": bx - 350,
-                              "layer_y": y})
+                              "layer_y": y, "layer": l if kind in ("group", "adjustment") else None,
+                              "fx": fx if kind in ("group", "adjustment") else None})
             return items
 
+        for n in sorted(aux_inputs):
+            xp = blend_pars(0, 0.0, False, ADJ_RESAMPLE, (1.0, 0.0, 0.0, 1.0), False, filt="linear")
+            xp.update({"outputresolution": "custom", "resolutionw": doc_w, "resolutionh": doc_h,
+                       "vec2valuex": 0.0, "vec2valuey": 0.0, "vec2valuez": 0.0, "vec2valuew": 0.0})
+            src_n = input_source(n)
+            add(_Node("auxin_%d" % n, "glslTOP", xp, [src_n, src_n, src_n], pos=(-450, -100 - 60 * n)))
         cropped_shape = set()
         items = walk(children.get(None, []), 0)
         self._shape_cropped = cropped_shape
@@ -1664,8 +2068,22 @@ class DocNetwork:
         def resolve(i):
             it = items[i]
             if it["kids"] is not None and not it.get("resolved"):
-                it["src"] = self._emit(add, it["kids"], "blank", tail_ok and after[i] and plain[i], doc_w, doc_h) or "blank"
+                fx = it.get("fx")
+                # a group with effects: its isolated composite feeds the chain, so it keeps 16 bit like any effect input
+                it["src"] = self._emit(add, it["kids"], "blank", tail_ok and after[i] and plain[i] and not fx, doc_w, doc_h) or "blank"
                 it["resolved"] = True
+                if fx:
+                    src = it["src"]
+                    if it["has_mask"]:
+                        # like every layer kind: the mask is applied BEFORE the effects (identity resample = source x mask)
+                        xp = self._blend_pars(0, 0.0, True, ADJ_RESAMPLE, (1.0, 0.0, 0.0, 1.0), False, filt="linear")
+                        xp.update({"outputresolution": "custom", "resolutionw": doc_w, "resolutionh": doc_h,
+                                   "vec2valuex": 0.0, "vec2valuey": 0.0, "vec2valuez": 0.0, "vec2valuew": 0.0})
+                        xname = "xf_L_" + it["sid"]
+                        add(_Node(xname, "glslTOP", xp, [src, it["mask"], src], pos=(it["xpos"] - 175, it["layer_y"])))
+                        src = xname
+                        it["has_mask"], it["mask"] = False, "blank"
+                    it["src"] = self._plan_effects(add, it["layer"], it["sid"], src, fx, doc_w, doc_h, (it["pos"][0] - 100, it["layer_y"]))
 
         i = 0
         while i < n:
@@ -1677,10 +2095,10 @@ class DocNetwork:
                 j = i + 1
                 while (j < n and items[j]["adjust"] == 0 and len(run) < MERGE_MAX and it["id"] != self._active
                        and items[j]["id"] != self._active):
+                    resolve(j)
                     m = 1 if items[j]["has_mask"] else 0
                     if masks_n + m > MERGE_MASKS_MAX:
                         break
-                    resolve(j)
                     run.append(items[j])
                     masks_n += m
                     j += 1
@@ -1730,8 +2148,24 @@ class DocNetwork:
                 src = it["src"]
                 if src == "$plan":
                     src = prev
-                bp = self._blend_pars(it["mode"], it["opacity"], it["has_mask"], it["adjust"], it["xf"], it["mip"], fmt=fmt)
-                bp.update(it["extra"])
+                adjust, extra = it["adjust"], it["extra"]
+                if it.get("fx") and it["kind"] == "adjustment":
+                    # effects on an adjustment layer: chain(adjusted image) is mixed with the image below by opacity x mask
+                    # (uAdjust 1).  Filter adjustments: the chain runs on the accumulated image itself.
+                    if prev is not None:
+                        adjusted = prev
+                    elif adjust == ADJ_PREMULT:
+                        adjusted = acc
+                    else:
+                        adjusted = "adjx_L_%s" % it["sid"]
+                        ap = self._blend_pars(0, 1.0, False, adjust, IDENTITY_XF, False, fmt=FMT)
+                        ap.update(extra)
+                        add(_Node(adjusted, "glslTOP", ap, [acc, "blank", "blank"], pos=(it["xpos"], it["layer_y"])))
+                    src = self._plan_effects(add, it["layer"], it["sid"], adjusted, it["fx"], doc_w, doc_h,
+                                             (it["xpos"] + 60, it["layer_y"]))
+                    adjust, extra = ADJ_PREMULT, {}
+                bp = self._blend_pars(it["mode"], it["opacity"], it["has_mask"], adjust, it["xf"], it["mip"], fmt=fmt)
+                bp.update(extra)
                 add(_Node(it["name"], "glslTOP", bp, [acc, src, it["mask"]], bypass=it["bypass"], pos=it["pos"]))
                 acc = it["name"]
             i += len(run)
@@ -1761,12 +2195,19 @@ class DocNetwork:
             self._fx = self._fx_shaders = None
             self.fx_error = "%s: %s" % (type(e).__name__, e)
 
+    def _effect_list(self, layer):
+        """Every effect dict that is applied to the layer's content: its ``effects`` plus, for a filter adjustment, the
+        filter itself FIRST (it is the adjusted image; the layer's effects then decorate it)."""
+        fx = [e for e in (layer.get("effects") or ()) if isinstance(e, dict)] if isinstance(layer.get("effects"), (list, tuple)) else []
+        f = adjustment_filter(layer.get("adjustment")) if layer.get("kind") == "adjustment" else None
+        return ([f] if f is not None else []) + fx
+
     def _layer_effects(self, layer, kind):
-        """The layer's effect list when at least one effect draws something, else None.  Pixel, input, text and shape
-        layers only (not groups / adjustments in v5)."""
-        if self._fx is None or kind not in ("pixel", "input", "base", "text", "shape"):
+        """The layer's effect list when at least one effect draws something, else None.  All layer kinds (v7: groups and
+        adjustments too; a filter adjustment's own filter leads the list)."""
+        if self._fx is None or kind not in ("pixel", "input", "base", "text", "shape", "group", "adjustment"):
             return None
-        fx = [e for e in (layer.get("effects") or ()) if isinstance(e, dict)]
+        fx = self._effect_list(layer)
         if not fx:
             return None
         try:
@@ -1777,10 +2218,29 @@ class DocNetwork:
 
     def _plan_effects(self, add, layer, sid, src, fx, doc_w, doc_h, pos):
         """Register the layer's effect chain: its input is the node ``src``; the returned alias name stands for the chain's
-        output in the blend node's wiring (the chain nodes are built by :meth:`_apply_effects`)."""
+        output in the blend node's wiring (the chain nodes are built by :meth:`_apply_effects`).  Also records the chain's
+        aux image reference and whether the layer is a tdPreview layer (:meth:`preview_layers`)."""
         alias = "fx_L_" + sid
         self._fx_todo[alias] = (layer["id"], src, fx, pos)
+        ref = effect_aux_ref(fx)
+        if ref is not None:
+            self._fx_aux[alias] = ref
+        try:
+            if any(self._fx.effect_td_preview(e) for e in fx):
+                self._preview[layer["id"]] = alias
+        except Exception:      # noqa: BLE001 - an older effects module without the planner flag: no preview layers
+            pass
         return alias
+
+    def _aux_node(self, alias):
+        """Name of the node holding the aux image of the chain ``alias`` (None = no aux: the filter renders unshifted)."""
+        ref = self._fx_aux.get(alias)
+        if ref is None:
+            return None
+        if ref[0] == "input":
+            return "auxin_%d" % ref[1]
+        name = self._content.get(ref[1])
+        return name if name in self._ops or name in self._fx_todo else None
 
     def _fx_acquire(self, optype):
         if self._pool:
@@ -1803,7 +2263,8 @@ class DocNetwork:
             self._garbage.append((op, cache))
 
     def _apply_effects(self):
-        """Build / update / remove the effect chains planned by the last _plan (after the nodes exist, before wiring)."""
+        """Build / update / remove the effect chains planned by the last _plan (after the nodes exist, before wiring).  A
+        chain whose aux image is another layer's (chained) content is built after that chain (cycles: no aux)."""
         todo = self._fx_todo
         keep = {v[0] for v in todo.values()}
         for lid in [k for k in self._chains if k not in keep]:
@@ -1811,47 +2272,87 @@ class DocNetwork:
         for alias in [a for a in self._fx_out if a not in todo]:
             del self._fx_out[alias]
             self._gen.pop(alias, None)
-        now = self._clock()
         for lid in [k for k in self._fx_fail if k not in keep]:
             del self._fx_fail[lid]
-        for alias, (lid, src, fx, pos) in todo.items():
-            src_op = self._ops[src]
-            fkey = json.dumps(fx, sort_keys=True, separators=(",", ":"), default=str)
-            fail = self._fx_fail.get(lid)
-            if fail is not None and fail[2] == fkey and now < fail[1]:
-                # this exact effect list failed recently: no retry on every apply(), the layer shows without effects
-                if self._fx_out.get(alias) is not src_op:
-                    self._fx_out[alias] = src_op
-                    self._gen_counter += 1
-                    self._gen[alias] = self._gen_counter
-                continue
-            chain = None
-            try:
-                chain = self._chains.get(lid)
-                if chain is None:
-                    chain = self._chains[lid] = self._fx.EffectChain(
-                        self.doc, "fx_" + sanitize(lid), self._fx_shaders, acquire=self._fx_acquire,
-                        release=self._fx_release, pos=pos, adopt=False)
-                c0 = dict(chain.counters)
-                out = chain.apply(fx, src_op)
-                for k in ("par_sets", "connects"):
-                    self._counters[k] += chain.counters[k] - c0[k]
-                self._fx_fail.pop(lid, None)
-            except Exception as e:      # noqa: BLE001 - never break the document: show the layer without its effects
-                self.fx_error = "chain %s: %s: %s" % (lid, type(e).__name__, e)
-                n = (fail[0] if fail is not None else 0) + 1
-                self._fx_fail[lid] = (n, now + min(30.0, 0.5 * 2 ** n), fkey)
-                try:                                       # clean up the partially built chain (nodes back to the pool)
-                    self._chains.pop(lid, None)
-                    if chain is not None:
-                        chain.destroy()
-                except Exception:      # noqa: BLE001
-                    pass
-                out = src_op
-            if self._fx_out.get(alias) is not out:
-                self._fx_out[alias] = out
+        self._fx_keys = {}
+        done, busy = set(), set()
+
+        def build(alias):
+            if alias in done:
+                return
+            done.add(alias)
+            busy.add(alias)
+            aux_name = self._aux_node(alias)
+            aux = None
+            if aux_name is not None and self._aux_cycle(alias):
+                aux_name = None                            # cycle (A displaces by B, B by A): neither side gets an aux
+            if aux_name is not None:
+                if aux_name in todo:
+                    build(aux_name)
+                aux = self._fx_out.get(aux_name) if aux_name in todo else self._ops.get(aux_name)
+            self._apply_chain(alias, aux)
+            busy.discard(alias)
+
+        for alias in list(todo):
+            build(alias)
+
+    def _aux_cycle(self, alias):
+        """True when following the aux references from ``alias`` leads back to it."""
+        seen, cur = set(), alias
+        while True:
+            nxt = self._aux_node(cur)
+            if nxt is None or nxt not in self._fx_todo:
+                return False
+            if nxt == alias:
+                return True
+            if nxt in seen:
+                return False
+            seen.add(nxt)
+            cur = nxt
+
+    def _apply_chain(self, alias, aux):
+        lid, src, fx, pos = self._fx_todo[alias]
+        now = self._clock()
+        src_op = self._ops[src]
+        if src in self._fx_todo:                       # (a chain fed by another chain: not produced by the planner today)
+            src_op = self._fx_out.get(src, src_op)
+        fkey = json.dumps(fx, sort_keys=True, separators=(",", ":"), default=str) + "|" + str(self._fx_aux.get(alias))
+        self._fx_keys[alias] = fkey
+        fail = self._fx_fail.get(lid)
+        if fail is not None and fail[2] == fkey and now < fail[1]:
+            # this exact effect list failed recently: no retry on every apply(), the layer shows without effects
+            if self._fx_out.get(alias) is not src_op:
+                self._fx_out[alias] = src_op
                 self._gen_counter += 1
                 self._gen[alias] = self._gen_counter
+            return
+        chain = None
+        try:
+            chain = self._chains.get(lid)
+            if chain is None:
+                chain = self._chains[lid] = self._fx.EffectChain(
+                    self.doc, "fx_" + sanitize(lid), self._fx_shaders, acquire=self._fx_acquire,
+                    release=self._fx_release, pos=pos, adopt=False)
+            c0 = dict(chain.counters)
+            out = chain.apply(fx, src_op, aux=aux) if aux is not None else chain.apply(fx, src_op)
+            for k in ("par_sets", "connects"):
+                self._counters[k] += chain.counters[k] - c0[k]
+            self._fx_fail.pop(lid, None)
+        except Exception as e:      # noqa: BLE001 - never break the document: show the layer without its effects
+            self.fx_error = "chain %s: %s: %s" % (lid, type(e).__name__, e)
+            n = (fail[0] if fail is not None else 0) + 1
+            self._fx_fail[lid] = (n, now + min(30.0, 0.5 * 2 ** n), fkey)
+            try:                                       # clean up the partially built chain (nodes back to the pool)
+                self._chains.pop(lid, None)
+                if chain is not None:
+                    chain.destroy()
+            except Exception:      # noqa: BLE001
+                pass
+            out = src_op
+        if self._fx_out.get(alias) is not out:
+            self._fx_out[alias] = out
+            self._gen_counter += 1
+            self._gen[alias] = self._gen_counter
 
     # ------------------------------------------------------------------ reconcile
 
