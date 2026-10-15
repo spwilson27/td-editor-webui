@@ -1,0 +1,23 @@
+{
+  "type": "emboss",
+  "group": "stylise",
+  "doc": "Emboss (Photoshop style): relief = amount * (luma(p - L*height) - luma(p + L*height)) where L is the unit vector towards the light (angle 0 = light from the right, counter-clockwise on screen) and luma is Rec.709 of the premultiplied colour (transparent = flat), taps are bilinear. mode 'gray': straight colour = 0.5 + relief (flat areas become mid grey); mode 'overlay': straight colour = original + relief. Result clamped to 0..1, alpha unchanged.",
+  "reads": "neighbourhood",
+  "preservesTransparent": true,
+  "params": {
+    "angle": {"kind": "num", "default": 135, "min": -360, "max": 360, "unit": "deg", "doc": "light direction, 0 = from the right, counter-clockwise on screen (90 = from above)"},
+    "height": {"kind": "num", "default": 2, "min": 1, "max": 10, "unit": "px", "doc": "sample distance on each side of the pixel"},
+    "amount": {"kind": "num", "default": 100, "min": 0, "max": 500, "unit": "%"},
+    "mode": {"kind": "enum", "values": ["gray", "overlay"], "default": "gray"}
+  },
+  "vars": [["dx", "cos(rad(angle))"], ["dy", "-sin(rad(angle))"]],
+  "noop": "amount <= 0 && mode == 1",
+  "passes": [{"pass": 0, "u": ["dx", "dy", "height", "amount / 100", "mode"]}],
+  "extent": ["height + 1", "height + 1", "0", "0"],
+  "samples": [
+    {"angle": 135, "height": 2, "amount": 300, "mode": "gray"},
+    {"angle": 0, "height": 1, "amount": 200, "mode": "overlay"},
+    {"angle": -45, "height": 7.5, "amount": 500, "mode": "gray"}
+  ],
+  "degenerate": [{}, {"amount": 0}, {"amount": 0, "mode": "overlay"}, {"angle": 1e9, "height": 1e9, "amount": 1e9}, {"height": -3, "angle": "x"}, {"mode": "bogus"}]
+}

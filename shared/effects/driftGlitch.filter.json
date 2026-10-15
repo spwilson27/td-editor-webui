@@ -1,0 +1,26 @@
+{
+  "type": "driftGlitch",
+  "group": "animated",
+  "doc": "Drift glitch (static version of an animated glitch): the document is cut into bands of blockSize px (axis h: horizontal strips shifted along x; v: vertical strips shifted along y; band index = floor(doc coordinate / blockSize)). Over `iterations` steps every band's offset random-walks: at step i, with probability density % (hash of seed, band, i) the band moves by (u - 0.5) * 2 * amount px, u in [0,1) another hash. Total offset o (px, |o| <= iterations * amount). Green is read at round(o), red at round(o + k), blue at round(o - k), k = o * rgbShift / amount (so the colour split grows with the drift, |k| <= iterations * rgbShift); out(x) = in(x - shift). Transparent outside the layer (no wrap); alpha = max of the three channel alphas. Deterministic: pure function of input + parameters.",
+  "reads": "neighbourhood",
+  "preservesTransparent": false,
+  "params": {
+    "iterations": {"kind": "num", "default": 8, "min": 1, "max": 64, "round": true, "unit": "steps"},
+    "amount": {"kind": "num", "default": 8, "min": 0, "max": 500, "unit": "px", "doc": "maximum offset change of a band per step"},
+    "blockSize": {"kind": "num", "default": 16, "min": 1, "max": 500, "round": true, "unit": "px", "doc": "band thickness, document aligned"},
+    "density": {"kind": "num", "default": 40, "min": 0, "max": 100, "unit": "%", "doc": "probability that a band moves in a step"},
+    "rgbShift": {"kind": "num", "default": 4, "min": 0, "max": 64, "unit": "px", "doc": "red/blue split per amount of drift: k = o * rgbShift / amount"},
+    "seed": {"kind": "seed", "default": 0},
+    "axis": {"kind": "enum", "values": ["h", "v"], "default": "h", "doc": "h: horizontal bands shifted along x; v: vertical bands shifted along y"}
+  },
+  "vars": [["reach", "min(G, ceil(iterations * (amount + rgbShift)) + 2)"]],
+  "noop": "amount <= 0 || density <= 0",
+  "passes": [{"pass": 0, "u": ["iterations", "amount", "blockSize", "density / 100", "rgbShift", "seed", "axis", "0"]}],
+  "extent": ["if(axis == 0, reach, 0)", "if(axis == 1, reach, 0)", "0", "0"],
+  "samples": [
+    {"iterations": 6, "amount": 10, "blockSize": 8, "density": 70, "rgbShift": 3, "seed": 3},
+    {"iterations": 20, "amount": 6, "blockSize": 12, "density": 50, "rgbShift": 0, "seed": 11, "axis": "v"},
+    {"iterations": 64, "amount": 30, "blockSize": 4, "density": 100, "rgbShift": 8, "seed": 99}
+  ],
+  "degenerate": [{}, {"amount": 0}, {"iterations": 1e9, "amount": 1e9, "blockSize": 0, "density": 1e9, "rgbShift": 1e9}, {"axis": "bogus", "seed": -5}, {"iterations": -3, "amount": "x", "density": -1}]
+}

@@ -1,0 +1,26 @@
+{
+  "type": "bloom",
+  "group": "stylise",
+  "doc": "Bloom: the bright part of the image (soft threshold on luma, see blur threshold/knee) is blurred with a gaussian of `radius` px (pyramid above 32 px), multiplied by intensity and tint and screen blended over the original with premultiplied maths: out = c + B - c*B on rgb and alpha, B = blurred * tint * intensity (clamped to 0..1), so glow also spreads into transparent surroundings (alpha = union coverage). threshold 0 blooms the whole image.",
+  "reads": "neighbourhood",
+  "preservesTransparent": false,
+  "params": {
+    "threshold": {"kind": "num", "default": 0.7, "min": 0, "max": 1, "doc": "luma above which pixels glow; 0 = everything"},
+    "knee": {"kind": "num", "default": 0.2, "min": 0, "max": 1, "doc": "soft knee width of the threshold"},
+    "radius": {"kind": "num", "default": 20, "min": 0, "max": 200, "unit": "px"},
+    "intensity": {"kind": "num", "default": 100, "min": 0, "max": 300, "unit": "%"},
+    "tint": {"kind": "color", "default": {"r": 255, "g": 255, "b": 255, "a": 255}}
+  },
+  "noop": "radius <= 0 || intensity <= 0 || tint.a <= 0",
+  "passes": [
+    {"sub": "blur", "with": {"radius": "radius", "threshold": "threshold", "knee": "knee"}},
+    {"pass": 0, "u": ["intensity / 100", "tint.r", "tint.g", "tint.b", "tint.a"]}
+  ],
+  "extent": ["blurReach(radius)", "blurReach(radius)", "0", "0"],
+  "samples": [
+    {"threshold": 0.3, "knee": 0.2, "radius": 8, "intensity": 150},
+    {"threshold": 0.5, "knee": 0.1, "radius": 60, "intensity": 250, "tint": {"r": 255, "g": 200, "b": 120, "a": 255}},
+    {"threshold": 0, "radius": 15, "intensity": 100}
+  ],
+  "degenerate": [{}, {"radius": 0}, {"intensity": 0}, {"radius": 1e9, "intensity": 1e9, "threshold": 5, "knee": -1}, {"tint": "red"}, {"tint": {"r": 0, "g": 0, "b": 0, "a": 0}}, {"radius": 33, "threshold": 1}]
+}

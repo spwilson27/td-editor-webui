@@ -1,38 +1,28 @@
-// Effect -> shader pass list. MIRRORS td/raster_editor/effects.py plan_effect() / effect_reach() (shared/effects/vectors.json
+// Effect / filter -> shader pass list. MIRRORS td/raster_editor/effects.py plan_effect() / effect_reach() (shared/effects/vectors.json
 // is checked against both). Units and shader contracts: shared/effects/*.glsl headers and effects.py's module docstring.
+// v6 filters are planned from shared/effects/<type>.filter.json by ./filters.ts (the spec engine).
 
 import type { Effect, RGBA, Rect } from '../types';
+import type { Filter } from '../../../../shared/effects/filters';
+import {
+  FILTER_SPECS, MAX_RADIUS, SEED_MOD, blurPlan, blurReach, clamp01, filterExtent, filterReads, filterTdPreview, isFilterType, num, planFilter, round,
+  type EffectPass, type PassFormat,
+} from './filters';
 
-export type PassFormat = 'u8' | 'f16' | 'f32';
+export type { EffectPass, PassFormat };
+export { MAX_RADIUS };
+/** Anything the planner accepts: a v5 layer effect or a v6 filter (same chain, same API). */
+export type AnyEffect = Effect | Filter;
 
-export interface EffectPass {
-  shader: Effect['type'];
-  pid: number;
-  /** uP0..uP3, 16 floats */
-  u: number[];
-  fmt: PassFormat;
-}
-
-export const MAX_RADIUS = 128;
 export const MAX_STROKE = 128;
 
-const round = (x: number): number => Math.floor(x + 0.5);
 const off = (v: unknown): number => Math.max(-MAX_OFFSET, Math.min(MAX_OFFSET, round(num(v))));
-/** Only finite JS numbers count (numeric strings, booleans, null -> default); effects.py `_num` does the same. */
-const num = (v: unknown, d = 0): number => (typeof v === 'number' && Number.isFinite(v) ? v : d);
-const SEED_MOD = 1 << 24; // seeds are reduced to 0..2^24-1 so the float uniform holds them exactly
 const MAX_OFFSET = 8192;
-const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
 
 function col(c: RGBA | undefined, opacity = 1): number[] {
-  const o = c ?? { r: 0, g: 0, b: 0, a: 255 };
-  return [o.r / 255, o.g / 255, o.b / 255, (o.a / 255) * clamp01(opacity)];
-}
-
-/** `size` is the kernel half width in px; sigma = size / 3. */
-function blurSize(px: number): [number, number] {
-  const p = Math.min(MAX_RADIUS, Math.max(0, px));
-  return [p / 3, Math.ceil(p)];
+  const o = (c && typeof c === 'object' ? c : {}) as Record<string, unknown>;
+  const k = (n: string, d: number): number => { const v = o[n]; return typeof v === 'number' && Number.isFinite(v) ? Math.min(255, Math.max(0, v)) : d; };
+  return [k('r', 0) / 255, k('g', 0) / 255, k('b', 0) / 255, (k('a', 255) / 255) * clamp01(opacity)];
 }
 
 function jfaSteps(d: number): number[] {
@@ -45,58 +35,74 @@ function jfaSteps(d: number): number[] {
   return steps;
 }
 
-const pad = (u: number[]): number[] => u.concat(new Array(16 - u.length).fill(0));
-const P = (shader: Effect['type'], pid: number, u: number[], fmt: PassFormat): EffectPass => ({ shader, pid, u: pad(u), fmt });
 
-export function planEffect(e: Effect): EffectPass[] {
+
+const pad = (u: number[]): number[] => u.concat(new Array(16 - u.length).fill(0));
+const P = (shader: string, pid: number, u: number[], fmt: PassFormat, level = 0): EffectPass =>
+  level ? { shader, pid, u: pad(u), fmt, level } : { shader, pid, u: pad(u), fmt };
+
+/** The four passes of a pyramid blur effect: down, H, V (level lv), up + composite (level 0). */
+const pyr = (t: string, u: number[], lv: number): EffectPass[] => [P(t, 2, u, 'f16', lv), P(t, 3, u, 'f16', lv), P(t, 4, u, 'f16', lv), P(t, 5, u, 'f16')];
+
+export function planEffect(e: AnyEffect): EffectPass[] {
   if (!e || e.enabled === false) return []; // only a literal false disables (a missing flag = enabled)
-  const op = clamp01(num((e as { opacity?: number }).opacity, 1));
-  switch (e.type) {
+  if (isFilterType(e.type)) return planFilter(e as unknown as Record<string, unknown>);
+  const x = e as Effect;
+  const op = clamp01(num((x as { opacity?: number }).opacity, 1));
+  switch (x.type) {
     case 'dropShadow': {
-      const [sg, r] = blurSize(num(e.blur));
-      const u = [sg, r, off(e.dx), off(e.dy), ...col(e.color, op)];
-      return [P(e.type, 0, u, 'f16'), P(e.type, 1, u, 'f16')];
+      const [sg, r, lv] = blurPlan(num(x.blur));
+      const u = [sg, r, off(x.dx), off(x.dy), ...col(x.color, op)];
+      if (lv) return pyr(x.type, [...u, lv], lv); // pyramid: down, H, V at level lv, up + composite (blurlib.glsl)
+      return [P(x.type, 0, u, 'f16'), P(x.type, 1, u, 'f16')];
     }
     case 'outerGlow':
     case 'innerGlow': {
-      const [sg, r] = blurSize(num(e.size));
-      const u = [sg, r, 0, 0, ...col(e.color, op)];
-      return [P(e.type, 0, u, 'f16'), P(e.type, 1, u, 'f16')];
+      const [sg, r, lv] = blurPlan(num(x.size));
+      const u = [sg, r, 0, 0, ...col(x.color, op)];
+      if (lv) return pyr(x.type, [...u, lv], lv);
+      return [P(x.type, 0, u, 'f16'), P(x.type, 1, u, 'f16')];
     }
     case 'stroke': {
-      const w = Math.min(MAX_STROKE, num(e.width));
+      const w = Math.min(MAX_STROKE, num(x.width));
       if (w <= 0) return [];
-      const pos = e.position === 'inside' ? 0 : e.position === 'center' ? 1 : 2;
+      const pos = x.position === 'inside' ? 0 : x.position === 'center' ? 1 : 2;
       const d = pos === 1 ? w / 2 + 1 : w + 1;
-      const out = jfaSteps(d).map((k, i) => P(e.type, 0, [k, i === 0 ? 1 : 0], 'f32'));
-      out.push(P(e.type, 1, [pos, w, 0, 0, ...col(e.color, op)], 'f16'));
+      const out = jfaSteps(d).map((k, i) => P(x.type, 0, [k, i === 0 ? 1 : 0], 'f32'));
+      out.push(P(x.type, 1, [pos, w, 0, 0, ...col(x.color, op)], 'f16'));
       return out;
     }
     case 'bevel': {
-      const [sg, r] = blurSize(num(e.size));
-      const a = (num(e.angle, 120) * Math.PI) / 180;
-      const depth = clamp01(num(e.depth, 100) / 100);
+      const size = num(x.size);
+      const [sg, r, lv] = blurPlan(size);
+      const a = ((num(x.angle, 120) % 360) * Math.PI) / 180;
+      const depth = clamp01(num(x.depth, 100) / 100);
+      if (lv) {
+        const head = [sg, r, depth, lv, Math.cos(a), -Math.sin(a), Math.min(MAX_RADIUS, Math.max(0, size)) / 3, 0];
+        const full = [...head, ...col(x.highlight), ...col(x.shadow)];
+        return [P(x.type, 2, head, 'f16', lv), P(x.type, 3, head, 'f16', lv), P(x.type, 4, head, 'f16', lv), P(x.type, 5, full, 'f16')];
+      }
       const head = [sg, r, depth, 0, Math.cos(a), -Math.sin(a), 0, 0];
-      return [P(e.type, 0, head, 'f16'), P(e.type, 1, [...head, ...col(e.highlight), ...col(e.shadow)], 'f16')];
+      return [P(x.type, 0, head, 'f16'), P(x.type, 1, [...head, ...col(x.highlight), ...col(x.shadow)], 'f16')];
     }
     case 'colorOverlay':
-      return [P(e.type, 0, col(e.color, op), 'f16')];
+      return [P(x.type, 0, col(x.color, op), 'f16')];
     case 'pixelSort': {
-      const u = [e.direction === 'v' ? 1 : 0, clamp01(num(e.low, 0)), clamp01(num(e.high, 1)), e.key === 'hue' ? 1 : 0];
-      return [P(e.type, 0, u, 'f32'), P(e.type, 1, u, 'f32'), P(e.type, 2, u, 'f16')];
+      const u = [x.direction === 'v' ? 1 : 0, clamp01(num(x.low, 0)), clamp01(num(x.high, 1)), x.key === 'hue' ? 1 : 0];
+      return [P(x.type, 0, u, 'f32'), P(x.type, 1, u, 'f32'), P(x.type, 2, u, 'f16')];
     }
     case 'glitch': {
-      const amount = Math.min(100, Math.max(0, num(e.amount)));
-      return [P(e.type, 0, [amount / 100, amount, Math.max(1, round(num(e.blockSize, 16))), ((round(num(e.seed)) % SEED_MOD) + SEED_MOD) % SEED_MOD, Math.min(256, Math.max(0, num(e.rgbShift)))], 'f16')];
+      const amount = Math.min(100, Math.max(0, num(x.amount)));
+      return [P(x.type, 0, [amount / 100, amount, Math.max(1, round(num(x.blockSize, 16))), ((round(num(x.seed)) % SEED_MOD) + SEED_MOD) % SEED_MOD, Math.min(256, Math.max(0, num(x.rgbShift)))], 'f16')];
     }
     case 'chromaticAberration': {
-      const a = (num(e.angle) * Math.PI) / 180;
-      const amt = num(e.amount);
-      return [P(e.type, 0, [amt * Math.cos(a), -amt * Math.sin(a)], 'f16')];
+      const a = ((num(x.angle) % 360) * Math.PI) / 180;
+      const amt = num(x.amount);
+      return [P(x.type, 0, [amt * Math.cos(a), -amt * Math.sin(a)], 'f16')];
     }
     case 'halftone': {
-      const a = (num(e.angle) * Math.PI) / 180;
-      return [P(e.type, 0, [Math.max(1, num(e.cellSize, 8)), Math.cos(a), Math.sin(a), e.shape === 'line' ? 1 : 0], 'f16')];
+      const a = ((num(x.angle) % 360) * Math.PI) / 180;
+      return [P(x.type, 0, [Math.max(1, num(x.cellSize, 8)), Math.cos(a), Math.sin(a), x.shape === 'line' ? 1 : 0], 'f16')];
     }
     default:
       return [];
@@ -114,35 +120,40 @@ export interface Extent {
 export const SORT_CHUNK = 256; // pixelSort.glsl MAXSPAN
 
 /** Exact extent of an effect (see expandRect). */
-export function effectExtent(e: Effect): Extent {
+export function effectExtent(e: AnyEffect): Extent {
   const z: Extent = { rx: 0, ry: 0, ax: 0, ay: 0 };
   if (!e || e.enabled === false || planEffect(e).length === 0) return z;
+  if (isFilterType(e.type)) {
+    const [rx, ry, ax, ay] = filterExtent(e as unknown as Record<string, unknown>);
+    return { rx, ry, ax, ay };
+  }
+  const x = e as Effect;
   const iso = (r: number): Extent => ({ rx: r, ry: r, ax: 0, ay: 0 });
-  switch (e.type) {
+  switch (x.type) {
     case 'dropShadow': {
-      const r = blurSize(num(e.blur))[1];
-      return { rx: Math.abs(off(e.dx)) + r, ry: Math.abs(off(e.dy)) + r, ax: 0, ay: 0 };
+      const r = blurReach(num(x.blur));
+      return { rx: Math.abs(off(x.dx)) + r, ry: Math.abs(off(x.dy)) + r, ax: 0, ay: 0 };
     }
     case 'outerGlow':
-    case 'innerGlow': return iso(blurSize(num(e.size))[1]);
+    case 'innerGlow': return iso(blurReach(num(x.size)));
     // jump flood: the result at a pixel depends on the source within the SUM of the jump sizes (+1 for the edge test, +1 slack)
-    case 'stroke': return iso(planEffect(e).reduce((a, p) => (p.fmt === 'f32' ? a + p.u[0] : a), 0) + 2);
-    case 'bevel': return iso(blurSize(num(e.size))[1] + 1);
-    case 'pixelSort': return e.direction === 'v' ? { ...z, ay: SORT_CHUNK } : { ...z, ax: SORT_CHUNK };
-    case 'glitch': return iso(Math.ceil(Math.min(100, Math.max(0, num(e.amount)))) + 2 * Math.ceil(Math.min(256, Math.max(0, num(e.rgbShift))) * 1.5) + 2);
-    case 'chromaticAberration': return iso(Math.ceil(Math.abs(num(e.amount))) + 2);
-    case 'halftone': return iso(Math.ceil(1.5 * Math.max(1, num(e.cellSize, 8))) + 2);
+    case 'stroke': return iso(planEffect(x).reduce((a, p) => (p.fmt === 'f32' ? a + p.u[0] : a), 0) + 2);
+    case 'bevel': return iso(blurReach(num(x.size)) + 1);
+    case 'pixelSort': return x.direction === 'v' ? { ...z, ay: SORT_CHUNK } : { ...z, ax: SORT_CHUNK };
+    case 'glitch': return iso(Math.ceil(Math.min(100, Math.max(0, num(x.amount)))) + 2 * Math.ceil(Math.min(256, Math.max(0, num(x.rgbShift))) * 1.5) + 2);
+    case 'chromaticAberration': return iso(Math.ceil(Math.abs(num(x.amount))) + 2);
+    case 'halftone': return iso(Math.ceil(1.5 * Math.max(1, num(x.cellSize, 8))) + 2);
     default: return z;
   }
 }
 
 /** Conservative isotropic reach in px (pixel sort: 255 = the largest widening to a 256 px chunk). Prefer expandRect. */
-export function effectReach(e: Effect): number {
+export function effectReach(e: AnyEffect): number {
   const x = effectExtent(e);
   return Math.max(x.rx, x.ry, x.ax ? x.ax - 1 : 0, x.ay ? x.ay - 1 : 0);
 }
 
-export function effectsReach(effects: readonly Effect[]): number {
+export function effectsReach(effects: readonly AnyEffect[]): number {
   let r = 0;
   for (const e of effects) r += effectReach(e);
   return r;
@@ -153,7 +164,7 @@ export function effectsReach(effects: readonly Effect[]): number {
  * backward = region of the INPUT needed to compute the output in `r` (effects in reverse). Each effect adds its (rx, ry) and
  * pixel sort widens along its axis to whole 256 px chunks in surface (= document) coordinates. Clipped to w x h after every step.
  */
-export function expandRect(r: Rect, effects: readonly Effect[], forward: boolean, w: number, h: number): Rect | null {
+export function expandRect(r: Rect, effects: readonly AnyEffect[], forward: boolean, w: number, h: number): Rect | null {
   const list = effects.map(effectExtent);
   if (!forward) list.reverse();
   let x0 = r.x, y0 = r.y, x1 = r.x + r.w, y1 = r.y + r.h;
@@ -170,7 +181,7 @@ export function expandRect(r: Rect, effects: readonly Effect[], forward: boolean
 }
 
 /** Flat pass list of the enabled effects; the chain's last pass is 'u8', the last pass of an earlier effect 'f16'. */
-export function planChain(effects: readonly Effect[]): { effect: number; pass: EffectPass }[] {
+export function planChain(effects: readonly AnyEffect[]): { effect: number; pass: EffectPass }[] {
   const groups: { i: number; ps: EffectPass[] }[] = [];
   effects.forEach((e, i) => {
     const ps = planEffect(e);
@@ -184,3 +195,29 @@ export function planChain(effects: readonly Effect[]): { effect: number; pass: E
   });
   return out;
 }
+
+/** 'none' (nothing to draw) | 'point' (an output pixel depends on the same input pixel only) | 'neighbourhood' | 'global' (any pixel). */
+export function effectReads(e: AnyEffect): 'none' | 'point' | 'neighbourhood' | 'global' {
+  if (!e || planEffect(e).length === 0) return 'none';
+  if (isFilterType(e.type)) return filterReads(e as unknown as Record<string, unknown>);
+  return e.type === 'pixelSort' ? 'global' : effectReach(e) > 0 ? 'neighbourhood' : 'point';
+}
+
+/** True when the output at a pixel reads other input pixels, i.e. a changed input region spreads (bbox / cache planning for adjustment layers). */
+export function effectNeedsNeighbourhood(e: AnyEffect): boolean {
+  const r = effectReads(e);
+  return r === 'neighbourhood' || r === 'global';
+}
+
+/** v5 effects that fail the 3/255 parity on another GPU implementation (pixel sort ties): see docs/FILTERS.md. */
+const TD_PREVIEW_V5 = new Set(['pixelSort']);
+
+/** True when the browser preview cannot match TouchDesigner within 3/255 for this effect: the UI shows TD's render of the layer instead. */
+export function effectTdPreview(e: AnyEffect): boolean {
+  if (!e || e.enabled === false) return false;
+  if (TD_PREVIEW_V5.has(e.type as string)) return planEffect(e).length > 0;
+  return isFilterType(e.type) && filterTdPreview(e as unknown as Record<string, unknown>, planEffect(e).length > 0);
+}
+
+/** Every known filter type (spec files). */
+export const filterTypes = (): string[] => Object.keys(FILTER_SPECS).sort();

@@ -13,18 +13,29 @@
 //   effectsReach(effects)                   conservative isotropic reach in px (finite; use expandRect for the exact region).
 //   expandRect(rect, effects, forward, w, h)
 //
+// v6 filters run through the same call.  An ADJUSTMENT layer passes the document-sized composite BELOW it as `src` (nothing else is special).
+//   applyEffects(src, effects, rect, out, aux?)  `aux` = optional document-sized surface read by filters that take a second image (displace
+//        by layer / input): `{ type: 'displace', source: 'aux' }`; without it such a filter renders with no displacement.
+//   effectNeedsNeighbourhood(e) / effectReads(e)  does an output pixel read other input pixels ('point' | 'neighbourhood' | 'global')?
+//   effectTdPreview(e)   the preview cannot match TouchDesigner within 3/255 for this effect: show TD's render instead (phase B).
+//
 // Without WebGL2 / EXT_color_buffer_float, or when a shader fails to compile / link (cached), or the context is lost, effects are
 // skipped: out receives the plain copy of src and one console warning is printed.
 // Region sizes are rounded up to multiples of 64 (textures and scratch canvas are re-used between frames); the texture pool is
 // capped at 256 MB and released, with the drawing buffer shrunk, after 4 s without use.
 
-import type { Effect, Rect } from '../types';
+import type { Rect } from '../types';
 import { createSurface, releaseSurface, type Surface } from '../surface';
 import { FxGL, type Tex } from './gl';
-import { effectExtent, effectReach, effectsReach, expandRect, planChain, planEffect, type EffectPass } from './plan';
+import {
+  effectExtent, effectNeedsNeighbourhood, effectReach, effectReads, effectsReach, effectTdPreview, expandRect, filterTypes, planChain, planEffect,
+  type AnyEffect, type EffectPass,
+} from './plan';
+import { cubeAtlas, parseCube } from './filters';
 
-export { effectExtent, effectReach, effectsReach, expandRect, planChain, planEffect };
-export type { EffectPass };
+export { effectExtent, effectNeedsNeighbourhood, effectReach, effectReads, effectsReach, effectTdPreview, expandRect, filterTypes, planChain, planEffect };
+export { cubeAtlas, parseCube };
+export type { AnyEffect, EffectPass };
 
 const BUCKET = 64;
 const IDLE_MS = 4000;
@@ -98,13 +109,14 @@ function copyRegion(src: Surface, out: Surface, r: Rect): void {
   c.restore();
 }
 
-export function applyEffects(src: Surface, effects: readonly Effect[], rect: Rect, out: Surface): Rect {
+export function applyEffects(src: Surface, effects: readonly AnyEffect[], rect: Rect, out: Surface, aux?: Surface | null): Rect {
   const none = { x: 0, y: 0, w: 0, h: 0 };
   if (![rect.x, rect.y, rect.w, rect.h].every(Number.isFinite)) return none;
   const W = Math.min(src.width, out.width);
   const H = Math.min(src.height, out.height);
   const chain = planChain(effects);
   const on = chain.length ? effects.filter((e) => planChain([e]).length) : [];
+  const needAux = chain.some((c) => c.pass.aux);
   const R = expandRect(rect, on, true, W, H);
   if (!R) return none;
   const fx = chain.length ? runner() : null;
@@ -116,10 +128,11 @@ export function applyEffects(src: Surface, effects: readonly Effect[], rect: Rec
   const bw = bucket(S.w);
   const bh = bucket(S.h);
   let srcTex: Tex | null = null;
-  try {
-    // upload the source region (premultiplied) into the top-left of a bucket-sized transparent canvas
-    let source: TexImageSource = src.canvas as TexImageSource;
-    if (!(S.x === 0 && S.y === 0 && S.w === src.width && S.h === src.height && bw === S.w && bh === S.h)) {
+  let auxTex: Tex | null = null;
+  // uploads the region S of a surface (premultiplied) into the top-left of a bucket-sized transparent canvas, then into a texture
+  const uploadRegion = (surf: Surface): Tex => {
+    let source: TexImageSource = surf.canvas as TexImageSource;
+    if (!(S.x === 0 && S.y === 0 && S.w === surf.width && S.h === surf.height && bw === S.w && bh === S.h)) {
       if (!scratch || scratch.width !== bw || scratch.height !== bh) {
         if (scratch) releaseSurface(scratch);
         scratch = createSurface(bw, bh);
@@ -130,14 +143,24 @@ export function applyEffects(src: Surface, effects: readonly Effect[], rect: Rec
       c.globalCompositeOperation = 'copy';
       c.fillStyle = 'rgba(0,0,0,0)';
       c.fillRect(0, 0, bw, bh); // 'copy' + a transparent fill clears everything including the padding
-      c.drawImage(src.canvas as CanvasImageSource, S.x, S.y, S.w, S.h, 0, 0, S.w, S.h);
+      c.drawImage(surf.canvas as CanvasImageSource, S.x, S.y, S.w, S.h, 0, 0, S.w, S.h);
       c.restore();
       source = scratch.canvas as TexImageSource;
     }
-    srcTex = fx.upload(source, S.w, S.h, bw, bh);
+    return fx.upload(source, S.w, S.h, bw, bh);
+  };
+  try {
+    srcTex = uploadRegion(src);
+    if (needAux && aux) auxTex = uploadRegion(aux);
     const t = srcTex;
     srcTex = null; // runChain owns it from here
-    runChain(fx, t, chain, { x: S.x, y: S.y, w: bw, h: bh }, false, S);
+    const ax = auxTex;
+    auxTex = null;
+    try {
+      runChain(fx, t, chain, { x: S.x, y: S.y, w: bw, h: bh }, false, S, ax, needAux && !aux, W, H);
+    } finally {
+      if (ax) fx.free(ax);
+    }
     if (fx.gl.isContextLost()) throw new Error('WebGL context lost');
     // result: the bucket sits in the bottom-left of the canvas, upright
     const cv = fx.canvas;
@@ -152,6 +175,7 @@ export function applyEffects(src: Surface, effects: readonly Effect[], rect: Rec
     touchIdle();
   } catch (err) {
     if (srcTex) fx.free(srcTex);
+    if (auxTex) fx.free(auxTex);
     warnOnce('fail:' + String((err as Error).message).slice(0, 80), 'effect rendering failed, effects skipped: ' + String((err as Error).message ?? err));
     copyRegion(src, out, R);
   }
@@ -159,7 +183,8 @@ export function applyEffects(src: Surface, effects: readonly Effect[], rect: Rec
 }
 
 /** Executes the planned passes on `srcTex` (consumed, returned to the pool even on failure); the last pass renders to the canvas. */
-function runChain(fx: FxGL, srcTex: Tex, chain: ReturnType<typeof planChain>, S: Rect, keepSrc = false, logical?: Rect): void {
+function runChain(fx: FxGL, srcTex: Tex, chain: ReturnType<typeof planChain>, S: Rect, keepSrc = false, logical?: Rect, aux: Tex | null = null,
+  auxMissing = false, docW = 0, docH = 0): void {
   let effIn: Tex = srcTex;
   let prev: Tex = srcTex;
   let held: Tex[] = [srcTex]; // textures of the current effect (its input + pass outputs)
@@ -177,9 +202,12 @@ function runChain(fx: FxGL, srcTex: Tex, chain: ReturnType<typeof planChain>, S:
         curEffect = effect;
       }
       const last = k === chain.length - 1;
-      const target = last ? null : fx.alloc(S.w, S.h, pass.fmt);
+      const lv = pass.level ?? 0;
+      const d = 1 << lv;
+      const target = last ? null : fx.alloc(lv ? Math.ceil(S.w / d) + 3 : S.w, lv ? Math.ceil(S.h / d) + 3 : S.h, pass.fmt); // level > 0: same size rule as TD
       if (target) held.push(target);
-      fx.run(pass, effIn, prev, target, S.x, S.y, logical?.w ?? 0, logical?.h ?? 0);
+      const in2 = pass.data ? fx.data(pass.data) : pass.aux ? aux : null;
+      fx.run(pass, effIn, prev, in2, target, S.x, S.y, logical?.w ?? 0, logical?.h ?? 0, docW, docH, !!pass.aux && auxMissing);
       if (target) prev = target;
     }
   } finally {
@@ -191,19 +219,22 @@ function runChain(fx: FxGL, srcTex: Tex, chain: ReturnType<typeof planChain>, S:
  * Benchmark helper (perf harness): GPU wall time per run of the effect passes over `src` (uploaded once, no read-back),
  * bracketed by a 1x1 read-back (gl.finish() does not wait in Chromium).  Returns null without WebGL2.
  */
-export function benchEffects(src: Surface, effects: readonly Effect[], iterations = 10): { passes: number; ms: number } | null {
+export function benchEffects(src: Surface, effects: readonly AnyEffect[], iterations = 10, aux?: Surface | null): { passes: number; ms: number } | null {
   const chain = planChain(effects);
   const fx = chain.length ? runner() : null;
   if (!fx) return null;
   const S = { x: 0, y: 0, w: src.width, h: src.height };
   const tex = fx.upload(src.canvas as TexImageSource, S.w, S.h);
-  runChain(fx, tex, chain, S, true); // warm-up (program compile)
+  const ax = aux && chain.some((c) => c.pass.aux) ? fx.upload(aux.canvas as TexImageSource, S.w, S.h) : null;
+  const needMiss = chain.some((c) => c.pass.aux) && !ax;
+  runChain(fx, tex, chain, S, true, undefined, ax, needMiss, S.w, S.h); // warm-up (program compile)
   const sync = () => fx.gl.readPixels(0, 0, 1, 1, fx.gl.RGBA, fx.gl.UNSIGNED_BYTE, new Uint8Array(4));
   sync();
   const t0 = performance.now();
-  for (let i = 0; i < iterations; i++) runChain(fx, tex, chain, S, true);
+  for (let i = 0; i < iterations; i++) runChain(fx, tex, chain, S, true, undefined, ax, needMiss, S.w, S.h);
   sync();
   const ms = (performance.now() - t0) / iterations;
   fx.free(tex);
+  if (ax) fx.free(ax);
   return { passes: chain.length, ms };
 }

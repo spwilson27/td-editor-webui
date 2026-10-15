@@ -1,0 +1,39 @@
+{
+  "type": "lensBlur",
+  "group": "blur",
+  "doc": "Lens blur (bokeh): average of the premultiplied rgba over a disc (blades 0) or a regular polygon (blades 3..8, circumradius = radius, first vertex at `rotation` degrees clockwise from +x) of `radius` px. The kernel is sampled with a deterministic golden-angle (Vogel) spiral of <= 64 bilinear taps, each rotated by a per-pixel angle hashed from (document position, seed) to turn banding into fine grain; polygon taps are re-weighted by (edge radius)^2 so the density is uniform over the polygon. Highlight boost: before averaging, rgb of every sample is multiplied by 1 + 15 * (brightness / 100) * h, h = clamp((luma - threshold) / (1 - threshold), 0, 1) of its straight colour, and the result is clamped to [0, alpha] (alpha is never boosted). brightness 0 = plain average. Quality: radius <= 8 px runs at full resolution (<= 64 taps over <= 200 px^2: ~3 px^2 per tap, mild grain). Larger radii first box down-sample by 2^L (L = 1..4 for radius <= 16 / 32 / 64 / 100) so the spiral radius is <= 8 low-res texels, sample the spiral at low resolution and bilinearly up-sample (cost ~constant): the kernel edge is softened by about 2^L px and a polygon's corners are rounded accordingly; very small bright points at large radii lose their shape (they are blended into 2^L-px blocks) and fine grain (up to ~1 level of a 64-tap estimate) remains in high-contrast detail.",
+  "include": ["filterlib", "blurlib"],
+  "reads": "neighbourhood",
+  "preservesTransparent": false,
+  "params": {
+    "radius": {"kind": "num", "default": 12, "min": 0, "max": 100, "unit": "px", "doc": "disc radius / polygon circumradius"},
+    "blades": {"kind": "num", "default": 0, "min": 0, "max": 8, "round": true, "doc": "0 = circle, 3..8 = polygon (1 and 2 act as 0)"},
+    "rotation": {"kind": "num", "default": 0, "min": -360, "max": 360, "unit": "deg", "doc": "polygon rotation, clockwise on screen"},
+    "brightness": {"kind": "num", "default": 0, "min": 0, "max": 100, "unit": "%", "doc": "highlight boost before averaging, 0 = none"},
+    "threshold": {"kind": "num", "default": 0.7, "min": 0, "max": 1, "doc": "luma above which samples are boosted"},
+    "seed": {"kind": "seed", "default": 0, "doc": "per-pixel kernel rotation jitter"}
+  },
+  "vars": [
+    ["bl", "if(blades < 3, 0, blades)"],
+    ["L", "if(radius <= 8, 0, if(radius <= 16, 1, if(radius <= 32, 2, if(radius <= 64, 3, 4))))"],
+    ["d", "pow(2, L)"],
+    ["Rl", "radius / d"],
+    ["N", "clamp(ceil(pi * Rl * Rl), 6, 64)"],
+    ["gk", "15 * brightness / 100"]
+  ],
+  "noop": "radius <= 0",
+  "passes": [
+    {"when": "L == 0", "pass": 0, "u": ["Rl", "N", "bl", "rad(rotation)", "gk", "threshold", "L", "seed"]},
+    {"when": "L > 0", "pass": 1, "level": "L", "u": ["Rl", "N", "bl", "rad(rotation)", "gk", "threshold", "L", "seed"]},
+    {"when": "L > 0", "pass": 2, "level": "L", "u": ["Rl", "N", "bl", "rad(rotation)", "gk", "threshold", "L", "seed"]},
+    {"when": "L > 0", "pass": 3, "u": ["Rl", "N", "bl", "rad(rotation)", "gk", "threshold", "L", "seed"]}
+  ],
+  "extent": ["if(L == 0, ceil(radius) + 3, ceil(radius) + 4 * d + 4)", "if(L == 0, ceil(radius) + 3, ceil(radius) + 4 * d + 4)", "0", "0"],
+  "samples": [
+    {"radius": 5, "blades": 0, "brightness": 40, "threshold": 0.6},
+    {"radius": 14, "blades": 6, "rotation": 15, "brightness": 60, "threshold": 0.5, "seed": 3},
+    {"radius": 60, "blades": 5, "rotation": 30, "brightness": 20, "threshold": 0.6},
+    {"radius": 100, "blades": 0}
+  ],
+  "degenerate": [{}, {"radius": 0}, {"radius": -5}, {"radius": 1e9, "blades": 99, "brightness": 1e9}, {"radius": "x", "blades": "y"}, {"radius": 8}, {"radius": 8.5, "blades": 3}, {"radius": 100, "blades": 8, "rotation": 1e9, "threshold": 1}, {"radius": 0.2, "seed": -3}]
+}

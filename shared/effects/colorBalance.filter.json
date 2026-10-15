@@ -1,0 +1,31 @@
+{
+  "type": "colorBalance",
+  "group": "color",
+  "doc": "Colour balance (Photoshop style): per tonal range (shadows / midtones / highlights) a shift along cyan-red, magenta-green and yellow-blue (-100..100 %; positive = more red / green / blue, negative = more cyan / magenta / yellow). With L = Rec.709 luma of the straight colour: weights ws = (1-L)^2, wh = L^2, wm = 1 - ws - wh = 2 L (1-L) (they sum to 1). out = clamp(c + 0.5 * sum_range w_range * (cyanRed, magentaGreen, yellowBlue) / 100) per channel (a +100 shift at full weight adds 0.5). With `preserveLuminosity` the result is offset by (L(c) - L(out)) per channel so the Rec.709 luma stays the same (then clamped). Alpha unchanged.",
+  "reads": "point",
+  "preservesTransparent": true,
+  "params": {
+    "shadowsCyanRed": {"kind": "num", "default": 0, "min": -100, "max": 100, "unit": "%"},
+    "shadowsMagentaGreen": {"kind": "num", "default": 0, "min": -100, "max": 100, "unit": "%"},
+    "shadowsYellowBlue": {"kind": "num", "default": 0, "min": -100, "max": 100, "unit": "%"},
+    "midtonesCyanRed": {"kind": "num", "default": 0, "min": -100, "max": 100, "unit": "%"},
+    "midtonesMagentaGreen": {"kind": "num", "default": 0, "min": -100, "max": 100, "unit": "%"},
+    "midtonesYellowBlue": {"kind": "num", "default": 0, "min": -100, "max": 100, "unit": "%"},
+    "highlightsCyanRed": {"kind": "num", "default": 0, "min": -100, "max": 100, "unit": "%"},
+    "highlightsMagentaGreen": {"kind": "num", "default": 0, "min": -100, "max": 100, "unit": "%"},
+    "highlightsYellowBlue": {"kind": "num", "default": 0, "min": -100, "max": 100, "unit": "%"},
+    "preserveLuminosity": {"kind": "bool", "default": true}
+  },
+  "noop": "shadowsCyanRed == 0 && shadowsMagentaGreen == 0 && shadowsYellowBlue == 0 && midtonesCyanRed == 0 && midtonesMagentaGreen == 0 && midtonesYellowBlue == 0 && highlightsCyanRed == 0 && highlightsMagentaGreen == 0 && highlightsYellowBlue == 0",
+  "passes": [{"pass": 0, "u": [
+    "shadowsCyanRed / 100", "shadowsMagentaGreen / 100", "shadowsYellowBlue / 100", "midtonesCyanRed / 100",
+    "midtonesMagentaGreen / 100", "midtonesYellowBlue / 100", "highlightsCyanRed / 100", "highlightsMagentaGreen / 100",
+    "highlightsYellowBlue / 100", "preserveLuminosity"]}],
+  "extent": ["0", "0", "0", "0"],
+  "samples": [
+    {"shadowsCyanRed": 40, "midtonesYellowBlue": 60, "highlightsMagentaGreen": -50},
+    {"midtonesCyanRed": -80, "midtonesMagentaGreen": 30, "preserveLuminosity": false},
+    {"shadowsYellowBlue": 100, "highlightsCyanRed": 100, "highlightsYellowBlue": -100}
+  ],
+  "degenerate": [{}, {"shadowsCyanRed": 1e9, "highlightsYellowBlue": -1e9}, {"midtonesCyanRed": "5"}, {"preserveLuminosity": 2, "shadowsMagentaGreen": -300}, {"highlightsMagentaGreen": null, "midtonesYellowBlue": true}]
+}

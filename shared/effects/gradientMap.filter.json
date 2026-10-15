@@ -1,0 +1,22 @@
+{
+  "type": "gradientMap",
+  "group": "color",
+  "doc": "Gradient map: the Rec.709 luma L = 0.2126 R + 0.7152 G + 0.0722 B of the straight colour (stored sRGB values, 0..1; 1 - L when `reverse`) indexes a 256 entry gradient LUT built from `stops` (piecewise linear colour interpolation, flat before the first / after the last stop); linear interpolation between LUT entries. The result is mixed with the original colour by `amount` / 100. The alpha of the stops is IGNORED (only the stop colours map); the layer alpha is unchanged.",
+  "in2": true,
+  "reads": "point",
+  "preservesTransparent": true,
+  "params": {
+    "stops": {"kind": "stops", "default": [[0, {"r": 0, "g": 0, "b": 0, "a": 255}], [1, {"r": 255, "g": 255, "b": 255, "a": 255}]]},
+    "reverse": {"kind": "bool", "default": false},
+    "amount": {"kind": "num", "default": 100, "min": 0, "max": 100, "unit": "%"}
+  },
+  "noop": "amount <= 0",
+  "passes": [{"pass": 0, "u": ["reverse", "amount / 100"], "data": {"gen": "gradient", "args": ["stops"]}}],
+  "extent": ["0", "0", "0", "0"],
+  "samples": [
+    {"stops": [{"pos": 0, "color": {"r": 20, "g": 0, "b": 80, "a": 255}}, {"pos": 0.5, "color": {"r": 220, "g": 40, "b": 60, "a": 255}}, {"pos": 1, "color": {"r": 255, "g": 240, "b": 160, "a": 255}}]},
+    {"reverse": true, "amount": 60},
+    {"stops": [{"pos": 0.3, "color": {"r": 0, "g": 255, "b": 0, "a": 10}}, {"pos": 0.7, "color": {"r": 255, "g": 0, "b": 255, "a": 255}}]}
+  ],
+  "degenerate": [{}, {"amount": 0}, {"amount": 1e9}, {"stops": []}, {"stops": "bad"}, {"stops": [{"pos": 2, "color": 5}, {"pos": -1}, {"color": {"r": 1}}]}, {"reverse": "yes", "amount": "50"}]
+}

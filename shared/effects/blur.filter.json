@@ -1,0 +1,36 @@
+{
+  "type": "blur",
+  "group": "blur",
+  "doc": "Gaussian blur of the premultiplied layer (radius = kernel half width, sigma = radius / 3). Radii above 16 px run as a down-sample pyramid. threshold/knee (bloom building block): blur only the bright part of the image (soft threshold on luma).",
+  "include": ["filterlib", "blurlib"],
+  "reads": "neighbourhood",
+  "preservesTransparent": false,
+  "params": {
+    "radius": {"kind": "num", "default": 10, "min": 0, "max": 200, "unit": "px"},
+    "threshold": {"kind": "num", "default": 0, "min": 0, "max": 1, "doc": "0 = blur everything; >0: only luma above it (bright pass)"},
+    "knee": {"kind": "num", "default": 0, "min": 0, "max": 1, "doc": "soft knee width of the bright pass"}
+  },
+  "vars": [
+    ["px", "radius"],
+    ["L", "pyrL(px)"],
+    ["sig", "blurSig(px)"],
+    ["R", "blurR(px)"],
+    ["mode", "if(threshold > 0, 3, 2)"]
+  ],
+  "noop": "px <= 0",
+  "passes": [
+    {"when": "L == 0", "pass": 0, "u": ["sig", "R", "mode", "0", "threshold", "knee"]},
+    {"when": "L == 0", "pass": 1, "u": ["sig", "R", "mode", "0", "threshold", "knee"]},
+    {"when": "L > 0", "pass": 2, "level": "L", "u": ["sig", "R", "mode", "L", "threshold", "knee"]},
+    {"when": "L > 0", "pass": 3, "level": "L", "u": ["sig", "R", "mode", "L", "threshold", "knee"]},
+    {"when": "L > 0", "pass": 4, "level": "L", "u": ["sig", "R", "mode", "L", "threshold", "knee"]},
+    {"when": "L > 0", "pass": 5, "u": ["sig", "R", "mode", "L", "threshold", "knee"]}
+  ],
+  "extent": ["blurReach(px)", "blurReach(px)", "0", "0"],
+  "samples": [
+    {"radius": 6},
+    {"radius": 40},
+    {"radius": 150, "threshold": 0.4, "knee": 0.2}
+  ],
+  "degenerate": [{}, {"radius": 0}, {"radius": -5}, {"radius": 1e9}, {"radius": "12"}, {"radius": 16}, {"radius": 17}, {"radius": 33}, {"radius": 200.5}]
+}

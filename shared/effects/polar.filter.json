@@ -1,0 +1,24 @@
+{
+  "type": "polar",
+  "group": "distort",
+  "doc": "Polar coordinates. R = radiusScale/100 * min(W, H) / 2 (document px), c = centre in px, angle measured clockwise from 'up'. rectToPolar: out(p) = in(x = fract((atan2(dx, -dy) - offset) / 2 pi) * W, y = |p - c| / R * H): the image's x axis wraps around the centre, its top row sits at the centre and its bottom row at radius R. polarToRect: the inverse, out(x, y) = in(c + (y / H) R (sin a, -cos a)), a = x / W * 2 pi + offset. angleOffset in degrees. The x axis of the source wraps seamlessly; edge applies to the radial (y) direction and to what is read outside the document.",
+  "reads": "global",
+  "preservesTransparent": false,
+  "params": {
+    "mode": {"kind": "enum", "values": ["rectToPolar", "polarToRect"], "default": "rectToPolar"},
+    "centerX": {"kind": "num", "default": 0.5, "min": -2, "max": 3, "unit": "fraction of document width"},
+    "centerY": {"kind": "num", "default": 0.5, "min": -2, "max": 3, "unit": "fraction of document height"},
+    "angleOffset": {"kind": "num", "default": 0, "min": -3600, "max": 3600, "unit": "degrees"},
+    "radiusScale": {"kind": "num", "default": 100, "min": 10, "max": 400, "unit": "percent"},
+    "edge": {"kind": "enum", "values": ["transparent", "clamp", "mirror", "wrap"], "default": "transparent"}
+  },
+  "passes": [{"pass": 0, "u": ["mode", "centerX", "centerY", "rad(angleOffset)", "radiusScale / 100", "edge"]}],
+  "extent": ["G", "G", "0", "0"],
+  "samples": [
+    {"mode": "rectToPolar"},
+    {"mode": "polarToRect", "angleOffset": 45},
+    {"mode": "rectToPolar", "centerX": 0.3, "centerY": 0.4, "radiusScale": 150, "edge": "clamp"},
+    {"mode": "polarToRect", "radiusScale": 60, "edge": "wrap", "angleOffset": -90}
+  ],
+  "degenerate": [{}, {"mode": "polarToRect"}, {"radiusScale": 0, "angleOffset": 1e9}, {"radiusScale": 1e9, "centerX": -1e9, "centerY": 1e9}, {"mode": "bogus", "edge": "bogus"}, {"mode": "polarToRect", "radiusScale": 10, "edge": "mirror"}]
+}

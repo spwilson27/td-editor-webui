@@ -1,0 +1,23 @@
+{
+  "type": "colorCycle",
+  "group": "animated",
+  "doc": "Colour cycling (a static frame of palette cycling), point operation on the straight colour in YIQ (the (I,Q) chroma plane is rotated, Y and chroma magnitude are kept). s0 = colour; for each of `iterations` steps: luma = Rec.709 luma of the previous result, phase += hueStep * (1 + lumaWarp/100 * (2*luma - 1)) degrees, s = clamp(rotate(s0, phase)). With bands >= 2 the rotation uses the phase snapped to multiples of 360/bands (bands 0 or 1 = smooth). Finally chroma is scaled by 1 + saturationBoost/100. Because luma is re-evaluated each step the loop is not a single rotation (it is, when lumaWarp = 0: total rotation iterations * hueStep). Alpha unchanged; hueStep 0 = no-op.",
+  "reads": "point",
+  "preservesTransparent": true,
+  "params": {
+    "iterations": {"kind": "num", "default": 8, "min": 1, "max": 64, "round": true, "unit": "steps"},
+    "hueStep": {"kind": "num", "default": 30, "min": -180, "max": 180, "unit": "deg", "doc": "hue rotation per iteration"},
+    "lumaWarp": {"kind": "num", "default": 50, "min": 0, "max": 100, "unit": "%", "doc": "how strongly luma scales the step: step * (1 + lumaWarp * (2*luma - 1)), bright pixels cycle faster"},
+    "saturationBoost": {"kind": "num", "default": 0, "min": 0, "max": 100, "unit": "%", "doc": "final chroma scale 1 + boost"},
+    "bands": {"kind": "num", "default": 0, "min": 0, "max": 64, "round": true, "unit": "bands", "doc": "0 or 1 = smooth, 2..64 = number of phase steps per turn"}
+  },
+  "noop": "hueStep == 0",
+  "passes": [{"pass": 0, "u": ["iterations", "hueStep", "lumaWarp / 100", "saturationBoost / 100", "bands", "0", "0", "0"]}],
+  "extent": ["0", "0", "0", "0"],
+  "samples": [
+    {"iterations": 3, "hueStep": 40, "lumaWarp": 60, "saturationBoost": 20, "bands": 0},
+    {"iterations": 12, "hueStep": -25, "lumaWarp": 100, "saturationBoost": 0, "bands": 6},
+    {"iterations": 1, "hueStep": 120, "lumaWarp": 0, "saturationBoost": 50, "bands": 0}
+  ],
+  "degenerate": [{}, {"hueStep": 0}, {"iterations": 1e9, "hueStep": 1e9, "lumaWarp": 1e9, "saturationBoost": 1e9, "bands": 1e9}, {"iterations": -1, "hueStep": "x", "bands": 1}, {"hueStep": -180, "iterations": 64, "bands": 2}]
+}

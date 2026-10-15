@@ -1,0 +1,28 @@
+{
+  "type": "ripple",
+  "group": "distort",
+  "doc": "Ripple. kind 'wave': out(p) = in(p + A sin(2 pi (p . u) / wavelength + phase) n) with u = (cos angle, sin angle) the wave direction and n = (-sin angle, cos angle) the displacement direction (angle 0: columns move vertically as x advances). kind 'ripple': out(p) = in(p + A g(r) sin(2 pi r / wavelength + phase) (p - c) / r), r = |p - c| px, g(r) = exp(-5 (decay / 100) r / halfDiagonal) (decay 0 = no fade). Positions in document px, centre = fraction of the document.",
+  "reads": "global",
+  "preservesTransparent": false,
+  "params": {
+    "kind": {"kind": "enum", "values": ["wave", "ripple"], "default": "ripple"},
+    "amplitude": {"kind": "num", "default": 8, "min": 0, "max": 200, "unit": "px"},
+    "wavelength": {"kind": "num", "default": 40, "min": 2, "max": 2000, "unit": "px"},
+    "phase": {"kind": "num", "default": 0, "min": -3600, "max": 3600, "unit": "degrees"},
+    "angle": {"kind": "num", "default": 0, "min": -3600, "max": 3600, "unit": "degrees", "doc": "wave direction (kind wave)"},
+    "centerX": {"kind": "num", "default": 0.5, "min": -2, "max": 3, "unit": "fraction of document width"},
+    "centerY": {"kind": "num", "default": 0.5, "min": -2, "max": 3, "unit": "fraction of document height"},
+    "decay": {"kind": "num", "default": 0, "min": 0, "max": 100, "unit": "percent", "doc": "amplitude fade with distance from the centre (kind ripple)"},
+    "edge": {"kind": "enum", "values": ["transparent", "clamp", "mirror", "wrap"], "default": "transparent"}
+  },
+  "noop": "amplitude == 0",
+  "passes": [{"pass": 0, "u": ["kind", "amplitude", "wavelength", "rad(phase)", "rad(angle)", "centerX", "centerY", "decay", "edge"]}],
+  "extent": ["G", "G", "0", "0"],
+  "samples": [
+    {"kind": "wave", "amplitude": 4, "wavelength": 16, "angle": 0},
+    {"kind": "ripple", "amplitude": 3, "wavelength": 12, "decay": 30, "edge": "clamp"},
+    {"kind": "wave", "amplitude": 6, "wavelength": 30, "angle": 60, "phase": 90, "edge": "wrap"},
+    {"kind": "ripple", "amplitude": 8, "wavelength": 20, "centerX": 0.2, "centerY": 0.7, "edge": "mirror"}
+  ],
+  "degenerate": [{}, {"amplitude": 0}, {"amplitude": 1e9, "wavelength": 0}, {"wavelength": -5, "phase": 1e9, "angle": -1e9}, {"kind": "bogus", "edge": "bogus", "decay": 1e9}, {"kind": "wave", "wavelength": 2, "amplitude": 200}]
+}

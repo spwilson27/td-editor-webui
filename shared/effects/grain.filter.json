@@ -1,0 +1,23 @@
+{
+  "type": "grain",
+  "group": "stylise",
+  "doc": "Grain: additive noise per grain cell (size x size document px, cell = floor(doc / size)), hash of (cell, seed) so it is deterministic and independent of the rendered region. kind 'noise': delta = (2u - 1) * amount/100 * 0.5 (uniform, +-0.5 at 100 %); kind 'film': approx gaussian (sum of 4 uniforms, sd 1) * amount/100 * 0.2 * 4 l (1 - l) with l the luma of the straight colour (strongest in midtones, 0 in pure black/white). colour=true: independent noise per channel, false: the same delta on r,g,b. Added to the straight colour (0..1) and clamped; alpha untouched, transparent pixels stay transparent.",
+  "reads": "point",
+  "preservesTransparent": true,
+  "params": {
+    "amount": {"kind": "num", "default": 30, "min": 0, "max": 100, "unit": "%"},
+    "size": {"kind": "num", "default": 1, "min": 1, "max": 16, "round": true, "unit": "px"},
+    "kind": {"kind": "enum", "values": ["film", "noise"], "default": "film"},
+    "colour": {"kind": "bool", "default": false},
+    "seed": {"kind": "seed", "default": 0}
+  },
+  "noop": "amount <= 0",
+  "passes": [{"pass": 0, "u": ["amount / 100", "size", "kind", "colour", "seed"]}],
+  "extent": ["0", "0", "0", "0"],
+  "samples": [
+    {"amount": 60, "size": 1, "kind": "film", "colour": false, "seed": 3},
+    {"amount": 80, "size": 3, "kind": "noise", "colour": true, "seed": 11},
+    {"amount": 100, "size": 16, "kind": "film", "colour": true, "seed": 0}
+  ],
+  "degenerate": [{}, {"amount": 0}, {"amount": 1e9, "size": 1e9}, {"size": -2, "seed": -5}, {"kind": "bogus", "colour": "x"}, {"seed": 1e12}]
+}

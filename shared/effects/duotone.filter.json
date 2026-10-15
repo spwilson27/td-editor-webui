@@ -1,0 +1,25 @@
+{
+  "type": "duotone",
+  "group": "color",
+  "doc": "Duotone / tritone: t = Rec.709 luma of the straight colour, contrast applied about 0.5 (t' = clamp((t - 0.5) k + 0.5), k = 1 + contrast/50 for contrast >= 0, 1 + contrast/100 for contrast < 0). Colour = mix(shadow, highlight, t'); with `useMid` three colours: t' < 0.5 -> mix(shadow, mid, 2 t'), else mix(mid, highlight, 2 t' - 1). The result is mixed with the original colour by amount / 100. Colour alpha values are ignored; the layer alpha is unchanged.",
+  "reads": "point",
+  "preservesTransparent": true,
+  "params": {
+    "shadow": {"kind": "color", "default": {"r": 16, "g": 8, "b": 64, "a": 255}},
+    "highlight": {"kind": "color", "default": {"r": 255, "g": 214, "b": 150, "a": 255}},
+    "mid": {"kind": "color", "default": {"r": 200, "g": 60, "b": 110, "a": 255}},
+    "useMid": {"kind": "bool", "default": false},
+    "contrast": {"kind": "num", "default": 0, "min": -100, "max": 100, "unit": "%"},
+    "amount": {"kind": "num", "default": 100, "min": 0, "max": 100, "unit": "%"}
+  },
+  "vars": [["k", "if(contrast >= 0, 1 + contrast / 50, 1 + contrast / 100)"]],
+  "noop": "amount <= 0",
+  "passes": [{"pass": 0, "u": ["shadow.r", "shadow.g", "shadow.b", "highlight.r", "highlight.g", "highlight.b", "mid.r", "mid.g", "mid.b", "useMid", "k", "amount / 100"]}],
+  "extent": ["0", "0", "0", "0"],
+  "samples": [
+    {},
+    {"useMid": true, "contrast": 40},
+    {"shadow": {"r": 0, "g": 40, "b": 0, "a": 0}, "highlight": {"r": 255, "g": 255, "b": 255, "a": 255}, "amount": 70, "contrast": -50}
+  ],
+  "degenerate": [{}, {"amount": 0}, {"contrast": 1e9, "amount": 1e9}, {"contrast": -1e9}, {"shadow": 5, "highlight": null, "mid": "x", "useMid": 1}, {"shadow": {"r": -50, "g": 900, "b": "a"}}]
+}

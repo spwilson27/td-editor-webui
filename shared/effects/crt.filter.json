@@ -1,0 +1,27 @@
+{
+  "type": "crt",
+  "group": "stylise",
+  "doc": "CRT monitor look in one pass, on premultiplied rgb (alpha kept inside the screen), formulas: curvature: barrel uv' = uv + uv*(uv.yx)^2*0.4*curvature (uv = -1..1 over the document), source read bilinearly at uv', outputs outside the curved screen are opaque black (bezel); glow: 5x5 taps (2 px spacing) mean of max(c-0.5,0)*2, added with weight 2*glow; scanlines: rgb *= 1 - scanlines*(1 - (0.5-0.5cos(2 pi (y mod period + 0.5)/period))); mask 'aperture': document column x mod 3 selects R/G/B, other channels multiplied by 1 - maskStrength, 'slot' adds dark gaps every 4th row per triad (staggered 2 rows on odd triads); vignette: rgb *= 1 - vignette*(uv.x^2+uv.y^2)/2. Scanlines, mask and vignette work in output (screen) coordinates. The bezel edge is a hard decision on float positions.",
+  "reads": "neighbourhood",
+  "readsGlobal": "curvature > 0",
+  "preservesTransparent": false,
+  "params": {
+    "scanlines": {"kind": "num", "default": 40, "min": 0, "max": 100, "unit": "%"},
+    "scanlinePeriod": {"kind": "num", "default": 3, "min": 2, "max": 16, "round": true, "unit": "px"},
+    "mask": {"kind": "enum", "values": ["none", "aperture", "slot"], "default": "aperture"},
+    "maskStrength": {"kind": "num", "default": 40, "min": 0, "max": 100, "unit": "%"},
+    "curvature": {"kind": "num", "default": 15, "min": 0, "max": 100, "unit": "%"},
+    "vignette": {"kind": "num", "default": 25, "min": 0, "max": 100, "unit": "%"},
+    "glow": {"kind": "num", "default": 25, "min": 0, "max": 100, "unit": "%"}
+  },
+  "vars": [["mk", "if(mask == 0, 0, maskStrength / 100)"]],
+  "noop": "scanlines <= 0 && (mask == 0 || maskStrength <= 0) && curvature <= 0 && vignette <= 0 && glow <= 0",
+  "passes": [{"pass": 0, "u": ["scanlines / 100", "scanlinePeriod", "if(mk > 0, mask, 0)", "mk", "curvature / 100", "vignette / 100", "glow / 100"]}],
+  "extent": ["if(curvature > 0, G, if(glow > 0, 4, 0))", "if(curvature > 0, G, if(glow > 0, 4, 0))", "0", "0"],
+  "samples": [
+    {"scanlines": 60, "scanlinePeriod": 3, "mask": "aperture", "maskStrength": 50, "curvature": 0, "vignette": 0, "glow": 0},
+    {"scanlines": 40, "scanlinePeriod": 4, "mask": "slot", "maskStrength": 60, "curvature": 30, "vignette": 40, "glow": 30},
+    {"scanlines": 0, "mask": "none", "curvature": 0, "vignette": 70, "glow": 50}
+  ],
+  "degenerate": [{}, {"scanlines": 0, "mask": "none", "curvature": 0, "vignette": 0, "glow": 0}, {"scanlinePeriod": 0, "scanlines": 1e9}, {"curvature": 1e9, "vignette": 1e9, "glow": 1e9, "maskStrength": 1e9}, {"mask": "bogus", "curvature": -5}, {"scanlinePeriod": "x", "mask": "slot", "maskStrength": 0}]
+}

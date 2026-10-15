@@ -1,0 +1,23 @@
+{
+  "type": "edgeDetect",
+  "group": "stylise",
+  "doc": "Edge detection on the luma (Rec.709) of the premultiplied colour, 3x3 neighbourhood (one value for all channels). sobel: e = sqrt(gx^2+gy^2)/4; laplacian: e = |8c - sum of the 8 neighbours|/4. e = clamp(e * strength); values below threshold become 0. mode 'edges': straight grey = e (invert: 1 - e); mode 'overlay': straight colour = original + e (invert: original - e). Alpha unchanged.",
+  "reads": "neighbourhood",
+  "preservesTransparent": true,
+  "params": {
+    "method": {"kind": "enum", "values": ["sobel", "laplacian"], "default": "sobel"},
+    "strength": {"kind": "num", "default": 100, "min": 0, "max": 500, "unit": "%"},
+    "threshold": {"kind": "num", "default": 0, "min": 0, "max": 1, "doc": "edge values below this become 0 (applied after strength)"},
+    "invert": {"kind": "bool", "default": false},
+    "mode": {"kind": "enum", "values": ["edges", "overlay"], "default": "edges"}
+  },
+  "noop": "strength <= 0 && mode == 1",
+  "passes": [{"pass": 0, "u": ["method", "strength / 100", "threshold", "invert", "mode"]}],
+  "extent": ["1", "1", "0", "0"],
+  "samples": [
+    {"method": "sobel", "strength": 300, "threshold": 0.02},
+    {"method": "laplacian", "strength": 400, "invert": true},
+    {"method": "sobel", "strength": 200, "mode": "overlay"}
+  ],
+  "degenerate": [{}, {"strength": 0}, {"strength": 0, "mode": "overlay"}, {"strength": 1e9, "threshold": 5}, {"threshold": -1, "invert": "yes"}, {"method": "bogus", "mode": "bogus"}]
+}

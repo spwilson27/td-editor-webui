@@ -1,0 +1,21 @@
+{
+  "type": "zoomBlur",
+  "group": "blur",
+  "doc": "Zoom blur: average of the premultiplied rgba along the straight line from each pixel towards (centerX, centerY) (fractions of the document); the streak covers amount % of the pixel's distance to the centre (amount 100 = all the way to the centre). Taps: ceil(streak length in px), capped at 64, starting at the pixel itself, equally weighted, bilinear; outside the document is transparent. Quality: smooth while the streak is <= 64 px; longer streaks (far from the centre, large amount) have tap spacing > 1 px and may show faint stepping on fine detail. Extent = document.",
+  "reads": "global",
+  "preservesTransparent": false,
+  "params": {
+    "amount": {"kind": "num", "default": 30, "min": 0, "max": 100, "unit": "%", "doc": "streak length as % of the distance to the centre"},
+    "centerX": {"kind": "num", "default": 0.5, "min": 0, "max": 1, "unit": "fraction of document width"},
+    "centerY": {"kind": "num", "default": 0.5, "min": 0, "max": 1, "unit": "fraction of document height"}
+  },
+  "noop": "amount <= 0",
+  "passes": [{"pass": 0, "u": ["amount / 100", "centerX", "centerY"]}],
+  "extent": ["G", "G", "0", "0"],
+  "samples": [
+    {"amount": 30, "centerX": 0.5, "centerY": 0.5},
+    {"amount": 70, "centerX": 0.3, "centerY": 0.6},
+    {"amount": 100, "centerX": 0.5, "centerY": 0.5}
+  ],
+  "degenerate": [{}, {"amount": 0}, {"amount": -4}, {"amount": 1e9, "centerX": -3, "centerY": 9}, {"amount": "x", "centerX": "y"}, {"amount": 0.001}, {"amount": 100, "centerX": 1, "centerY": 1}]
+}

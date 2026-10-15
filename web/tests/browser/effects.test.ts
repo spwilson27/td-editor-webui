@@ -1,8 +1,10 @@
 import { afterAll, describe, expect, it } from 'vitest';
 import type { Effect } from '../../src/engine/types';
+import type { AnyEffect } from '../../src/engine/effects';
 import { createSurface } from '../../src/engine/surface';
 import vectors from '../../../shared/effects/vectors.json';
-import { applyEffects, disposeEffects, effectExtent, effectsAvailable, effectsReach, expandRect, planChain } from '../../src/engine/effects';
+import fuzz from '../../../shared/effects/fuzz_vectors.json';
+import { applyEffects, disposeEffects, effectExtent, effectReads, effectsAvailable, effectsReach, effectTdPreview, expandRect, planChain } from '../../src/engine/effects';
 import { allPremult, black, makeSurface, pm, red, run, square, straight, white, type Px } from './effectsTestUtils';
 
 afterAll(() => disposeEffects());
@@ -309,19 +311,32 @@ describe.skipIf(!effectsAvailable())('effects (WebGL2 preview)', () => {
 });
 
 
+type Ref = { effect: number; shader: string; pass: number; u: number[]; fmt: string; level?: number; aux?: boolean; data?: { w: number; h: number; digest: string } };
+type VecCase = { effects: AnyEffect[]; chain: Ref[]; reach: number; extent: number[][]; tdPreview: boolean[]; reads: string[] };
+function checkVectors(cases: VecCase[]): void {
+  for (const c of cases) {
+    const label = JSON.stringify(c.effects).slice(0, 200);
+    const got = planChain(c.effects);
+    expect(got.length, label).toBe(c.chain.length);
+    got.forEach((g, i) => {
+      const ref = c.chain[i];
+      expect([g.effect, g.pass.shader, g.pass.pid], label).toEqual([ref.effect, ref.shader, ref.pass]);
+      expect(g.pass.fmt).toBe({ rgba8fixed: 'u8', rgba16float: 'f16', rgba32float: 'f32' }[ref.fmt]);
+      expect([g.pass.level ?? 0, g.pass.aux ?? false], label).toEqual([ref.level ?? 0, ref.aux ?? false]);
+      expect(g.pass.data ? { w: g.pass.data.w, h: g.pass.data.h, digest: g.pass.data.digest } : undefined, label).toEqual(ref.data);
+      g.pass.u.forEach((v, k) => expect(Math.abs(v - ref.u[k]), label + ' u' + k).toBeLessThanOrEqual(1e-6 + 1e-9 * Math.abs(ref.u[k])));
+    });
+    expect(effectsReach(c.effects), label).toBe(c.reach);
+    expect(c.effects.map((e) => { const x = effectExtent(e); return [x.rx, x.ry, x.ax, x.ay]; }), label).toEqual(c.extent);
+    expect(c.effects.map((e) => effectTdPreview(e)), label).toEqual(c.tdPreview);
+    expect(c.effects.map((e) => effectReads(e)), label).toEqual(c.reads);
+  }
+}
+
 describe('effect planner == td/raster_editor/effects.py', () => {
-  it('matches shared/effects/vectors.json', () => {
-    for (const c of vectors.cases as { effects: Effect[]; chain: { effect: number; shader: string; pass: number; u: number[]; fmt: string }[]; reach: number; extent: number[][] }[]) {
-      const got = planChain(c.effects);
-      expect(got.length).toBe(c.chain.length);
-      got.forEach((g, i) => {
-        const ref = c.chain[i];
-        expect([g.effect, g.pass.shader, g.pass.pid]).toEqual([ref.effect, ref.shader, ref.pass]);
-        expect(g.pass.fmt).toBe({ rgba8fixed: 'u8', rgba16float: 'f16', rgba32float: 'f32' }[ref.fmt]);
-        g.pass.u.forEach((v, k) => expect(Math.abs(v - ref.u[k])).toBeLessThan(1e-6));
-      });
-      expect(effectsReach(c.effects)).toBe(c.reach);
-      expect(c.effects.map((e) => { const x = effectExtent(e); return [x.rx, x.ry, x.ax, x.ay]; })).toEqual(c.extent);
-    }
+  it('matches shared/effects/vectors.json', () => checkVectors(vectors.cases as unknown as VecCase[]));
+  it('matches the seeded fuzz vectors (shared/effects/fuzz_vectors.json: random + hostile parameter sets)', () => {
+    expect((fuzz.cases as unknown[]).length).toBeGreaterThan(300);
+    checkVectors(fuzz.cases as unknown as VecCase[]);
   });
 });

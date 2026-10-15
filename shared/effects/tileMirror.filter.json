@@ -1,0 +1,26 @@
+{
+  "type": "tileMirror",
+  "group": "distort",
+  "doc": "Tile / mirror: the whole document is repeated tilesX x tilesY times, every tile showing the full image scaled down (tile size tw = W / tilesX, th = H / tilesY). The tile grid is rotated by rotation degrees (clockwise) about the document centre and shifted by offsetX % of tw / offsetY % of th. With mirror on, odd tiles (counted per axis in the grid's own axes) are flipped so neighbours meet seamlessly. Bilinear; the sampled position always lies inside the document, edge only affects the half pixel at the borders.",
+  "reads": "global",
+  "preservesTransparent": false,
+  "params": {
+    "tilesX": {"kind": "num", "default": 2, "min": 1, "max": 32, "round": true, "unit": "tiles"},
+    "tilesY": {"kind": "num", "default": 2, "min": 1, "max": 32, "round": true, "unit": "tiles"},
+    "mirror": {"kind": "bool", "default": true},
+    "offsetX": {"kind": "num", "default": 0, "min": 0, "max": 100, "unit": "percent of tile width"},
+    "offsetY": {"kind": "num", "default": 0, "min": 0, "max": 100, "unit": "percent of tile height"},
+    "rotation": {"kind": "num", "default": 0, "min": -3600, "max": 3600, "unit": "degrees"},
+    "edge": {"kind": "enum", "values": ["transparent", "clamp", "mirror", "wrap"], "default": "transparent"}
+  },
+  "noop": "tilesX == 1 && tilesY == 1 && offsetX == 0 && offsetY == 0 && mod(rotation, 360) == 0",
+  "passes": [{"pass": 0, "u": ["tilesX", "tilesY", "mirror", "edge", "offsetX / 100", "offsetY / 100", "rad(rotation)"]}],
+  "extent": ["G", "G", "0", "0"],
+  "samples": [
+    {"tilesX": 2, "tilesY": 2, "mirror": true},
+    {"tilesX": 3, "tilesY": 1, "mirror": false, "offsetX": 40},
+    {"tilesX": 4, "tilesY": 3, "mirror": true, "rotation": 30, "offsetY": 25, "edge": "clamp"},
+    {"tilesX": 1, "tilesY": 1, "offsetX": 50, "offsetY": 50, "edge": "wrap"}
+  ],
+  "degenerate": [{}, {"tilesX": 1, "tilesY": 1, "offsetX": 0, "offsetY": 0, "rotation": 0}, {"tilesX": 0, "tilesY": 1e9}, {"rotation": 1e9, "offsetX": -5, "offsetY": 1e9}, {"mirror": "yes", "edge": "bogus"}, {"tilesX": 32, "tilesY": 32, "rotation": 360}]
+}

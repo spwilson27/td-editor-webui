@@ -4,8 +4,7 @@
 //   * Formats: u8 = RGBA8, f16 = RGBA16F, f32 = RGBA32F (needs EXT_color_buffer_float, present in Chromium 132 / TD's CEF).
 //   * The final pass renders to the canvas' default framebuffer; the caller copies the region into a 2D surface.
 
-import type { EffectType } from '../types';
-import type { EffectPass, PassFormat } from './plan';
+import type { DataTex, EffectPass, PassFormat } from './filters';
 import { WEBGL_ADAPTER, shaderBody } from './shaders';
 
 type GLCanvas = OffscreenCanvas | HTMLCanvasElement;
@@ -20,19 +19,20 @@ export interface Tex {
 
 interface Prog {
   prog: WebGLProgram;
-  u: Record<'uP0' | 'uP1' | 'uP2' | 'uP3' | 'uPass' | 'uSize' | 'in0' | 'in1', WebGLUniformLocation | null>;
+  u: Record<'uP0' | 'uP1' | 'uP2' | 'uP3' | 'uPass' | 'uSize' | 'in0' | 'in1' | 'in2', WebGLUniformLocation | null>;
 }
 
 export class FxGL {
   readonly gl: WebGL2RenderingContext;
   readonly canvas: GLCanvas;
-  private progs = new Map<EffectType, Prog>();
+  private progs = new Map<string, Prog>();
+  private dataTex = new Map<string, Tex>();
   private pool: Tex[] = [];
   private vao: WebGLVertexArrayObject | null;
   lost = false;
   passesRun = 0;
   /** shader types whose compile / link failed (cached: the effect is skipped from then on) */
-  readonly failed = new Map<EffectType, string>();
+  readonly failed = new Map<string, string>();
   private poolBytes = 0;
   static readonly POOL_BUDGET = 256 * 1024 * 1024;
 
@@ -62,7 +62,7 @@ export class FxGL {
     }
   }
 
-  private program(type: EffectType): Prog {
+  private program(type: string): Prog {
     let p = this.progs.get(type);
     if (p) return p;
     const bad = this.failed.get(type);
@@ -75,7 +75,7 @@ export class FxGL {
     }
   }
 
-  private build(type: EffectType): Prog {
+  private build(type: string): Prog {
     const gl = this.gl;
     const mk = (t: number, src: string): WebGLShader => {
       const sh = gl.createShader(t)!;
@@ -94,7 +94,7 @@ export class FxGL {
     gl.deleteShader(vs);
     gl.deleteShader(fs);
     const L = (n: string) => gl.getUniformLocation(prog, n);
-    const p: Prog = { prog, u: { uP0: L('uP0'), uP1: L('uP1'), uP2: L('uP2'), uP3: L('uP3'), uPass: L('uPass'), uSize: L('uSize'), in0: L('sTD2DInputs[0]'), in1: L('sTD2DInputs[1]') } };
+    const p: Prog = { prog, u: { uP0: L('uP0'), uP1: L('uP1'), uP2: L('uP2'), uP3: L('uP3'), uPass: L('uPass'), uSize: L('uSize'), in0: L('sTD2DInputs[0]'), in1: L('sTD2DInputs[1]'), in2: L('sTD2DInputs[2]') } };
     this.progs.set(type, p);
     return p;
   }
@@ -143,6 +143,8 @@ export class FxGL {
 
   /** Idle: free pooled textures and shrink the drawing buffer. */
   releaseIdle(): void {
+    for (const t of this.dataTex.values()) this.drop(t, false);
+    this.dataTex.clear();
     while (this.pool.length) this.drop(this.pool.pop()!, true);
     this.poolBytes = 0;
     if (this.canvas.width > 1 || this.canvas.height > 1) {
@@ -161,6 +163,29 @@ export class FxGL {
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, source);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    return t;
+  }
+
+  /** RGBA8 texture of a pass' data (curve / gradient / LUT / table), cached by digest (small LRU). Row 0 = first row of `d.data`. */
+  data(d: DataTex): Tex {
+    const hit = this.dataTex.get(d.digest);
+    if (hit) {
+      this.dataTex.delete(d.digest);
+      this.dataTex.set(d.digest, hit);
+      return hit;
+    }
+    const gl = this.gl;
+    const t = this.alloc(d.w, d.h, 'u8');
+    gl.bindTexture(gl.TEXTURE_2D, t.tex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, d.w, d.h, gl.RGBA, gl.UNSIGNED_BYTE, d.data);
+    this.dataTex.set(d.digest, t);
+    while (this.dataTex.size > 6) {
+      const k = this.dataTex.keys().next().value as string;
+      this.drop(this.dataTex.get(k)!, false);
+      this.dataTex.delete(k);
+    }
     return t;
   }
 
@@ -185,7 +210,8 @@ export class FxGL {
   }
 
   /** One pass: reads in0 / in1, renders into `target` (null: canvas' default framebuffer, bottom-left w x h). */
-  run(pass: EffectPass, in0: Tex, in1: Tex, target: Tex | null, originX: number, originY: number, logicalW = 0, logicalH = 0): void {
+  run(pass: EffectPass, in0: Tex, in1: Tex, in2: Tex | null, target: Tex | null, originX: number, originY: number, logicalW = 0, logicalH = 0,
+    docW = 0, docH = 0, auxMissing = false): void {
     const gl = this.gl;
     const p = this.program(pass.shader);
     gl.useProgram(p.prog);
@@ -195,16 +221,20 @@ export class FxGL {
     gl.bindTexture(gl.TEXTURE_2D, in0.tex);
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, in1.tex);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, (in2 ?? in1).tex);
+    gl.activeTexture(gl.TEXTURE0);
     gl.uniform1i(p.u.in0, 0);
     gl.uniform1i(p.u.in1, 1);
+    gl.uniform1i(p.u.in2, 2);
     const u = pass.u;
     gl.uniform4f(p.u.uP0, u[0], u[1], u[2], u[3]);
     gl.uniform4f(p.u.uP1, u[4], u[5], u[6], u[7]);
     gl.uniform4f(p.u.uP2, u[8], u[9], u[10], u[11]);
     gl.uniform4f(p.u.uP3, u[12], u[13], u[14], u[15]);
-    gl.uniform4f(p.u.uPass, pass.pid, originX, originY, 0);
-    gl.uniform4f(p.u.uSize, logicalW, logicalH, 0, 0); // 0 = the whole texture
-    this.bindTarget(target, in0.w, in0.h);
+    gl.uniform4f(p.u.uPass, pass.pid, originX, originY, (pass.level ?? 0) + (auxMissing ? 0.5 : 0));
+    gl.uniform4f(p.u.uSize, logicalW, logicalH, docW, docH); // 0 = the whole texture / the texture is the document
+    this.bindTarget(target, target ? target.w : in0.w, target ? target.h : in0.h);
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     this.passesRun++;
@@ -214,6 +244,8 @@ export class FxGL {
   dispose(): void {
     try {
       for (const t of this.pool) this.drop(t, false);
+      for (const t of this.dataTex.values()) this.drop(t, false);
+      this.dataTex.clear();
       this.pool = [];
       this.poolBytes = 0;
       for (const p of this.progs.values()) this.gl.deleteProgram(p.prog);

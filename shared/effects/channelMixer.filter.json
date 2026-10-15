@@ -1,0 +1,35 @@
+{
+  "type": "channelMixer",
+  "group": "color",
+  "doc": "Channel mixer on straight colour: R' = rr R + rg G + rb B + r, G' = gr R + gg G + gb B + g, B' = br R + bg G + bb B + b (coefficients in % / 100, constants in % of full scale / 100), clamped to 0..1. With `monochrome` the matrix and constants are ignored and all three outputs equal grayRed R + grayGreen G + grayBlue B (weights in % / 100, default 30/59/11), clamped. Alpha unchanged.",
+  "reads": "point",
+  "preservesTransparent": true,
+  "params": {
+    "rr": {"kind": "num", "default": 100, "min": -200, "max": 200, "unit": "%"},
+    "rg": {"kind": "num", "default": 0, "min": -200, "max": 200, "unit": "%"},
+    "rb": {"kind": "num", "default": 0, "min": -200, "max": 200, "unit": "%"},
+    "gr": {"kind": "num", "default": 0, "min": -200, "max": 200, "unit": "%"},
+    "gg": {"kind": "num", "default": 100, "min": -200, "max": 200, "unit": "%"},
+    "gb": {"kind": "num", "default": 0, "min": -200, "max": 200, "unit": "%"},
+    "br": {"kind": "num", "default": 0, "min": -200, "max": 200, "unit": "%"},
+    "bg": {"kind": "num", "default": 0, "min": -200, "max": 200, "unit": "%"},
+    "bb": {"kind": "num", "default": 100, "min": -200, "max": 200, "unit": "%"},
+    "r": {"kind": "num", "default": 0, "min": -100, "max": 100, "unit": "%"},
+    "g": {"kind": "num", "default": 0, "min": -100, "max": 100, "unit": "%"},
+    "b": {"kind": "num", "default": 0, "min": -100, "max": 100, "unit": "%"},
+    "monochrome": {"kind": "bool", "default": false},
+    "grayRed": {"kind": "num", "default": 30, "min": -200, "max": 200, "unit": "%"},
+    "grayGreen": {"kind": "num", "default": 59, "min": -200, "max": 200, "unit": "%"},
+    "grayBlue": {"kind": "num", "default": 11, "min": -200, "max": 200, "unit": "%"}
+  },
+  "noop": "!monochrome && rr == 100 && rg == 0 && rb == 0 && gr == 0 && gg == 100 && gb == 0 && br == 0 && bg == 0 && bb == 100 && r == 0 && g == 0 && b == 0",
+  "passes": [{"pass": 0, "u": ["rr / 100", "rg / 100", "rb / 100", "gr / 100", "gg / 100", "gb / 100", "br / 100", "bg / 100", "bb / 100",
+    "r / 100", "g / 100", "b / 100", "monochrome", "grayRed / 100", "grayGreen / 100", "grayBlue / 100"]}],
+  "extent": ["0", "0", "0", "0"],
+  "samples": [
+    {"rr": 0, "rg": 0, "rb": 100, "bb": 0, "br": 100},
+    {"monochrome": true},
+    {"rr": 120, "rg": -30, "gg": 80, "gb": 20, "r": 10, "b": -15}
+  ],
+  "degenerate": [{}, {"rr": 1e9, "gg": -1e9}, {"monochrome": true, "grayRed": 1e9, "grayGreen": -1e9, "grayBlue": 0}, {"rr": "a", "r": null}, {"monochrome": 1, "r": 500}]
+}

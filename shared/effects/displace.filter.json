@@ -1,0 +1,28 @@
+{
+  "type": "displace",
+  "group": "distort",
+  "doc": "Displace: out(p) = in(p + offset(p)). source 'noise': offset = (fbm(p / scale, seed) * 2 - 1) * strength per axis (value noise, deterministic); source 'aux': offset = (aux.rg * 2 - 1) * strength where aux is the chain's second image (straight colour, 0.5 = no shift; document sized; transparent aux pixels shift nothing; absent aux = no displacement). edge: what is read outside the document.",
+  "in2": true,
+  "reads": "neighbourhood",
+  "readsGlobal": "edge != 0",
+  "preservesTransparent": false,
+  "params": {
+    "source": {"kind": "enum", "values": ["noise", "aux"], "default": "noise"},
+    "strengthX": {"kind": "num", "default": 20, "min": -500, "max": 500, "unit": "px"},
+    "strengthY": {"kind": "num", "default": 20, "min": -500, "max": 500, "unit": "px"},
+    "scale": {"kind": "num", "default": 64, "min": 1, "max": 4000, "unit": "px", "doc": "noise feature size"},
+    "octaves": {"kind": "num", "default": 2, "min": 1, "max": 6, "round": true},
+    "seed": {"kind": "seed", "default": 0},
+    "edge": {"kind": "enum", "values": ["transparent", "clamp", "mirror", "wrap"], "default": "transparent"}
+  },
+  "vars": [["smax", "max(abs(strengthX), abs(strengthY))"], ["reach", "if(edge == 0, ceil(smax) + 2, G)"]],
+  "noop": "smax == 0",
+  "passes": [{"pass": 0, "aux": true, "u": ["source", "strengthX", "strengthY", "edge", "scale", "octaves", "seed"]}],
+  "extent": ["reach", "reach", "0", "0"],
+  "samples": [
+    {"source": "noise", "strengthX": 14, "strengthY": -9, "scale": 40, "octaves": 3, "seed": 5},
+    {"source": "aux", "strengthX": 12, "strengthY": 12, "edge": "clamp"},
+    {"source": "noise", "strengthX": 30, "strengthY": 30, "scale": 20, "edge": "wrap", "seed": 99}
+  ],
+  "degenerate": [{}, {"strengthX": 0, "strengthY": 0}, {"strengthX": 1e9, "strengthY": -1e9, "scale": 0, "octaves": 99}, {"source": "bogus", "edge": "bogus"}, {"seed": -7}]
+}

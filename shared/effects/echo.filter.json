@@ -1,0 +1,26 @@
+{
+  "type": "echo",
+  "group": "animated",
+  "doc": "Echo: translation-only feedback. Echo i (i = 0..iterations-1; 0 = the input itself) is the input shifted by i * (dx, dy) px (bilinear, transparent outside) with opacity w_i = decay^i (fade 'exp') or max(0, 1 - i * (1 - decay)) (fade 'linear'), decay = decay % / 100. Composited in order of i: 'over' = later echoes behind the earlier ones (input on top), 'add' = premultiplied sum (clamped), 'lighten' = per-channel max of premultiplied values. Uses the feedback shader (one pass). iterations = 1 or decay 0 leaves the input unchanged.",
+  "glsl": false,
+  "reads": "neighbourhood",
+  "preservesTransparent": false,
+  "params": {
+    "iterations": {"kind": "num", "default": 8, "min": 1, "max": 64, "round": true, "unit": "echoes (including the original)"},
+    "dx": {"kind": "num", "default": 12, "min": -500, "max": 500, "unit": "px", "doc": "shift per echo (right +)"},
+    "dy": {"kind": "num", "default": 0, "min": -500, "max": 500, "unit": "px", "doc": "shift per echo (down +)"},
+    "decay": {"kind": "num", "default": 80, "min": 0, "max": 100, "unit": "%", "doc": "opacity multiplier per echo (exp) / linear drop is 100 - decay % per echo"},
+    "blend": {"kind": "enum", "values": ["over", "add", "lighten"], "default": "over"},
+    "fade": {"kind": "enum", "values": ["linear", "exp"], "default": "exp"}
+  },
+  "vars": [["rx", "min(G, ceil((iterations - 1) * abs(dx)) + 2)"], ["ry", "min(G, ceil((iterations - 1) * abs(dy)) + 2)"], ["fadeMode", "if(fade == 0, 1, 0)"]],
+  "noop": "iterations <= 1 || decay <= 0",
+  "passes": [{"shader": "feedback", "pass": 0, "u": ["iterations", "dx", "dy", "1", "0", "1", "decay / 100", "blend", "0.5", "0.5", "fadeMode", "0"]}],
+  "extent": ["rx", "ry", "0", "0"],
+  "samples": [
+    {"iterations": 8, "dx": 12, "dy": 0, "decay": 80, "blend": "over", "fade": "exp"},
+    {"iterations": 6, "dx": -6, "dy": 5, "decay": 85, "blend": "add", "fade": "linear"},
+    {"iterations": 10, "dx": 3, "dy": 7, "decay": 90, "blend": "lighten", "fade": "linear"}
+  ],
+  "degenerate": [{}, {"iterations": 1}, {"iterations": 1e9, "dx": 1e9, "dy": -1e9, "decay": 1e9}, {"blend": "bogus", "fade": "bogus"}, {"iterations": 64, "dx": -500, "dy": 500, "decay": 100, "fade": "linear"}]
+}

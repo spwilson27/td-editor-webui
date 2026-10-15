@@ -1,0 +1,24 @@
+{
+  "type": "kaleidoscope",
+  "group": "distort",
+  "doc": "Kaleidoscope: the plane around the centre c is cut into N = segments wedges of S = 2 pi / N; inside every wedge the polar angle a = atan2(dy, dx) (document px, y down) is mirror-folded to a' = S/2 - |mod(a, S) - S/2| in [0, S/2], so each wedge contains a source half-wedge and its mirror image (mirror lines every S/2 through the centre). out(p) = in(c + |p - c| / zoom (cos(a' + angle), sin(a' + angle))). angle rotates which part of the source is shown; zoom = percent magnification. Edge: what is read outside the document.",
+  "reads": "global",
+  "preservesTransparent": false,
+  "params": {
+    "segments": {"kind": "num", "default": 6, "min": 2, "max": 32, "round": true, "unit": "wedges"},
+    "angle": {"kind": "num", "default": 0, "min": -3600, "max": 3600, "unit": "degrees"},
+    "centerX": {"kind": "num", "default": 0.5, "min": -2, "max": 3, "unit": "fraction of document width"},
+    "centerY": {"kind": "num", "default": 0.5, "min": -2, "max": 3, "unit": "fraction of document height"},
+    "zoom": {"kind": "num", "default": 100, "min": 25, "max": 400, "unit": "percent"},
+    "edge": {"kind": "enum", "values": ["transparent", "clamp", "mirror", "wrap"], "default": "transparent"}
+  },
+  "passes": [{"pass": 0, "u": ["segments", "rad(angle)", "centerX", "centerY", "zoom / 100", "edge"]}],
+  "extent": ["G", "G", "0", "0"],
+  "samples": [
+    {"segments": 6, "angle": 20},
+    {"segments": 2, "angle": 0, "edge": "clamp"},
+    {"segments": 8, "angle": -45, "centerX": 0.4, "centerY": 0.55, "zoom": 200, "edge": "mirror"},
+    {"segments": 5, "zoom": 50, "edge": "wrap"}
+  ],
+  "degenerate": [{}, {"segments": 0}, {"segments": 1e9, "angle": 1e9}, {"zoom": 0, "centerX": 1e9}, {"segments": "x", "edge": "bogus"}, {"segments": 32, "zoom": 400, "angle": -1e9}]
+}

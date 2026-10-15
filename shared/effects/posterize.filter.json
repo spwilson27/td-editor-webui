@@ -1,0 +1,14 @@
+{
+  "type": "posterize",
+  "group": "color",
+  "doc": "Posterize: each straight colour channel is quantised to `levels` equally spaced values (0 and 1 included). Alpha unchanged.",
+  "reads": "point",
+  "preservesTransparent": true,
+  "params": {
+    "levels": {"kind": "num", "default": 4, "min": 2, "max": 255, "round": true, "unit": "levels per channel"}
+  },
+  "passes": [{"pass": 0, "u": ["levels"]}],
+  "extent": ["0", "0", "0", "0"],
+  "samples": [{"levels": 4}, {"levels": 2}, {"levels": 7}],
+  "degenerate": [{}, {"levels": 0}, {"levels": 1e9}, {"levels": "5"}, {"levels": 3.5}]
+}

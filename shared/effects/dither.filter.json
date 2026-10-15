@@ -1,0 +1,25 @@
+{
+  "type": "dither",
+  "group": "stylise",
+  "doc": "Dither: quantise to `levels` values per channel (0 and 1 included) with 'ordered' Bayer dithering (matrix 2, 4 or 8, tiled on the document origin) or 'diffusion'. colour=false quantises the luma and outputs grey. strength mixes the dithered result with the original. Alpha unchanged. 'diffusion' is a WINDOWED Floyd-Steinberg (7,3,5,1)/16 error diffusion: true error diffusion is sequential over the whole image (each pixel depends on all previous ones), which a GPU cannot do and which would make a region render depend on the whole document. Instead every pixel re-simulates the algorithm in integer arithmetic (8-bit straight colour * 16, floor shifts) over the causal window of rows y-6..y and columns x-12..x+6 (left to right, no serpentine, the error entering the window from its top row and left column is a pseudo-random value in +-half a step hashed from the document position, because otherwise every pixel of a flat area would simulate the same window and get the same value) and outputs the result for its own position. The error propagation is therefore truncated to 6 rows / ~12 columns: it is an approximation of true error diffusion (same look and local tone reproduction, but not bit-identical to a sequential run, and the pattern differs slightly near where the window starts), exactly reproducible on every GPU because no float accumulation is involved.",
+  "reads": "neighbourhood",
+  "preservesTransparent": true,
+  "params": {
+    "mode": {"kind": "enum", "values": ["ordered", "diffusion"], "default": "ordered"},
+    "levels": {"kind": "num", "default": 4, "min": 2, "max": 16, "round": true, "unit": "levels per channel"},
+    "matrix": {"kind": "num", "default": 4, "min": 2, "max": 8, "round": true, "unit": "px", "doc": "Bayer matrix size, 2 | 4 | 8 (3 -> 4, 5..7 -> 8); ordered mode only"},
+    "colour": {"kind": "bool", "default": true},
+    "strength": {"kind": "num", "default": 100, "min": 0, "max": 100, "unit": "%"}
+  },
+  "vars": [["msz", "if(matrix <= 2, 2, if(matrix <= 4, 4, 8))"]],
+  "noop": "strength <= 0",
+  "passes": [{"pass": 0, "u": ["mode", "levels", "msz", "colour", "strength / 100"]}],
+  "extent": ["if(mode == 1, 12, 0)", "if(mode == 1, 6, 0)", "0", "0"],
+  "samples": [
+    {"mode": "ordered", "levels": 3, "matrix": 4, "colour": true, "strength": 100},
+    {"mode": "ordered", "levels": 2, "matrix": 8, "colour": false},
+    {"mode": "diffusion", "levels": 3, "colour": true},
+    {"mode": "diffusion", "levels": 2, "colour": false, "strength": 70}
+  ],
+  "degenerate": [{}, {"strength": 0}, {"levels": 0}, {"levels": 1e9, "matrix": 1e9}, {"mode": "diffusion", "levels": 2, "matrix": -3}, {"mode": "bogus", "colour": "x"}, {"mode": "diffusion", "levels": 16, "strength": 1e9}]
+}

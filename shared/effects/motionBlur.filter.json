@@ -1,0 +1,30 @@
+{
+  "type": "motionBlur",
+  "group": "blur",
+  "doc": "Motion blur: box average of the premultiplied rgba along a line through each pixel, total streak length `length` px centred on the pixel, direction `angle` degrees (0 = horizontal, clockwise on screen). Long streaks stay a smooth, exact box: pass 0 is a box of width a = length / N (<= 32 bilinear taps, spacing <= 1 px), pass 1 is a comb of N = ceil(length / 32) taps spaced a px apart; box (*) comb = one box of width length. At most 32 + 13 taps per pixel at any length. Quality: the continuous box is sampled with bilinear taps at <= 1 px spacing, so the result matches an ideal box blur to ~1/255 on smooth content; for lengths below 1 px the streak is a 2-tap bilinear box.",
+  "reads": "neighbourhood",
+  "preservesTransparent": false,
+  "params": {
+    "length": {"kind": "num", "default": 30, "min": 0, "max": 400, "unit": "px", "doc": "total streak length (centred)"},
+    "angle": {"kind": "num", "default": 0, "min": -360, "max": 360, "unit": "deg", "doc": "0 = horizontal, clockwise on screen"}
+  },
+  "vars": [
+    ["n2", "clamp(ceil(length / 32), 1, 13)"],
+    ["a", "length / n2"],
+    ["n1", "max(2, ceil(a))"],
+    ["dx", "cos(rad(angle))"],
+    ["dy", "sin(rad(angle))"]
+  ],
+  "noop": "length <= 0",
+  "passes": [
+    {"pass": 0, "u": ["dx", "dy", "a", "n1"]},
+    {"when": "n2 > 1", "pass": 1, "u": ["dx", "dy", "a", "n2"]}
+  ],
+  "extent": ["ceil(length / 2 * abs(dx)) + 4", "ceil(length / 2 * abs(dy)) + 4", "0", "0"],
+  "samples": [
+    {"length": 12, "angle": 0},
+    {"length": 90, "angle": 35},
+    {"length": 400, "angle": -70}
+  ],
+  "degenerate": [{}, {"length": 0}, {"length": -5}, {"length": 1e9, "angle": 1e9}, {"length": "x", "angle": "y"}, {"length": 0.3}, {"length": 33, "angle": 90}]
+}

@@ -1,0 +1,22 @@
+{
+  "type": "curves",
+  "group": "color",
+  "doc": "Curves: master (RGB) and per-channel curves through control points (x, y in 0..1), monotone cubic interpolation baked into a 256 entry LUT texture (input 2); channel curve is applied after the master curve. Straight colour in, alpha unchanged. Points as [x, y] or {x, y}; at most 32; x outside 0..1 clamped, equal x: last wins; no points = identity.",
+  "in2": true,
+  "reads": "point",
+  "preservesTransparent": true,
+  "params": {
+    "master": {"kind": "points", "default": [[0, 0], [1, 1]]},
+    "red": {"kind": "points", "default": [[0, 0], [1, 1]]},
+    "green": {"kind": "points", "default": [[0, 0], [1, 1]]},
+    "blue": {"kind": "points", "default": [[0, 0], [1, 1]]}
+  },
+  "passes": [{"pass": 0, "u": ["0"], "data": {"gen": "curves", "args": ["master", "red", "green", "blue"]}}],
+  "extent": ["0", "0", "0", "0"],
+  "samples": [
+    {"master": [[0, 0], [0.25, 0.15], [0.75, 0.9], [1, 1]]},
+    {"red": [[0, 0.1], [0.5, 0.7], [1, 0.9]], "blue": [[0, 0], [1, 0.6]], "master": [[0, 0], [1, 1]]},
+    {"master": [{"x": 0, "y": 1}, {"x": 1, "y": 0}]}
+  ],
+  "degenerate": [{}, {"master": []}, {"master": [[0.5, 0.5]]}, {"master": [[2, -1], [0.3, 7], [0.3, 0.2], ["a", 1]]}, {"red": "bad"}, {"green": [[0, 0], [0.5, 1], [1, 0]]}]
+}

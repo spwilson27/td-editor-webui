@@ -1,0 +1,30 @@
+{
+  "type": "feedback",
+  "group": "animated",
+  "doc": "Video feedback trail frozen after `iterations` frames. Layers i = 0..iterations-1 are the input transformed i times by T (about the centre c = (centerX, centerY) * document size: scale about c by scale %, rotate by `rotate` degrees clockwise, then translate by (dx, dy) px), each with opacity decay^i, composited into the running result in order of i: 'over' = newer iterations behind the older ones (the untransformed input is on top, exact compositing of the copies), 'add' = premultiplied sum, 'lighten' = per-channel max of premultiplied colour/alpha, 'screen' = a + b - a*b on premultiplied channels. Bilinear resampling, transparent outside the layer. One pass, <= 63 taps per pixel. iterations = 1 (or decay 0) leaves the input unchanged.",
+  "reads": "neighbourhood",
+  "readsGlobal": "!(rotate == 0 && scale == 100)",
+  "preservesTransparent": false,
+  "params": {
+    "iterations": {"kind": "num", "default": 8, "min": 1, "max": 64, "round": true, "unit": "frames"},
+    "dx": {"kind": "num", "default": 10, "min": -500, "max": 500, "unit": "px", "doc": "translation per iteration (right +)"},
+    "dy": {"kind": "num", "default": 6, "min": -500, "max": 500, "unit": "px", "doc": "translation per iteration (down +)"},
+    "rotate": {"kind": "num", "default": 0, "min": -180, "max": 180, "unit": "deg", "doc": "rotation per iteration, clockwise on screen"},
+    "scale": {"kind": "num", "default": 100, "min": 50, "max": 200, "unit": "%", "doc": "scale per iteration about the centre"},
+    "decay": {"kind": "num", "default": 80, "min": 0, "max": 100, "unit": "%", "doc": "opacity multiplier per iteration"},
+    "blend": {"kind": "enum", "values": ["over", "add", "lighten", "screen"], "default": "over"},
+    "centerX": {"kind": "num", "default": 0.5, "min": 0, "max": 1, "unit": "fraction of document width"},
+    "centerY": {"kind": "num", "default": 0.5, "min": 0, "max": 1, "unit": "fraction of document height"}
+  },
+  "vars": [["pure", "rotate == 0 && scale == 100"], ["rx", "if(pure, min(G, ceil((iterations - 1) * abs(dx)) + 2), G)"], ["ry", "if(pure, min(G, ceil((iterations - 1) * abs(dy)) + 2), G)"]],
+  "noop": "iterations <= 1 || decay <= 0",
+  "passes": [{"pass": 0, "u": ["iterations", "dx", "dy", "cos(rad(rotate))", "sin(rad(rotate))", "scale / 100", "decay / 100", "blend", "centerX", "centerY", "0", "0"]}],
+  "extent": ["rx", "ry", "0", "0"],
+  "samples": [
+    {"iterations": 8, "dx": 10, "dy": 6, "decay": 80, "blend": "over"},
+    {"iterations": 10, "dx": 4, "dy": -3, "rotate": 12, "scale": 92, "decay": 85, "blend": "add", "centerX": 0.4, "centerY": 0.5},
+    {"iterations": 12, "rotate": -8, "scale": 108, "decay": 90, "blend": "lighten", "dx": 0, "dy": 0},
+    {"iterations": 6, "dx": -7, "dy": 5, "rotate": 5, "scale": 100, "decay": 70, "blend": "screen"}
+  ],
+  "degenerate": [{}, {"iterations": 1}, {"iterations": 1e9, "dx": 1e9, "dy": -1e9, "rotate": 1e9, "scale": 0, "decay": 1e9}, {"blend": "bogus", "scale": 1e9}, {"iterations": 64, "scale": 50, "rotate": 180, "decay": 100, "centerX": -4, "centerY": "x"}]
+}

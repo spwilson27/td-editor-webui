@@ -1,0 +1,20 @@
+{
+  "type": "unsharp",
+  "group": "blur",
+  "doc": "Unsharp mask: out = src + amount * (src - blur(src, radius)) where |src - blur| exceeds threshold; operates on premultiplied rgb, alpha unchanged, rgb clamped to [0, alpha].",
+  "reads": "neighbourhood",
+  "preservesTransparent": true,
+  "params": {
+    "amount": {"kind": "num", "default": 100, "min": 0, "max": 500, "unit": "%"},
+    "radius": {"kind": "num", "default": 2, "min": 0, "max": 200, "unit": "px"},
+    "threshold": {"kind": "num", "default": 0, "min": 0, "max": 255, "unit": "levels", "doc": "differences below this (0..255) are left alone"}
+  },
+  "noop": "amount <= 0 || radius <= 0",
+  "passes": [
+    {"sub": "blur", "with": {"radius": "radius"}},
+    {"pass": 0, "u": ["amount / 100", "threshold / 255"]}
+  ],
+  "extent": ["blurReach(radius)", "blurReach(radius)", "0", "0"],
+  "samples": [{"amount": 150, "radius": 3, "threshold": 4}, {"amount": 300, "radius": 60, "threshold": 0}],
+  "degenerate": [{}, {"amount": 0}, {"radius": 0}, {"amount": 1e9, "radius": 1e9, "threshold": -1}, {"amount": "x"}]
+}

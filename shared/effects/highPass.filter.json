@@ -1,0 +1,17 @@
+{
+  "type": "highPass",
+  "group": "blur",
+  "doc": "High-pass: straight colour = 0.5 + (src - blur(src, radius)); alpha unchanged (flat areas become mid grey).",
+  "reads": "neighbourhood",
+  "preservesTransparent": true,
+  "params": {
+    "radius": {"kind": "num", "default": 4, "min": 0, "max": 200, "unit": "px"}
+  },
+  "passes": [
+    {"sub": "blur", "with": {"radius": "radius"}},
+    {"pass": 0, "u": ["radius > 0"]}
+  ],
+  "extent": ["blurReach(radius)", "blurReach(radius)", "0", "0"],
+  "samples": [{"radius": 5}, {"radius": 90}],
+  "degenerate": [{}, {"radius": 0}, {"radius": -3}, {"radius": 1e12}]
+}

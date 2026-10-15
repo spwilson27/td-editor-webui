@@ -1,0 +1,25 @@
+{
+  "type": "lensDistortion",
+  "group": "distort",
+  "doc": "Lens distortion (inverse mapping, evaluated per OUTPUT pixel, no iteration): with x = (p - c) / H the offset from the centre in units of H = half the document diagonal (so r = 1 at the corners of a centred document), the source position is c + H x (1 + k1' r^2 + k2' r^4) / zoom, k1' = k1 / 100, k2' = k2 / 100, zoom = scale / 100. k1 > 0 barrel (centre magnified, edges compressed), k1 < 0 pincushion; scale > 100 zooms in (hides borders), < 100 zooms out (shows transparent/edge borders). Centre = fraction of the document.",
+  "reads": "global",
+  "preservesTransparent": false,
+  "params": {
+    "k1": {"kind": "num", "default": 30, "min": -100, "max": 100, "unit": "percent (r^2 coefficient)"},
+    "k2": {"kind": "num", "default": 0, "min": -100, "max": 100, "unit": "percent (r^4 coefficient)"},
+    "scale": {"kind": "num", "default": 100, "min": 50, "max": 200, "unit": "percent zoom"},
+    "centerX": {"kind": "num", "default": 0.5, "min": -2, "max": 3, "unit": "fraction of document width"},
+    "centerY": {"kind": "num", "default": 0.5, "min": -2, "max": 3, "unit": "fraction of document height"},
+    "edge": {"kind": "enum", "values": ["transparent", "clamp", "mirror", "wrap"], "default": "transparent"}
+  },
+  "noop": "k1 == 0 && k2 == 0 && scale == 100",
+  "passes": [{"pass": 0, "u": ["k1 / 100", "k2 / 100", "scale / 100", "edge", "centerX", "centerY"]}],
+  "extent": ["G", "G", "0", "0"],
+  "samples": [
+    {"k1": 40, "k2": 0},
+    {"k1": -50, "k2": 10, "scale": 80, "edge": "clamp"},
+    {"k1": 80, "k2": -60, "scale": 120, "centerX": 0.4, "centerY": 0.6},
+    {"k1": 0, "k2": 0, "scale": 150, "edge": "mirror"}
+  ],
+  "degenerate": [{}, {"k1": 0, "k2": 0, "scale": 100}, {"k1": 1e9, "k2": -1e9, "scale": 0}, {"k1": -100, "k2": -100, "scale": 50, "centerX": 9e9}, {"edge": "bogus", "k1": "a"}, {"k1": 100, "k2": 100, "scale": 200, "edge": "wrap"}]
+}

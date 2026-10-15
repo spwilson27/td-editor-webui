@@ -1,0 +1,24 @@
+{
+  "type": "twirl",
+  "group": "distort",
+  "doc": "Twirl: out(p) = in(c + R(-a(r)) (p - c)), r = |p - c| in document px, a(r) = angle * (1 - s(min(r / radius, 1))) with s the cubic smoothstep t^2 (3 - 2t); positive angle turns the content clockwise at the centre, 0 at radius and beyond. Centre = fraction of the document. Bilinear resampling; edge: what is read outside the document.",
+  "reads": "global",
+  "preservesTransparent": false,
+  "params": {
+    "angle": {"kind": "num", "default": 90, "min": -3600, "max": 3600, "unit": "degrees"},
+    "radius": {"kind": "num", "default": 200, "min": 1, "max": 4000, "unit": "px"},
+    "centerX": {"kind": "num", "default": 0.5, "min": -2, "max": 3, "unit": "fraction of document width"},
+    "centerY": {"kind": "num", "default": 0.5, "min": -2, "max": 3, "unit": "fraction of document height"},
+    "edge": {"kind": "enum", "values": ["transparent", "clamp", "mirror", "wrap"], "default": "transparent"}
+  },
+  "noop": "angle == 0",
+  "passes": [{"pass": 0, "u": ["rad(angle)", "radius", "centerX", "centerY", "edge"]}],
+  "extent": ["G", "G", "0", "0"],
+  "samples": [
+    {"angle": 120, "radius": 60},
+    {"angle": -300, "radius": 150, "centerX": 0.3, "centerY": 0.6, "edge": "clamp"},
+    {"angle": 720, "radius": 40, "edge": "mirror"},
+    {"angle": 45, "radius": 500, "edge": "wrap"}
+  ],
+  "degenerate": [{}, {"angle": 0}, {"angle": 1e9, "radius": 0}, {"angle": -1e9, "radius": 1e9, "centerX": 1e9, "centerY": -1e9}, {"edge": "bogus", "angle": "x"}, {"radius": 1, "angle": 3600}]
+}

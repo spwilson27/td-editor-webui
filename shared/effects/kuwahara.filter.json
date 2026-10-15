@@ -1,0 +1,15 @@
+{
+  "type": "kuwahara",
+  "group": "stylise",
+  "doc": "Kuwahara oil-paint filter, classic 4 overlapping quadrants of (radius+1)^2 px around the pixel; each pixel takes the mean colour of the quadrant with the lowest luma variance (variance of the integer 8-bit luma) (flat painterly regions, edges preserved). Radii above 6 px stride-subsample the window (stride = ceil(radius/6), at most 13x13 taps). Means are taken over premultiplied rgba (alpha weighted straight colour, alpha = mean alpha of the chosen quadrant). The quadrant is chosen with exact integer arithmetic (integer straight 8-bit luma, N*S2 - S1^2, ties -> lowest index), identical on every GPU.",
+  "reads": "neighbourhood",
+  "preservesTransparent": false,
+  "params": {
+    "radius": {"kind": "num", "default": 4, "min": 1, "max": 16, "round": true, "unit": "px"}
+  },
+  "vars": [["st", "ceil(radius / 6)"], ["n", "floor(radius / st)"]],
+  "passes": [{"pass": 0, "u": ["n", "st"]}],
+  "extent": ["n * st", "n * st", "0", "0"],
+  "samples": [{"radius": 4}, {"radius": 12}, {"radius": 1}],
+  "degenerate": [{}, {"radius": 0}, {"radius": -3}, {"radius": 1e9}, {"radius": "8"}, {"radius": 6}, {"radius": 7}, {"radius": 16}]
+}

@@ -1,0 +1,21 @@
+{
+  "type": "radialBlur",
+  "group": "blur",
+  "doc": "Radial (spin) blur: average of the premultiplied rgba over an arc around (centerX, centerY) (fractions of the document), total arc `amount` degrees centred on each pixel's own angle (+-amount/2). Taps: ceil(arc length in px at the pixel's radius), capped at 64, equally weighted, bilinear, rotating the pixel about the centre; outside the document is transparent. Quality: while radius * amount(rad) <= 64 px the tap spacing is <= 1 px (smooth); beyond that the spacing grows (e.g. 180 deg at 300 px radius: ~15 px between taps) and fine detail shows faint stepping. Reads the whole document in principle (extent = document).",
+  "reads": "global",
+  "preservesTransparent": false,
+  "params": {
+    "amount": {"kind": "num", "default": 20, "min": 0, "max": 180, "unit": "deg", "doc": "total arc, centred on the pixel's angle"},
+    "centerX": {"kind": "num", "default": 0.5, "min": 0, "max": 1, "unit": "fraction of document width"},
+    "centerY": {"kind": "num", "default": 0.5, "min": 0, "max": 1, "unit": "fraction of document height"}
+  },
+  "noop": "amount <= 0",
+  "passes": [{"pass": 0, "u": ["rad(amount)", "centerX", "centerY"]}],
+  "extent": ["G", "G", "0", "0"],
+  "samples": [
+    {"amount": 25, "centerX": 0.5, "centerY": 0.5},
+    {"amount": 90, "centerX": 0.2, "centerY": 0.8},
+    {"amount": 180, "centerX": 0.5, "centerY": 0.5}
+  ],
+  "degenerate": [{}, {"amount": 0}, {"amount": -4}, {"amount": 1e9, "centerX": -3, "centerY": 9}, {"amount": "x", "centerX": "y"}, {"amount": 0.001}, {"amount": 180, "centerX": 0, "centerY": 0}]
+}

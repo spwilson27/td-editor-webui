@@ -1,0 +1,16 @@
+{
+  "type": "vibrance",
+  "group": "color",
+  "doc": "Vibrance + saturation on straight colour. Let G = Rec.709 luma gray, S = HSV saturation (max-min)/max of the colour. Colour = G + (c - G) * f with f = fv * (1 + saturation/100), fv = 1 + v (1 - S) for vibrance v = vibrance/100 >= 0 (low-saturation colours are boosted most, grey is unaffected, fully saturated colours not at all) and fv = 1 + v S for v < 0 (saturated colours are reduced most). `saturation` -100 gives luma grey, +100 doubles the distance from grey (linear in the luma / chroma plane, not in HSV). Result clamped to 0..1, alpha unchanged.",
+  "reads": "point",
+  "preservesTransparent": true,
+  "params": {
+    "vibrance": {"kind": "num", "default": 0, "min": -100, "max": 100, "unit": "%"},
+    "saturation": {"kind": "num", "default": 0, "min": -100, "max": 100, "unit": "%"}
+  },
+  "noop": "vibrance == 0 && saturation == 0",
+  "passes": [{"pass": 0, "u": ["vibrance / 100", "saturation / 100"]}],
+  "extent": ["0", "0", "0", "0"],
+  "samples": [{"vibrance": 70}, {"saturation": -100}, {"vibrance": -60, "saturation": 40}],
+  "degenerate": [{}, {"vibrance": 1e9, "saturation": -1e9}, {"vibrance": "x"}, {"saturation": null}, {"vibrance": -100, "saturation": -100}, {"vibrance": 100, "saturation": 100}]
+}

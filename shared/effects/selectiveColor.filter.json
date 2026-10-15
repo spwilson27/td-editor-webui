@@ -1,0 +1,20 @@
+{
+  "type": "selectiveColor",
+  "group": "color",
+  "doc": "Selective colour (Photoshop style): CMYK ink adjustments per colour range. `adjust` = 36 values in -1..1 (UI -100..100 %), range-major then cyan, magenta, yellow, black; ranges in order reds, yellows, greens, cyans, blues, magentas, whites, neutrals, blacks. Range weights of the straight colour (h = HSV hue in degrees, chroma = max - min, mx / mn = max / min channel, L = Rec.709 luma): colour ranges with centres 0, 60, 120, 180, 240, 300: w = max(0, 1 - hueDistance / 60) * chroma; whites = smoothstep(0.5, 1, mn); blacks = smoothstep(0.5, 1, 1 - mx); neutrals = (1 - smoothstep(0, 0.25, chroma)) * (1 - |2 L - 1|). Inks C, M, Y = 1 - R, 1 - G, 1 - B, K = min(C, M, Y). For each ink i: i' = i + w * a_i * (relative ? i : 1) summed over the ranges; the black adjustment adds w * a_k * (relative ? K : 1) to all three inks; result 1 - clamp(ink'). `relative` = Photoshop's relative method (changes proportional to the existing ink), off = absolute. The 36 values travel through an 8-bit table (resolution 1/127.5, |value| < 0.5 % is treated as 0). Alpha unchanged.",
+  "in2": true,
+  "reads": "point",
+  "preservesTransparent": true,
+  "params": {
+    "adjust": {"kind": "list", "len": 36, "min": -1, "max": 1, "unit": "-1..1 = -100..100 %, range-major (reds .. blacks) then c, m, y, k"},
+    "relative": {"kind": "bool", "default": true}
+  },
+  "passes": [{"pass": 0, "u": ["relative"], "data": {"gen": "table", "args": ["adjust"]}}],
+  "extent": ["0", "0", "0", "0"],
+  "samples": [
+    {"adjust": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.8, 0, 0, 0, 0.9, 0.5, -0.6, 0, 0, 0, 0.8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.4], "relative": false},
+    {"adjust": [0.5, 0, 0, 0, 0, 0, 0.7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.5, 0, 0, 0, -0.5, 0, 0, 0, 0.5]},
+    {"adjust": [-1, 1, -1, 1, 1, -1, 1, -1, 1, 1, 1, 1, -1, -1, -1, -1, 1, 0.3, 0.2, 0.1, 0.9, 0.9, 0.9, 0.9, 1, 1, 1, 1, -1, -1, -1, -1, 1, 1, 1, 1]}
+  ],
+  "degenerate": [{}, {"adjust": []}, {"adjust": [5, -5, "a", null]}, {"adjust": "bad", "relative": 3}, {"adjust": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]}]
+}
