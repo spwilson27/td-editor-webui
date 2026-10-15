@@ -144,3 +144,24 @@ that has not fetched for 10 s is stalled (no further notices of that kind until 
    TD overlay; external clients in TD mode receive `view` notices and fetch `GET /view`.
 7. Input change in TD: as v2 (`docSize` / `base` notices).
 8. Disconnect: TD keeps the document and its output. Reconnect → step 1 with `fresh: false`.
+
+## 6. Version 4 additions (DESIGN_V3)
+
+`ready.protocol` / `hello.protocol` = **4**. Everything in §1–5 is unchanged except:
+
+- LayerSpec (`§3`): `kind` may also be `'text' | 'shape'`; new fields `text: TextSpec | null`,
+  `shape: ShapeSpec | null`, `rasterize: boolean` (false for other kinds). A text/shape layer has a
+  `slot` only when `rasterize` is true (then TD treats it exactly like a pixel layer); with
+  `rasterize: false` TD renders it from the spec. Specs: `DESIGN_V3.md` §2.2 (RGBA colours are
+  `{r,g,b,a}` 0..255, straight).
+- Frame type `6` TOP_IMAGE (TD → web, `GET /top`): one band, `x=y=0`, `w×h` = the TOP's size,
+  `docW/docH` = the same `w/h` (not the document size), `slot` 0, `FRAME_END`.
+
+| Direction | `t` | Fields | Meaning |
+| --- | --- | --- | --- |
+| TD → web | `fonts` | `families: string[]` | sent after `hello`; sorted, de-duplicated font family names |
+| web → TD | `listTops` | `requestId` | list importable TOPs |
+| TD → web | `tops` | `requestId`, `items: [{path, w, h}]` | every TOP in the project outside `raster_editor`, ≤ 2000 items |
+| web → TD | `importTop` | `requestId`, `path` | snapshot that TOP once |
+| TD → web | `topReady` | `requestId`, `w`, `h` | fetch with `GET /top?token&client&requestId=` (frame type 6; `404` unknown/expired after 30 s) |
+| TD → web | `topError` | `requestId`, `msg` | path invalid, not a TOP, too large (> 8192²), or readback failed |

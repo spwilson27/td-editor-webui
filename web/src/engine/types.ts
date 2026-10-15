@@ -9,7 +9,27 @@ export type BlendMode =
 
 export interface Rect { x: number; y: number; w: number; h: number }
 
-export type LayerKind = 'pixel' | 'group' | 'base' | 'adjustment';
+export type LayerKind = 'pixel' | 'group' | 'base' | 'adjustment' | 'text' | 'shape';
+
+/** v3: editable text and shape layers (docs/DESIGN_V3.md §2.2). Colours are straight RGBA 0..255. */
+export interface TextSpec {
+  text: string; font: string; size: number; color: RGBA; align: 'left' | 'center' | 'right';
+  bold: boolean; italic: boolean; lineHeight: number; x: number; y: number; boxWidth: number | null;
+}
+export interface ShapeFill { enabled: boolean; color: RGBA }
+export interface ShapeStroke { enabled: boolean; color: RGBA; width: number }
+export type ShapeSpec =
+  | { type: 'rect'; x: number; y: number; w: number; h: number; radius: number; fill: ShapeFill; stroke: ShapeStroke; rotation: number }
+  | { type: 'ellipse'; x: number; y: number; w: number; h: number; fill: ShapeFill; stroke: ShapeStroke; rotation: number }
+  | { type: 'line'; x1: number; y1: number; x2: number; y2: number; stroke: ShapeStroke; arrowStart: boolean; arrowEnd: boolean }
+  | { type: 'polygon'; cx: number; cy: number; radius: number; sides: number; innerRatio: number; fill: ShapeFill; stroke: ShapeStroke; rotation: number };
+export type ShapeType = ShapeSpec['type'];
+
+export type SelectionMode = 'new' | 'add' | 'subtract' | 'intersect';
+export interface SelectionOptions {
+  mode: SelectionMode; feather: number; antialias: boolean;
+  wandTolerance: number; wandContiguous: boolean; wandSampleAll: boolean;
+}
 
 /** v2: adjustment layers (docs/DESIGN_V2.md §3, docs/PROTOCOL.md §3). */
 export type AdjustmentSpec =
@@ -37,6 +57,9 @@ export interface LayerSpec {
   slot: number | null;
   mask: { slot: number; enabled: boolean } | null;
   adjustment: AdjustmentSpec | null;
+  text: TextSpec | null;
+  shape: ShapeSpec | null;
+  rasterize: boolean;
 }
 export interface DocSpec { rev: number; width: number; height: number; layers: LayerSpec[] }
 
@@ -55,6 +78,9 @@ export interface LayerInfo {
   slot: number | null; // pixel surface slot (pixel layers)
   mask: { slot: number; enabled: boolean } | null; // pixel + adjustment layers
   adjustment: AdjustmentSpec | null; // adjustment layers
+  text: TextSpec | null; // text layers
+  shape: ShapeSpec | null; // shape layers
+  rasterize: boolean; // text/shape: true = browser renders into a surface slot
 }
 
 export type ToolId =
@@ -163,6 +189,24 @@ export interface EditorEngine {
   writeSurface(slot: number, rect: Rect, rgba: Uint8Array | Uint8ClampedArray): void; // no history
   commitSurfaces(): void; // recomposite / thumbnails after a batch of writeSurface
   setPreviewEnabled(enabled: boolean): void; // false = TD-view mode, compositor only on demand
+
+  // v3: selections, text/shape layers, import (docs/DESIGN_V3.md §2)
+  setSelectionOptions(opts: SelectionOptions): void; // used by marquee / lasso / wand
+  selectionMask(): { rect: Rect; alpha: Uint8Array } | null; // doc-sized coverage, rect = bounds
+  selectionPath(): Array<Array<{ x: number; y: number }>>; // outlines for marching ants (doc px)
+  selectAll(): void;
+  deselect(): void;
+  invertSelection(): void;
+  maskFromSelection(layerId: string): void;
+  addTextLayer(spec: TextSpec): string;
+  addShapeLayer(spec: ShapeSpec): string;
+  setText(id: string, spec: TextSpec): void; // coalesced history like opacity
+  setShape(id: string, spec: ShapeSpec): void;
+  setRasterize(id: string, rasterize: boolean): void;
+  flattenLayer(id: string): void; // text/shape → pixel layer
+  setShapeTool(type: ShapeType): void; // shape drawn by the 'shape' tool
+  textLayerAt(x: number, y: number): string | null; // hit test for the text tool (doc px)
+  importImage(rgba: Uint8Array | Uint8ClampedArray, w: number, h: number, name: string): string;
 
   dispose(): void;
 }
