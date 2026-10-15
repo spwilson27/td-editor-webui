@@ -3,7 +3,7 @@ import type { AdjustmentType, LayerInfo } from '../engine/types';
 import { computeDrop, dropZone, type DropZone } from '../state/layerDrop';
 import { capture } from './capture';
 import { store } from '../state/store';
-import { BLEND_LABELS, BLEND_MODES } from '../state/tools';
+import { BLEND_LABELS, BLEND_MODES, TOOLS, shapeKind } from '../state/tools';
 import { Icon, NOT_IN_VERSION } from './Icon';
 
 const EYE = 'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12zM12 9a3 3 0 100 6 3 3 0 000-6z';
@@ -28,11 +28,15 @@ function Thumb({ layer }: { layer: LayerInfo }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const tick = store.thumbTick.value;
   useEffect(() => {
-    if (layer.kind !== 'group' && layer.kind !== 'adjustment' && ref.current) store.engine.drawThumbnail(layer.id, ref.current);
+    if (layer.kind !== 'group' && layer.kind !== 'adjustment' && layer.kind !== 'text' && layer.kind !== 'shape' && ref.current) store.engine.drawThumbnail(layer.id, ref.current);
   }, [layer.id, layer.kind, tick]);
   const bg = 'background-color:#ffffff;background-image:repeating-conic-gradient(#cfcfcf 0 25%,#ffffff 0 50%);background-size:8px 8px';
   if (layer.kind === 'adjustment') {
     return <span aria-hidden="true" data-adjust-icon title={layer.adjustment ? adjustmentLabel(layer.adjustment.type) : 'Adjustment'} style="width:34px;height:24px;flex:none;border-radius:2px;box-shadow:0 0 0 1px #111111;background:#3a3a3a;display:flex;align-items:center;justify-content:center;color:#d4d4d4"><Icon d={ADJUST_ICON} size={14} sw={1.6} /></span>;
+  }
+  if (layer.kind === 'text' || layer.kind === 'shape') {
+    const d = layer.kind === 'text' ? TOOLS.find((t) => t.id === 'text')!.d : shapeKind(layer.shape?.type ?? 'rect').d;
+    return <span aria-hidden="true" data-kind-icon={layer.kind} title={layer.kind === 'text' ? 'Text layer' : 'Shape layer'} style="width:34px;height:24px;flex:none;border-radius:2px;box-shadow:0 0 0 1px #111111;background:#3a3a3a;display:flex;align-items:center;justify-content:center;color:#d4d4d4"><Icon d={d} size={14} sw={1.6} /></span>;
   }
   if (layer.kind === 'group') {
     return <span aria-hidden="true" style="width:34px;height:24px;flex:none;border-radius:2px;box-shadow:0 0 0 1px #111111;background:#3a3a3a;display:flex;align-items:center;justify-content:center;color:#d4d4d4"><Icon d={FOLDER} size={14} sw={1.6} /></span>;
@@ -138,6 +142,7 @@ function LayerSettings({ layer }: { layer: LayerInfo | undefined }) {
     input.value = opacity;
   };
   return (
+    <>
     <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid #1f1f1f">
       <select aria-label="Blend mode" disabled={!layer || layer.kind === 'adjustment'} value={layer?.blend || 'normal'} style="flex:1 1 auto"
         onChange={(ev) => layer && e.setLayerProps(layer.id, { blend: (ev.target as HTMLSelectElement).value as LayerInfo['blend'] })}>
@@ -150,6 +155,18 @@ function LayerSettings({ layer }: { layer: LayerInfo | undefined }) {
           style="width:26px;padding:0;text-align:right;color:#e3e3e3;background:none;border:0;outline:0" />%
       </span>
     </div>
+    {layer && (layer.kind === 'text' || layer.kind === 'shape') && (
+      <div data-layer-props style="display:flex;align-items:center;gap:10px;padding:6px 10px;border-bottom:1px solid #1f1f1f">
+        <label for="lras" title="On: the browser renders this layer into pixels. Off: TouchDesigner renders it live." style="display:flex;align-items:center;gap:6px;color:#e3e3e3">
+          <input id="lras" data-rasterize type="checkbox" aria-label="Rasterize" checked={layer.rasterize} style="accent-color:#4a8fe0;margin:0"
+            onChange={(ev) => store.setRasterize(layer.id, (ev.target as HTMLInputElement).checked)} />Rasterize
+        </label>
+        <span style="flex:1 1 auto;color:#8f8f8f;font-size:11px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{layer.rasterize ? 'Browser-rendered pixels' : 'Rendered live by TouchDesigner'}</span>
+        <button data-flatten onClick={() => store.flattenLayer(layer.id)} title="Convert to a plain pixel layer"
+          style="height:22px;padding:0 10px;border:1px solid #474747;border-radius:4px;background:#262626;color:#e3e3e3">Flatten</button>
+      </div>
+    )}
+    </>
   );
 }
 

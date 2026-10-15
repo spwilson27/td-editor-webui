@@ -29,7 +29,7 @@ describe('ToolRail', () => {
 
   it('shows the not-in-this-version state on disabled tools and ignores clicks', async () => {
     const disabled = TOOLS.filter((t) => !t.enabled).map((t) => t.id);
-    expect(disabled.sort()).toEqual(['clone', 'crop', 'lasso', 'shape', 'smudge', 'text', 'wand']);
+    expect(disabled.sort()).toEqual(['clone', 'crop', 'smudge']);
     for (const id of disabled) {
       const b = q(`[data-tool=${id}]`);
       expect(b.getAttribute('aria-disabled')).toBe('true');

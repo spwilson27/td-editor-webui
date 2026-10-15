@@ -16,7 +16,7 @@ const hook = <T,>(page: Page, fn: string, ...args: unknown[]) =>
 test('connects, says ready as the panel client and shows the linked state', async ({ page }) => {
   await open(page);
   await td.waitFor(() => td.messages.length > 0);
-  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 3, client: 'panel', token: td.token, fresh: true });
+  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 4, client: 'panel', token: td.token, fresh: true });
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   expect((await hook<any>(page, 'state')).doc).toEqual({ w: 160, h: 90 });
 });
@@ -135,7 +135,7 @@ test('docSize from TD resizes the document', async ({ page }) => {
 });
 
 const pxLayer = (id: string, slot: number, extra: Partial<LayerSpec> = {}): LayerSpec => ({
-  id, kind: 'pixel', parentId: null, name: id, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot, mask: null, adjustment: null, ...extra,
+  id, kind: 'pixel', parentId: null, name: id, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot, mask: null, adjustment: null, text: null, shape: null, rasterize: false, ...extra,
 });
 const baseLayer = (): LayerSpec => ({ ...pxLayer('base', 0), kind: 'base', slot: null, name: 'TD Input' });
 

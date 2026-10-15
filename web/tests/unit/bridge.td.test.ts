@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_VIEW, decodeFrame, decodeWebMessage, encodeBands, encodeMessage,
+  FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, FRAME_VIEW, decodeFrame, encodeFrame, decodeWebMessage, encodeBands, encodeMessage,
   type Frame, type TdMessage, type WebMessage,
 } from '../../src/bridge/codec';
 import {
@@ -47,7 +47,7 @@ class FakeSocket {
 }
 
 const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({
-  t: 'hello', protocol: 3, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
+  t: 'hello', protocol: 4, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
 });
 
 interface TestStatus {
@@ -91,13 +91,13 @@ beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(100000); FakeSocket.all 
 afterEach(() => { bridge?.dispose(); vi.useRealTimers(); });
 
 describe('tdBridge session', () => {
-  it('sends ready{protocol 3, fresh} after open', () => {
+  it('sends ready{protocol 4, fresh} after open', () => {
     start();
     expect(status.conn).toEqual(['reconnecting']);
     expect(sock().url).toBe('ws://td:9980/ws');
     expect(sock().binaryType).toBe('arraybuffer');
     sock().open();
-    expect(sock().json()).toEqual([{ t: 'ready', protocol: 3, client: 'panel', version: '0.1.0', token: 'tok-123', fresh: true }]);
+    expect(sock().json()).toEqual([{ t: 'ready', protocol: 4, client: 'panel', version: '0.1.0', token: 'tok-123', fresh: true }]);
   });
 
   it('becomes linked on hello and pushes doc + every surface in full when TD has no document', () => {
@@ -156,7 +156,7 @@ describe('tdBridge session', () => {
 });
 
 const spec = (over: Partial<LayerSpec> & { id: string }): LayerSpec => ({
-  kind: 'pixel', parentId: null, name: over.id, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot: null, mask: null, adjustment: null, ...over,
+  kind: 'pixel', parentId: null, name: over.id, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot: null, mask: null, adjustment: null, text: null, shape: null, rasterize: false, ...over,
 });
 const tdLayers: LayerSpec[] = [
   spec({ id: 'base', kind: 'base' }),
@@ -1308,5 +1308,222 @@ describe('tdBridge helpers', () => {
     expect(console.error).toBe(quiet);
     expect(listeners.size).toBe(0);
     console.error = orig;
+  });
+});
+
+
+describe('tdBridge v4: fonts and TOP import', () => {
+  let fm: FetchMock;
+  let fonts: string[][];
+  const startV4 = () => {
+    fm = new FetchMock();
+    engine = new FakeEngine(64, 48);
+    status = Object.assign(makeStatus(), { setFonts(f: string[]) { fonts.push(f); } });
+    fonts = [];
+    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 'tok-123', fetch: fm.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
+    connectActive();
+  };
+  const topFrame = (w: number, h: number, v: number) =>
+    encodeFrame({ type: FRAME_TOP, frameEnd: true, slot: 0, frameId: 1, docW: w, docH: h, x: 0, y: 0, w, h }, new Uint8Array(w * h * 4).fill(v));
+  const last = <T extends WebMessage['t']>(t: T) => sock().json().filter((m) => m.t === t).pop() as Extract<WebMessage, { t: T }>;
+
+  it('forwards the fonts message to the status sink', () => {
+    startV4();
+    sock().tell({ t: 'fonts', families: ['Arial', 'Menlo'] });
+    expect(fonts).toEqual([['Arial', 'Menlo']]);
+  });
+
+  it('listTops sends a request id and resolves with the tops reply; unrelated ids are ignored', async () => {
+    startV4();
+    const p = bridge.listTops();
+    const req = last('listTops');
+    expect(req.requestId).toBeTruthy();
+    sock().tell({ t: 'tops', requestId: 'other', items: [] });
+    sock().tell({ t: 'tops', requestId: req.requestId, items: [{ path: '/project1/ramp1', w: 100, h: 50 }] });
+    await expect(p).resolves.toEqual([{ path: '/project1/ramp1', w: 100, h: 50 }]);
+  });
+
+  it('listTops times out after 10 s and rejects when not connected', async () => {
+    startV4();
+    const p = bridge.listTops();
+    const caught = p.catch((e: Error) => e.message);
+    vi.advanceTimersByTime(10001);
+    expect(await caught).toMatch(/did not answer/);
+    sock().close();
+    await expect(bridge.listTops()).rejects.toThrow(/Not connected/);
+  });
+
+  it('importTop: importTop message, topReady, GET /top with token, client and requestId, then engine.importImage', async () => {
+    startV4();
+    const p = bridge.importTop('/project1/noise1');
+    const req = last('importTop');
+    expect(req).toMatchObject({ t: 'importTop', path: '/project1/noise1' });
+    expect(fm.calls.length).toBe(0); // nothing is fetched before topReady
+    sock().tell({ t: 'topReady', requestId: req.requestId, w: 8, h: 4 });
+    await flushP();
+    expect(fm.calls.map((c) => c.url)).toEqual([`http://td:9980/top?token=tok-123&client=c1&requestId=${req.requestId}`]);
+    fm.calls[0].settle(okBytes(topFrame(8, 4, 77)));
+    const id = await p;
+    expect(engine.imported).toEqual([{ w: 8, h: 4, name: 'noise1', len: 8 * 4 * 4 }]);
+    expect(engine.layers().find((l) => l.id === id)?.name).toBe('noise1');
+  });
+
+  it('a TOP larger than the document is passed through at its own size (the engine scales it)', async () => {
+    startV4();
+    const p = bridge.importTop('/big');
+    sock().tell({ t: 'topReady', requestId: last('importTop').requestId, w: 200, h: 100 });
+    await flushP();
+    fm.calls[0].settle(okBytes(topFrame(200, 100, 1)));
+    await p;
+    expect(engine.imported[0]).toMatchObject({ w: 200, h: 100 });
+  });
+
+  it('topError rejects, raises a notice and fetches nothing', async () => {
+    startV4();
+    const p = bridge.importTop('/nope');
+    const caught = p.catch((e: Error) => e.message);
+    sock().tell({ t: 'topError', requestId: last('importTop').requestId, msg: 'not a TOP' });
+    expect(await caught).toBe('not a TOP');
+    expect(status.notices).toContain('not a TOP');
+    expect(fm.calls.length).toBe(0);
+    expect(engine.imported.length).toBe(0);
+  });
+
+  it('retries a failed /top once, then reports; a 404 (expired) is final and a 403 is a token error', async () => {
+    startV4();
+    let p = bridge.importTop('/a');
+    let caught = p.catch((e: Error) => e.message);
+    sock().tell({ t: 'topReady', requestId: last('importTop').requestId, w: 2, h: 2 });
+    await flushP();
+    fm.calls[0].settle(new Response(null, { status: 500 }));
+    await flushP();
+    vi.advanceTimersByTime(600);
+    await flushP();
+    expect(fm.calls.length).toBe(2);
+    fm.calls[1].settle(okBytes(topFrame(2, 2, 3)));
+    await p;
+    expect(engine.imported.length).toBe(1);
+
+    p = bridge.importTop('/b');
+    caught = p.catch((e: Error) => e.message);
+    sock().tell({ t: 'topReady', requestId: last('importTop').requestId, w: 2, h: 2 });
+    await flushP();
+    fm.calls[2].settle(new Response(null, { status: 404 }));
+    expect(await caught).toMatch(/expired/);
+    expect(fm.calls.length).toBe(3);
+  });
+
+  it('a /top fetch that hangs is aborted after 10 s', async () => {
+    startV4();
+    const p = bridge.importTop('/a');
+    const caught = p.catch((e: Error) => e.message);
+    sock().tell({ t: 'topReady', requestId: last('importTop').requestId, w: 2, h: 2 });
+    await flushP();
+    expect(fm.calls[0].signal?.aborted).toBe(false);
+    vi.advanceTimersByTime(10001);
+    expect(fm.calls[0].signal?.aborted).toBe(true);
+    await flushP();
+    vi.advanceTimersByTime(600);
+    await flushP();
+    vi.advanceTimersByTime(10001);
+    await flushP();
+    expect(await caught).toBeTruthy();
+    expect(engine.imported.length).toBe(0);
+  });
+
+  it('importTop waits at most 30 s for topReady and a disconnect rejects pending requests', async () => {
+    startV4();
+    const a = bridge.importTop('/slow').catch((e: Error) => e.message);
+    vi.advanceTimersByTime(30001);
+    expect(await a).toMatch(/did not answer/);
+    const b = bridge.listTops().catch((e: Error) => e.message);
+    sock().close();
+    expect(await b).toMatch(/Disconnected/);
+  });
+
+  it('the imported layer reaches TD like any new pixel layer (doc + SURFACE)', async () => {
+    startV4();
+    vi.advanceTimersByTime(100);
+    const before = sock().sent.length;
+    const p = bridge.importTop('/p/x');
+    sock().tell({ t: 'topReady', requestId: last('importTop').requestId, w: 4, h: 4 });
+    await flushP();
+    fm.calls[0].settle(okBytes(topFrame(4, 4, 9)));
+    const id = await p;
+    vi.advanceTimersByTime(100);
+    const docs = sock().json().filter((m) => m.t === 'doc');
+    expect(sock().sent.length).toBeGreaterThan(before);
+    expect((docs[docs.length - 1] as Extract<WebMessage, { t: 'doc' }>).layers.map((l) => l.id)).toContain(id);
+  });
+});
+
+describe('tdBridge v4 review fixes', () => {
+  const textLayer = (over: Partial<LayerSpec> = {}) => spec({
+    id: 't1', kind: 'text', slot: 3, rasterize: true,
+    text: { text: 'Hi', font: 'Arial', size: 20, color: { r: 0, g: 0, b: 0, a: 255 }, align: 'left', bold: false, italic: false, lineHeight: 1.2, x: 0, y: 0, boxWidth: null }, ...over,
+  });
+  const loadLayers = [spec({ id: 'base', kind: 'base' }), spec({ id: 'p1', slot: 1 }), textLayer()];
+
+  it('a load does not fetch /surface for rasterized text/shape slots; after a COMPLETE load their render is pushed as full tiles', async () => {
+    start(64, 48);
+    connectActive({ hasDocument: true, rev: 7 });
+    sock().tell(docState(7, loadLayers));
+    await flushP();
+    expect(fm!.calls.map((c) => new URL(c.url).searchParams.get('slot'))).toEqual(['1']);
+    expect(sock().frames()).toHaveLength(0);
+    fm!.calls[0].settle(okBytes(dump(1, 64, 48, 9)));
+    await flushP();
+    vi.advanceTimersByTime(200);
+    const frames = sock().frames();
+    expect(frames.map((f) => f.slot)).toEqual([3]); // derived pixels only; the loaded pixel slot is not echoed
+    expect(frames[0]).toMatchObject({ w: 64, h: 48, x: 0, y: 0, frameEnd: true });
+  });
+
+  it('a 404 for the pixel slot still completes the load and pushes the rasterized layer', async () => {
+    start(64, 48);
+    connectActive({ hasDocument: true, rev: 7 });
+    sock().tell(docState(7, loadLayers));
+    await flushP();
+    fm!.calls[0].settle(new Response(null, { status: 404 }));
+    await flushP();
+    vi.advanceTimersByTime(200);
+    expect(sock().frames().map((f) => f.slot)).toEqual([3]);
+  });
+
+  it('an INCOMPLETE load (surface keeps failing) pushes nothing', async () => {
+    start(64, 48);
+    connectActive({ hasDocument: true, rev: 7 });
+    sock().tell(docState(7, loadLayers));
+    await flushP();
+    fm!.calls[0].settle(new Response(null, { status: 500 }));
+    await flushP();
+    vi.advanceTimersByTime(600);
+    await flushP();
+    fm!.calls[1].settle(new Response(null, { status: 500 }));
+    await flushP();
+    vi.advanceTimersByTime(300);
+    expect(sock().frames()).toHaveLength(0);
+  });
+
+  it('listTops rejects immediately on a topError for its request id', async () => {
+    start(64, 48);
+    connectActive();
+    const p = bridge.listTops().catch((e: Error) => e.message);
+    const req = sock().json().filter((m) => m.t === 'listTops').pop() as Extract<WebMessage, { t: 'listTops' }>;
+    sock().tell({ t: 'topError', requestId: req.requestId, msg: 'listing failed' });
+    expect(await p).toBe('listing failed');
+  });
+
+  it('importTop drops its result when the document was reloaded/resized meanwhile', async () => {
+    start(64, 48);
+    connectActive();
+    const p = bridge.importTop('/a').catch((e: Error) => e.message);
+    const req = sock().json().filter((m) => m.t === 'importTop').pop() as Extract<WebMessage, { t: 'importTop' }>;
+    sock().tell({ t: 'topReady', requestId: req.requestId, w: 2, h: 2 });
+    await flushP();
+    sock().tell({ t: 'docSize', w: 32, h: 16, hasInput: false });
+    fm!.calls[0].settle(okBytes(encodeFrame({ type: FRAME_TOP, frameEnd: true, slot: 0, frameId: 1, docW: 2, docH: 2, x: 0, y: 0, w: 2, h: 2 }, new Uint8Array(16))));
+    expect(await p).toMatch(/document changed/);
+    expect(engine.imported).toHaveLength(0);
   });
 });

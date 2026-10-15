@@ -15,7 +15,7 @@ describe('layers', () => {
   it('starts with a locked base layer that is active', () => {
     e = newEngine(10, 10);
     expect(e.layers()).toEqual([
-      { id: 'base', name: 'TD Input', kind: 'base', visible: true, locked: true, opacity: 1, blend: 'normal', depth: 0, parentId: null, slot: null, mask: null, adjustment: null },
+      { id: 'base', name: 'TD Input', kind: 'base', visible: true, locked: true, opacity: 1, blend: 'normal', depth: 0, parentId: null, slot: null, mask: null, adjustment: null, text: null, shape: null, rasterize: false },
     ]);
     expect(e.activeLayerId()).toBe('base');
   });

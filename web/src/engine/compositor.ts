@@ -1,6 +1,7 @@
 import type { AdjustmentSpec, BlendMode, Rect } from './types';
 import { createSurface, releaseSurface, type Ctx2D, type Surface } from './surface';
-import type { Document, GroupLayer, Mask } from './model';
+import { isVector, specBounds, type Document, type GroupLayer, type Mask, type SurfaceLayer, type VectorLayer } from './model';
+import { drawShape, drawText } from './textShape';
 import { clipToSize, intersect, union } from './rect';
 import { adjustmentReach, isIdentity, pixRect, renderAdjusted } from './adjustments';
 
@@ -215,21 +216,41 @@ export class Compositor {
         this.blit(ctx, s.canvas, pixRect(s, r), r, l.opacity, l.blend);
       } else if (l.kind === 'adjustment') {
         if (!isIdentity(l.adjustment)) this.applyAdjustment(tgt, l.adjustment, l.opacity, l.mask && l.mask.enabled ? l.mask : null, r, depth);
+      } else if (isVector(l) && !l.surface) {
+        this.drawVector(tgt, l, r, depth);
       } else {
-        const vis = intersect(r, { x: l.x, y: l.y, w: l.surface.width, h: l.surface.height });
+        const pl = l as SurfaceLayer;
+        const vis = intersect(r, { x: pl.x, y: pl.y, w: pl.surface.width, h: pl.surface.height });
         if (!vis) continue;
-        const src: Rect = { x: vis.x - l.x, y: vis.y - l.y, w: vis.w, h: vis.h };
-        if (l.mask && l.mask.enabled) {
+        const src: Rect = { x: vis.x - pl.x, y: vis.y - pl.y, w: vis.w, h: vis.h };
+        if (pl.mask && pl.mask.enabled) {
           const s = this.scratch(tgt, depth, r);
           s.ctx.clearRect(vis.x, vis.y, vis.w, vis.h);
-          s.ctx.drawImage(l.surface.canvas as CanvasImageSource, src.x, src.y, src.w, src.h, vis.x, vis.y, vis.w, vis.h);
-          this.maskIn(s.ctx, l.mask, src, vis);
-          this.blit(ctx, s.canvas, pixRect(s, vis), vis, l.opacity, l.blend);
+          s.ctx.drawImage(pl.surface.canvas as CanvasImageSource, src.x, src.y, src.w, src.h, vis.x, vis.y, vis.w, vis.h);
+          this.maskIn(s.ctx, pl.mask, src, vis);
+          this.blit(ctx, s.canvas, pixRect(s, vis), vis, pl.opacity, pl.blend);
         } else {
-          this.blit(ctx, l.surface.canvas, src, vis, l.opacity, l.blend);
+          this.blit(ctx, pl.surface.canvas, src, vis, pl.opacity, pl.blend);
         }
       }
     }
+  }
+
+  /** A non-rasterized text / shape layer: rendered straight from its spec into a scratch window, then masked and blended. */
+  private drawVector(tgt: Target, l: VectorLayer, r: Rect, depth: number): void {
+    const vis = intersect(r, specBounds(l));
+    if (!vis) return;
+    const s = this.scratch(tgt, depth, r);
+    s.ctx.clearRect(vis.x, vis.y, vis.w, vis.h);
+    s.ctx.save();
+    s.ctx.beginPath();
+    s.ctx.rect(vis.x, vis.y, vis.w, vis.h);
+    s.ctx.clip();
+    if (l.kind === 'text') drawText(s.ctx, l.spec);
+    else drawShape(s.ctx, l.spec);
+    s.ctx.restore();
+    if (l.mask && l.mask.enabled) this.maskIn(s.ctx, l.mask, vis, vis);
+    this.blit(tgt.ctx, s.canvas, pixRect(s, vis), vis, l.opacity, l.blend);
   }
 
   /** dst = dst * mask, for the (document-space) region `dst` of ctx; mask pixels come from `src` of the mask surface. */

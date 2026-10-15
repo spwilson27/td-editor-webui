@@ -1,7 +1,7 @@
 import type { EditorEngine, Rect } from '../engine/types';
 import {
-  FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_VIEW, MAX_BAND_PAYLOAD, PROTOCOL_VERSION,
-  decodeFrame, decodeTdMessage, encodeBands, encodeMessage, isStale, type TdMessage, type ViewMode, type ViewRect, type WebMessage,
+  FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, FRAME_VIEW, MAX_BAND_PAYLOAD, PROTOCOL_VERSION,
+  decodeFrame, decodeTdMessage, encodeBands, encodeMessage, isStale, type TdMessage, type TopItem, type ViewMode, type ViewRect, type WebMessage,
 } from './codec';
 
 export type Connection = 'linked' | 'standalone' | 'reconnecting';
@@ -22,6 +22,8 @@ export interface BridgeStatus {
   setViewLatency?(s: LatencyStats): void;
   /** An image of TD's output for the external TD view: straight RGBA, document sized; `ageMs` = notice to display. */
   setViewFrame?(w: number, h: number, rgba: Uint8ClampedArray, ageMs: number): void;
+  /** v4: TD's font family list (sent after hello). */
+  setFonts?(families: string[]): void;
 }
 
 export interface ViewState { mode: ViewMode; zoom: number; panX: number; panY: number; rect: ViewRect }
@@ -31,6 +33,10 @@ export interface Bridge {
   dispose(): void;
   /** Report viewport state; sent to TD at most once per animation frame. */
   setView(v: ViewState): void;
+  /** v4: the importable TOPs of the TD project. Rejects when not linked, on a timeout or when TD answers with an error. */
+  listTops(): Promise<TopItem[]>;
+  /** v4: snapshot a TOP once and add it as a pixel layer (engine.importImage). Resolves with the new layer id. */
+  importTop(path: string): Promise<string>;
 }
 
 export interface TdBridgeOptions {
@@ -51,6 +57,7 @@ const FETCH_TIMEOUT_MS = 10000, FETCH_RETRY_MS = 500, REQUEST_BASE_MS = 2000;
 const BACKOFF_MIN = 500, BACKOFF_MAX = 5000, DEFAULT_FPS = 30;
 const LOAD_RETRY_MIN = 2000, LOAD_RETRY_MAX = 10000, NO_DOC_FALLBACK_MS = 10000;
 const LATENCY_WINDOW = 60, SENT_KEEP = 512;
+export const LIST_TOPS_TIMEOUT_MS = 10000, IMPORT_TOP_TIMEOUT_MS = 30000;
 
 export function resolveWsUrl(search: string, loc: { protocol: string; host: string }): string {
   const override = new URLSearchParams(search).get('ws');
@@ -143,6 +150,16 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   // view
   let viewState: ViewState | null = null, viewQueued = false, viewDirty = false;
   let viewFetching = false, viewRefetch = false, viewNotice: { frameId: number; applied: number; at: number } | null = null;
+  // v4 TOP import
+  let requestSeq = 0;
+  const pendingTops = new Map<string, { resolve: (items: TopItem[]) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  const pendingImports = new Map<string, { resolve: (w: number, h: number) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  const failPending = (msg: string) => {
+    for (const p of pendingTops.values()) { clearTimeout(p.timer); p.reject(new Error(msg)); }
+    for (const p of pendingImports.values()) { clearTimeout(p.timer); p.reject(new Error(msg)); }
+    pendingTops.clear();
+    pendingImports.clear();
+  };
   // latency
   const sentAt = new Map<number, number>();
   const samples: number[] = [], viewSamples: number[] = [];
@@ -308,11 +325,15 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     unsafe.clear();
     const sock = ws;
     let complete = false;
+    const derivedSlots: number[] = [];
     try {
       engine.loadDocument({ rev: m.rev, width: m.docW, height: m.docH, layers: m.layers });
       const slots: number[] = [];
       for (const l of m.layers) {
-        if (l.slot !== null && l.slot !== undefined) slots.push(l.slot);
+        // Rasterized text / shape pixels are derived data: the engine renders them from the spec on load and they are pushed afterwards.
+        const derived = (l.kind === 'text' || l.kind === 'shape') && l.rasterize === true;
+        if (derived && l.slot !== null && l.slot !== undefined) derivedSlots.push(l.slot);
+        else if (l.slot !== null && l.slot !== undefined) slots.push(l.slot);
         if (l.mask) slots.push(l.mask.slot);
       }
       let next = 0;
@@ -342,6 +363,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
           authoritative = true;
           tdRev = m.rev;
           endLoadState();
+          if (derivedSlots.length) markFull(derivedSlots.filter((x) => engine.surfaceSlots().includes(x)));
         } else if (loadPending && !disposed) {
           armLoadRetry(); // stay non-authoritative; ask TD again
           status.setNotice('Loading document from TouchDesigner… (retrying)');
@@ -445,7 +467,92 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         if (/token/i.test(m.msg)) rejectToken();
         else status.setNotice(m.msg);
         break;
+      case 'fonts':
+        status.setFonts?.(m.families);
+        break;
+      case 'tops': {
+        const p = pendingTops.get(m.requestId);
+        if (!p) break;
+        pendingTops.delete(m.requestId);
+        clearTimeout(p.timer);
+        p.resolve(m.items);
+        break;
+      }
+      case 'topReady': {
+        const p = pendingImports.get(m.requestId);
+        if (!p) break;
+        pendingImports.delete(m.requestId);
+        clearTimeout(p.timer);
+        p.resolve(m.w, m.h);
+        break;
+      }
+      case 'topError': {
+        const p = pendingImports.get(m.requestId);
+        status.setNotice(m.msg);
+        const lt = pendingTops.get(m.requestId);
+        if (lt) { pendingTops.delete(m.requestId); clearTimeout(lt.timer); lt.reject(new Error(m.msg)); }
+        if (!p) break;
+        pendingImports.delete(m.requestId);
+        clearTimeout(p.timer);
+        p.reject(new Error(m.msg));
+        break;
+      }
     }
+  }
+
+  function listTops(): Promise<TopItem[]> {
+    if (!isOpen() || !clientId) return Promise.reject(new Error('Not connected to TouchDesigner'));
+    const requestId = `t${++requestSeq}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { pendingTops.delete(requestId); reject(new Error('TouchDesigner did not answer')); }, LIST_TOPS_TIMEOUT_MS);
+      pendingTops.set(requestId, { resolve, reject, timer });
+      sendJson({ t: 'listTops', requestId });
+    });
+  }
+
+  async function importTop(path: string): Promise<string> {
+    if (!isOpen() || !clientId) throw new Error('Not connected to TouchDesigner');
+    const requestId = `i${++requestSeq}`;
+    const sock = ws, epoch = docEpoch;
+    await new Promise<{ w: number; h: number }>((resolve, reject) => {
+      const timer = setTimeout(() => { pendingImports.delete(requestId); reject(new Error('TouchDesigner did not answer')); }, IMPORT_TOP_TIMEOUT_MS);
+      pendingImports.set(requestId, { resolve: (w, h) => resolve({ w, h }), reject, timer });
+      sendJson({ t: 'importTop', requestId, path });
+    });
+    const frame = await fetchTop(requestId, sock);
+    if (disposed || epoch !== docEpoch) throw new Error('The document changed during the import');
+    const name = path.split('/').filter(Boolean).pop() ?? 'TOP';
+    return engine.importImage(frame.payload, frame.w, frame.h, name);
+  }
+
+  /** GET /top: same auth, abort and timeout rules as /surface; one retry. */
+  async function fetchTop(requestId: string, sock: WebSocket | null): Promise<{ w: number; h: number; payload: Uint8Array }> {
+    let lastErr = 'TOP fetch failed';
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const ctrl = new AbortController();
+      aborts.add(ctrl);
+      const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+      try {
+        const res = await doFetch(`${httpBase}/top?${query(`&requestId=${encodeURIComponent(requestId)}`)}`, { cache: 'no-store', signal: ctrl.signal });
+        if (res.status === 403) { rejectToken(); throw new Error(TOKEN_EXPIRED_MESSAGE); }
+        if (res.status === 404) throw new Error('The TOP snapshot expired');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const buf = await res.arrayBuffer();
+        if (disposed || ws !== sock) throw new Error('Disconnected from TouchDesigner');
+        const r = decodeFrame(buf);
+        if (!r.ok || r.frame.type !== FRAME_TOP) throw new Error('Invalid TOP image from TouchDesigner');
+        return { w: r.frame.w, h: r.frame.h, payload: r.frame.payload };
+      } catch (err) {
+        lastErr = err instanceof Error ? err.message : String(err);
+        if (rejected || disposed || ws !== sock || /expired|Invalid|Disconnected/.test(lastErr)) break;
+        if (attempt === 0) await new Promise<void>((resolve) => setTimeout(resolve, FETCH_RETRY_MS));
+      } finally {
+        clearTimeout(timeout);
+        aborts.delete(ctrl);
+      }
+    }
+    status.setNotice(`TOP import failed: ${lastErr}`);
+    throw new Error(lastErr);
   }
 
   function rejectToken() {
@@ -573,6 +680,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       endLoadState();
       docEpoch++;
       for (const c of aborts) c.abort();
+      failPending('Disconnected from TouchDesigner');
       viewFetching = viewRefetch = false;
       if (sendTimer) { clearTimeout(sendTimer); sendTimer = null; }
       status.setConnection('reconnecting');
@@ -601,8 +709,11 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         if (!disposed && viewDirty) sendView();
       });
     },
+    listTops,
+    importTop,
     dispose() {
       disposed = true;
+      failPending('Bridge closed');
       offEngine();
       stopLogs();
       if (sendTimer) clearTimeout(sendTimer);

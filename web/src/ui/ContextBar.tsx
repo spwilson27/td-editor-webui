@@ -1,6 +1,8 @@
 import type { ComponentChildren } from 'preact';
 import { store } from '../state/store';
-import { PAINT_TOOLS, BRUSHES, toolInfo } from '../state/tools';
+import type { RGBA, SelectionMode } from '../engine/types';
+import { toHex } from '../state/colour';
+import { PAINT_TOOLS, BRUSHES, SHAPE_KINDS, toolInfo } from '../state/tools';
 import { Icon, NOT_IN_VERSION } from './Icon';
 
 const BOX = 'padding:3px 6px;background:#1f1f1f;border:1px solid #474747;border-radius:4px;text-align:right';
@@ -46,19 +48,136 @@ function BrushOptions() {
   );
 }
 
-function SelectOptions() {
-  const modes = ['New', 'Add', 'Subtract', 'Intersect'];
+const SEG = 'display:flex;gap:2px;padding:2px;background:#1f1f1f;border:1px solid #474747;border-radius:5px';
+const segBtn = (on: boolean) => `height:22px;padding:0 10px;border-radius:3px;${on ? 'background:#3d6fb4;color:#ffffff' : 'color:#b5b5b5'}`;
+const hex = (c: RGBA) => toHex(c);
+
+function Check({ id, label, checked, onChange, low }: { id: string; label: string; checked: boolean; onChange: (v: boolean) => void; low?: boolean }) {
+  return (
+    <label class={low ? 'lowprio' : undefined} for={id} style="display:flex;align-items:center;gap:6px;color:#e3e3e3">
+      <input id={id} type="checkbox" checked={checked} style={CHK} onChange={(e) => onChange((e.target as HTMLInputElement).checked)} />{label}
+    </label>
+  );
+}
+
+function Swatch({ label, value, onChange, id }: { label: string; value: string; onChange: (hex: string) => void; id: string }) {
+  return (
+    <input id={id} type="color" aria-label={label} title={label} value={value}
+      onInput={(e) => onChange((e.target as HTMLInputElement).value)}
+      style="width:26px;height:22px;padding:0;border:1px solid #474747;border-radius:4px;background:#1f1f1f" />
+  );
+}
+
+function Toggle({ label, on, onClick, d, data }: { label: string; on: boolean; onClick: () => void; d?: string; data?: string }) {
+  return (
+    <button aria-label={label} title={label} aria-pressed={on} data-opt={data} onClick={onClick}
+      style={`${segBtn(on)};display:inline-flex;align-items:center;justify-content:center;min-width:24px;padding:0 6px`}>
+      {d ? <Icon d={d} size={14} sw={1.8} /> : label}
+    </button>
+  );
+}
+
+const MODES_SEL: { id: SelectionMode; label: string }[] = [{ id: 'new', label: 'New' }, { id: 'add', label: 'Add' }, { id: 'subtract', label: 'Subtract' }, { id: 'intersect', label: 'Intersect' }];
+
+function SelectOptions({ wand }: { wand?: boolean }) {
+  const o = store.selOpts.value;
   return (
     <div class="opts">
-      <div role="group" aria-label="Selection mode" style="display:flex;gap:2px;padding:2px;background:#1f1f1f;border:1px solid #474747;border-radius:5px">
-        {modes.map((m, i) => (
-          <button key={m} aria-pressed={i === 0} aria-disabled={i !== 0} title={i === 0 ? undefined : NOT_IN_VERSION}
-            style={`height:22px;padding:0 10px;border-radius:3px;${i === 0 ? 'background:#3d6fb4;color:#ffffff' : 'color:#8f8f8f'}`}>{m}</button>
+      <div role="group" aria-label="Selection mode" style={SEG}>
+        {MODES_SEL.map((m) => (
+          <button key={m.id} data-sel-mode={m.id} aria-pressed={o.mode === m.id} onClick={() => store.setSelOpts({ mode: m.id })} style={segBtn(o.mode === m.id)}>{m.label}</button>
         ))}
       </div>
-      <div style="display:flex;align-items:center;gap:8px"><label style="color:#a8a8a8">Feather</label><span style={`min-width:40px;${BOX}`}>0 px</span></div>
-      <Disabled><input type="checkbox" checked disabled style={CHK} />Antialias</Disabled>
-      <button aria-disabled="true" title={NOT_IN_VERSION} style="height:26px;padding:0 12px;border:1px solid #474747;border-radius:5px;background:#262626;color:#8f8f8f">Refine…</button>
+      <span class="lowprio" data-sel-hint style="color:#8f8f8f">Shift add · Alt subtract · Shift+Alt intersect</span>
+      <RangeRow label="Feather" id="sf" min={0} max={100} value={o.feather} unit=" px" w={80} span={44} onInput={(v) => store.setSelOpts({ feather: v })} />
+      <Check id="sa" label="Antialias" checked={o.antialias} onChange={(v) => store.setSelOpts({ antialias: v })} />
+      {wand && <>
+        <RangeRow label="Tolerance" id="wt" min={0} max={255} value={o.wandTolerance} unit="" w={110} span={36} onInput={(v) => store.setSelOpts({ wandTolerance: v })} />
+        <Check id="wc" label="Contiguous" checked={o.wandContiguous} onChange={(v) => store.setSelOpts({ wandContiguous: v })} />
+        <Check id="wa" label="Sample all layers" checked={o.wandSampleAll} onChange={(v) => store.setSelOpts({ wandSampleAll: v })} low />
+      </>}
+    </div>
+  );
+}
+
+const ALIGN_D = {
+  left: 'M4 6h16M4 10h10M4 14h16M4 18h10',
+  center: 'M4 6h16M7 10h10M4 14h16M7 18h10',
+  right: 'M4 6h16M10 10h10M4 14h16M10 18h10',
+};
+
+function TextOptions() {
+  store.docVersion.value;
+  const bound = store.boundText()?.text;
+  const o = store.textOpts.value;
+  const v = bound ?? { ...o, color: store.primaryRgba() };
+  const fonts = store.fonts.value.includes(v.font) ? store.fonts.value : [v.font, ...store.fonts.value];
+  return (
+    <div class="opts">
+      <select id="tf" aria-label="Font" value={v.font} style="max-width:150px" onChange={(e) => store.setTextOpt({ font: (e.target as HTMLSelectElement).value })}>
+        {fonts.map((f) => <option key={f} value={f} selected={f === v.font}>{f}</option>)}
+      </select>
+      <div style="display:flex;align-items:center;gap:6px">
+        <label for="ts" style="color:#a8a8a8">Size</label>
+        <input id="ts" type="number" min={1} max={1000} value={v.size} aria-label="Font size"
+          onChange={(e) => { const n = Math.round(Number((e.target as HTMLInputElement).value)); if (n >= 1) store.setTextOpt({ size: Math.min(1000, n) }); }}
+          style={`width:52px;${BOX}`} />
+      </div>
+      <div role="group" aria-label="Style" style={SEG}>
+        <Toggle label="Bold" data="bold" on={v.bold} onClick={() => store.setTextOpt({ bold: !v.bold })} />
+        <Toggle label="Italic" data="italic" on={v.italic} onClick={() => store.setTextOpt({ italic: !v.italic })} />
+      </div>
+      <div role="group" aria-label="Alignment" style={SEG}>
+        {(['left', 'center', 'right'] as const).map((a) => (
+          <Toggle key={a} label={`Align ${a}`} data={`align-${a}`} on={v.align === a} d={ALIGN_D[a]} onClick={() => store.setTextOpt({ align: a })} />
+        ))}
+      </div>
+      <RangeRow label="Line height" id="tl" min={80} max={300} value={Math.round(v.lineHeight * 100)} unit="%" w={80} span={44} onInput={(n) => store.setTextOpt({ lineHeight: n / 100 })} />
+      <div style="display:flex;align-items:center;gap:6px"><label for="tc" style="color:#a8a8a8">Colour</label>
+        <Swatch id="tc" label="Text colour" value={hex(v.color)} onChange={(h) => store.setTextColor(h)} /></div>
+    </div>
+  );
+}
+
+function ShapeOptions() {
+  store.docVersion.value;
+  const o = store.shapeOpts.value;
+  const bound = store.boundShape()?.shape;
+  // Bound layer values win; for a layer the switch to line has no fill.
+  let fillOn = o.fillOn, strokeOn = o.strokeOn, width = o.strokeWidth, radius = o.radius, sides = o.sides, inner = o.innerRatio, aS = o.arrowStart, aE = o.arrowEnd;
+  let fillC = hex(store.primaryRgba()), strokeC = hex(store.secondaryRgba());
+  if (bound) {
+    if (bound.type === 'line') { width = bound.stroke.width; aS = bound.arrowStart; aE = bound.arrowEnd; strokeC = hex(bound.stroke.color); }
+    else {
+      fillOn = bound.fill.enabled; strokeOn = bound.stroke.enabled; width = bound.stroke.width; fillC = hex(bound.fill.color); strokeC = hex(bound.stroke.color);
+      if (bound.type === 'rect') radius = bound.radius;
+      if (bound.type === 'polygon') { sides = bound.sides; inner = bound.innerRatio; }
+    }
+  }
+  const line = o.type === 'line';
+  return (
+    <div class="opts">
+      <div role="group" aria-label="Shape type" style={SEG}>
+        {SHAPE_KINDS.map((k) => <Toggle key={k.id} label={k.name} data={`shape-${k.id}`} on={o.type === k.id} d={k.d} onClick={() => store.setShapeOpt({ type: k.id })} />)}
+      </div>
+      {!line && <>
+        <Check id="shf" label="Fill" checked={fillOn} onChange={(v) => store.setShapeOpt({ fillOn: v })} />
+        <Swatch id="shfc" label="Fill colour" value={fillC} onChange={(h) => store.setShapeFill(h)} />
+        <Check id="shs" label="Stroke" checked={strokeOn} onChange={(v) => store.setShapeOpt({ strokeOn: v })} />
+      </>}
+      {line
+        ? <Swatch id="shsc" label="Line colour" value={bound?.type === 'line' ? hex(bound.stroke.color) : fillC} onChange={(h) => store.setLineColor(h)} />
+        : <Swatch id="shsc" label="Stroke colour" value={strokeC} onChange={(h) => store.setShapeStroke(h)} />}
+      {(line || strokeOn) && <RangeRow label="Width" id="shw" min={1} max={100} value={width} unit=" px" w={80} span={44} onInput={(v) => store.setShapeOpt({ strokeWidth: v })} />}
+      {o.type === 'rect' && <RangeRow label="Radius" id="shr" min={0} max={300} value={radius} unit=" px" w={80} span={44} onInput={(v) => store.setShapeOpt({ radius: v })} />}
+      {o.type === 'polygon' && <>
+        <RangeRow label="Sides" id="shn" min={3} max={64} value={sides} unit="" w={80} span={28} onInput={(v) => store.setShapeOpt({ sides: v })} />
+        <RangeRow label="Inner" id="shi" min={10} max={100} value={Math.round(inner * 100)} unit="%" w={80} span={40} onInput={(v) => store.setShapeOpt({ innerRatio: v / 100 })} />
+      </>}
+      {line && <>
+        <Check id="sha0" label="Start arrow" checked={aS} onChange={(v) => store.setShapeOpt({ arrowStart: v })} low />
+        <Check id="sha1" label="End arrow" checked={aE} onChange={(v) => store.setShapeOpt({ arrowEnd: v })} low />
+      </>}
     </div>
   );
 }
@@ -98,7 +217,10 @@ export function ContextBar() {
       </div>
       <div style="width:1px;height:22px;background:#474747" />
       {PAINT_TOOLS.has(id) ? <BrushOptions />
-        : id === 'marquee' ? <SelectOptions />
+        : id === 'marquee' || id === 'lasso' ? <SelectOptions />
+        : id === 'wand' ? <SelectOptions wand />
+        : id === 'text' ? <TextOptions />
+        : id === 'shape' ? <ShapeOptions />
         : id === 'fill' ? <FillOptions />
         : id === 'gradient' ? <span style="color:#a8a8a8">Linear · primary to secondary colour</span>
         : <Readout />}

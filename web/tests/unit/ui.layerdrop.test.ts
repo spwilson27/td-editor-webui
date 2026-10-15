@@ -3,7 +3,7 @@ import type { LayerInfo } from '../../src/engine/types';
 import { computeDrop, dropZone } from '../../src/state/layerDrop';
 
 const L = (id: string, kind: LayerInfo['kind'], parentId: string | null = null): LayerInfo => ({
-  id, name: id, kind, visible: true, locked: false, opacity: 1, blend: 'normal', depth: parentId ? 1 : 0, parentId, slot: null, mask: null, adjustment: null,
+  id, name: id, kind, visible: true, locked: false, opacity: 1, blend: 'normal', depth: parentId ? 1 : 0, parentId, slot: null, mask: null, adjustment: null, text: null, shape: null, rasterize: false,
 });
 // display order (top first): G { a, b }, c, base
 const layers = [L('G', 'group'), L('a', 'pixel', 'G'), L('b', 'pixel', 'G'), L('c', 'pixel'), L('base', 'base')];

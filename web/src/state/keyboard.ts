@@ -28,6 +28,11 @@ const toolKeys = new Map<string, ToolId[]>();
 for (const t of TOOLS) toolKeys.set(t.key.toLowerCase(), [...(toolKeys.get(t.key.toLowerCase()) || []), t.id]);
 
 export function onKeyDown(store: Store, e: KeyLike): void {
+  if (store.textEdit.peek()) { // forwarded TD keys arrive as normal key events: the inline text editor owns them
+    if (e.key === 'Escape') { store.commitText(); e.preventDefault(); }
+    return;
+  }
+  if (store.topDialog.peek()) return; // the import dialog owns the keyboard (it closes itself on Escape)
   if (isTyping(e.target) || store.loadingDoc.peek()) return; // locked while loading TD's document
   const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
   const mod = e.ctrlKey || e.metaKey;
@@ -37,6 +42,8 @@ export function onKeyDown(store: Store, e: KeyLike): void {
     if (key === 'z') { e.shiftKey ? store.redo() : store.undo(); }
     else if (key === 'y') store.redo();
     else if (key === 'd') store.deselect();
+    else if (key === 'a') store.selectAll();
+    else if (key === 'i' && e.shiftKey) store.invertSelection();
     else return;
     e.preventDefault();
     return;

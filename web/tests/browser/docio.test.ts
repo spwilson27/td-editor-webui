@@ -30,7 +30,7 @@ describe('docSpec', () => {
     expect(spec.layers.map((l) => l.parentId)).toEqual([null, null, null, g, g, null]);
     expect(spec.layers[0]).toEqual({
       id: 'base', kind: 'base', parentId: null, name: 'TD Input', visible: true, opacity: 1, blend: 'normal',
-      x: 0, y: 0, slot: null, mask: null, adjustment: null,
+      x: 0, y: 0, slot: null, mask: null, adjustment: null, text: null, shape: null, rasterize: false,
     });
     expect(spec.layers[1]).toMatchObject({ kind: 'pixel', name: 'A', slot: slotOf(e, a), mask: { slot: m, enabled: true }, adjustment: null });
     expect(spec.layers[2]).toMatchObject({ kind: 'group', slot: null, mask: null, adjustment: null });
@@ -368,9 +368,9 @@ describe('loadDocument', () => {
     const spec: DocSpec = {
       rev: 5, width: 12, height: 8,
       layers: [
-        { id: 'whatever', kind: 'base', parentId: null, name: 'In', visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot: null, mask: null, adjustment: null },
-        { id: 'L7', kind: 'pixel', parentId: null, name: 'P', visible: true, opacity: 3, blend: 'bogus' as never, x: 2.4, y: -1, slot: 40, mask: null, adjustment: null },
-        { id: 'A', kind: 'adjustment', parentId: null, name: 'Adj', visible: true, opacity: 1, blend: 'multiply', x: 0, y: 0, slot: null, mask: { slot: 41, enabled: false }, adjustment: { type: 'threshold', level: 5 } },
+        { id: 'whatever', kind: 'base', parentId: null, name: 'In', visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot: null, mask: null, adjustment: null, text: null, shape: null, rasterize: false },
+        { id: 'L7', kind: 'pixel', parentId: null, name: 'P', visible: true, opacity: 3, blend: 'bogus' as never, x: 2.4, y: -1, slot: 40, mask: null, adjustment: null, text: null, shape: null, rasterize: false },
+        { id: 'A', kind: 'adjustment', parentId: null, name: 'Adj', visible: true, opacity: 1, blend: 'multiply', x: 0, y: 0, slot: null, mask: { slot: 41, enabled: false }, adjustment: { type: 'threshold', level: 5 }, text: null, shape: null, rasterize: false },
       ],
     };
     e.loadDocument(spec);

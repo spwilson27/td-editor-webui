@@ -1,18 +1,19 @@
-// Pure encode/decode of docs/PROTOCOL.md (version 3). No sockets here.
+// Pure encode/decode of docs/PROTOCOL.md (version 4). No sockets here.
 import type { LayerSpec } from '../engine/types';
 
 export const MAGIC = [0x52, 0x45, 0x46, 0x31]; // "REF1"
 export const HEADER_BYTES = 24;
 export const MAX_BAND_PAYLOAD = 2 * 1024 * 1024;
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 export const FRAME_BASE = 1;
 export const FRAME_SURFACE = 3;
 export const FRAME_SURFACE_DUMP = 4;
 export const FRAME_VIEW = 5;
+export const FRAME_TOP = 6; // v4: TD → web, GET /top (a TOP snapshot; docW/docH = the TOP's own size)
 export const FLAG_FRAME_END = 1;
 
-export type FrameType = typeof FRAME_BASE | typeof FRAME_SURFACE | typeof FRAME_SURFACE_DUMP | typeof FRAME_VIEW;
-const VALID_TYPES: readonly number[] = [FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_VIEW];
+export type FrameType = typeof FRAME_BASE | typeof FRAME_SURFACE | typeof FRAME_SURFACE_DUMP | typeof FRAME_VIEW | typeof FRAME_TOP;
+const VALID_TYPES: readonly number[] = [FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_VIEW, FRAME_TOP];
 
 export interface FrameHeader {
   type: FrameType;
@@ -135,6 +136,8 @@ export type WebMessage =
   | { t: 'view'; mode: ViewMode; zoom: number; panX: number; panY: number; rect: ViewRect }
   | { t: 'takeover' }
   | { t: 'requestBase' }
+  | { t: 'listTops'; requestId: string }
+  | { t: 'importTop'; requestId: string; path: string }
   | { t: 'log'; level: LogLevel; msg: string };
 
 export type TdMessage =
@@ -145,7 +148,13 @@ export type TdMessage =
   | { t: 'applied'; frameId: number; tdFrame: number }
   | { t: 'docSize'; w: number; h: number; hasInput: boolean }
   | { t: 'active'; active: boolean }
-  | { t: 'error'; msg: string };
+  | { t: 'error'; msg: string }
+  | { t: 'fonts'; families: string[] }
+  | { t: 'tops'; requestId: string; items: TopItem[] }
+  | { t: 'topReady'; requestId: string; w: number; h: number }
+  | { t: 'topError'; requestId: string; msg: string };
+
+export interface TopItem { path: string; w: number; h: number }
 
 export function encodeMessage(m: WebMessage | TdMessage): string {
   return JSON.stringify(m);
@@ -201,6 +210,20 @@ export function decodeTdMessage(text: string): TdMessage | null {
       return isBool(o.active) ? { t: 'active', active: o.active } : null;
     case 'error':
       return isStr(o.msg) ? { t: 'error', msg: o.msg } : null;
+    case 'fonts':
+      return Array.isArray(o.families) ? { t: 'fonts', families: o.families.filter(isStr) } : null;
+    case 'tops': {
+      if (!isStr(o.requestId) || !Array.isArray(o.items)) return null;
+      const items: TopItem[] = [];
+      for (const it of o.items as Record<string, unknown>[]) {
+        if (it && typeof it === 'object' && isStr(it.path) && isNum(it.w) && isNum(it.h)) items.push({ path: it.path, w: it.w, h: it.h });
+      }
+      return { t: 'tops', requestId: o.requestId, items };
+    }
+    case 'topReady':
+      return isStr(o.requestId) && isSize(o.w) && isSize(o.h) ? { t: 'topReady', requestId: o.requestId, w: o.w, h: o.h } : null;
+    case 'topError':
+      return isStr(o.requestId) ? { t: 'topError', requestId: o.requestId, msg: isStr(o.msg) ? o.msg : 'TouchDesigner import failed' } : null;
     default:
       return null;
   }
@@ -229,6 +252,10 @@ export function decodeWebMessage(text: string): WebMessage | null {
       return { t: 'takeover' };
     case 'requestBase':
       return { t: 'requestBase' };
+    case 'listTops':
+      return isStr(o.requestId) ? { t: 'listTops', requestId: o.requestId } : null;
+    case 'importTop':
+      return isStr(o.requestId) && isStr(o.path) ? { t: 'importTop', requestId: o.requestId, path: o.path } : null;
     case 'log':
       return (o.level === 'info' || o.level === 'warn' || o.level === 'error') && isStr(o.msg) ? { t: 'log', level: o.level, msg: o.msg } : null;
     default:

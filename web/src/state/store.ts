@@ -1,8 +1,10 @@
 import { computed, effect, signal } from '@preact/signals';
-import type { AdjustmentSpec, AdjustmentType, BrushSettings, EditorEngine, RGBA, ToolId } from '../engine/types';
-import { NO_LATENCY, type LatencyStats } from '../bridge/tdBridge';
+import type { AdjustmentSpec, AdjustmentType, BrushSettings, EditorEngine, LayerInfo, RGBA, SelectionOptions, ToolId } from '../engine/types';
+import { NO_LATENCY, type Bridge, type LatencyStats } from '../bridge/tdBridge';
+import { decodeImage } from './importImage';
+import { DEFAULT_SHAPE_OPTIONS, DEFAULT_TEXT_OPTIONS, newTextSpec, type ShapeOptions, type TextOptions } from './specs';
 import { hsvToRgb, parseHex, rgbToHsl, rgbToHsv, toHex, type Hsv, type Rgb } from './colour';
-import { BRUSHES, RECENT_DEFAULT, toolInfo } from './tools';
+import { BRUSHES, FALLBACK_FONTS, RECENT_DEFAULT, toolInfo } from './tools';
 import { fitView, screenToDoc, zoomAbout, clampZoom, type View } from './view';
 
 export type Connection = 'linked' | 'standalone' | 'reconnecting';
@@ -13,6 +15,7 @@ export function createStore() {
   let engine: EditorEngine | null = null;
   let offEngine: (() => void) | null = null;
   let stopContextSync: (() => void) | null = null;
+  let stopSelSync: (() => void) | null = null;
   let thumbTimer: ReturnType<typeof setTimeout> | null = null;
   let noticeTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -26,6 +29,15 @@ export function createStore() {
   const brush = signal<BrushSettings>({ size: 64, opacity: 1, flow: 0.72, hardness: 0.4, spacing: 0.15 });
   const brushPreset = signal('round');
   const fillTolerance = signal(32);
+
+  // v3: selection / text / shape options, fonts, inline text editor, TOP import dialog
+  const selOpts = signal<SelectionOptions>({ mode: 'new', feather: 0, antialias: true, wandTolerance: 32, wandContiguous: true, wandSampleAll: false });
+  const textOpts = signal<TextOptions>(DEFAULT_TEXT_OPTIONS);
+  const shapeOpts = signal<ShapeOptions>(DEFAULT_SHAPE_OPTIONS);
+  const fonts = signal<string[]>(FALLBACK_FONTS);
+  const textEdit = signal<{ id: string; isNew: boolean; baseIndex?: number } | null>(null);
+  const topDialog = signal(false);
+  let bridgeApi: Pick<Bridge, 'listTops' | 'importTop'> | null = null;
 
   const colorTab = signal<'color' | 'swatches' | 'brushes'>('color');
   const layerTab = signal<'layers' | 'history' | 'adjust'>('layers');
@@ -77,6 +89,12 @@ export function createStore() {
 
   const store = {
     tool, hsv, primary, secondary, alpha, recent, customSwatches, brush, brushPreset, fillTolerance,
+    selOpts, textOpts, shapeOpts, fonts, textEdit, topDialog,
+    /** The bridge's TOP import API (null in standalone mode). */
+    get bridge() { return bridgeApi; },
+    set bridge(b: Pick<Bridge, 'listTops' | 'importTop'> | null) { bridgeApi = b; },
+    /** Set by the App: opens the Place Image file chooser. */
+    openPlace: null as (() => void) | null,
     colorTab, layerTab, viewMode, clientKind, viewRect, latency, viewLatency, viewAge, tdViewTick, adjDraft, loadingDoc,
     view, zoom, spaceHeld, docSize, docName, connection, active, notice, fatal,
     docVersion, historyVersion, selectionVersion, thumbTick,
@@ -106,7 +124,10 @@ export function createStore() {
             const id = e.activeLayerId();
             if (id !== lastActiveId) {
               lastActiveId = id;
-              const kind = e.layers().find((l) => l.id === id)?.kind;
+              const layer = e.layers().find((l) => l.id === id);
+              const kind = layer?.kind;
+              if (layer) store.syncOptionsFrom(layer);
+              if (textEdit.peek() && textEdit.peek()!.id !== id) store.commitText();
               if (kind === 'adjustment') layerTab.value = 'adjust';
               else if (layerTab.peek() === 'adjust') layerTab.value = 'layers';
             }
@@ -129,6 +150,7 @@ export function createStore() {
         }
       });
       e.setTool(tool.value);
+      e.setShapeTool(shapeOpts.peek().type);
       e.setPreviewEnabled(viewMode.peek() === 'local');
       lastActiveId = e.activeLayerId();
       stopContextSync = effect(() => {
@@ -139,6 +161,7 @@ export function createStore() {
           fillTolerance: fillTolerance.value,
         });
       });
+      stopSelSync = effect(() => { e.setSelectionOptions(selOpts.value); });
       docVersion.value++;
       store.fit();
     },
@@ -146,6 +169,9 @@ export function createStore() {
     detach() {
       if (offEngine) offEngine();
       if (stopContextSync) stopContextSync();
+      if (stopSelSync) stopSelSync();
+      stopSelSync = null;
+      textEdit.value = null;
       if (thumbTimer) clearTimeout(thumbTimer);
       offEngine = stopContextSync = thumbTimer = null;
       engine = null;
@@ -154,8 +180,10 @@ export function createStore() {
     // Tools
     setTool(id: ToolId) {
       if (!toolInfo(id).enabled) return;
+      if (id !== 'text') store.commitText();
       tool.value = id;
       engine?.setTool(id);
+      if (id === 'shape') engine?.setShapeTool(shapeOpts.peek().type);
     },
 
     // Colour
@@ -270,7 +298,7 @@ export function createStore() {
     },
     canAddMask() {
       const l = store.activeLayer();
-      return !!l && (l.kind === 'pixel' || l.kind === 'adjustment') && !l.mask;
+      return !!l && (l.kind === 'pixel' || l.kind === 'adjustment' || l.kind === 'text' || l.kind === 'shape') && !l.mask;
     },
     addMask() {
       const l = store.activeLayer();
@@ -302,7 +330,174 @@ export function createStore() {
     },
     undo: () => engine?.undo(),
     redo: () => engine?.redo(),
-    deselect: () => engine?.setSelection(null),
+    deselect: () => engine?.deselect(),
+    selectAll: () => engine?.selectAll(),
+    invertSelection: () => engine?.invertSelection(),
+    canMaskFromSelection() {
+      const l = engine ? store.activeLayer() : undefined;
+      return !!l && !!engine?.selection() && (l.kind === 'pixel' || l.kind === 'adjustment' || l.kind === 'text' || l.kind === 'shape');
+    },
+    maskFromSelection() {
+      const l = store.activeLayer();
+      if (l && store.canMaskFromSelection()) store.engine.maskFromSelection(l.id);
+    },
+
+    // v3: selection options, text / shape options and editing
+    setSelOpts(p: Partial<SelectionOptions>) { selOpts.value = { ...selOpts.peek(), ...p }; },
+    setFonts(families: string[]) {
+      if (!families.length) return;
+      fonts.value = families;
+      const cur = textOpts.peek().font;
+      if (!families.includes(cur)) {
+        const pick = ['Arial', 'Helvetica'].find((f) => families.includes(f)) ?? families[0];
+        textOpts.value = { ...textOpts.peek(), font: pick };
+      }
+    },
+    rgbaOf: (hex: string, a = 100) => toRgba(hex, a),
+    primaryRgba: () => toRgba(primary.peek(), alpha.peek()),
+    secondaryRgba: () => toRgba(secondary.peek(), 100),
+    /** The active layer when it is a text layer (the context bar edits it). */
+    boundText(): LayerInfo | undefined {
+      const l = engine ? store.activeLayer() : undefined;
+      return l?.kind === 'text' && l.text ? l : undefined;
+    },
+    /** The active layer when it is a shape layer of the shape type currently chosen (the context bar edits it). */
+    boundShape(): LayerInfo | undefined {
+      const l = engine ? store.activeLayer() : undefined;
+      return l?.kind === 'shape' && l.shape && l.shape.type === shapeOpts.peek().type ? l : undefined;
+    },
+    /** Selecting a text / shape layer loads its settings into the tool options so new layers inherit them. */
+    syncOptionsFrom(l: LayerInfo) {
+      if (l.kind === 'text' && l.text) {
+        const t = l.text;
+        textOpts.value = { font: t.font, size: t.size, bold: t.bold, italic: t.italic, align: t.align, lineHeight: t.lineHeight };
+      } else if (l.kind === 'shape' && l.shape) {
+        const sp = l.shape, o = shapeOpts.peek();
+        const n: ShapeOptions = { ...o, type: sp.type };
+        if (sp.type === 'line') { n.strokeWidth = sp.stroke.width; n.arrowStart = sp.arrowStart; n.arrowEnd = sp.arrowEnd; }
+        else {
+          n.fillOn = sp.fill.enabled; n.strokeOn = sp.stroke.enabled; n.strokeWidth = sp.stroke.width;
+          if (sp.type === 'rect') n.radius = sp.radius;
+          if (sp.type === 'polygon') { n.sides = sp.sides; n.innerRatio = sp.innerRatio; }
+        }
+        shapeOpts.value = n;
+        engine?.setShapeTool(n.type);
+      }
+    },
+    setTextOpt(p: Partial<TextOptions>) {
+      textOpts.value = { ...textOpts.peek(), ...p };
+      const l = store.boundText();
+      if (l) engine!.setText(l.id, { ...l.text!, ...p });
+    },
+    setTextColor(hex: string) {
+      store.setPrimaryHex(hex, false);
+      const l = store.boundText();
+      if (l) engine!.setText(l.id, { ...l.text!, color: toRgba(hex, alpha.peek()) });
+    },
+    setShapeOpt(p: Partial<ShapeOptions>) {
+      const prev = shapeOpts.peek();
+      const l = p.type && p.type !== prev.type ? undefined : store.boundShape();
+      shapeOpts.value = { ...prev, ...p };
+      if (p.type && p.type !== prev.type) { engine?.setShapeTool(p.type); return; }
+      if (!l) return;
+      const sp = l.shape!;
+      const patch = (fill: boolean) => ({
+        ...(fill && 'fill' in sp && p.fillOn !== undefined ? { fill: { ...sp.fill, enabled: p.fillOn } } : {}),
+      });
+      let next = sp;
+      if (sp.type === 'line') {
+        next = { ...sp, stroke: { ...sp.stroke, width: p.strokeWidth ?? sp.stroke.width }, arrowStart: p.arrowStart ?? sp.arrowStart, arrowEnd: p.arrowEnd ?? sp.arrowEnd };
+      } else {
+        next = { ...sp, ...patch(true), stroke: { ...sp.stroke, enabled: p.strokeOn ?? sp.stroke.enabled, width: p.strokeWidth ?? sp.stroke.width } } as typeof sp;
+        if (sp.type === 'rect' && p.radius !== undefined) next = { ...(next as typeof sp), radius: p.radius } as typeof sp;
+        if (sp.type === 'polygon') next = { ...(next as typeof sp), sides: p.sides ?? sp.sides, innerRatio: p.innerRatio ?? sp.innerRatio } as typeof sp;
+      }
+      engine!.setShape(l.id, next);
+    },
+    setShapeFill(hex: string) {
+      store.setPrimaryHex(hex, false);
+      const l = store.boundShape();
+      if (l && l.shape && l.shape.type !== 'line') engine!.setShape(l.id, { ...l.shape, fill: { ...l.shape.fill, color: toRgba(hex, alpha.peek()) } });
+    },
+    /** A line has a single colour, the primary. */
+    setLineColor(hex: string) {
+      store.setPrimaryHex(hex, false);
+      const l = store.boundShape();
+      if (l?.shape?.type === 'line') engine!.setShape(l.id, { ...l.shape, stroke: { ...l.shape.stroke, color: toRgba(hex, alpha.peek()) } });
+    },
+    setShapeStroke(hex: string) {
+      secondary.value = hex;
+      const l = store.boundShape();
+      if (l && l.shape) engine!.setShape(l.id, { ...l.shape, stroke: { ...l.shape.stroke, color: toRgba(hex, 100) } } as typeof l.shape);
+    },
+    setRasterize(id: string, on: boolean) { engine?.setRasterize(id, on); },
+    flattenLayer(id: string) { engine?.flattenLayer(id); },
+
+    /** Text tool click: edit the text layer under the point, else add a new one there, and open the inline editor. */
+    beginText(x: number, y: number) {
+      const e = store.engine;
+      store.commitText();
+      const hit = e.textLayerAt(x, y);
+      if (hit) {
+        e.setActiveLayer(hit);
+        textEdit.value = { id: hit, isNew: false };
+        return hit;
+      }
+      const baseIndex = e.history().index;
+      const id = e.addTextLayer(newTextSpec(textOpts.peek(), toRgba(primary.peek(), alpha.peek()), x, y));
+      textEdit.value = { id, isNew: true, baseIndex };
+      return id;
+    },
+    /** Live text edits from the inline editor. */
+    updateEditedText(text: string) {
+      const ed = textEdit.peek();
+      if (!ed || !engine) return;
+      const l = engine.layers().find((x) => x.id === ed.id);
+      if (l?.text && l.text.text !== text) engine.setText(ed.id, { ...l.text, text });
+    },
+    /** Esc / click-away: close the editor; a new text layer left empty is removed. */
+    commitText() {
+      const ed = textEdit.peek();
+      if (!ed) return;
+      textEdit.value = null;
+      if (!engine || !ed.isNew) return;
+      const l = engine.layers().find((x) => x.id === ed.id);
+      if (l && l.text && l.text.text.trim() === '') {
+        // Only the add happened: undo it so the abandoned click leaves no new history entry (the redo tail is the add).
+        if (ed.baseIndex !== undefined && engine.history().index === ed.baseIndex + 1) engine.undo();
+        else engine.deleteLayer(ed.id);
+      }
+    },
+
+    // v3 import
+    /** Decode an image file / clipboard blob and add it as a pixel layer. */
+    async importBlob(blob: Blob, name: string): Promise<string | null> {
+      if (!engine) return null;
+      try {
+        const img = await decodeImage(blob);
+        return store.engine.importImage(img.rgba, img.w, img.h, name.replace(/\.[a-z0-9]+$/i, '') || 'Image');
+      } catch {
+        setNotice(`Could not read "${name}" as an image`);
+        return null;
+      }
+    },
+    async importFiles(files: Iterable<File>): Promise<void> {
+      for (const f of files) if (f.type.startsWith('image/')) await store.importBlob(f, f.name || 'Image');
+    },
+    placeImage() { store.openPlace?.(); },
+    /** Edit > Paste: reads image items from the async clipboard (Ctrl+V uses the paste event instead). */
+    async pasteFromClipboard() {
+      try {
+        for (const item of await navigator.clipboard.read()) {
+          const type = item.types.find((t) => t.startsWith('image/'));
+          if (type) { await store.importBlob(await item.getType(type), 'Pasted image'); return; }
+        }
+        setNotice('No image on the clipboard');
+      } catch {
+        setNotice('Press Ctrl+V to paste an image');
+      }
+    },
+
 
     /** A forwarded key press may never send its keyup; a held Space repeats, so silence for >1 s means it is stuck. */
     releaseStaleSpace(now = performance.now()) {

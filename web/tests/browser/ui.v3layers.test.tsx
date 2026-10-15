@@ -1,0 +1,111 @@
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { completeShapeSpec, completeTextSpec } from '../../src/state/specs';
+import { store } from '../../src/state/store';
+import { LayersPanel } from '../../src/ui/LayersPanel';
+import { TopBar } from '../../src/ui/TopBar';
+import { App } from '../../src/ui/App';
+import type { FakeEngine } from './fakeEngine';
+import { freshEngine, mount, q, settle, unmount } from './uiHelpers';
+
+let engine: FakeEngine;
+beforeEach(() => { engine = freshEngine(64, 48); store.layerTab.value = 'layers'; });
+afterEach(unmount);
+
+const openMenu = async (label: string) => {
+  [...document.querySelectorAll<HTMLElement>('.menu')].find((b) => b.textContent === label)!.click();
+  await settle();
+};
+const item = (name: string) => [...document.querySelectorAll<HTMLElement>('[role=menuitem]')].find((b) => b.textContent!.includes(name))!;
+
+describe('layers panel: text and shape layers', () => {
+  beforeEach(async () => { await mount(<LayersPanel />, 'width:300px;height:500px;display:flex;flex-direction:column'); });
+
+  it('rows show an icon and the name; pixel layers still draw thumbnails', async () => {
+    engine.addPixelLayer('Paint');
+    const t = engine.addTextLayer(completeTextSpec({ text: 'Title' }));
+    const s = engine.addShapeLayer(completeShapeSpec({ type: 'ellipse' }));
+    await settle();
+    expect(q(`[data-layer="${t}"] [data-kind-icon=text]`)).toBeTruthy();
+    expect(q(`[data-layer="${s}"] [data-kind-icon=shape]`)).toBeTruthy();
+    expect(q(`[data-layer="${t}"] [data-name]`).textContent).toBe('Title');
+    expect(q(`[data-layer="${s}"] [data-name]`).textContent).toBe('ellipse');
+    expect(document.querySelectorAll('[data-layer] canvas').length).toBe(2); // Paint + TD Input
+    expect(engine.calls).not.toContain(`thumb:${t}`);
+  });
+
+  it('the layer properties strip appears for text / shape only and its Rasterize checkbox drives engine.setRasterize', async () => {
+    expect(document.querySelector('[data-layer-props]')).toBeNull();
+    const t = engine.addTextLayer(completeTextSpec({ text: 'T' }));
+    await settle();
+    const box = q<HTMLInputElement>('[data-rasterize]');
+    expect(box.checked).toBe(false);
+    expect(q('[data-layer-props]').textContent).toContain('TouchDesigner');
+    box.click();
+    await settle();
+    expect(engine.calls).toContain(`rasterize:${t}:true`);
+    expect(q<HTMLInputElement>('[data-rasterize]').checked).toBe(true);
+    expect(engine.layers().find((l) => l.id === t)!.slot).not.toBeNull();
+    q<HTMLInputElement>('[data-rasterize]').click();
+    await settle();
+    expect(engine.calls).toContain(`rasterize:${t}:false`);
+    engine.addPixelLayer('Px');
+    await settle();
+    expect(document.querySelector('[data-layer-props]')).toBeNull();
+  });
+
+  it('Flatten in the strip flattens the layer into a pixel layer', async () => {
+    const s = engine.addShapeLayer(completeShapeSpec({ type: 'rect' }));
+    await settle();
+    q('[data-flatten]').click();
+    await settle();
+    expect(engine.calls).toContain(`flattenLayer:${s}`);
+    expect(engine.layers().find((l) => l.id === s)!.kind).toBe('pixel');
+    expect(document.querySelector('[data-layer-props]')).toBeNull();
+  });
+
+  it('text and shape layers can take a mask; the Add mask button works on them', async () => {
+    const t = engine.addTextLayer(completeTextSpec());
+    await settle();
+    expect(store.canAddMask()).toBe(true);
+    q('[aria-label="Add mask"]').click();
+    await settle();
+    expect(engine.calls).toContain(`addMask:${t}`);
+  });
+});
+
+describe('Layer menu', () => {
+  beforeEach(async () => { await mount(<TopBar />, 'width:1200px'); });
+
+  it('Flatten Layer and Rasterize are enabled for text / shape layers only', async () => {
+    await openMenu('Layer');
+    expect(item('Flatten Layer').getAttribute('aria-disabled')).toBe('true');
+    expect(item('Rasterize').getAttribute('aria-disabled')).toBe('true');
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    await settle();
+    const t = engine.addTextLayer(completeTextSpec());
+    await settle();
+    await openMenu('Layer');
+    expect(item('Rasterize').getAttribute('aria-disabled')).toBe('false');
+    expect(item('Rasterize').getAttribute('aria-checked')).toBe('false');
+    item('Rasterize').click();
+    await settle();
+    expect(engine.calls).toContain(`rasterize:${t}:true`);
+    await openMenu('Layer');
+    expect(item('Rasterize').getAttribute('aria-checked')).toBe('true');
+    expect(item('Rasterize').textContent).toContain('✓');
+    item('Flatten Layer').click();
+    await settle();
+    expect(engine.calls).toContain(`flattenLayer:${t}`);
+    expect(engine.layers()[0].kind).toBe('pixel');
+  });
+});
+
+describe('App layout with the new tools', () => {
+  it('mounts with the shape flyout toggle and the hidden place input inside the app root', async () => {
+    await mount(<App />, 'width:1600px;height:960px');
+    expect(document.querySelector('[data-flyout-toggle]')).toBeTruthy();
+    expect(document.querySelectorAll('[data-tool]').length).toBe(17);
+    expect(q<HTMLInputElement>('[data-place-input]').hidden).toBe(true);
+    for (const id of ['lasso', 'wand', 'text', 'shape']) expect(q(`[data-tool=${id}]`).getAttribute('aria-disabled')).toBe('false');
+  });
+});

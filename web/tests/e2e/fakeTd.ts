@@ -3,16 +3,18 @@ import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { resolve } from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
-  FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_VIEW, decodeFrame, decodeWebMessage, encodeFrame, encodeMessage, isStale,
+  FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, FRAME_VIEW, decodeFrame, decodeWebMessage, encodeFrame, encodeMessage, isStale,
   type Frame, type TdMessage, type WebMessage,
 } from '../../src/bridge/codec';
 import type { LayerSpec } from '../../src/engine/types';
 
-export interface FakeTdOptions { token?: string; w: number; h: number; active?: boolean; hasInput?: boolean; maxSendFps?: number }
+export interface FakeTdOptions { token?: string; w: number; h: number; active?: boolean; hasInput?: boolean; maxSendFps?: number; fonts?: string[] }
+
+export interface FakeTop { path: string; w: number; h: number; rgba: Uint8Array }
 
 /**
- * A stand-in for the TouchDesigner web server DAT (protocol v3): WebSocket for JSON and SURFACE tiles (stored per
- * slot with the last `doc`), HTTP `GET /base` / `/surface` / `/view`; `applied` replies per finished SURFACE frame.
+ * A stand-in for the TouchDesigner web server DAT (protocol v4): WebSocket for JSON and SURFACE tiles (stored per
+ * slot with the last `doc`), HTTP `GET /base` / `/surface` / `/view` / `/top`; `fonts` after `hello`; `listTops` / `importTop` over a registry of fake TOPs; `applied` replies per finished SURFACE frame.
  */
 export class FakeTd {
   messages: WebMessage[] = [];
@@ -30,6 +32,12 @@ export class FakeTd {
   /** Delay the docState reply (a slow TouchDesigner). */
   docStateDelayMs = 0;
   requestDocs = 0;
+  /** v4: TOPs the project 'contains' (listTops / importTop) and snapshots waiting for GET /top. */
+  tops: FakeTop[] = [];
+  topSnapshots = new Map<string, Uint8Array>();
+  topFetches: string[] = [];
+  /** Hold topReady for this long (a slow readback). */
+  topDelayMs = 0;
   viewFetches: { frameId: number; status: number }[] = [];
   viewSubscribed = false;
   lastView: Extract<WebMessage, { t: 'view' }> | null = null;
@@ -96,6 +104,15 @@ export class FakeTd {
     }
     const cors = FakeTd.corsHeaders(req.headers.origin);
     const q = u.searchParams;
+    if (u.pathname === '/top') {
+      if (q.get('token') !== this.token || q.get('client') !== this.clientId) { this.badFetches++; res.writeHead(403, cors).end(); return; }
+      const id = q.get('requestId') ?? '';
+      this.topFetches.push(id);
+      const body = this.topSnapshots.get(id);
+      res.writeHead(body ? 200 : 404, { ...cors, 'Content-Type': 'application/octet-stream' });
+      res.end(body ? Buffer.from(body) : undefined);
+      return;
+    }
     if (u.pathname === '/surface' || u.pathname === '/view') {
       if (q.get('token') !== this.token || q.get('client') !== this.clientId) { this.badFetches++; res.writeHead(403, cors).end(); return; }
       const send = (status: number, body?: Uint8Array) => { res.writeHead(status, { ...cors, 'Content-Type': 'application/octet-stream' }); res.end(body ? Buffer.from(body) : undefined); };
@@ -161,11 +178,22 @@ export class FakeTd {
             return;
           }
           this.send(this.hello());
+          if (this.opts.fonts) this.send({ t: 'fonts', families: this.opts.fonts });
           if (this.stored) this.announce();
         }
         if (m.t === 'requestBase') { this.pending = false; this.announce(); }
         if (m.t === 'doc' && this.active) { this.doc = { rev: m.rev, layers: m.layers }; this.docMessages++; this.syncSlots(m.layers); }
         if (m.t === 'requestDoc') this.requestDocs++;
+        if (m.t === 'listTops') this.send({ t: 'tops', requestId: m.requestId, items: this.tops.map(({ path, w, h }) => ({ path, w, h })) });
+        if (m.t === 'importTop') {
+          const top = this.tops.find((x) => x.path === m.path);
+          if (!top) this.send({ t: 'topError', requestId: m.requestId, msg: `No TOP at ${m.path}` });
+          else if (top.w > 8192 || top.h > 8192) this.send({ t: 'topError', requestId: m.requestId, msg: 'TOP is larger than 8192x8192' });
+          else {
+            this.topSnapshots.set(m.requestId, encodeFrame({ type: FRAME_TOP, frameEnd: true, slot: 0, frameId: 1, docW: top.w, docH: top.h, x: 0, y: 0, w: top.w, h: top.h }, top.rgba));
+            setTimeout(() => this.send({ t: 'topReady', requestId: m.requestId, w: top.w, h: top.h }), this.topDelayMs);
+          }
+        }
         if (m.t === 'requestDoc' && this.doc) {
           const doc = this.doc;
           setTimeout(() => this.send({ t: 'docState', rev: doc.rev, layers: doc.layers, docW: this.w, docH: this.h }), this.docStateDelayMs);
@@ -199,7 +227,7 @@ export class FakeTd {
 
   hello(): TdMessage {
     return {
-      t: 'hello', protocol: 3, doc: { w: this.w, h: this.h }, hasInput: this.opts.hasInput ?? false, maxSendFps: this.opts.maxSendFps ?? 30,
+      t: 'hello', protocol: 4, doc: { w: this.w, h: this.h }, hasInput: this.opts.hasInput ?? false, maxSendFps: this.opts.maxSendFps ?? 30,
       active: this.active, clientId: this.clientId, hasDocument: this.doc !== null, rev: this.doc?.rev ?? null,
     };
   }

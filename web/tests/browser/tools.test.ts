@@ -428,7 +428,7 @@ describe('locked, hidden and unsupported cases', () => {
     expect(notices).toEqual(['Select a pixel layer']);
   });
 
-  it.each(['lasso', 'wand', 'crop', 'clone', 'smudge', 'text', 'shape', 'hand', 'zoom'] as ToolId[])('%s is a no-op', (tool) => {
+  it.each(['crop', 'clone', 'smudge', 'text', 'hand', 'zoom'] as ToolId[])('%s is a no-op', (tool) => {
     const id = paintSetup();
     const n = e.history().entries.length;
     stroke(e, tool, [[10, 10], [30, 30]]);

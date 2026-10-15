@@ -8,15 +8,22 @@ type Item = 'sep' | { label: string; hint?: string; run?: (s: Store) => void; ch
 interface MenuDef { label: string; items: Item[] }
 
 const off = (label: string, hint?: string): Item => ({ label, hint });
+const isEditable = (kind?: string) => kind === 'text' || kind === 'shape';
 
 const MENUS: MenuDef[] = [
   { label: 'File', items: [off('Open…', 'Ctrl+O'), off('Save', 'Ctrl+S'), off('Export…'), 'sep',
+    { label: 'Place Image…', run: (s) => s.placeImage() },
+    { label: 'Import from TouchDesigner…', run: (s) => { s.topDialog.value = true; }, enabled: (s) => s.connection.value === 'linked' }, 'sep',
     { label: 'New layer', run: (s) => s.addLayer() }, { label: 'Flatten to new layer', run: (s) => s.flatten() }] },
   { label: 'Edit', items: [{ label: 'Undo', hint: 'Ctrl+Z', run: (s) => s.undo() }, { label: 'Redo', hint: 'Ctrl+Shift+Z', run: (s) => s.redo() },
-    'sep', off('Cut', 'Ctrl+X'), off('Copy', 'Ctrl+C'), off('Paste', 'Ctrl+V')] },
+    'sep', off('Cut', 'Ctrl+X'), off('Copy', 'Ctrl+C'), { label: 'Paste', hint: 'Ctrl+V', run: (s) => void s.pasteFromClipboard() }] },
   { label: 'Document', items: [off('Resize document…'), off('Resize canvas…'), off('Rotate…')] },
-  { label: 'Layer', items: [off('Duplicate'), off('Merge down'), off('Layer properties…'), 'sep', { label: 'Add mask', run: (s) => s.addMask(), enabled: (s) => s.canAddMask() }, { label: 'Delete mask', run: (s) => s.deleteMask(), enabled: (s) => !!s.activeLayer()?.mask }] },
-  { label: 'Select', items: [off('Select all', 'Ctrl+A'), { label: 'Deselect', hint: 'Ctrl+D', run: (s) => s.deselect() }, off('Invert selection')] },
+  { label: 'Layer', items: [off('Duplicate'), off('Merge down'), off('Layer properties…'), 'sep',
+    { label: 'Flatten Layer', run: (s) => { const l = s.activeLayer(); if (l) s.flattenLayer(l.id); }, enabled: (s) => isEditable(s.activeLayer()?.kind) },
+    { label: 'Rasterize', checked: (s) => !!s.activeLayer()?.rasterize, enabled: (s) => isEditable(s.activeLayer()?.kind), run: (s) => { const l = s.activeLayer(); if (l) s.setRasterize(l.id, !l.rasterize); } }, 'sep', { label: 'Add mask', run: (s) => s.addMask(), enabled: (s) => s.canAddMask() }, { label: 'Delete mask', run: (s) => s.deleteMask(), enabled: (s) => !!s.activeLayer()?.mask }] },
+  { label: 'Select', items: [{ label: 'Select All', hint: 'Ctrl+A', run: (s) => s.selectAll() }, { label: 'Deselect', hint: 'Ctrl+D', run: (s) => s.deselect() },
+    { label: 'Invert Selection', hint: 'Shift+Ctrl+I', run: (s) => s.invertSelection() }, 'sep',
+    { label: 'Mask from Selection', run: (s) => s.maskFromSelection(), enabled: (s) => s.canMaskFromSelection() }] },
   { label: 'Filters', items: [off('Blur…'), off('Sharpen…'), off('Noise…')] },
   { label: 'View', items: [{ label: 'Zoom in', hint: '+', run: (s) => s.zoomStep(1) }, { label: 'Zoom out', hint: '-', run: (s) => s.zoomStep(-1) },
     { label: 'Fit', hint: '0', run: (s) => s.fit() }, { label: '100%', hint: '1', run: (s) => s.zoomTo(1) }, 'sep',

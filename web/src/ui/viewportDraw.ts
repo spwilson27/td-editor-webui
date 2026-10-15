@@ -91,10 +91,43 @@ export function drawDocument(ctx: CanvasRenderingContext2D, backdrop: Backdrop, 
 }
 
 export interface CursorShape { x: number; y: number; diameter: number; square: boolean }
+export type Pt = { x: number; y: number };
+export interface OverlayExtra {
+  /** Outlines of the current selection (document px); drawn closed. Falls back to the bounding rect. */
+  paths?: Pt[][] | null;
+  /** In-progress lasso / shape outline (document px). */
+  preview?: { paths: Pt[][]; closed: boolean } | null;
+}
 
-export function drawOverlay(ctx: CanvasRenderingContext2D, vw: number, vh: number, view: View, selection: Rect | null, dashOffset: number, cursor: CursorShape | null): void {
+function antPath(ctx: CanvasRenderingContext2D, view: View, paths: Pt[][], closed: boolean, dashOffset: number): void {
+  const trace = () => {
+    ctx.beginPath();
+    for (const p of paths) {
+      p.forEach((pt, i) => {
+        const x = view.x + pt.x * view.zoom, y = view.y + pt.y * view.zoom;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      if (closed && p.length > 2) ctx.closePath();
+    }
+  };
+  ctx.lineWidth = 1;
+  ctx.setLineDash([]);
+  ctx.strokeStyle = '#000000';
+  trace();
+  ctx.stroke();
+  ctx.setLineDash([4, 4]);
+  ctx.lineDashOffset = -dashOffset;
+  ctx.strokeStyle = '#ffffff';
+  trace();
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+export function drawOverlay(ctx: CanvasRenderingContext2D, vw: number, vh: number, view: View, selection: Rect | null, dashOffset: number, cursor: CursorShape | null, extra: OverlayExtra = {}): void {
   ctx.clearRect(0, 0, vw, vh);
-  if (selection) {
+  if (extra.paths && extra.paths.length) {
+    antPath(ctx, view, extra.paths, true, dashOffset);
+  } else if (selection) {
     const x = Math.round(view.x + selection.x * view.zoom) + 0.5, y = Math.round(view.y + selection.y * view.zoom) + 0.5;
     const w = Math.round(selection.w * view.zoom), h = Math.round(selection.h * view.zoom);
     ctx.lineWidth = 1;
@@ -107,6 +140,7 @@ export function drawOverlay(ctx: CanvasRenderingContext2D, vw: number, vh: numbe
     ctx.strokeRect(x, y, w, h);
     ctx.setLineDash([]);
   }
+  if (extra.preview) antPath(ctx, view, extra.preview.paths, extra.preview.closed, dashOffset);
   if (cursor) {
     const r = Math.max(2, cursor.diameter / 2);
     ctx.lineWidth = 1;

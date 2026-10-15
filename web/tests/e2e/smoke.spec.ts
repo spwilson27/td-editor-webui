@@ -49,10 +49,10 @@ test('switches tools by click and keyboard; disabled tools stay off', async ({ p
   await expect(page.locator('[data-context=name]')).toHaveText('Flood Fill');
   await page.keyboard.press('g');
   await expect(page.locator('[data-context=name]')).toHaveText('Gradient Tool');
-  await page.locator('[data-tool=lasso]').click({ force: true });
+  await page.locator('[data-tool=crop]').click({ force: true });
   await expect(page.locator('[data-context=name]')).toHaveText('Gradient Tool');
-  await expect(page.locator('[data-tool=lasso]')).toHaveAttribute('title', /Not in this version/);
-  await page.keyboard.press('l');
+  await expect(page.locator('[data-tool=crop]')).toHaveAttribute('title', /Not in this version/);
+  await page.keyboard.press('c');
   await expect(page.locator('[data-status=notice]')).toContainText('not available');
 });
 

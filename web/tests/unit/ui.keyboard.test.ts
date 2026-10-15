@@ -38,9 +38,46 @@ describe('keyboard shortcuts', () => {
   });
 
   it('disabled tools do not activate and raise a notice', () => {
-    press('l');
+    press('c');
     expect(store.tool.value).toBe('brush');
     expect(store.notice.value).toMatch(/not available/);
+  });
+
+  it('selects the v3 tools: L lasso, W wand, T text, U shape', () => {
+    press('l'); expect(store.tool.value).toBe('lasso');
+    press('w'); expect(store.tool.value).toBe('wand');
+    press('t'); expect(store.tool.value).toBe('text');
+    press('u'); expect(store.tool.value).toBe('shape');
+    expect(engine.shapeTool).toBe('rect');
+  });
+
+  it('Select All (Ctrl/Cmd+A), Deselect (Ctrl/Cmd+D) and Invert (Shift+Ctrl/Cmd+I) call the engine and prevent the browser default', () => {
+    const a = press('a', { ctrlKey: true });
+    expect(a.preventDefault).toHaveBeenCalled();
+    expect(engine.selection()).toEqual({ x: 0, y: 0, w: 200, h: 100 });
+    press('i', { metaKey: true, shiftKey: true });
+    press('d', { metaKey: true });
+    expect(engine.calls.filter((c) => /selectAll|invertSelection|deselect/.test(c))).toEqual(['selectAll', 'invertSelection', 'deselect']);
+    press('i', { ctrlKey: true }); // no shift: nothing
+    expect(engine.calls.filter((c) => c === 'invertSelection').length).toBe(1);
+  });
+
+  it('while the inline text editor is open no shortcut fires (forwarded TD keys target the body); Escape commits', () => {
+    store.setTool('text');
+    const id = store.beginText(5, 5);
+    expect(store.textEdit.value).toMatchObject({ id, isNew: true });
+    for (const k of ['b', 'e', 'x', ' ', '0']) press(k);
+    press('a', { ctrlKey: true });
+    press('z', { ctrlKey: true });
+    expect(store.tool.value).toBe('text');
+    expect(engine.calls).not.toContain('selectAll');
+    expect(engine.calls).not.toContain('undo');
+    expect(store.spaceHeld.value).toBe(false);
+    press('Escape');
+    expect(store.textEdit.value).toBeNull();
+    expect(engine.layers().some((l) => l.id === id)).toBe(false); // empty new text removed
+    press('b');
+    expect(store.tool.value).toBe('brush');
   });
 
   it('brackets resize, X swaps, D resets colours', () => {

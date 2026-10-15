@@ -16,7 +16,7 @@ const open = async (page: Page, client: 'panel' | 'external' = 'panel') => {
 const hook = <T,>(page: Page, fn: string, ...args: unknown[]) =>
   page.evaluate(([f, a]) => (window as any).__editorTest[f as string](...(a as unknown[])), [fn, args] as const) as Promise<T>;
 const layer = (id: string, over: Partial<LayerSpec>): LayerSpec => ({
-  id, kind: 'pixel', parentId: null, name: id, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot: null, mask: null, adjustment: null, ...over,
+  id, kind: 'pixel', parentId: null, name: id, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot: null, mask: null, adjustment: null, text: null, shape: null, rasterize: false, ...over,
 });
 const baseLayer = () => layer('base', { kind: 'base', name: 'TD Input' });
 const mainPixel = (page: Page, fx: number, fy: number) => page.locator('[data-viewport] canvas').first().evaluate((c: HTMLCanvasElement, [x, y]) => {

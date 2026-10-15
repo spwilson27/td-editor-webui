@@ -15,9 +15,13 @@ describe('shared fixtures (docs/fixtures)', () => {
     expect(manifest.messages.find((m) => m.name === 'invalid_zero_size_rect')?.valid).toBe(false);
   });
 
-  it('covers every v3 frame type and rejects the v1/v2 COMPOSITE type', () => {
+  it('covers every frame type (v4 adds TOP_IMAGE = 6 once the TD fixtures include it) and rejects the v1/v2 COMPOSITE type', () => {
     const types = new Set(manifest.messages.filter((m) => m.valid).map((m) => m.header!.type));
-    expect([...types].sort()).toEqual([1, 3, 4, 5]);
+    expect([...types].sort()).toEqual(expect.arrayContaining([1, 3, 4, 5]));
+    for (const t of types) expect([1, 3, 4, 5, 6]).toContain(t);
+    for (const m of manifest.messages.filter((x) => x.valid && x.header!.type === 6)) {
+      expect({ x: m.header!.x, y: m.header!.y, slot: m.header!.slot, end: m.header!.frameEnd }).toEqual({ x: 0, y: 0, slot: 0, end: true });
+    }
     expect(manifest.messages.find((m) => m.name === 'invalid_type_2')?.valid).toBe(false);
     expect(manifest.messages.some((m) => m.valid && m.header!.slot > 0)).toBe(true);
   });

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   decodeFrame, decodeTdMessage, decodeWebMessage, encodeBands, encodeFrame, encodeMessage, isStale, PROTOCOL_VERSION,
-  FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_VIEW, HEADER_BYTES, MAX_BAND_PAYLOAD, type FrameHeader,
+  FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, FRAME_VIEW, HEADER_BYTES, MAX_BAND_PAYLOAD, type FrameHeader,
 } from '../../src/bridge/codec';
 
 const hdr = (o: Partial<FrameHeader> = {}): FrameHeader => ({
@@ -54,7 +54,7 @@ describe('decode validation', () => {
     ['too-short', () => good().subarray(0, 23)],
     ['bad-magic', () => { const m = good(); m[0] = 0x58; return m; }],
     ['bad-type', () => { const m = good(); m[4] = 2; return m; }], // COMPOSITE is invalid in v3
-    ['bad-type', () => { const m = good(); m[4] = 6; return m; }],
+    ['bad-type', () => { const m = good(); m[4] = 7; return m; }],
     ['bad-rect', () => { const m = good(); m[20] = 0; m[21] = 0; return m; }], // w = 0
     ['bad-rect', () => { const m = good(); m[16] = 99; return m; }], // x + w > docW
     ['bad-rect', () => { const m = good(); m[18] = 49; return m; }], // y + h > docH
@@ -155,7 +155,7 @@ describe('frame types', () => {
 });
 
 describe('protocol v3 messages', () => {
-  it('is protocol version 3', () => { expect(PROTOCOL_VERSION).toBe(3); });
+  it('is protocol version 4', () => { expect(PROTOCOL_VERSION).toBe(4); });
 
   it('decodes a base notice and rejects incomplete ones', () => {
     const n = { t: 'base', frameId: 4000000000, docW: 1920, docH: 1080, x: 0, y: 0, w: 1920, h: 1080 } as const;
@@ -165,7 +165,7 @@ describe('protocol v3 messages', () => {
   });
 
   it('hello carries hasDocument and rev (defaults false / null) and clientId (empty when absent)', () => {
-    const h = { t: 'hello', protocol: 3, doc: { w: 4, h: 4 }, hasInput: false, maxSendFps: 30, active: true };
+    const h = { t: 'hello', protocol: 4, doc: { w: 4, h: 4 }, hasInput: false, maxSendFps: 30, active: true };
     expect(decodeTdMessage(JSON.stringify({ ...h, clientId: 'abc', hasDocument: true, rev: 12 }))).toEqual({ ...h, clientId: 'abc', hasDocument: true, rev: 12 });
     expect(decodeTdMessage(JSON.stringify({ ...h, rev: null }))).toEqual({ ...h, clientId: '', hasDocument: false, rev: null });
     expect(decodeWebMessage('{"t":"ack","frameId":1}')).toBeNull();
@@ -188,7 +188,7 @@ describe('json messages', () => {
   it('web messages round trip', () => {
     const spec = { id: 'a', kind: 'adjustment', parentId: null, name: 'Levels', visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot: null, mask: { slot: 4, enabled: true }, adjustment: { type: 'invert' } };
     const msgs = [
-      { t: 'ready', protocol: 3, client: 'panel', version: '0.1.0', token: 'abc', fresh: true },
+      { t: 'ready', protocol: 4, client: 'panel', version: '0.1.0', token: 'abc', fresh: true },
       { t: 'doc', rev: 5, layers: [spec] },
       { t: 'requestDoc' },
       { t: 'view', mode: 'td', zoom: 0.5, panX: 12, panY: -3, rect: { x: 100, y: 80, w: 900, h: 700 } },
@@ -199,15 +199,41 @@ describe('json messages', () => {
     for (const m of msgs) expect(decodeWebMessage(encodeMessage(m as never))).toEqual(m);
   });
 
+  it('v4: TOP_IMAGE frames (type 6) use the TOP size as the document size', () => {
+    const top = hdr({ type: FRAME_TOP, slot: 0, docW: 4, docH: 3, x: 0, y: 0, w: 4, h: 3 });
+    const bytes = encodeFrame(top, px(48));
+    const r = decodeFrame(bytes);
+    expect(r.ok && r.frame.type).toBe(6);
+    expect(r.ok && [r.frame.w, r.frame.h]).toEqual([4, 3]);
+    expect(Array.from(bytes.subarray(4, 6))).toEqual([6, 1]);
+  });
+
+  it('v4: fonts / tops / topReady / topError decode, listTops / importTop round trip', () => {
+    expect(decodeTdMessage('{"t":"fonts","families":["Arial","Zapf",3]}')).toEqual({ t: 'fonts', families: ['Arial', 'Zapf'] });
+    expect(decodeTdMessage('{"t":"fonts"}')).toBeNull();
+    const tops = { t: 'tops', requestId: 'r1', items: [{ path: '/project1/noise1', w: 1280, h: 720 }, { path: '/b', w: 8, h: 8 }] };
+    expect(decodeTdMessage(encodeMessage(tops as never))).toEqual(tops);
+    expect(decodeTdMessage('{"t":"tops","requestId":"r1","items":[{"path":"/a"},{"path":"/b","w":2,"h":3},5]}')).toEqual({ t: 'tops', requestId: 'r1', items: [{ path: '/b', w: 2, h: 3 }] });
+    expect(decodeTdMessage('{"t":"tops","items":[]}')).toBeNull();
+    const ready = { t: 'topReady', requestId: 'r2', w: 640, h: 480 } as const;
+    expect(decodeTdMessage(encodeMessage(ready))).toEqual(ready);
+    expect(decodeTdMessage('{"t":"topReady","requestId":"r2","w":0,"h":4}')).toBeNull();
+    expect(decodeTdMessage('{"t":"topError","requestId":"r3","msg":"too large"}')).toEqual({ t: 'topError', requestId: 'r3', msg: 'too large' });
+    expect(decodeTdMessage('{"t":"topError"}')).toBeNull();
+    for (const m of [{ t: 'listTops', requestId: 'a' }, { t: 'importTop', requestId: 'b', path: '/p1/x' }] as const) expect(decodeWebMessage(encodeMessage(m))).toEqual(m);
+    expect(decodeWebMessage('{"t":"importTop","requestId":"b"}')).toBeNull();
+    expect(decodeWebMessage('{"t":"listTops"}')).toBeNull();
+  });
+
   it('rejects malformed v3 web messages', () => {
     expect(decodeWebMessage('{"t":"doc","rev":1}')).toBeNull();
     expect(decodeWebMessage('{"t":"view","mode":"x","zoom":1,"panX":0,"panY":0,"rect":{"x":0,"y":0,"w":1,"h":1}}')).toBeNull();
     expect(decodeWebMessage('{"t":"view","mode":"td","zoom":1,"panX":0,"panY":0}')).toBeNull();
-    expect(decodeWebMessage('{"t":"ready","protocol":3,"client":"panel","version":"1"}')).toEqual({ t: 'ready', protocol: 3, client: 'panel', version: '1', token: '', fresh: false });
+    expect(decodeWebMessage('{"t":"ready","protocol":4,"client":"panel","version":"1"}')).toEqual({ t: 'ready', protocol: 4, client: 'panel', version: '1', token: '', fresh: false });
   });
 
   it('td messages round trip and strip unknown fields', () => {
-    const hello = { t: 'hello', protocol: 3, doc: { w: 1920, h: 1080 }, hasInput: true, maxSendFps: 30, active: false, clientId: 'c1', hasDocument: false, rev: null } as const;
+    const hello = { t: 'hello', protocol: 4, doc: { w: 1920, h: 1080 }, hasInput: true, maxSendFps: 30, active: false, clientId: 'c1', hasDocument: false, rev: null } as const;
     expect(decodeTdMessage(encodeMessage(hello))).toEqual(hello);
     expect(decodeTdMessage(JSON.stringify({ ...hello, extra: 1 }))).toEqual(hello);
     expect(decodeTdMessage('{"t":"docSize","w":4,"h":5,"hasInput":false}')).toEqual({ t: 'docSize', w: 4, h: 5, hasInput: false });
@@ -223,7 +249,7 @@ describe('json messages', () => {
   });
 
   it('rejects non-integer or non-positive sizes in hello and docSize', () => {
-    const hello = (w: number, h: number) => JSON.stringify({ t: 'hello', protocol: 3, doc: { w, h }, hasInput: true, maxSendFps: 30, active: true });
+    const hello = (w: number, h: number) => JSON.stringify({ t: 'hello', protocol: 4, doc: { w, h }, hasInput: true, maxSendFps: 30, active: true });
     expect(decodeTdMessage(hello(1920, 1080))).not.toBeNull();
     for (const [w, h] of [[0, 10], [10, 0], [-5, 10], [10.5, 10], [10, 1e9]]) {
       expect(decodeTdMessage(hello(w, h))).toBeNull();

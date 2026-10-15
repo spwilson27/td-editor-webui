@@ -18,7 +18,7 @@ describe('store: tools and brush', () => {
     store.setTool('eraser');
     expect(store.tool.value).toBe('eraser');
     expect(engine.tool).toBe('eraser');
-    store.setTool('lasso');
+    store.setTool('crop');
     expect(store.tool.value).toBe('eraser');
     expect(engine.tool).toBe('eraser');
   });

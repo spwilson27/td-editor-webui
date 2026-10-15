@@ -128,7 +128,7 @@ describe('ContextBar', () => {
     store.setTool('marquee');
     await settle();
     expect(document.body.textContent).toContain('Feather');
-    expect([...document.querySelectorAll('[aria-label="Selection mode"] button')].map((b) => b.getAttribute('aria-disabled'))).toEqual(['false', 'true', 'true', 'true']);
+    expect([...document.querySelectorAll('[aria-label="Selection mode"] button')].map((b) => b.getAttribute('aria-pressed'))).toEqual(['true', 'false', 'false', 'false']);
     store.setTool('move');
     await settle();
     expect(document.body.textContent).toContain('W 64 px');

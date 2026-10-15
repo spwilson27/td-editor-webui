@@ -3,9 +3,12 @@ import { useEffect, useRef } from 'preact/hooks';
 import type { ToolPointer } from '../engine/types';
 import { capture } from './capture';
 import { store } from '../state/store';
-import { Backdrop, drawDocument, drawOverlay, type CursorShape } from './viewportDraw';
+import { hasFiles, imageFiles } from '../state/importImage';
+import { shapeFromDrag, shapePreviewPath } from '../state/specs';
+import { TextEditor } from './TextEditor';
+import { Backdrop, drawDocument, drawOverlay, type CursorShape, type Pt } from './viewportDraw';
 
-const mouseCursor: Record<string, string> = { move: 'move', marquee: 'crosshair', gradient: 'crosshair', fill: 'crosshair', picker: 'crosshair', zoom: 'zoom-in', hand: 'grab' };
+const mouseCursor: Record<string, string> = { move: 'move', marquee: 'crosshair', lasso: 'crosshair', wand: 'crosshair', shape: 'crosshair', text: 'text', gradient: 'crosshair', fill: 'crosshair', picker: 'crosshair', zoom: 'zoom-in', hand: 'grab' };
 
 export function Viewport() {
   const host = useRef<HTMLDivElement>(null);
@@ -20,7 +23,12 @@ export function Viewport() {
     let mainQueued = false, overQueued = false, dash = 0;
     let hover: { x: number; y: number } | null = null;
     let activeId: number | null = null;
-    let mode: 'pan' | 'draw' | null = null;
+    let mode: 'pan' | 'draw' | 'shape' | null = null;
+    let selPaths: Pt[][] = [];
+    let hasSel = false;
+    let selDirty = true;
+    let lasso: Pt[] | null = null;
+    let shapeDrag: { x0: number; y0: number; x1: number; y1: number; shift: boolean } | null = null;
     let panFrom = { x: 0, y: 0 };
     let lastTool: ToolPointer | null = null;
 
@@ -46,7 +54,15 @@ export function Viewport() {
         cursor = { x: hover.x, y: hover.y, diameter: b.size * z, square: t === 'pencil' };
       }
       setScale(overCtx);
-      drawOverlay(overCtx, vw, vh, store.view.peek(), store.engine.selection(), dash, cursor);
+      let preview: { paths: Pt[][]; closed: boolean } | null = null;
+      if (lasso && lasso.length > 1) preview = { paths: [lasso], closed: false };
+      else if (shapeDrag) {
+        const spec = shapeFromDrag(store.shapeOpts.peek(), store.primaryRgba(), store.secondaryRgba(), shapeDrag, shapeDrag.shift);
+        if (spec) preview = { paths: shapePreviewPath(spec), closed: spec.type !== 'line' };
+      }
+      // Tracing a contour is not free: recompute at most once per frame and not while a stroke is still adding to the selection.
+      if (selDirty && mode !== 'draw') refreshSel();
+      drawOverlay(overCtx, vw, vh, store.view.peek(), store.engine.selection(), dash, cursor, { paths: mode === 'draw' ? null : selPaths, preview });
     };
     const queueMain = () => { if (!mainQueued) { mainQueued = true; requestAnimationFrame(paintMain); } };
     const queueOver = () => { if (!overQueued) { overQueued = true; requestAnimationFrame(paintOver); } };
@@ -76,15 +92,21 @@ export function Viewport() {
     };
     watchDpr();
 
+    function refreshSel() {
+      selDirty = false;
+      hasSel = store.engine.selection() !== null;
+      selPaths = hasSel ? store.engine.selectionPath() : [];
+    };
+    refreshSel();
     const off = store.engine.on((ev) => {
       if (ev.type === 'composite' || ev.type === 'resize') queueMain();
-      if (ev.type === 'selection') queueOver();
+      if (ev.type === 'selection') { selDirty = true; hasSel = store.engine.selection() !== null; queueOver(); }
     });
     const stopFx = effect(() => {
       store.view.value; store.viewMode.value; store.clientKind.value; store.tdViewTick.value; store.tool.value; store.brush.value; store.spaceHeld.value; store.selectionVersion.value;
       queueMain(); queueOver();
     });
-    const ants = setInterval(() => { if (store.engine.selection()) { dash = (dash + 1) % 8; queueOver(); } }, 120);
+    const ants = setInterval(() => { if (hasSel) { dash = (dash + 1) % 8; queueOver(); } }, 120);
 
     const local = (e: { clientX: number; clientY: number }) => {
       const r = el.getBoundingClientRect();
@@ -95,14 +117,19 @@ export function Viewport() {
       return { x: d.x, y: d.y, pressure: e.pointerType === 'pen' ? e.pressure || 1 : 1, shift: e.shiftKey, alt: e.altKey, ctrl: e.ctrlKey || e.metaKey };
     };
 
-    const finish = (up: ToolPointer | null) => {
+    const finish = (up: ToolPointer | null, cancel = false) => {
       if (mode === 'draw') { const p = up ?? lastTool; if (p) store.engine.pointerUp(p); }
-      mode = null; activeId = null; lastTool = null;
+      if (mode === 'shape' && shapeDrag && !cancel) {
+        if (up) { shapeDrag.x1 = up.x; shapeDrag.y1 = up.y; shapeDrag.shift = up.shift; }
+        const spec = shapeFromDrag(store.shapeOpts.peek(), store.primaryRgba(), store.secondaryRgba(), shapeDrag, shapeDrag.shift);
+        if (spec) store.engine.addShapeLayer(spec);
+      }
+      mode = null; activeId = null; lastTool = null; lasso = null; shapeDrag = null;
       updateCursor();
       queueOver();
     };
     /** Pointer cancelled, capture lost or window blurred: end the stroke at the last known position. */
-    const abort = () => { if (mode) finish(null); };
+    const abort = () => { if (mode) finish(null, true); };
 
     const onDown = (e: PointerEvent) => {
       if (activeId !== null || e.button === 2 || store.loadingDoc.peek()) return;
@@ -116,9 +143,29 @@ export function Viewport() {
       }
       if (tool === 'zoom') { store.zoomStep(e.altKey ? -1 : 1, p.x, p.y); return; }
       if (e.button !== 0) return;
+      if (tool === 'text') {
+        const d = toolPointer(e);
+        if (store.textEdit.peek()) {
+          // click-away commits; a click on another text layer moves the editor there
+          const ed = store.textEdit.peek()!;
+          store.commitText();
+          const hit = store.engine.textLayerAt(d.x, d.y);
+          if (hit && hit !== ed.id) store.beginText(d.x, d.y);
+        } else store.beginText(d.x, d.y);
+        e.preventDefault(); // keep the new editor's focus
+        return;
+      }
+      if (tool === 'shape') {
+        const d = toolPointer(e);
+        mode = 'shape'; activeId = e.pointerId;
+        capture(el, e.pointerId);
+        shapeDrag = { x0: d.x, y0: d.y, x1: d.x, y1: d.y, shift: d.shift };
+        return;
+      }
       mode = 'draw'; activeId = e.pointerId;
       capture(el, e.pointerId);
       lastTool = toolPointer(e);
+      if (tool === 'lasso') lasso = [{ x: lastTool.x, y: lastTool.y }];
       store.engine.pointerDown(lastTool);
     };
     const onMove = (e: PointerEvent) => {
@@ -128,12 +175,18 @@ export function Viewport() {
       if (mode === 'pan') {
         store.panBy(p.x - panFrom.x, p.y - panFrom.y);
         panFrom = p;
+      } else if (mode === 'shape' && shapeDrag) {
+        const d = toolPointer(e);
+        shapeDrag.x1 = d.x; shapeDrag.y1 = d.y; shapeDrag.shift = d.shift;
+        queueOver();
       } else if (mode === 'draw') {
         const list = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
         for (const c of list.length ? list : [e]) {
           lastTool = toolPointer(c);
+          if (lasso) lasso.push({ x: lastTool.x, y: lastTool.y });
           store.engine.pointerMove(lastTool);
         }
+        if (lasso) queueOver();
       }
       const t = store.tool.peek();
       if (t === 'brush' || t === 'eraser' || t === 'pencil') queueOver();
@@ -156,6 +209,19 @@ export function Viewport() {
     };
     const stopCursor = effect(() => { store.tool.value; store.spaceHeld.value; updateCursor(); });
 
+    const onDragOver = (e: DragEvent) => {
+      if (!hasFiles(e.dataTransfer)) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+    };
+    const onDrop = (e: DragEvent) => {
+      const files = imageFiles(e.dataTransfer);
+      if (!files.length && !hasFiles(e.dataTransfer)) return;
+      e.preventDefault();
+      void store.importFiles(files);
+    };
+    el.addEventListener('dragover', onDragOver);
+    el.addEventListener('drop', onDrop);
     el.addEventListener('pointerdown', onDown);
     el.addEventListener('pointermove', onMove);
     el.addEventListener('pointerup', onUp);
@@ -169,6 +235,8 @@ export function Viewport() {
     return () => {
       ro.disconnect(); off(); stopFx(); stopCursor(); clearInterval(ants);
       dprQuery?.removeEventListener('change', onDprChange);
+      el.removeEventListener('dragover', onDragOver);
+      el.removeEventListener('drop', onDrop);
       el.removeEventListener('pointerdown', onDown);
       el.removeEventListener('pointermove', onMove);
       el.removeEventListener('pointerup', onUp);
@@ -186,6 +254,7 @@ export function Viewport() {
     <div ref={host} data-viewport data-td-panel={clear} style={`flex:1 1 auto;min-height:0;position:relative;overflow:hidden;background:${clear ? 'transparent' : '#1c1c1c'};touch-action:none`}>
       <canvas ref={main} style={layer} />
       <canvas ref={over} style={layer + ';pointer-events:none'} />
+      {store.textEdit.value && <TextEditor />}
     </div>
   );
 }

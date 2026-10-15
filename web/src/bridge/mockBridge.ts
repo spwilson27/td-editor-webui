@@ -47,5 +47,6 @@ export function startMockBridge(engine: EditorEngine, status: BridgeStatus & { d
   if (status.docName) status.docName.value = 'landscape.png';
   status.setConnection('standalone');
   status.setActive(true);
-  return { takeover() {}, dispose() {}, setView() {} };
+  const offline = () => Promise.reject(new Error('Not connected to TouchDesigner'));
+  return { takeover() {}, dispose() {}, setView() {}, listTops: offline, importTop: offline };
 }

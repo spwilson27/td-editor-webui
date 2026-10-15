@@ -1,17 +1,28 @@
 import type {
   AdjustmentSpec, AdjustmentType, BlendMode, BrushSettings, DocSpec, EditorEngine, EngineEvent, HistoryEntry, LayerInfo, PaintTarget,
-  Rect, RGBA, ToolContext, ToolId, ToolPointer,
+  Rect, RGBA, SelectionOptions, ShapeSpec, ShapeType, TextSpec, ToolContext, ToolId, ToolPointer,
 } from './types';
 import { ADJUSTMENT_NAMES, clampAdjustment, defaultAdjustment, isIdentity, sameAdjustment } from './adjustments';
 import { Compositor } from './compositor';
 import { History } from './history';
-import { BASE_ID, Document, layerExtent, snapshotSurfaces, specSame, type AdjustmentLayer, type EditTarget, type GroupLayer, type Layer, type Mask, type PixelLayer, type StructureSnapshot } from './model';
+import {
+  BASE_ID, Document, isVector, layerExtent, snapshotSurfaces, specBounds, specSame,
+  type AdjustmentLayer, type EditTarget, type GroupLayer, type Layer, type Mask, type PixelLayer, type ShapeLayer, type StructureSnapshot,
+  type SurfaceLayer, type TextLayer, type VectorLayer,
+} from './model';
+import {
+  invert as invertSel, materialize, NO_SEL, rectSel, resizeSel, selectAllState, tracePath, type SelState,
+} from './selection';
+import {
+  drawShape, drawText, sameSpec, sanitizeShape, sanitizeText, shapeBounds, textBox, textBounds,
+} from './textShape';
 import type { Patch } from './tiles';
 import { clipToSize, equal, intersect, isEmpty, translate, union } from './rect';
 import { createSurface, releaseSurface, resizedCopy, type Surface } from './surface';
 import type { Host, Scratch, Tool } from './tools/host';
 import { StrokeTool } from './tools/paint';
-import { FillTool, GradientTool, MarqueeTool, MoveTool, PickerTool } from './tools/others';
+import { FillTool, GradientTool, MoveTool, PickerTool } from './tools/others';
+import { LassoTool, MarqueeTool, WandTool } from './tools/select';
 
 const MAX_BRUSH = 1000;
 const MAX_DIM = 16384;
@@ -34,6 +45,8 @@ function clampDim(n: number): number {
 }
 
 const clamp01 = (n: number): number => Math.min(1, Math.max(0, n));
+
+const sameSel = (a: SelState, b: SelState): boolean => a.alpha === b.alpha && equal(a.rect, b.rect);
 
 /** A document-sized mask surface, fully visible (white). */
 function whiteMask(w: number, h: number): Surface {
@@ -74,6 +87,17 @@ export class Engine implements EditorEngine, Host {
   private maskTargetLayer: string | null = null; // layer whose mask is the paint target
   private surfaceDirty: Rect | null = null; // writeSurface area (document space) waiting for commitSurfaces
   private conv = new Uint8ClampedArray(0);
+  private sel: SelState = NO_SEL;
+  private selOpts: SelectionOptions = { mode: 'new', feather: 0, antialias: true, wandTolerance: 32, wandContiguous: true, wandSampleAll: false };
+  private selCanvas: Surface | null = null; // doc-sized canvas, alpha = coverage (lazy, non-rect selections only)
+  private selCanvasFor: SelState | null = null; // the selection selCanvas currently shows
+  private selCanvasRect: Rect | null = null; // area of selCanvas that holds pixels
+  private selMaskCache: Uint8Array | null = null;
+  private selPathCache: Array<Array<{ x: number; y: number }>> | null = null;
+  private tmp: Surface | null = null;
+  private shapeType: ShapeType = 'rect';
+  private textCount = 0;
+  private shapeCount = 0;
 
   constructor(width: number, height: number) {
     const w = clampDim(width);
@@ -87,7 +111,9 @@ export class Engine implements EditorEngine, Host {
     this.compositor = new Compositor(this.doc, (rect) => this.emit({ type: 'composite', rect }));
     this.tools = {
       move: new MoveTool(this),
-      marquee: new MarqueeTool((r) => this.setSelection(r)),
+      marquee: new MarqueeTool(this),
+      lasso: new LassoTool(this),
+      wand: new WandTool(this),
       brush: new StrokeTool(this, 'brush'),
       pencil: new StrokeTool(this, 'pencil'),
       eraser: new StrokeTool(this, 'eraser'),
@@ -119,8 +145,9 @@ export class Engine implements EditorEngine, Host {
     const l = this.doc.active();
     const toMask = l !== null && l.kind !== 'group' && l.mask !== null && this.paintTarget().target === 'mask';
     const why = !l || l.kind === 'group' ? 'Select a pixel layer'
-      : l.kind === 'adjustment' && !toMask ? 'Select a pixel layer or a mask'
-        : !l.visible ? 'Layer is hidden' : l.locked ? 'Layer is locked' : null;
+      : isVector(l) && !toMask ? 'Flatten the layer to paint on it'
+        : l.kind === 'adjustment' && !toMask ? 'Select a pixel layer or a mask'
+          : !l.visible ? 'Layer is hidden' : l.locked ? 'Layer is locked' : null;
     if (why || !l || l.kind === 'group') {
       this.emit({ type: 'notice', message: why ?? 'Select a pixel layer' });
       return null;
@@ -128,7 +155,7 @@ export class Engine implements EditorEngine, Host {
     return this.makeTarget(l, toMask);
   }
 
-  movableLayer(): PixelLayer | null {
+  movableLayer(): PixelLayer | VectorLayer | null {
     const l = this.doc.active();
     const why = !l || l.kind === 'group' || l.kind === 'adjustment' ? 'Select a pixel layer to move' : !l.visible ? 'Layer is hidden' : l.locked ? 'Layer is locked' : null;
     if (why || !l || l.kind === 'group' || l.kind === 'adjustment') {
@@ -138,14 +165,14 @@ export class Engine implements EditorEngine, Host {
     return l;
   }
 
-  private makeTarget(layer: PixelLayer | AdjustmentLayer, mask: boolean): EditTarget {
+  private makeTarget(layer: PixelLayer | AdjustmentLayer | VectorLayer, mask: boolean): EditTarget {
     const m = layer.mask as Mask;
     return {
       layer, isMask: mask,
       surface: mask ? m.surface : (layer as PixelLayer).surface,
       slot: mask ? m.slot : (layer as PixelLayer).slot,
-      get x() { return layer.kind === 'adjustment' ? 0 : layer.x; },
-      get y() { return layer.kind === 'adjustment' ? 0 : layer.y; },
+      get x() { return layer.kind === 'pixel' || layer.kind === 'base' ? layer.x : 0; },
+      get y() { return layer.kind === 'pixel' || layer.kind === 'base' ? layer.y : 0; },
     };
   }
 
@@ -188,8 +215,10 @@ export class Engine implements EditorEngine, Host {
     const after = this.doc.snapshot();
     const apply = (s: StructureSnapshot) => () => {
       const prev = this.doc.snapshot();
-      this.doc.restore(s);
+      const changed = this.doc.restore(s);
+      const surfaceEvents = this.rerender(changed);
       this.structureChanged(null, !specSame(prev, this.doc.snapshot()));
+      surfaceEvents.forEach((e) => this.emit(e));
     };
     // Layers only history keeps alive (deleted / not yet re-added) hold whole surfaces.
     const a = snapshotSurfaces(before);
@@ -221,6 +250,7 @@ export class Engine implements EditorEngine, Host {
     const w = clampDim(width);
     const h = clampDim(height);
     if (w === this.doc.width && h === this.doc.height) return;
+    const ow = this.doc.width;
     this.doc.width = w;
     this.doc.height = h;
     for (const l of this.doc.pixelLayers()) {
@@ -238,13 +268,16 @@ export class Engine implements EditorEngine, Host {
     this.compositor.resize();
     this.version++;
     this.thumbs.clear();
-    const oldSel = this.doc.selection;
-    this.doc.selection = oldSel && clipToSize(oldSel, w, h);
+    const oldSel = this.sel;
+    const newSel = resizeSel(oldSel, ow, w, h);
+    this.dropSelCaches();
+    this.sel = newSel;
+    this.doc.selection = newSel.rect;
     this.baseDirty = null;
     this.hist.clear();
     this.surfaceDirty = null;
     this.emit({ type: 'resize', width: w, height: h });
-    if (!equal(oldSel, this.doc.selection)) this.emit({ type: 'selection' });
+    if (!sameSel(oldSel, newSel)) this.emit({ type: 'selection' });
     this.syncSpec(true);
     for (const m of this.doc.masks()) this.emit({ type: 'surface', slot: m.slot, rect: { x: 0, y: 0, w, h } }); // new area is visible
     this.emit({ type: 'history' });
@@ -438,12 +471,24 @@ export class Engine implements EditorEngine, Host {
     const k = Math.min(target.width / this.doc.width, target.height / this.doc.height);
     const w = this.doc.width * k;
     const h = this.doc.height * k;
+    if (isVector(l) && !l.surface) {
+      c.save();
+      c.translate((target.width - w) / 2, (target.height - h) / 2);
+      c.scale(k, k);
+      c.beginPath();
+      c.rect(0, 0, this.doc.width, this.doc.height);
+      c.clip();
+      if (l.kind === 'text') drawText(c, l.spec);
+      else drawShape(c, l.spec);
+      c.restore();
+      return;
+    }
     const group = l.kind === 'group';
-    const src = group ? this.compositor.renderIsolated(l, k) : l.surface; // groups render at thumbnail scale
+    const src = group ? this.compositor.renderIsolated(l, k) : (l as SurfaceLayer).surface; // groups render at thumbnail scale
     const sw = group ? Math.max(1, Math.round(this.doc.width * k)) : this.doc.width;
     const sh = group ? Math.max(1, Math.round(this.doc.height * k)) : this.doc.height;
-    const ox = group ? 0 : l.x;
-    const oy = group ? 0 : l.y;
+    const ox = group ? 0 : (l as SurfaceLayer).x;
+    const oy = group ? 0 : (l as SurfaceLayer).y;
     c.imageSmoothingQuality = 'high';
     c.drawImage(src.canvas as CanvasImageSource, 0, 0, sw, sh, (target.width - w) / 2 + ox * k, (target.height - h) / 2 + oy * k, w, h);
     if (l.kind === 'group') {
@@ -494,7 +539,7 @@ export class Engine implements EditorEngine, Host {
       if (l.kind === 'group') continue;
       const ox = l.kind === 'adjustment' ? 0 : l.x;
       const oy = l.kind === 'adjustment' ? 0 : l.y;
-      if (l.kind === 'pixel' && l.slot === slot) return { surface: l.surface, isMask: false, ox, oy };
+      if ((l.kind === 'pixel' || isVector(l)) && l.slot === slot && l.surface) return { surface: l.surface, isMask: false, ox, oy };
       if (l.mask && l.mask.slot === slot) return { surface: l.mask.surface, isMask: true, ox, oy };
     }
     return null;
@@ -600,6 +645,17 @@ export class Engine implements EditorEngine, Host {
         kids.set(sp.id, []);
       } else if (sp.kind === 'adjustment') {
         layer = { ...common, blend: 'normal', kind: 'adjustment', adjustment: clampAdjustment(sp.adjustment as AdjustmentSpec), mask: mk(sp.mask) };
+      } else if (sp.kind === 'text' || sp.kind === 'shape') {
+        const raster = !!sp.rasterize;
+        if (raster) maxSlot = Math.max(maxSlot, sp.slot as number);
+        const v = {
+          ...common, rasterize: raster, surface: raster ? createSurface(w, h) : null, slot: raster ? (sp.slot as number) : null,
+          x: 0, y: 0, mask: mk(sp.mask),
+        };
+        layer = sp.kind === 'text'
+          ? ({ ...v, kind: 'text', spec: sanitizeText(sp.text as TextSpec) } as TextLayer)
+          : ({ ...v, kind: 'shape', spec: sanitizeShape(sp.shape as ShapeSpec) } as ShapeLayer);
+        if (raster) this.renderRaster(layer as VectorLayer, null);
       } else if (sp.kind === 'base') {
         layer = oldBase;
         Object.assign(oldBase, common, { x: 0, y: 0, slot: null, mask: null, surface: resized ? createSurface(w, h) : oldBase.surface });
@@ -627,7 +683,9 @@ export class Engine implements EditorEngine, Host {
     }
     this.version++;
     this.thumbs.clear();
-    const hadSel = this.doc.selection !== null;
+    const hadSel = this.sel.rect !== null;
+    this.dropSelCaches();
+    this.sel = NO_SEL;
     this.doc.selection = null;
     this.baseDirty = null;
     this.surfaceDirty = null;
@@ -660,7 +718,12 @@ export class Engine implements EditorEngine, Host {
       if (l.kind === 'group') groups.add(l.id);
       else if (l.kind === 'pixel') take(l.slot);
       else if (l.kind === 'adjustment') { if (!l.adjustment || !(l.adjustment.type in ADJUSTMENT_NAMES)) bad(`adjustment ${l.id}`); }
-      else if (l.kind !== 'base') bad(`unknown kind ${String(l.kind)}`);
+      else if (l.kind === 'text' || l.kind === 'shape') {
+        const sp = l.kind === 'text' ? l.text : l.shape;
+        if (!sp || typeof sp !== 'object') bad(`${l.kind} spec of ${l.id}`);
+        try { if (l.kind === 'text') sanitizeText(l.text as TextSpec); else sanitizeShape(l.shape as ShapeSpec); } catch { bad(`${l.kind} spec of ${l.id}`); }
+        if (l.rasterize) take(l.slot);
+      } else if (l.kind !== 'base') bad(`unknown kind ${String(l.kind)}`);
       if (l.mask && l.kind !== 'group' && l.kind !== 'base') take(l.mask.slot);
       else if (l.mask) bad(`${l.kind} layers cannot have masks`);
     });
@@ -718,14 +781,403 @@ export class Engine implements EditorEngine, Host {
 
   // ---- Selection ----
 
-  selection(): Rect | null { return this.doc.selection && { ...this.doc.selection }; }
+  selection(): Rect | null { return this.sel.rect && { ...this.sel.rect }; }
 
   setSelection(rect: Rect | null): void {
+    this.finishStroke();
     const r = rect && clipToSize(rect, this.doc.width, this.doc.height);
-    const next = r && !isEmpty(r) ? r : null;
-    if (equal(next, this.doc.selection)) return;
-    this.doc.selection = next;
+    const next = r && !isEmpty(r) ? rectSel(r) : NO_SEL;
+    if (sameSel(next, this.sel)) return;
+    const before = this.sel;
+    this.setSel(next);
+    this.commitSelection('Select', before);
+  }
+
+  setSelectionOptions(opts: SelectionOptions): void {
+    this.selOpts = {
+      mode: opts.mode, feather: Math.min(500, Math.max(0, Number(opts.feather) || 0)), antialias: !!opts.antialias,
+      wandTolerance: Math.min(255, Math.max(0, Math.round(Number(opts.wandTolerance) || 0))),
+      wandContiguous: !!opts.wandContiguous, wandSampleAll: !!opts.wandSampleAll,
+    };
+  }
+
+  /** Coverage of the selection, document sized (a shared array: do not modify). */
+  selectionMask(): { rect: Rect; alpha: Uint8Array } | null {
+    const s = this.sel;
+    if (!s.rect) return null;
+    if (s.alpha) return { rect: { ...s.rect }, alpha: s.alpha };
+    this.selMaskCache ??= materialize(s, this.doc.width, this.doc.height);
+    return { rect: { ...s.rect }, alpha: this.selMaskCache };
+  }
+
+  selectionPath(): Array<Array<{ x: number; y: number }>> {
+    this.selPathCache ??= tracePath(this.sel, this.doc.width);
+    return this.selPathCache.map((l) => l.map((p) => ({ ...p })));
+  }
+
+  selectAll(): void {
+    this.finishStroke();
+    this.changeSelection('Select all', selectAllState(this.doc.width, this.doc.height));
+  }
+
+  deselect(): void {
+    this.finishStroke();
+    this.changeSelection('Deselect', NO_SEL);
+  }
+
+  invertSelection(): void {
+    this.finishStroke();
+    if (!this.sel.rect) return;
+    this.changeSelection('Invert selection', invertSel(this.sel, this.doc.width, this.doc.height));
+  }
+
+  maskFromSelection(layerId: string): void {
+    const l = this.doc.find(layerId);
+    if (!l || l.kind === 'group' || l.kind === 'base') {
+      this.emit({ type: 'notice', message: 'Masks need a pixel or adjustment layer' });
+      return;
+    }
+    const s = this.sel;
+    if (!s.rect) {
+      this.emit({ type: 'notice', message: 'Make a selection first' });
+      return;
+    }
+    const surface = createSurface(this.doc.width, this.doc.height, true);
+    const lx = l.kind === 'adjustment' ? 0 : l.x;
+    const ly = l.kind === 'adjustment' ? 0 : l.y;
+    surface.ctx.putImageData(this.coverageImage(s), s.rect.x - lx, s.rect.y - ly);
+    const mask: Mask = { slot: this.doc.newSlot(), surface, enabled: true };
+    this.structural('Mask from selection', () => { l.mask = mask; }, layerExtent(l, this.docRect()));
+  }
+
+  // Host: selection
+  selectionOptions(): SelectionOptions { return this.selOpts; }
+  selectionState(): SelState { return this.sel; }
+
+  previewSelection(s: SelState): void {
+    if (!sameSel(s, this.sel)) this.setSel(s);
+  }
+
+  commitSelection(label: string, before: SelState): void {
+    const after = this.sel;
+    if (sameSel(before, after)) return;
+    const go = (s: SelState) => () => { this.setSel(s); };
+    this.hist.push({ label, bytes: 64 + (before.alpha?.length ?? 0) + (after.alpha?.length ?? 0), undo: go(before), redo: go(after) });
+    this.emit({ type: 'history' });
+  }
+
+  selectionAlpha(): Uint8Array | null { return this.sel.alpha; }
+
+  /** Canvas whose alpha is the coverage (rgb white); built on first use after a selection change, only for non-rect selections. */
+  selectionCanvas(): Surface | null {
+    const s = this.sel;
+    if (!s.rect || !s.alpha) return null;
+    if (this.selCanvasFor === s && this.selCanvas) return this.selCanvas;
+    if (!this.selCanvas) this.selCanvas = createSurface(this.doc.width, this.doc.height);
+    const c = this.selCanvas.ctx;
+    if (this.selCanvasRect) c.clearRect(this.selCanvasRect.x, this.selCanvasRect.y, this.selCanvasRect.w, this.selCanvasRect.h);
+    c.putImageData(this.coverageImage(s), s.rect.x, s.rect.y);
+    this.selCanvasFor = s;
+    this.selCanvasRect = s.rect;
+    return this.selCanvas;
+  }
+
+  tempWindow(w: number, h: number): Surface {
+    const nw = Math.ceil(w);
+    const nh = Math.ceil(h);
+    if (!this.tmp || this.tmp.width < nw || this.tmp.height < nh) {
+      const old = this.tmp;
+      this.tmp = createSurface(Math.ceil(Math.max(nw, old?.width ?? 0, 64) / 64) * 64, Math.ceil(Math.max(nh, old?.height ?? 0, 64) / 64) * 64);
+      if (old) releaseSurface(old);
+    }
+    this.tmp.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    this.tmp.ctx.globalCompositeOperation = 'source-over';
+    this.tmp.ctx.globalAlpha = 1;
+    return this.tmp;
+  }
+
+  wandSource(sampleAll: boolean): Uint8ClampedArray | null {
+    const W = this.doc.width;
+    const H = this.doc.height;
+    const l = this.doc.active();
+    const composite = (): Uint8ClampedArray => {
+      this.compositor.ensure(null);
+      return this.compositor.surface.ctx.getImageData(0, 0, W, H).data;
+    };
+    if (sampleAll || !l || l.kind === 'group' || l.kind === 'adjustment') return composite();
+    if (this.paintTarget().target === 'mask' && l.mask) {
+      const d = l.mask.surface.ctx.getImageData(0, 0, W, H).data; // alpha-stored: expose the value as grey
+      const out = new Uint8ClampedArray(d.length);
+      for (let i = 0; i < d.length; i += 4) out.fill(d[i + 3], i, i + 3), (out[i + 3] = 255);
+      return this.shifted(out, l.kind === 'pixel' || l.kind === 'base' ? l.x : 0, l.kind === 'pixel' || l.kind === 'base' ? l.y : 0);
+    }
+    if (isVector(l) && !l.surface) {
+      const t = this.tempWindow(W, H);
+      t.ctx.clearRect(0, 0, W, H);
+      if (l.kind === 'text') drawText(t.ctx, l.spec);
+      else drawShape(t.ctx, l.spec);
+      return t.ctx.getImageData(0, 0, W, H).data;
+    }
+    const sl = l as SurfaceLayer;
+    return this.shifted(sl.surface.ctx.getImageData(0, 0, sl.surface.width, sl.surface.height).data, sl.x, sl.y);
+  }
+
+  /** Layer-space RGBA -> document-space RGBA for a layer offset by (ox, oy) (transparent where the layer is missing). */
+  private shifted(data: Uint8ClampedArray, ox: number, oy: number): Uint8ClampedArray {
+    if (ox === 0 && oy === 0) return data;
+    const W = this.doc.width;
+    const H = this.doc.height;
+    const out = new Uint8ClampedArray(W * H * 4);
+    for (let y = 0; y < H; y++) {
+      const sy = y - oy;
+      if (sy < 0 || sy >= H) continue;
+      const x0 = Math.max(0, ox);
+      const x1 = Math.min(W, W + ox);
+      if (x1 <= x0) continue;
+      out.set(data.subarray((sy * W + x0 - ox) * 4, (sy * W + x1 - ox) * 4), (y * W + x0) * 4);
+    }
+    return out;
+  }
+
+  private coverageImage(s: SelState): ImageData {
+    const r = s.rect as Rect;
+    const img = new ImageData(r.w, r.h);
+    const d = img.data;
+    const a = s.alpha;
+    const W = this.doc.width;
+    for (let y = 0; y < r.h; y++) {
+      let o = y * r.w * 4;
+      const src = (r.y + y) * W + r.x;
+      for (let x = 0; x < r.w; x++, o += 4) {
+        d[o] = 255;
+        d[o + 1] = 255;
+        d[o + 2] = 255;
+        d[o + 3] = a ? a[src + x] : 255;
+      }
+    }
+    return img;
+  }
+
+  private changeSelection(label: string, next: SelState): void {
+    if (sameSel(next, this.sel)) return;
+    const before = this.sel;
+    this.setSel(next);
+    this.commitSelection(label, before);
+  }
+
+  private setSel(s: SelState): void {
+    this.dropSelCaches();
+    this.sel = s;
+    this.doc.selection = s.rect;
     this.emit({ type: 'selection' });
+  }
+
+  private dropSelCaches(): void {
+    this.selMaskCache = null;
+    this.selPathCache = null;
+    this.selCanvasFor = null;
+    if (this.selCanvas && (this.selCanvas.width !== this.doc.width || this.selCanvas.height !== this.doc.height)) {
+      releaseSurface(this.selCanvas);
+      this.selCanvas = null;
+      this.selCanvasRect = null;
+    }
+  }
+
+  // ---- Text and shape layers (v3) ----
+
+  addTextLayer(spec: TextSpec): string {
+    const clean = sanitizeText(spec);
+    const first = clean.text.split('\n')[0].trim();
+    const layer: TextLayer = {
+      id: this.doc.newId(), kind: 'text', name: first ? first.slice(0, 24) : `Text ${++this.textCount}`, visible: true, locked: false,
+      opacity: 1, blend: 'normal', spec: clean, rasterize: false, surface: null, slot: null, x: 0, y: 0, mask: null,
+    };
+    this.insertAboveActive('Add text', layer, textBounds(clean));
+    return layer.id;
+  }
+
+  addShapeLayer(spec: ShapeSpec): string {
+    const clean = sanitizeShape(spec);
+    const layer = this.makeShapeLayer(clean);
+    this.insertAboveActive('Add shape', layer, shapeBounds(clean));
+    return layer.id;
+  }
+
+  private makeShapeLayer(spec: ShapeSpec): ShapeLayer {
+    const names = { rect: 'Rectangle', ellipse: 'Ellipse', line: 'Line', polygon: spec.type === 'polygon' && spec.innerRatio < 1 ? 'Star' : 'Polygon' };
+    return {
+      id: this.doc.newId(), kind: 'shape', name: `${names[spec.type]} ${++this.shapeCount}`, visible: true, locked: false,
+      opacity: 1, blend: 'normal', spec, rasterize: false, surface: null, slot: null, x: 0, y: 0, mask: null,
+    };
+  }
+
+  setText(id: string, spec: TextSpec): void {
+    const l = this.doc.find(id);
+    if (!l || l.kind !== 'text') return;
+    const next = sanitizeText(spec);
+    if (sameSpec(next, l.spec)) return;
+    this.editSpec(l, next, 'Edit text');
+  }
+
+  setShape(id: string, spec: ShapeSpec): void {
+    const l = this.doc.find(id);
+    if (!l || l.kind !== 'shape') return;
+    const next = sanitizeShape(spec);
+    if (sameSpec(next, l.spec)) return;
+    this.editSpec(l, next, 'Edit shape');
+  }
+
+  private editSpec(l: VectorLayer, next: TextSpec | ShapeSpec, label: string): void {
+    this.finishStroke();
+    const before = this.doc.snapshot();
+    const area = union(specBounds(l), l.kind === 'text' ? textBounds(next as TextSpec) : shapeBounds(next as ShapeSpec)) as Rect;
+    (l as { spec: unknown }).spec = next;
+    if (l.surface) this.renderRaster(l, area);
+    this.commitStructure(label, before, `${l.kind}:${l.id}`, l.visible && l.opacity > 0 ? area : false);
+    this.emitSurface(l, area);
+  }
+
+  setRasterize(id: string, rasterize: boolean): void {
+    const l = this.doc.find(id);
+    if (!l || !isVector(l) || l.rasterize === rasterize) return;
+    const slot = rasterize ? this.doc.newSlot() : null; // may throw: do it before touching the layer
+    this.structural(rasterize ? 'Rasterize on' : 'Rasterize off', () => {
+      if (rasterize) {
+        l.surface = createSurface(this.doc.width, this.doc.height);
+        l.slot = slot;
+        l.rasterize = true;
+        this.freshSlots.add(slot as number); // empty outside the shape: only the shape's area is announced below
+        this.renderRaster(l, null);
+      } else {
+        l.rasterize = false;
+        l.surface = null; // history keeps the old surface alive for undo
+        l.slot = null;
+      }
+    }, false);
+    if (rasterize) this.emitSurface(l, specBounds(l));
+  }
+
+  flattenLayer(id: string): void {
+    const l = this.doc.find(id);
+    const loc = this.doc.locate(id);
+    if (!l || !loc || !isVector(l)) return;
+    this.finishStroke();
+    const surface = createSurface(this.doc.width, this.doc.height);
+    if (l.surface) surface.ctx.drawImage(l.surface.canvas as CanvasImageSource, 0, 0);
+    else if (l.kind === 'text') drawText(surface.ctx, l.spec);
+    else drawShape(surface.ctx, l.spec);
+    const px: PixelLayer = {
+      id: l.id, kind: 'pixel', name: l.name, visible: l.visible, locked: l.locked, opacity: l.opacity, blend: l.blend,
+      surface, x: 0, y: 0, slot: l.surface && l.slot !== null ? l.slot : this.doc.newSlot(), mask: l.mask,
+    };
+    this.structural('Flatten layer', () => { loc.parent.children[loc.index] = px; }, false);
+  }
+
+  /** Stored only: the UI creates shape layers itself (addShapeLayer); the engine's 'shape' / 'text' tools are no-ops. */
+  setShapeTool(type: ShapeType): void { this.shapeType = type; }
+  shapeTool(): ShapeType { return this.shapeType; }
+  /** Topmost visible text layer whose layout box contains the point (document px). */
+  textLayerAt(x: number, y: number): string | null {
+    const walk = (g: GroupLayer): string | null => {
+      for (const c of g.children) {
+        if (!c.visible) continue;
+        if (c.kind === 'group') {
+          const h = walk(c);
+          if (h) return h;
+        } else if (c.kind === 'text') {
+          const b = textBox(c.spec);
+          if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) return c.id;
+        }
+      }
+      return null;
+    };
+    return walk(this.doc.root);
+  }
+
+  /** Set a text / shape spec without history (live drags): rerender, recomposite, announce. */
+  respec(l: VectorLayer, spec: TextSpec | ShapeSpec): void {
+    const area = union(specBounds(l), l.kind === 'text' ? textBounds(spec as TextSpec) : shapeBounds(spec as ShapeSpec)) as Rect;
+    (l as { spec: unknown }).spec = spec;
+    if (l.surface) this.renderRaster(l, area);
+    this.changed(area);
+    this.emitSurface(l, area);
+  }
+
+  /** Draw the layer's spec into its surface, replacing the content of `area` (document space; null = everything). */
+  private renderRaster(l: VectorLayer, area: Rect | null): void {
+    const s = l.surface;
+    if (!s) return;
+    const r = area ? clipToSize(area, s.width, s.height) : { x: 0, y: 0, w: s.width, h: s.height };
+    if (!r) return;
+    const c = s.ctx;
+    c.clearRect(r.x, r.y, r.w, r.h);
+    c.save();
+    c.beginPath();
+    c.rect(r.x, r.y, r.w, r.h);
+    c.clip();
+    if (l.kind === 'text') drawText(c, l.spec);
+    else drawShape(c, l.spec);
+    c.restore();
+  }
+
+  private emitSurface(l: VectorLayer, area: Rect | null): void {
+    if (!l.surface || l.slot === null) return;
+    const r = area ? clipToSize(area, l.surface.width, l.surface.height) : { x: 0, y: 0, w: l.surface.width, h: l.surface.height };
+    if (r) this.emit({ type: 'surface', slot: l.slot, rect: r });
+  }
+
+  /** After undo / redo: re-render the rasterized layers whose spec changed. Returns the 'surface' events to emit. */
+  private rerender(changed: Array<{ layer: VectorLayer; prevSpec: TextSpec | ShapeSpec; prevRasterize: boolean }>): EngineEvent[] {
+    const out: EngineEvent[] = [];
+    for (const { layer, prevSpec, prevRasterize } of changed) {
+      if (!layer.surface || layer.slot === null) continue;
+      const partial = prevRasterize && layer.rasterize;
+      const bounds = (sp: TextSpec | ShapeSpec): Rect => (layer.kind === 'text' ? textBounds(sp as TextSpec) : shapeBounds(sp as ShapeSpec));
+      const area = partial ? (union(bounds(prevSpec), bounds(layer.spec)) as Rect) : null;
+      this.renderRaster(layer, area);
+      const r = area ? clipToSize(area, layer.surface.width, layer.surface.height) : { x: 0, y: 0, w: layer.surface.width, h: layer.surface.height };
+      if (r) out.push({ type: 'surface', slot: layer.slot, rect: r });
+    }
+    return out;
+  }
+
+  // ---- Image import (v3) ----
+
+  importImage(rgba: Uint8Array | Uint8ClampedArray, w: number, h: number, name: string): string {
+    if (!Number.isInteger(w) || !Number.isInteger(h) || w < 1 || h < 1) throw new RangeError('importImage: size must be positive integers');
+    const need = w * h * 4;
+    if (rgba.length < need) throw new RangeError(`importImage: need ${need} bytes, got ${rgba.length}`);
+    this.finishStroke();
+    const dw = this.doc.width;
+    const dh = this.doc.height;
+    const k = w > dw || h > dh ? Math.min(dw / w, dh / h) : 1;
+    const tw = k < 1 ? Math.max(1, Math.min(dw, Math.round(w * k))) : w;
+    const th = k < 1 ? Math.max(1, Math.min(dh, Math.round(h * k))) : h;
+    let cur = createSurface(w, h);
+    cur.ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba.buffer as ArrayBuffer, rgba.byteOffset, need), w, h), 0, 0);
+    while (cur.width >= tw * 2 && cur.height >= th * 2) { // halve step by step: far better than one big box-less jump
+      const next = createSurface(Math.max(tw, Math.floor(cur.width / 2)), Math.max(th, Math.floor(cur.height / 2)));
+      next.ctx.imageSmoothingEnabled = true;
+      next.ctx.imageSmoothingQuality = 'high';
+      next.ctx.drawImage(cur.canvas as CanvasImageSource, 0, 0, next.width, next.height);
+      releaseSurface(cur);
+      cur = next;
+    }
+    const ox = Math.round((dw - tw) / 2);
+    const oy = Math.round((dh - th) / 2);
+    const surface = createSurface(dw, dh);
+    surface.ctx.imageSmoothingEnabled = true;
+    surface.ctx.imageSmoothingQuality = 'high';
+    if (cur.width === tw && cur.height === th) surface.ctx.drawImage(cur.canvas as CanvasImageSource, ox, oy);
+    else surface.ctx.drawImage(cur.canvas as CanvasImageSource, 0, 0, cur.width, cur.height, ox, oy, tw, th);
+    releaseSurface(cur);
+    const layer: PixelLayer = {
+      id: this.doc.newId(), kind: 'pixel', name: String(name || 'Image'), visible: true, locked: false, opacity: 1, blend: 'normal',
+      surface, x: 0, y: 0, slot: this.doc.newSlot(), mask: null,
+    };
+    this.insertAboveActive('Import image', layer, { x: ox, y: oy, w: tw, h: th });
+    if (k < 1) this.emit({ type: 'notice', message: `Image scaled to fit (${w}\u00d7${h} \u2192 ${tw}\u00d7${th})` });
+    return layer.id;
   }
 
   // ---- Tools ----
@@ -800,6 +1252,8 @@ export class Engine implements EditorEngine, Host {
     Object.values(this.scratch).forEach(releaseSurface);
     this.doc.pixelLayers().forEach((l) => releaseSurface(l.surface));
     this.doc.masks().forEach((m) => releaseSurface(m.surface));
+    if (this.selCanvas) releaseSurface(this.selCanvas);
+    if (this.tmp) releaseSurface(this.tmp);
     this.listeners.clear();
   }
 

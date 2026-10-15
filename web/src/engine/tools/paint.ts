@@ -7,6 +7,25 @@ import { TileBackup } from '../tiles';
 
 export type PaintMode = 'brush' | 'pencil' | 'eraser';
 
+/**
+ * Where to draw `r` (document space) of `canvas` from so that it is multiplied by the selection coverage:
+ * the canvas itself when the selection is absent or a plain rect (the rect is clipped separately), otherwise a
+ * window copy masked with destination-in against the cached selection canvas. Cost is proportional to `r`.
+ */
+export function coveredSource(host: Host, canvas: CanvasImageSource, r: Rect): { img: CanvasImageSource; x: number; y: number } {
+  const sel = host.selectionCanvas();
+  if (!sel) return { img: canvas, x: r.x, y: r.y };
+  const t = host.tempWindow(r.w, r.h);
+  const c = t.ctx;
+  c.globalCompositeOperation = 'source-over';
+  c.clearRect(0, 0, r.w, r.h);
+  c.drawImage(canvas, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
+  c.globalCompositeOperation = 'destination-in';
+  c.drawImage(sel.canvas as CanvasImageSource, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
+  c.globalCompositeOperation = 'source-over';
+  return { img: t.canvas as CanvasImageSource, x: 0, y: 0 };
+}
+
 /** Restore the pre-edit pixels in `r` (layer space), then run `draw` clipped to the selection. */
 export function restoreAndDraw(host: Host, layer: EditTarget, tb: TileBackup, r: Rect, draw: () => void): void {
   tb.restore(r);
@@ -186,7 +205,10 @@ export class StrokeTool implements Tool {
     const ly = r.y - layer.y;
     restoreAndDraw(this.host, layer, this.tb as TileBackup, { x: lx, y: ly, w: r.w, h: r.h }, () => {
       const c = layer.surface.ctx;
-      const stroke = this.host.scratch.stroke.canvas as CanvasImageSource;
+      const cov = coveredSource(this.host, this.host.scratch.stroke.canvas as CanvasImageSource, r);
+      const stroke = cov.img;
+      const sx = cov.x;
+      const sy = cov.y;
       if (layer.isMask) {
         // mask = lerp(mask, value, coverage * opacity), stored as alpha: scale the old alpha down, add value * coverage.
         const a = brush.opacity * primary.a / 255;
@@ -194,17 +216,17 @@ export class StrokeTool implements Tool {
         const amount = this.mode === 'eraser' ? brush.opacity : a;
         c.globalAlpha = amount;
         c.globalCompositeOperation = 'destination-out';
-        c.drawImage(stroke, r.x, r.y, r.w, r.h, lx, ly, r.w, r.h);
+        c.drawImage(stroke, sx, sy, r.w, r.h, lx, ly, r.w, r.h);
         if (value > 0) {
           c.globalAlpha = amount * value;
           c.globalCompositeOperation = 'lighter';
-          c.drawImage(stroke, r.x, r.y, r.w, r.h, lx, ly, r.w, r.h);
+          c.drawImage(stroke, sx, sy, r.w, r.h, lx, ly, r.w, r.h);
         }
         return;
       }
       c.globalAlpha = brush.opacity * (this.mode === 'eraser' ? 1 : primary.a / 255);
       c.globalCompositeOperation = this.mode === 'eraser' ? 'destination-out' : 'source-over';
-      c.drawImage(stroke, r.x, r.y, r.w, r.h, lx, ly, r.w, r.h);
+      c.drawImage(stroke, sx, sy, r.w, r.h, lx, ly, r.w, r.h);
     });
     this.host.paintChanged(layer, r);
   }
