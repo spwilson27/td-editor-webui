@@ -12,7 +12,7 @@ html[data-td-panel],html[data-td-panel] body{background:transparent}
 #app .ib[aria-disabled=true]:hover{background:none}
 #app input[type=range]{accent-color:#4a8fe0;height:14px;margin:0}
 #app select{font:inherit;color:#e3e3e3;background:#1f1f1f;border:1px solid #474747;border-radius:4px;padding:2px 6px;height:24px}
-#app input{font:inherit}
+#app input{font:inherit;color:#e3e3e3}
 #app .lockbtn{opacity:0}
 #app .row:hover .lockbtn{opacity:.55}
 #app .lockbtn.on{opacity:1}

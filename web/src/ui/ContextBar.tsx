@@ -6,7 +6,7 @@ import { PAINT_TOOLS, BRUSHES, SHAPE_KINDS, toolInfo } from '../state/tools';
 import { editBounds, type BoundsField } from '../state/transform';
 import { Icon, NOT_IN_VERSION } from './Icon';
 
-const BOX = 'padding:3px 6px;background:#1f1f1f;border:1px solid #474747;border-radius:4px;text-align:right';
+const BOX = 'padding:3px 6px;color:#e3e3e3;background:#1f1f1f;border:1px solid #474747;border-radius:4px;text-align:right';
 const CHK = 'accent-color:#4a8fe0;margin:0';
 
 interface RangeProps { label: string; id: string; min: number; max: number; value: number; unit: string; w: number; span: number; onInput: (v: number) => void }
