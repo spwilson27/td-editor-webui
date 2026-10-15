@@ -1,7 +1,9 @@
 import type { CanvasMode, EditorEngine, LayerSpec, Rect } from '../engine/types';
+import type { FileResult } from '../state/filesSlice';
+import type { InputItem } from '../state/inputsSlice';
 import {
   FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, FRAME_VIEW, MAX_BAND_PAYLOAD, PROTOCOL_VERSION,
-  decodeFrame, decodeTdMessage, encodeBands, encodeMessage, isStale, type TdMessage, type TopItem, type ViewMode, type ViewRect, type WebMessage,
+  decodeFrame, decodeTdMessage, encodeBands, encodeMessage, isStale, type ChoosePurpose, type TdMessage, type TopItem, type ViewMode, type ViewRect, type WebMessage,
 } from './codec';
 
 export type Connection = 'linked' | 'standalone' | 'reconnecting';
@@ -24,7 +26,15 @@ export interface BridgeStatus {
   setViewFrame?(w: number, h: number, rgba: Uint8ClampedArray, ageMs: number): void;
   /** v4: TD's font family list (sent after hello). */
   setFonts?(families: string[]): void;
+  /** v6: TD's input list (`inputs` message / `hello.inputs`) for the Add Input Layer menu. The bridge itself calls engine.setInputs. */
+  setInputs?(items: InputItem[]): void;
+  /** v6: `files` message: current Projectfile / Pngfile parameter values. */
+  setFiles?(f: { projectFile: string; pngFile: string }): void;
+  /** v6: a `fileResult` that no dialog request is waiting for (TD pulses). */
+  onFileResult?(r: FileResult): void;
 }
+export type { FileResult, FileOp } from '../state/filesSlice';
+export type { InputItem } from '../state/inputsSlice';
 
 export interface ViewState { mode: ViewMode; zoom: number; panX: number; panY: number; rect: ViewRect }
 
@@ -41,6 +51,14 @@ export interface Bridge {
   renderLayer(layerId: string): Promise<void>;
   /** v5: tell TD the canvas size / mode (active, loaded page only). Returns false when nothing was sent. */
   setCanvas(w: number, h: number, mode: CanvasMode): boolean;
+  /** v6 files (written/read by TD). `path` omitted = the TD parameter value. Reject when not linked / on timeout; resolve with TD's `fileResult` (ok may be false). */
+  saveProject(path?: string): Promise<FileResult>;
+  openProject(path?: string): Promise<FileResult>;
+  exportPng(path?: string): Promise<FileResult>;
+  /** v6: TD shows a file chooser (panel clients have no file input). Resolves with the chosen path, null when cancelled. */
+  chooseFile(purpose: Exclude<ChoosePurpose, 'placeImage'>): Promise<string | null>;
+  /** v6 Place Image through TD's chooser: resolves the new layer id (named after the file), null when cancelled. Rejects on topError / disconnect / 5 min timeout. */
+  placeImageViaTd(): Promise<string | null>;
 }
 
 export interface TdBridgeOptions {
@@ -62,6 +80,8 @@ const BACKOFF_MIN = 500, BACKOFF_MAX = 5000, DEFAULT_FPS = 30;
 const LOAD_RETRY_MIN = 2000, LOAD_RETRY_MAX = 10000, NO_DOC_FALLBACK_MS = 10000;
 const LATENCY_WINDOW = 60, SENT_KEEP = 512;
 export const RENDER_LAYER_TIMEOUT_MS = 30000;
+export const FILE_OP_TIMEOUT_MS = 60000;
+export const CHOOSE_FILE_TIMEOUT_MS = 300000, PLACE_IMAGE_TIMEOUT_MS = 300000; // the user is picking a file
 export const LIST_TOPS_TIMEOUT_MS = 10000, IMPORT_TOP_TIMEOUT_MS = 30000;
 
 export function resolveWsUrl(search: string, loc: { protocol: string; host: string }): string {
@@ -135,9 +155,11 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   let maxFps = DEFAULT_FPS;
   let frameId = 0;
   let clientId = '';
-  let noticeId = 0;
-  let fetching = false;
-  let refetch = false; // a newer notice arrived while fetching: fetch again, newest wins
+  // v6: BASE bookkeeping per TD input: newest notice id, single flight, and a refetch flag (newest wins)
+  interface BaseState { noticeId: number; fetching: boolean; refetch: boolean }
+  const baseStates = new Map<number, BaseState>();
+  let reapplyInputs = false; // after `reload`: re-apply knownInputs once the reload's load completes
+  let knownInputs: InputItem[] = []; // the list as last announced (hello.inputs / inputs), sizes corrected by BASE frames
   let docEpoch = 0; // bumped by docSize/reconnect/doc load: results fetched before are void
   let synced = false; // the page has loaded or pushed a document; false = `fresh`
   let loading = false; // loading TD's document: engine events are not echoed back
@@ -164,7 +186,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   // canvas as TD knows it (last received from / sent to TD): engine changes of any other origin (undo, redo, jumpTo) are sent
   let tdCanvas: { w: number; h: number; mode: CanvasMode } | null = null;
   let adopting = false;
-  let pendingTd: { size?: Extract<TdMessage, { t: 'docSize' }>; base?: { w: number; h: number } } = {};
+  let pendingTd: { size?: Extract<TdMessage, { t: 'docSize' }>; inputs?: InputItem[] } = {};
   // doc stack
   let docPending = false, docQueued = false, lastDocRev = -1;
   // view
@@ -174,7 +196,15 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   let requestSeq = 0;
   const pendingTops = new Map<string, { resolve: (items: TopItem[]) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   const pendingImports = new Map<string, { resolve: (w: number, h: number) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  const pendingFiles = new Map<string, { resolve: (r: FileResult) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  const pendingChoose = new Map<string, { resolve: (p: string | null) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  const placeWatch = new Map<string, (path: string | null) => void>(); // placeImageViaTd: fileChosen listeners
   const failPending = (msg: string) => {
+    for (const p of pendingChoose.values()) { clearTimeout(p.timer); p.reject(new Error(msg)); }
+    pendingChoose.clear();
+    placeWatch.clear();
+    for (const p of pendingFiles.values()) { clearTimeout(p.timer); p.reject(new Error(msg)); }
+    pendingFiles.clear();
     for (const p of pendingTops.values()) { clearTimeout(p.timer); p.reject(new Error(msg)); }
     for (const p of pendingImports.values()) { clearTimeout(p.timer); p.reject(new Error(msg)); }
     pendingTops.clear();
@@ -198,11 +228,6 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     if (spec.rev !== sizesRev) { sizesRev = spec.rev; sizesCache = slotSizesOf(spec.layers, spec.width, spec.height); }
     return sizesCache;
   };
-  const baseSize = (): { w: number; h: number } => {
-    const b = engine.layers().find((l) => l.kind === 'base');
-    return { w: b?.surfaceW ?? engine.width, h: b?.surfaceH ?? engine.height };
-  };
-
   const markFull = (slots: number[] = engine.surfaceSlots()) => {
     const sizes = slotSizes();
     for (const slot of slots) {
@@ -236,17 +261,17 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   function schedule() {
     if (sendTimer || !dirty.size || !canSend() || !isOpen()) return;
     const wait = Math.max(0, lastSend + 1000 / maxFps - now());
-    sendTimer = setTimeout(flush, wait);
+    sendTimer = setTimeout(() => flush(), wait);
   }
 
-  function flush() {
+  function flush(force = false) {
     sendTimer = null;
     if (!dirty.size || !canSend() || !isOpen()) return;
-    if (ws!.bufferedAmount > BACKPRESSURE_BYTES) { sendTimer = setTimeout(flush, 1000 / maxFps); return; }
-    if (docPending) sendDocNow(); // TD drops surfaces of slots it has not seen in a `doc`
+    if (!force && ws!.bufferedAmount > BACKPRESSURE_BYTES) { sendTimer = setTimeout(() => flush(), 1000 / maxFps); return; }
+    if (docPending || (force && lastDocRev !== engine.docSpec().rev)) sendDocNow(); // TD drops surfaces of slots it has not seen in a `doc`
     lastSend = now();
     for (const [slot, r] of [...dirty]) {
-      if (ws!.bufferedAmount > BACKPRESSURE_BYTES) break;
+      if (!force && ws!.bufferedAmount > BACKPRESSURE_BYTES) break;
       dirty.delete(slot);
       const x0 = Math.max(0, Math.floor(r.x)), y0 = Math.max(0, Math.floor(r.y));
       const sz = slotSizes().get(slot);
@@ -265,7 +290,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         ws!.send(band as BufferSource);
       }
     }
-    if (dirty.size) schedule();
+    if (dirty.size) { if (force) flush(true); else schedule(); }
   }
 
   const offEngine = engine.on((e) => {
@@ -405,21 +430,29 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         loading = false;
         try { engine.commitSurfaces(); } catch { /* the document may be unusable; the retry reloads it */ }
         dirty.clear();
+        const specKey = (sp: ReturnType<EditorEngine['docSpec']>) => JSON.stringify([sp.layers, sp.guides, sp.canvas, sp.width, sp.height]);
+        const specLoaded = engine.docSpec();
+        const revLoaded = specLoaded.rev; // what TD has: the loaded document
+        const keyLoaded = specKey(specLoaded);
         if (complete) { // TD changes that arrived mid-load: applied while still not authoritative, so nothing is pushed back
           tdCanvas = { w: m.docW, h: m.docH, mode: m.canvas.mode };
           const pend = pendingTd;
           pendingTd = {};
           if (pend.size) adoptCanvas(pend.size.w, pend.size.h, pend.size.mode);
-          if (pend.base) applyBaseSize(pend.base.w, pend.base.h);
+          if (pend.inputs) applyInputs(pend.inputs);
+          else if (reapplyInputs && knownInputs.length) applyInputs(knownInputs); // restores badges / missing input layers
+          reapplyInputs = false;
         }
         dirty.clear();
-        lastDocRev = engine.docSpec().rev;
+        lastDocRev = revLoaded;
         if (complete) {
           loadIncomplete = false;
           synced = true;
           authoritative = true;
           tdRev = m.rev;
           endLoadState();
+          // Layers that setInputs auto-created differ from TD's stored document: TD must get them.
+          if (isOpen() && active) { const now2 = engine.docSpec(); if (now2.rev !== revLoaded && specKey(now2) !== keyLoaded) sendDocNow(); }
         } else if (loadPending && !disposed) {
           armLoadRetry(); // stay non-authoritative; ask TD again
           status.setNotice('Loading document from TouchDesigner… (retrying)');
@@ -486,10 +519,10 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         const newer = synced && m.rev !== null && tdRev !== null && m.rev > tdRev;
         const needsLoad = m.hasDocument && (!synced || loadIncomplete || newer);
         setActive(m.active);
-        if (m.baseSize) {
+        if (m.inputs) {
           docEpoch++;
-          if (m.active && needsLoad) pendingTd.base = m.baseSize; // applied when the load completes
-          else applyBaseSize(m.baseSize.w, m.baseSize.h);
+          if (m.active && needsLoad) pendingTd.inputs = m.inputs; // applied when the load completes
+          else applyInputs(m.inputs);
         }
         if (m.active) {
           if (needsLoad) beginLoad();
@@ -506,15 +539,36 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         if (loading || loadPending) { pendingTd.size = m; break; } // never adopt mid-load: applied when the load completes
         adoptCanvas(m.w, m.h, m.mode);
         break;
-      case 'baseSize':
+      case 'inputs':
         docEpoch++;
-        if (loading || loadPending) { pendingTd.base = { w: m.w, h: m.h }; break; }
-        applyBaseSize(m.w, m.h);
+        if (loading || loadPending) { pendingTd.inputs = m.items; break; }
+        applyInputs(m.items);
         break;
-      case 'base':
-        noticeId = m.frameId;
-        pullBase();
+      case 'base': {
+        let st = baseStates.get(m.input);
+        if (!st) baseStates.set(m.input, (st = { noticeId: 0, fetching: false, refetch: false }));
+        st.noticeId = m.frameId;
+        pullBase(m.input, st);
         break;
+      }
+      case 'reload':
+        onReload();
+        break;
+      case 'fileChosen': {
+        const c = pendingChoose.get(m.requestId);
+        if (c) { pendingChoose.delete(m.requestId); clearTimeout(c.timer); c.resolve(m.path); break; }
+        placeWatch.get(m.requestId)?.(m.path);
+        break;
+      }
+      case 'files':
+        status.setFiles?.({ projectFile: m.projectFile, pngFile: m.pngFile });
+        break;
+      case 'fileResult': {
+        const r: FileResult = { op: m.op, ok: m.ok, path: m.path, ...(m.msg !== undefined ? { msg: m.msg } : {}) };
+        const p = m.requestId !== undefined ? pendingFiles.get(m.requestId) : undefined;
+        if (p) { pendingFiles.delete(m.requestId!); clearTimeout(p.timer); p.resolve(r); } else status.onFileResult?.(r);
+        break;
+      }
       case 'view':
         viewNotice = { frameId: m.frameId, applied: m.appliedFrameId, at: now() };
         pullView();
@@ -583,12 +637,90 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     tdCanvas = { w: engine.width, h: engine.height, mode: engine.canvasMode() };
   }
 
-  /** v5: the TD Input resolution changed; the base surface follows (no history). 0x0 = no input (the engine keeps an empty placeholder). */
-  function applyBaseSize(w: number, h: number) {
-    if (w < 0 || h < 0) return;
-    const cur = baseSize();
-    if (cur.w === w && cur.h === h) return;
-    engine.setBaseSize?.(w, h);
+  /** v6: TD's input list (hello.inputs / inputs). The engine creates / updates the input layers; no history. */
+  function applyInputs(items: InputItem[]) {
+    knownInputs = items.map((i) => ({ ...i }));
+    engine.setInputs(knownInputs.map((i) => ({ ...i })));
+    status.setInputs?.(knownInputs.map((i) => ({ ...i })));
+  }
+
+  /** A BASE frame announces the real size of its input: correct the known list when it differs (the input is connected). */
+  function adoptInputSize(input: number, w: number, h: number) {
+    const cur = knownInputs.find((i) => i.input === input);
+    if (cur && cur.w === w && cur.h === h) return;
+    const next = cur ? knownInputs.map((i) => (i.input === input ? { ...i, w, h, connected: true } : i)) : [...knownInputs, { input, w, h, connected: true }].sort((a, b) => a.input - b.input);
+    applyInputs(next);
+  }
+
+  /** TD replaced its stored document (Open Project): drop ours and load TD's again. */
+  function onReload() {
+    loadToken++; // cancels an in-flight load
+    loading = false;
+    docEpoch++;
+    dirty.clear();
+    unsafe.clear();
+    docPending = false;
+    if (sendTimer) { clearTimeout(sendTimer); sendTimer = null; }
+    authoritative = false;
+    tdRev = null;
+    tdHasDocument = true;
+    reapplyInputs = true;
+    loadIncomplete = true; // a standby page reloads on its next takeover / hello
+    if (active) beginLoad();
+  }
+
+  /** Make TD current before it writes a file: the pending doc and every dirty surface go out at once. */
+  function syncForFile() {
+    if (!canSend() || !isOpen()) return;
+    if (sendTimer) { clearTimeout(sendTimer); sendTimer = null; }
+    if (docPending || lastDocRev !== engine.docSpec().rev) sendDocNow();
+    flush(true);
+  }
+
+  function chooseFile(purpose: Exclude<ChoosePurpose, 'placeImage'>): Promise<string | null> {
+    if (!isOpen() || !clientId) return Promise.reject(new Error('Not connected to TouchDesigner'));
+    const requestId = `c${++requestSeq}`;
+    return new Promise<string | null>((resolve, reject) => {
+      const timer = setTimeout(() => { pendingChoose.delete(requestId); reject(new Error('TouchDesigner did not answer')); }, CHOOSE_FILE_TIMEOUT_MS);
+      pendingChoose.set(requestId, { resolve, reject, timer });
+      sendJson({ t: 'chooseFile', requestId, purpose });
+    });
+  }
+
+  async function placeImageViaTd(): Promise<string | null> {
+    if (!isOpen() || !clientId) throw new Error('Not connected to TouchDesigner');
+    const requestId = `p${++requestSeq}`;
+    const sock = ws, epoch = docEpoch;
+    let name = 'Image';
+    let sized: { w: number; h: number } | null;
+    try {
+      sized = await new Promise<{ w: number; h: number } | null>((resolve, reject) => {
+        const timer = setTimeout(() => { pendingImports.delete(requestId); reject(new Error('TouchDesigner did not answer')); }, PLACE_IMAGE_TIMEOUT_MS);
+        pendingImports.set(requestId, { resolve: (w, h) => resolve({ w, h }), reject, timer });
+        placeWatch.set(requestId, (path) => {
+          if (path === null) { pendingImports.delete(requestId); clearTimeout(timer); resolve(null); return; }
+          name = path.split(/[\\/]/).filter(Boolean).pop() ?? 'Image';
+        });
+        sendJson({ t: 'chooseFile', requestId, purpose: 'placeImage' });
+      });
+    } finally {
+      placeWatch.delete(requestId);
+    }
+    if (!sized) return null;
+    const frame = await fetchTop(requestId, sock);
+    if (disposed || epoch !== docEpoch) throw new Error('The document changed during the import');
+    return engine.importImage(frame.payload, frame.w, frame.h, name);
+  }
+
+  function fileOp(op: FileResult['op'], path?: string): Promise<FileResult> {
+    if (!isOpen() || !clientId) return Promise.reject(new Error('Not connected to TouchDesigner'));
+    const requestId = `f${++requestSeq}`;
+    if (op !== 'openProject') syncForFile();
+    return new Promise<FileResult>((resolve, reject) => {
+      const timer = setTimeout(() => { pendingFiles.delete(requestId); reject(new Error('TouchDesigner did not answer')); }, FILE_OP_TIMEOUT_MS);
+      pendingFiles.set(requestId, { resolve, reject, timer });
+      sendJson({ t: op, requestId, ...(path !== undefined ? { path } : {}) });
+    });
   }
 
   function listTops(): Promise<TopItem[]> {
@@ -683,40 +815,40 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     (status.setFatal ?? status.setNotice)(TOKEN_EXPIRED_MESSAGE);
   }
 
-  /** BASE frames are pulled over HTTP (never the WebSocket): one fetch in flight, a newer notice just triggers one more. */
-  function pullBase() {
-    if (fetching) { refetch = true; return; }
-    fetching = true;
-    void fetchBase(0).finally(() => {
-      fetching = false;
-      if (refetch && !disposed) { refetch = false; pullBase(); }
+  /** BASE frames are pulled over HTTP (never the WebSocket): per input one fetch in flight, a newer notice just triggers one more. */
+  function pullBase(input: number, st: BaseState) {
+    if (st.fetching) { st.refetch = true; return; }
+    st.fetching = true;
+    void fetchBase(input, st, 0).finally(() => {
+      st.fetching = false;
+      if (st.refetch && !disposed && baseStates.get(input) === st) { st.refetch = false; pullBase(input, st); }
     });
   }
 
-  async function fetchBase(attempt: number): Promise<void> {
+  async function fetchBase(input: number, st: BaseState, attempt: number): Promise<void> {
     const sock = ws, epoch = docEpoch;
     const ctrl = new AbortController();
     aborts.add(ctrl);
     const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
     try {
-      const res = await doFetch(`${httpBase}/base?${query(`&frameId=${noticeId}`)}`, { cache: 'no-store', signal: ctrl.signal });
+      const res = await doFetch(`${httpBase}/base?${query(`&frameId=${st.noticeId}&input=${input}`)}`, { cache: 'no-store', signal: ctrl.signal });
       if (res.status === 404) return; // nothing stored yet; a notice follows
       if (res.status === 403) { rejectToken(); return; }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const buf = await res.arrayBuffer();
       if (disposed || ws !== sock) return;
-      if (epoch !== docEpoch) { refetch = true; return; } // TD counted this frame as fetched and will not re-announce it
+      if (epoch !== docEpoch) { st.refetch = true; return; } // TD counted this frame as fetched and will not re-announce it
 
       const r = decodeFrame(buf);
-      if (!r.ok || r.frame.type !== FRAME_BASE) return;
-      applyBaseSize(r.frame.docW, r.frame.docH); // v5: BASE docW/docH = the input's size, not the document's
-      engine.writeBase({ x: r.frame.x, y: r.frame.y, w: r.frame.w, h: r.frame.h }, r.frame.payload);
-      if (r.frame.frameEnd) engine.commitBase();
+      if (!r.ok || r.frame.type !== FRAME_BASE || r.frame.slot !== input) return;
+      adoptInputSize(input, r.frame.docW, r.frame.docH); // BASE docW/docH = the input's size, not the document's
+      engine.writeInput(input, { x: r.frame.x, y: r.frame.y, w: r.frame.w, h: r.frame.h }, r.frame.payload);
+      if (r.frame.frameEnd) engine.commitInput(input);
     } catch {
       if (disposed || ws !== sock) return;
       if (attempt === 0) {
         await new Promise<void>((resolve) => { retryTimer = setTimeout(() => { retryTimer = null; resolve(); }, FETCH_RETRY_MS); });
-        if (!disposed && ws === sock) await fetchBase(1);
+        if (!disposed && ws === sock) await fetchBase(input, st, 1);
       } else {
         // Give up on this notice; ask TD to announce the stored frame again later.
         requestTimer = setTimeout(() => { requestTimer = null; sendJson({ t: 'requestBase' }); }, REQUEST_BASE_MS);
@@ -802,6 +934,8 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       authoritative = false;
       loadToken++;
       pendingTd = {};
+      baseStates.clear();
+      knownInputs = [];
       tdCanvas = null;
       endLoadState();
       docEpoch++;
@@ -839,6 +973,11 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     importTop,
     renderLayer,
     setCanvas,
+    saveProject: (path) => fileOp('saveProject', path),
+    openProject: (path) => fileOp('openProject', path),
+    exportPng: (path) => fileOp('exportPng', path),
+    chooseFile,
+    placeImageViaTd,
     dispose() {
       disposed = true;
       failPending('Bridge closed');

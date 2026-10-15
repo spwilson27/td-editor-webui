@@ -80,10 +80,18 @@ class FakeConnector:
     def disconnect(self):
         self.source = None
         self.op._log.disconnects.append((self.op.name, self.index))
+        _trim(self.op)
 
     @property
     def connections(self):
         return [self.source] if self.source is not None else []
+
+
+def _trim(op):
+    """Like TD, a Multi TOP keeps exactly one free connector after the last connected one: trailing free ones vanish."""
+    if op.OPType == "glslmultiTOP":
+        while len(op.inputConnectors) > 1 and op.inputConnectors[-1].source is None and op.inputConnectors[-2].source is None:
+            op.inputConnectors.pop()
 
 
 class FakeOp:
@@ -172,6 +180,7 @@ class FakeOp:
                 for con in c.inputConnectors:
                     if con.source is self:
                         con.source = None
+                        _trim(c)
 
     # -- Text TOP measurement (deterministic stand-in: 0.5 em per character, line box 1.1 em, descender 0.25 em)
     def _tp(self, k, d=0):

@@ -5,14 +5,17 @@ import { formatZoom } from '../state/view';
 import { Icon, NOT_IN_VERSION } from './Icon';
 
 type Item = 'sep' | { label: string; hint?: string; run?: (s: Store) => void; checked?: (s: Store) => boolean; enabled?: (s: Store) => boolean; title?: (s: Store) => string | undefined };
-interface MenuDef { label: string; items: Item[] }
+interface MenuDef { label: string; items: Item[] | ((s: Store) => Item[]) }
 
 const off = (label: string, hint?: string): Item => ({ label, hint });
 const isEditable = (kind?: string) => kind === 'text' || kind === 'shape';
 
 const MENUS: MenuDef[] = [
-  { label: 'File', items: [off('Open…', 'Ctrl+O'), off('Save', 'Ctrl+S'), off('Export…'), 'sep',
-    { label: 'Place Image…', run: (s) => s.placeImage() },
+  { label: 'File', items: [
+    { label: 'Save Project…', run: (s) => s.openFileDialog('saveProject'), enabled: (s) => s.canUseFiles(), title: (s) => s.fileTitle() },
+    { label: 'Open Project…', run: (s) => s.openFileDialog('openProject'), enabled: (s) => s.canUseFiles(), title: (s) => s.fileTitle() },
+    { label: 'Export PNG…', run: (s) => s.openFileDialog('exportPng'), enabled: (s) => s.canUseFiles(), title: (s) => s.fileTitle() }, 'sep',
+    { label: 'Place Image…', run: (s) => s.placeImage(), title: (s) => s.placeImageTitle() },
     { label: 'Import from TouchDesigner…', run: (s) => { s.topDialog.value = true; }, enabled: (s) => s.connection.value === 'linked' }, 'sep',
     { label: 'New layer', run: (s) => s.addLayer() }, { label: 'Flatten to new layer', run: (s) => s.flatten() }] },
   { label: 'Edit', items: [{ label: 'Undo', hint: 'Ctrl+Z', run: (s) => s.undo() }, { label: 'Redo', hint: 'Ctrl+Shift+Z', run: (s) => s.redo() },
@@ -20,21 +23,33 @@ const MENUS: MenuDef[] = [
   { label: 'Document', items: [off('Resize document…'),
     { label: 'Canvas Size…', run: (s) => { s.canvasDialog.value = true; } },
     { label: 'Follow Input Size', run: (s) => s.followInput(), checked: (s) => s.canvasMode.value === 'input', title: () => 'The document size tracks the TouchDesigner Input resolution' }, off('Rotate…')] },
-  { label: 'Layer', items: [off('Duplicate'), off('Merge down'), off('Layer properties…'), 'sep',
+  { label: 'Layer', items: (s) => [off('Duplicate'), off('Merge down'), off('Layer properties…'), 'sep',
+    { label: 'Layer Effects…', run: (x) => x.openEffects(), enabled: (x) => x.canHaveEffects(x.activeLayer()?.kind) },
+    ...(s.connectedInputs().length
+      ? s.connectedInputs().map((i): Item => ({ label: `Add Input Layer ▸ Input ${i.input}`, run: (x) => void x.addInputLayer(i.input) }))
+      : [{ label: 'Add Input Layer ▸ (no connected inputs)', run: () => {}, enabled: () => false } as Item]), 'sep',
     { label: 'Flatten Layer', run: (s) => { const l = s.activeLayer(); if (l) void s.flattenLayer(l.id); }, enabled: (s) => s.canFlatten(s.activeLayer()),
       title: (s) => (isEditable(s.activeLayer()?.kind) && s.connection.value !== 'linked' ? 'Flatten needs TouchDesigner' : undefined) },
     { label: 'Apply Transform', run: (s) => s.applyTransform(), enabled: (s) => s.canApplyTransform(s.activeLayer()) },
     { label: 'Reset Transform', run: (s) => s.resetTransform(), enabled: (s) => s.canResetTransform(s.activeLayer()) }, 'sep', { label: 'Add mask', run: (s) => s.addMask(), enabled: (s) => s.canAddMask() }, { label: 'Delete mask', run: (s) => s.deleteMask(), enabled: (s) => !!s.activeLayer()?.mask }] },
   { label: 'Select', items: [{ label: 'Select All', hint: 'Ctrl+A', run: (s) => s.selectAll() }, { label: 'Deselect', hint: 'Ctrl+D', run: (s) => s.deselect() },
     { label: 'Invert Selection', hint: 'Shift+Ctrl+I', run: (s) => s.invertSelection() }, 'sep',
-    { label: 'Mask from Selection', run: (s) => s.maskFromSelection(), enabled: (s) => s.canMaskFromSelection() }] },
+    { label: 'Mask from Selection', run: (s) => s.maskFromSelection(), enabled: (s) => s.canMaskFromSelection() }, 'sep',
+    { label: 'Transform Selection', hint: 'Ctrl+T', run: (s) => void s.beginTransformSelection(), enabled: (s) => s.canTransformSelection() },
+    { label: 'Quick Mask', hint: 'Q', run: (s) => s.toggleQuickMask(), checked: (s) => (s.floatVersion.value, s.selectionVersion.value, s.quickMaskOn()) }, 'sep',
+    { label: 'Grow…', run: (s) => s.openSelectionOp('grow'), enabled: (s) => s.canModifySelection() },
+    { label: 'Shrink…', run: (s) => s.openSelectionOp('shrink'), enabled: (s) => s.canModifySelection() },
+    { label: 'Smooth…', run: (s) => s.openSelectionOp('smooth'), enabled: (s) => s.canModifySelection() },
+    { label: 'Feather…', run: (s) => s.openSelectionOp('feather'), enabled: (s) => s.canModifySelection() },
+    { label: 'Border…', run: (s) => s.openSelectionOp('border'), enabled: (s) => s.canModifySelection() }] },
   { label: 'Filters', items: [off('Blur…'), off('Sharpen…'), off('Noise…')] },
   { label: 'View', items: [{ label: 'Zoom in', hint: '+', run: (s) => s.zoomStep(1) }, { label: 'Zoom out', hint: '-', run: (s) => s.zoomStep(-1) },
     { label: 'Fit', hint: '0', run: (s) => s.fit() }, { label: '100%', hint: '1', run: (s) => s.zoomTo(1) }, 'sep',
     { label: 'Show Rulers', run: (s) => s.setShowRulers(!s.showRulers.value), checked: (s) => s.showRulers.value },
     { label: 'Show Guides', run: (s) => s.setShowGuides(!s.showGuides.value), checked: (s) => s.showGuides.value },
     { label: 'Snap', run: (s) => s.setSnapOn(!s.snapOn.value), checked: (s) => s.snapOn.value },
-    { label: 'Clear Guides', run: (s) => s.clearGuides(), enabled: (s) => s.hasGuides() }, 'sep',
+    { label: 'Clear Guides', run: (s) => s.clearGuides(), enabled: (s) => s.hasGuides() },
+    { label: 'Quick Mask', hint: 'Q', run: (s) => s.toggleQuickMask(), checked: (s) => (s.floatVersion.value, s.selectionVersion.value, s.quickMaskOn()) }, 'sep',
     { label: 'Local view', run: (s) => s.setViewMode('local'), checked: (s) => s.viewMode.value === 'local' },
     { label: 'TouchDesigner view', run: (s) => s.setViewMode('td'), checked: (s) => s.viewMode.value === 'td', enabled: (s) => s.tdAvailable.value }, 'sep',
     { label: 'Shape antialiasing: Exact (matches TouchDesigner)', run: (s) => s.setShapeRenderer('sdf'), checked: (s) => s.shapeRenderer.value === 'sdf' },
@@ -66,7 +81,7 @@ function MenuBar() {
             style="padding:5px 8px;border-radius:4px">{m.label}</button>
           {open === i && (
             <div role="menu" style="position:absolute;left:0;top:100%;z-index:50;min-width:210px;padding:4px;background:#2f2f2f;border:1px solid #161616;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,0.55)">
-              {m.items.map((it, k) => {
+              {(typeof m.items === 'function' ? m.items(store) : m.items).map((it, k) => {
                 if (it === 'sep') return <div key={k} style="height:1px;background:#444;margin:4px 2px" />;
                 const usable = !!it.run && (!it.enabled || it.enabled(store));
                 const check = it.checked?.(store);

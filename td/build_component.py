@@ -201,28 +201,64 @@ HELP = {
                  "editor as you left it. An existing file at Export Path is overwritten. It is written to a temporary file and renamed, so a failed export never "
                  "damages an earlier one. Refused while the document is still being restored. Does not save the "
                  "project itself; the result is shown in Status.",
+    "Projectfile": "The project file (.redoc) that Save Project writes and Open Project reads (default empty = "
+                   "raster_editor.redoc in the project folder for saving). A relative path is relative to the project "
+                   "folder and a missing .redoc ending is added. A .redoc is a zip with the whole document: layers "
+                   "with their transforms, masks, text/shape/adjustment settings, effects, guides and canvas mode "
+                   "plus every layer's pixels as PNG. TD Inputs are live and are not stored. The editor's File menu "
+                   "writes this parameter for you.",
+    "Saveproject": "Pulse: writes the current document to Project File (.redoc). The file is written to a temporary "
+                   "file and renamed, so a failed save never damages an earlier one; the pixels are encoded off the "
+                   "main thread so the output keeps running. Refused while a restore or another file operation is "
+                   "running. The result is shown in Status and sent to the editor.",
+    "Openproject": "Pulse: replaces the current document with the one in Project File (.redoc): layers, pixels, "
+                   "effects, guides and canvas mode (Doc Width/Height and Document Size Mode follow the file). The "
+                   "undo history of every editor window is cleared and all windows reload the document. Nothing is "
+                   "changed when the file is damaged or invalid; the reason is shown in Status. TD Inputs are live: "
+                   "input layers show whatever is connected now.",
+    "Pngfile": "The PNG file that Export PNG writes (default empty = raster_editor.png in the project folder). A "
+               "relative path is relative to the project folder and a missing .png ending is added. The editor's File "
+               "menu writes this parameter for you.",
+    "Exportpng": "Pulse: saves the flattened output of this component (what the output TOP shows, at the document "
+                 "size) to PNG File with straight (non-premultiplied) alpha, as 8-bit RGBA. Written to a temporary "
+                 "file and renamed. Refused while the editor is inactive or another file operation is running. "
+                 "The result is shown in Status.",
     "Status": "Informational, read-only: a one-line summary of the editor (which window is active, document size, "
               "tiles per second received, connected windows, errors). Nothing to set here.",
 }
-COMMENT = ("Raster Editor: a layer-based raster editor with a web UI. Wire a TOP into the input or set the "
-           "document size on the Raster Editor page; Open in Browser opens a second window. Hover a parameter "
-           "for help.")
+COMMENT = ("Raster Editor: a layer-based raster editor with a web UI. Wire TOPs into the inputs (a new spare input "
+           "appears as you connect, up to 8) or set the document size on the Raster Editor page; Open in Browser "
+           "opens a second window; Save/Open Project and Export PNG are on the same page. Hover a parameter for help.")
 
-PARAMS = "Active Port Docw Doch Premultiplied Maxsendfps Maxinputfps Maxviewfps Devurl Panelquery Openbrowser Reloadui Exportdoc Docsizemode"
+PARAMS = "Active Port Docw Doch Premultiplied Maxsendfps Maxinputfps Maxviewfps Devurl Panelquery Openbrowser Reloadui Exportdoc Docsizemode Projectfile Saveproject Openproject Pngfile Exportpng"
 
 
 # --------------------------------------------------------------------------- build (inside TD)
 
 
 SOURCES = ("td/raster_editor/protocol.py", "td/raster_editor/frames.py", "td/raster_editor/ext.py",
-           "td/raster_editor/network.py", "td/raster_editor/blend.glsl", "td/raster_editor/shape.glsl",
-           "dist/ui/index.html")
+           "td/raster_editor/network.py", "td/raster_editor/effects.py", "td/raster_editor/blend.glsl",
+           "td/raster_editor/shape.glsl", "dist/ui/index.html")
+EFFECT_DIR = "shared/effects"  # shared with the web preview; every *.glsl becomes a DAT `fx_<stem>` (common, dropShadow, ...)
+MAX_INPUTS = 8
+
+
+def effect_sources(repo=None):
+    """Repo-relative paths of the shared effect shaders (sorted). Missing folder -> none: the COMP builds without effects."""
+    root = os.path.join(repo if repo is not None else REPO, EFFECT_DIR)
+    if not os.path.isdir(root):
+        return []
+    return [f"{EFFECT_DIR}/{n}" for n in sorted(os.listdir(root)) if n.endswith(".glsl")]
+
+
+def effect_dat_name(rel):
+    return "fx_" + os.path.splitext(os.path.basename(rel))[0]
 
 
 def read_sources():
     """Read every embedded file up front, before the old COMP is touched."""
     out = {}
-    for rel in SOURCES:
+    for rel in SOURCES + tuple(effect_sources()):
         path = os.path.join(REPO, rel)
         if not os.path.isfile(path):
             hint = " (run `npm run build` in web/ first)" if rel.startswith("dist/") else ""
@@ -294,11 +330,11 @@ def build(dev=False, name=NAME, in_place=True):
     sources = read_sources()
     parent = op(PARENT)
     old = parent.op(name) if in_place else None
-    state = {"x": 0, "y": 0, "w": 1280, "h": 800, "in": None, "out": [], "pars": {}, "kept": []}
+    state = {"x": 0, "y": 0, "w": 1280, "h": 800, "ins": {}, "n_in": 1, "out": [], "pars": {}, "kept": []}
     if old is not None:
         state.update(x=old.nodeX, y=old.nodeY, w=int(old.par.w), h=int(old.par.h))
-        if old.inputConnectors and old.inputConnectors[0].connections:
-            state["in"] = old.inputConnectors[0].connections[0].owner
+        state["ins"] = {i + 1: k.connections[0].owner for i, k in enumerate(old.inputConnectors) if k.connections}
+        state["n_in"] = min(MAX_INPUTS, max(state["ins"], default=0) + 1)
         if old.outputConnectors:
             state["out"] = [(c.owner, c.index) for c in old.outputConnectors[0].connections]
         state["pars"] = {p.name: p.val for p in old.customPars
@@ -340,6 +376,11 @@ def build(dev=False, name=NAME, in_place=True):
     page.appendPulse("Reloadui", label="Reload UI")
     page.appendFile("Exportpath", label="Export Path")
     page.appendPulse("Exportdoc", label="Export with Document")
+    page.appendFile("Projectfile", label="Project File")
+    page.appendPulse("Saveproject", label="Save Project")
+    page.appendPulse("Openproject", label="Open Project")
+    page.appendFile("Pngfile", label="PNG File")
+    page.appendPulse("Exportpng", label="Export PNG")
     page.appendStr("Status", label="Status")[0].readOnly = True
     for pname, lo, hi in (("Port", 1024, 65535), ("Docw", 1, 16384), ("Doch", 1, 16384),
                           ("Maxsendfps", 1, 120), ("Maxinputfps", 1, 120), ("Maxviewfps", 1, 120)):
@@ -361,6 +402,9 @@ def build(dev=False, name=NAME, in_place=True):
     text_dat(comp, "protocol", "td/raster_editor/protocol.py", dev, -600, 500, sources)
     text_dat(comp, "frames", "td/raster_editor/frames.py", dev, -600, 400, sources)
     text_dat(comp, "network", "td/raster_editor/network.py", dev, -600, 300, sources)
+    text_dat(comp, "effects", "td/raster_editor/effects.py", dev, -900, 300, sources)
+    for i, rel in enumerate(effect_sources()):  # shader sources shared with the web preview
+        text_dat(comp, effect_dat_name(rel), rel, dev, -1200 + 150 * (i % 4), -400 - 100 * (i // 4), sources)
     text_dat(comp, "RasterEditorExt", "td/raster_editor/ext.py", dev, -600, 200, sources)
     text_dat(comp, "ui_html", "dist/ui/index.html", dev, -600, 100, sources)
     text_dat(comp, "blend_glsl", "td/raster_editor/blend.glsl", dev, -600, 0, sources)
@@ -370,8 +414,15 @@ def build(dev=False, name=NAME, in_place=True):
         ds.nodeX, ds.nodeY = -900, 200
 
     # --- TOP chain: in1 / doc_out (= doc/out) -> out_switch -> out1
-    in1 = comp.create(inTOP, "in1")
+    in1 = comp.create(inTOP, "in1")  # in2..in8 are created by the extension, always one spare connector (Connector Order = N)
     in1.nodeX, in1.nodeY = -300, 0
+    in1.par.connectorder = 1
+    extra = []
+    for n in range(2, min(MAX_INPUTS, state.get("n_in", 1)) + 1):  # a rebuild keeps the connectors that had wires
+        t = comp.create(inTOP, f"in{n}")
+        t.nodeX, t.nodeY = -300, 150 - 100 * n
+        t.par.connectorder = n
+        extra.append(t)
     out_switch = comp.create(switchTOP, "out_switch")
     out_switch.nodeX, out_switch.nodeY = 0, -50
     out1 = comp.create(outTOP, "out1")
@@ -471,8 +522,9 @@ def restore(comp, state):
             getattr(comp.par, name).val = val
         except Exception as e:  # noqa: BLE001 - a parameter that no longer exists
             print("could not restore", name, e)
-    if state["in"] is not None and not comp.inputConnectors[0].connections:
-        comp.inputConnectors[0].connect(state["in"])
+    for n, src in sorted(state["ins"].items()):
+        if n <= len(comp.inputConnectors) and not comp.inputConnectors[n - 1].connections:
+            comp.inputConnectors[n - 1].connect(src)
     for target, index in state["out"]:
         if not any(c.owner is comp for c in target.inputConnectors[index].connections):
             target.inputConnectors[index].connect(comp.outputConnectors[0])

@@ -1,7 +1,8 @@
-import type { AdjustmentSpec, BlendMode, Rect } from './types';
+import type { AdjustmentSpec, BlendMode, Effect, Rect } from './types';
 import { createSurface, releaseSurface, type Ctx2D, type Surface } from './surface';
-import { isVector, specBounds, surfaceDocBounds, type Document, type GroupLayer, type Mask, type PixelLayer, type VectorLayer } from './model';
+import { floatingBounds, grow, isVector, specBounds, surfaceDocBounds, type Document, type GroupLayer, type Mask, type PixelLayer, type VectorLayer } from './model';
 import { drawMapped, IDENT, isAligned, outerRect, type Xf } from './xform';
+import { applyEffectsSafe, effectsReach, effectsSourceRect, hasEffects } from './effectsAdapter';
 import { drawText } from './textShape';
 import { drawShapeWith } from './shapeSdf';
 import { clipToSize, intersect, union } from './rect';
@@ -18,6 +19,8 @@ export const raf: (cb: () => void) => unknown =
   typeof requestAnimationFrame === 'function' ? (cb) => requestAnimationFrame(cb) : (cb) => setTimeout(cb, 16);
 export const cancelRaf: (h: unknown) => void =
   typeof cancelAnimationFrame === 'function' ? (h) => cancelAnimationFrame(h as number) : (h) => clearTimeout(h as number);
+
+interface FxEntry { sig: unknown[]; rect: Rect; surf: Surface }
 
 /** A render target: a canvas context plus the document position of its top-left pixel. */
 interface Target {
@@ -45,8 +48,12 @@ export class Compositor {
   private tpool: Surface[] = []; // scratch windows of thumbnail passes: never shared with the main passes
   private padWin: Surface | null = null; // blur edge-hold source
   private thumb: Surface | null = null;
+  private fxSrc: Surface | null = null; // effects input / output windows (exact size of the rect being processed)
+  private fxOut: Surface | null = null;
   private stage: Surface | null = null; // render target when blur needs source pixels beyond the output rect
   private dirty: Rect | null = null;
+  private epoch = 0; // bumped by every invalidation that may change layer content (not by property / transform edits)
+  private fxCache = new Map<object, FxEntry>(); // per layer: the effects output over a rect, valid while the signature matches
   private handle: unknown = null;
   private disposed = false;
   private enabled = true;
@@ -59,8 +66,9 @@ export class Compositor {
   get isEnabled(): boolean { return this.enabled; }
 
   /** Mark a document-space rect dirty; null = whole document. */
-  invalidate(r: Rect | null): void {
+  invalidate(r: Rect | null, propsOnly = false): void {
     if (this.disposed) return;
+    if (!propsOnly) this.epoch++; // pixels changed somewhere: cached effect results are stale
     const full = { x: 0, y: 0, w: this.doc.width, h: this.doc.height };
     const clipped = r ? clipToSize(r, full.w, full.h) : full;
     if (!clipped) return;
@@ -94,6 +102,7 @@ export class Compositor {
     this.dirty = null;
     const out = this.widen(r);
     this.renderRegion(out);
+    this.pruneFxCache();
     this.onComposite(out);
   }
 
@@ -140,13 +149,19 @@ export class Compositor {
     return this.thumb;
   }
 
-  /** Sum of the reach of all visible blur adjustments: how far a change can show up from where it happened. */
+  /**
+   * How far a change can show up from where it happened: the sum of the reach of all visible blur adjustments plus the
+   * largest reach of the layer effects (a drop shadow / glow paints beyond the layer's own pixels).
+   */
   reach(): number {
     let n = 0;
+    let fx = 0;
     for (const l of this.doc.all()) {
-      if (l.kind === 'adjustment' && l.visible && l.opacity > 0) n += adjustmentReach(l.adjustment);
+      if (!l.visible || l.opacity <= 0) continue;
+      if (l.kind === 'adjustment') n += adjustmentReach(l.adjustment);
+      else if (l.kind !== 'group' && l.effects.length) fx = Math.max(fx, effectsReach(l.effects));
     }
-    return n;
+    return n + fx;
   }
 
   private widen(r: Rect): Rect {
@@ -175,7 +190,11 @@ export class Compositor {
   }
 
   private releaseScratch(): void {
-    for (const s of [...this.pool, ...this.tpool, this.stage, this.padWin, this.thumb]) if (s) releaseSurface(s);
+    for (const s of [...this.pool, ...this.tpool, this.stage, this.padWin, this.thumb, this.fxSrc, this.fxOut]) if (s) releaseSurface(s);
+    this.fxSrc = null;
+    this.fxOut = null;
+    this.fxCache.forEach((c) => releaseSurface(c.surf));
+    this.fxCache.clear();
     this.pool = [];
     this.tpool = [];
     this.stage = null;
@@ -227,28 +246,45 @@ export class Compositor {
   }
 
   /**
-   * A pixel / base layer under its transform. Pixel-aligned layers (scale 1, whole-pixel position) are copied; others are
-   * resampled by drawImage (bilinear, 'high' quality when minifying) clipped to the visible rect; masks use the same mapping.
+   * A pixel / input layer under its transform. Pixel-aligned layers (scale 1, whole-pixel position, no rotation or skew)
+   * are copied; others are resampled by drawImage (bilinear, 'high' quality when minifying) under the layer's full affine,
+   * clipped to the visible rect; masks use the same mapping. Layers with enabled effects go through a scratch window and
+   * the effects module (see effectsAdapter.ts) before they are blended.
    */
   private drawPixel(tgt: Target, pl: PixelLayer, r: Rect, depth: number): void {
-    const vis = intersect(r, outerRect(surfaceDocBounds(pl)));
-    if (!vis) return;
+    if (!this.doc.inputConnected(pl)) return; // a disconnected TD input renders nothing (the layer keeps its placement)
+    const fx = hasEffects(pl.effects) && tgt.k === 1;
+    const own = outerRect(surfaceDocBounds(pl));
+    const vis = intersect(r, fx ? grow(own, effectsReach(pl.effects)) : own);
+    if (!vis) {
+      this.drawFloating(tgt, pl, r);
+      return;
+    }
     const ctx = tgt.ctx;
     const masked = pl.mask && pl.mask.enabled;
-    if (!masked) {
+    if (!masked && !fx) {
       if (isAligned(pl)) {
         const src: Rect = { x: vis.x - pl.x, y: vis.y - pl.y, w: vis.w, h: vis.h };
         this.blit(ctx, pl.surface.canvas, src, vis, pl.opacity, pl.blend);
-        return;
+      } else {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(vis.x, vis.y, vis.w, vis.h);
+        ctx.clip();
+        ctx.globalAlpha = pl.opacity;
+        ctx.globalCompositeOperation = OPS[pl.blend];
+        drawMapped(ctx, pl.surface.canvas as CanvasImageSource, pl.surface.width, pl.surface.height, pl, vis);
+        ctx.restore();
       }
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(vis.x, vis.y, vis.w, vis.h);
-      ctx.clip();
-      ctx.globalAlpha = pl.opacity;
-      ctx.globalCompositeOperation = OPS[pl.blend];
-      drawMapped(ctx, pl.surface.canvas as CanvasImageSource, pl.surface.width, pl.surface.height, pl, vis);
-      ctx.restore();
+      this.drawFloating(tgt, pl, r);
+      return;
+    }
+    if (fx) {
+      this.renderFx(tgt, pl, [pl.surface, pl.mask, pl.mask?.enabled, pl.x, pl.y, pl.sx, pl.sy, pl.rot, pl.kx, pl.ky], vis, pl.effects, pl.opacity, pl.blend, (c, cr) => {
+        drawMapped(c, pl.surface.canvas as CanvasImageSource, pl.surface.width, pl.surface.height, pl, cr);
+        if (masked) this.maskIn(c, pl.mask as Mask, pl, cr);
+      });
+      this.drawFloating(tgt, pl, r);
       return;
     }
     const s = this.scratch(tgt, depth, r);
@@ -259,14 +295,24 @@ export class Compositor {
     s.ctx.clip();
     drawMapped(s.ctx, pl.surface.canvas as CanvasImageSource, pl.surface.width, pl.surface.height, pl, vis);
     s.ctx.restore();
-    this.maskIn(s.ctx, pl.mask as Mask, pl, vis);
-    this.blit(ctx, s.canvas, pixRect(s, vis), vis, pl.opacity, pl.blend);
+    if (masked) this.maskIn(s.ctx, pl.mask as Mask, pl, vis);
+    this.blit(tgt.ctx, s.canvas, pixRect(s, vis), vis, pl.opacity, pl.blend);
+    this.drawFloating(tgt, pl, r);
   }
 
-  /** A text / shape layer: rendered straight from its spec into a scratch window, then masked and blended. */
+  /** A text / shape layer: rendered straight from its spec into a scratch window, then masked, given its effects and blended. */
   private drawVector(tgt: Target, l: VectorLayer, r: Rect, depth: number): void {
-    const vis = intersect(r, specBounds(l));
+    const fx = hasEffects(l.effects) && tgt.k === 1;
+    const vis = intersect(r, fx ? grow(specBounds(l), effectsReach(l.effects)) : specBounds(l));
     if (!vis) return;
+    if (fx) {
+      this.renderFx(tgt, l, [l.spec, l.mask, l.mask?.enabled, this.doc.shapeRenderer], vis, l.effects, l.opacity, l.blend, (c, cr) => {
+        if (l.kind === 'text') drawText(c, l.spec);
+        else drawShapeWith(this.doc.shapeRenderer, c, l.spec, this.doc.width, this.doc.height);
+        if (l.mask && l.mask.enabled) this.maskIn(c, l.mask, IDENT, cr);
+      });
+      return;
+    }
     const s = this.scratch(tgt, depth, r);
     s.ctx.clearRect(vis.x, vis.y, vis.w, vis.h);
     s.ctx.save();
@@ -278,6 +324,90 @@ export class Compositor {
     s.ctx.restore();
     if (l.mask && l.mask.enabled) this.maskIn(s.ctx, l.mask, IDENT, vis);
     this.blit(tgt.ctx, s.canvas, pixRect(s, vis), vis, l.opacity, l.blend);
+  }
+
+  /**
+   * Layer effects run in DOCUMENT space (TouchDesigner does the same): the layer's masked, transformed content is painted
+   * into a document-sized surface over `vis` grown by the effects' reach, effects.applyEffects(src, effects, vis, out) runs
+   * with document-space surfaces and rect, and the rewritten part of `out` inside `vis` is blended.
+   */
+  private renderFx(tgt: Target, layer: object, sig: unknown[], vis: Rect, effects: Effect[], opacity: number, blend: BlendMode, paint: (c: Ctx2D, cr: Rect) => void): void {
+    const W = this.doc.width;
+    const H = this.doc.height;
+    const v = clipToSize(vis, W, H);
+    const cr = v && (effectsSourceRect(effects, v, W, H) ?? grow(v, effectsReach(effects)));
+    if (!cr || !v) return;
+    const full = [this.epoch, W, H, effects, ...sig];
+    const hit = this.fxCache.get(layer);
+    if (hit && hit.sig.length === full.length && hit.sig.every((x, i) => x === full[i]) && hit.rect.x <= v.x && hit.rect.y <= v.y
+      && hit.rect.x + hit.rect.w >= v.x + v.w && hit.rect.y + hit.rect.h >= v.y + v.h) {
+      // opacity / blend (or a smaller dirty rect) changed only: re-blend the cached effects output
+      this.blit(tgt.ctx, hit.surf.canvas, { x: v.x - hit.rect.x, y: v.y - hit.rect.y, w: v.w, h: v.h }, v, opacity, blend);
+      return;
+    }
+    if (!this.fxSrc || this.fxSrc.width !== W || this.fxSrc.height !== H) {
+      if (this.fxSrc) releaseSurface(this.fxSrc);
+      if (this.fxOut) releaseSurface(this.fxOut);
+      this.fxSrc = createSurface(W, H, true);
+      this.fxOut = createSurface(W, H, true);
+    }
+    const src = this.fxSrc;
+    const out = this.fxOut as Surface;
+    src.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    src.ctx.clearRect(cr.x, cr.y, cr.w, cr.h);
+    src.ctx.save();
+    src.ctx.beginPath();
+    src.ctx.rect(cr.x, cr.y, cr.w, cr.h);
+    src.ctx.clip();
+    paint(src.ctx, cr);
+    src.ctx.restore();
+    const valid = applyEffectsSafe(src, effects, v, out);
+    const from = valid ? out : src;
+    const got = valid ? intersect(valid, v) : v;
+    if (got) {
+      this.blit(tgt.ctx, from.canvas, got, got, opacity, blend);
+      if (valid) { // keep the result (v is what was asked for; got ⊇ v unless clipped)
+        const old = this.fxCache.get(layer);
+        if (old) releaseSurface(old.surf);
+        const surf = createSurface(got.w, got.h);
+        surf.ctx.drawImage(from.canvas as CanvasImageSource, got.x, got.y, got.w, got.h, 0, 0, got.w, got.h);
+        this.fxCache.set(layer, { sig: full, rect: got, surf });
+      }
+    }
+  }
+
+  /** Forget cached effect results of layers that are gone (called after every flush). */
+  private pruneFxCache(): void {
+    if (!this.fxCache.size) return;
+    const live = new Set<object>(this.doc.all());
+    let total = 0;
+    this.fxCache.forEach((c, k) => {
+      if (!live.has(k)) {
+        releaseSurface(c.surf);
+        this.fxCache.delete(k);
+      } else total += c.surf.width * c.surf.height * 4;
+    });
+    if (total > 512 * 1024 * 1024) {
+      this.fxCache.forEach((c) => releaseSurface(c.surf));
+      this.fxCache.clear();
+    }
+  }
+
+  /** The floating selection of `pl` (lifted pixels under their own transform), drawn right above the layer. */
+  private drawFloating(tgt: Target, pl: PixelLayer, r: Rect): void {
+    const f = this.doc.floating;
+    if (!f || f.layer !== pl) return;
+    const vis = intersect(r, outerRect(floatingBounds(f)));
+    if (!vis) return;
+    const ctx = tgt.ctx;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(vis.x, vis.y, vis.w, vis.h);
+    ctx.clip();
+    ctx.globalAlpha = pl.opacity;
+    ctx.globalCompositeOperation = OPS[pl.blend];
+    drawMapped(ctx, f.buf.canvas as CanvasImageSource, f.buf.width, f.buf.height, f.t, vis);
+    ctx.restore();
   }
 
   /** dst = dst * mask over the document rect `dst` of ctx; the mask is drawn under `t` (the layer's mapping; identity for document-space masks). */

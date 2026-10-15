@@ -42,11 +42,12 @@ export function startMockBridge(engine: EditorEngine, status: BridgeStatus & { d
   c.height = engine.height;
   const ctx = c.getContext('2d')!;
   drawLandscape(ctx, c.width, c.height);
-  engine.writeBase({ x: 0, y: 0, w: c.width, h: c.height }, ctx.getImageData(0, 0, c.width, c.height).data);
-  engine.commitBase();
+  engine.setInputs([{ input: 1, w: c.width, h: c.height, connected: true }]);
+  engine.writeInput(1, { x: 0, y: 0, w: c.width, h: c.height }, ctx.getImageData(0, 0, c.width, c.height).data);
+  engine.commitInput(1);
   if (status.docName) status.docName.value = 'landscape.png';
   status.setConnection('standalone');
   status.setActive(true);
   const offline = () => Promise.reject(new Error('Not connected to TouchDesigner'));
-  return { takeover() {}, dispose() {}, setView() {}, listTops: offline, importTop: offline, renderLayer: offline, setCanvas: () => false };
+  return { takeover() {}, dispose() {}, setView() {}, listTops: offline, importTop: offline, renderLayer: offline, setCanvas: () => false, saveProject: offline, openProject: offline, exportPng: offline, chooseFile: offline, placeImageViaTd: offline };
 }

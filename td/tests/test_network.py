@@ -3391,7 +3391,17 @@ def test_default_construction_matches_the_ext_call_and_public_api():
     assert set(net.stats()) >= {"nodes", "surfaces", "pool", "mpool", "plan", "last", "totals"}
 
 
-def test_spares_are_prewarmed_when_idle_only_once_and_wiring_is_replaced(opt):
+def test_prewarm_is_off_by_default(opt):
+    net, comp, log, clock = opt
+    net.apply([base(), px("a", 1)], W, H)
+    for _ in range(20):
+        clock.t += 5.0
+        net.tick()
+    assert not any(c.get("warm") for c in net._cache.values()), "no spare may be pre-warmed unless PREWARM is on"
+
+
+def test_spares_are_prewarmed_when_idle_only_once_and_wiring_is_replaced(opt, monkeypatch):
+    monkeypatch.setattr(network, "PREWARM", True)  # pre-warm is opt-in (off by default)
     net, comp, log, clock = opt
     net.apply([base(), px("a", 1)], W, H)
     for _ in range(40):
@@ -3626,3 +3636,223 @@ def test_pyramid_shader_mutations_are_caught(pin, old, new):
     assert old in GLSL
     mutated = GLSL.replace(old, new, 1)
     assert mutated != GLSL and pin in [k for k, v in PYRAMID_PINS.items() if v not in mutated]
+
+
+def test_rewiring_a_recycled_multi_node_whose_connectors_were_cut_by_destroyed_sources(opt):
+    """Regression (live v5 validation: IndexError in _wire): a pooled Multi TOP keeps its connections; when TD cuts them
+    (destroyed sources) the connector list SHRINKS below what the cache believes, so connecting input i raised IndexError."""
+    net, comp, log, clock = opt
+    net.apply([base()] + [px("p%d" % i, i) for i in range(1, 8)], W, H)
+    op = net._ops["mrg_L_base"]
+    net.apply([base()], W, H)                                   # the merged node goes back to the pool, still wired
+    for c in op.inputConnectors[5:]:                            # TD cut the trailing connections: the list shrank
+        c.source = None
+    del op.inputConnectors[6:]
+    doc21 = [base()] + [px("q%d" % i, 20 + i) for i in range(1, 21)]
+    net.apply(doc21, W, H)                                      # must not raise
+    assert all(c.source is not None for c in net._ops["mrg_L_base"].inputConnectors[:16])
+    assert ins(net, "mrg_L_base")[:3] == ["blank", "src_in1", "s21"]
+    # defensive: connecting past the end of a shrunk list although the cache believes the inputs are connected
+    node = net._ops["mrg_L_base"]
+    net._cache["mrg_L_base"]["inputs"] = [("blank", net._gen["blank"])] * 16
+    del node.inputConnectors[3:]
+    net._wire("mrg_L_base", ["blank"] * 3 + ["src_in1"] * 13)
+    assert len(node.inputConnectors) >= 16 and ins(net, "mrg_L_base")[3:5] == ["src_in1", "src_in1"]
+
+
+def test_repeat_apply_shortcut_does_not_skip_after_a_pool_reset(opt):
+    """_set_pars skips an identical dict; a recycled node whose parameters were reset by the pool (custom resolution ->
+    useinput) must get them back when the next role asks for the same values."""
+    net, comp, log, _ = opt
+    st = [base(), px("a", 1, surfaceW=24, surfaceH=18, x=5.5, sx=1.5, sy=1.5)]
+    net.apply(st, W, H)
+    xf = net._ops["xf_L_a"]
+    want = dict(net._cache["xf_L_a"]["pars"])
+    net.apply([base()], W, H)                                           # back to the pool: resolution reset to useinput
+    assert xf.par.value("outputresolution") == "useinput"
+    net.apply(st, W, H)
+    node = net._ops["xf_L_a"]
+    assert node is xf and node.par.value("outputresolution") == "custom" and node.par.value("resolutionw") == want["resolutionw"]
+    m = log.mark()
+    net.apply(st, W, H)                                                 # identical apply: nothing is written at all
+    assert not log.since(m)["par_sets"]
+
+
+ADJ_DOCS = [
+    ("x", {"type": "levels", "inLow": 0.15, "inHigh": 0.85, "gamma": 1.4, "outLow": 0.05, "outHigh": 0.95}),
+    ("y", {"type": "hueSaturation", "hue": 40, "saturation": 1.3, "value": 1.0}),
+    ("z", {"type": "brightnessContrast", "brightness": 0.2, "contrast": 0.3}),
+    ("x", {"type": "threshold", "level": 0.7}),
+    ("y", {"type": "levels", "inLow": 0.3, "inHigh": 0.6, "gamma": 0.8, "outLow": 0.0, "outHigh": 0.5}),
+    ("x", {"type": "invert"}),
+    ("w", {"type": "hueSaturation", "hue": -20, "saturation": 0.4, "value": 1.2}),
+]
+
+
+def _assert_adjustment_uniforms(net, aid, spec):
+    plan_ = network.adjustment_plan(spec, network.sanitize(aid), W, H, pyramid=True)
+    node = net._ops["blend_L_" + network.sanitize(aid)]
+    pv = node.par.value
+    assert pv("vec0valuew") == plan_.adjust, (aid, spec)
+    for k, v in plan_.extra.items():
+        assert pv(k) == v, (aid, spec, k, pv(k), v)
+
+
+@pytest.mark.parametrize("optimize", [True, False])
+def test_recycled_nodes_get_the_adjustment_uniforms_of_their_new_role(optimize):
+    """Regression (live parity step): pooled / warmed spares are handed from role to role across documents; every apply must
+    leave the uniforms of the CURRENT role on the node (no 'same parameters as last time' shortcut may skip a write)."""
+    clock = fakenet.Clock()
+    comp, log = fakenet.make_comp()
+    net = DocNetwork(comp, GLSL, clock=clock, optimize=optimize)
+    for rnd in range(3):
+        for aid, spec in ADJ_DOCS:
+            st = [base(), px("a", 1), px("b", 2), adj(aid, spec, mask={"slot": 9, "enabled": True}), px("c", 3)]
+            net.apply(st, W, H)
+            _assert_adjustment_uniforms(net, aid, spec)
+            for _ in range(8):                                    # idle frames: spares get pre-warmed, pools refilled
+                clock.t += 0.2
+                net.tick()
+    # two adjustments swap parameters between documents (their nodes are reused as they are)
+    a1, a2 = ADJ_DOCS[0][1], ADJ_DOCS[1][1]
+    net.apply([base(), px("a", 1), adj("p", a1), adj("q", a2)], W, H)
+    _assert_adjustment_uniforms(net, "p", a1)
+    _assert_adjustment_uniforms(net, "q", a2)
+    net.apply([base(), px("a", 1), adj("p", a2), adj("q", a1)], W, H)
+    _assert_adjustment_uniforms(net, "p", a2)
+    _assert_adjustment_uniforms(net, "q", a1)
+    net.apply([base(), px("a", 1), adj("q", a1), adj("p", a2)], W, H)              # reordered
+    _assert_adjustment_uniforms(net, "p", a2)
+    _assert_adjustment_uniforms(net, "q", a1)
+
+
+def test_adjustment_node_taken_back_from_the_pool_is_rewired_and_rewritten(opt):
+    net, comp, log, clock = opt
+    spec1, spec2 = ADJ_DOCS[0][1], ADJ_DOCS[2][1]
+    net.apply([base(), px("a", 1), adj("p", spec1, mask={"slot": 9, "enabled": True})], W, H)
+    node = net._ops["blend_L_p"]
+    net.apply([base(), px("a", 1)], W, H)                                          # back to the pool
+    for _ in range(6):
+        clock.t += 0.5
+        net.tick()
+    net.apply([base(), px("a", 1), adj("p", spec2, mask={"slot": 9, "enabled": True})], W, H)
+    _assert_adjustment_uniforms(net, "p", spec2)
+    assert source_of(net, "blend_L_p", 0) == "mrg_L_base" and source_of(net, "blend_L_p", 2) == "s9"
+
+
+def test_adopted_glsl_node_is_reset_before_its_role_parameters_are_written(opt):
+    """A node adopted from a loaded file / rebuilt component carries the leftovers of its previous role."""
+    net, comp, log, clock = opt
+    st = [base(), px("a", 1, surfaceW=24, surfaceH=18, x=5.5, sx=1.5, sy=1.5), adj("p", ADJ_DOCS[0][1])]
+    net.apply(st, W, H)
+    for _ in range(3):
+        net.tick()
+    stale = net._ops["blend_L_p"]
+    stale.par.outputresolution = "custom"                                       # what an earlier role left behind
+    stale.par.inputfiltertype = "mipmap"
+    stale.bypass = True
+    net2 = DocNetwork(comp, GLSL, clock=clock)
+    net2.apply(st, W, H)
+    assert net2._ops["blend_L_p"] is stale
+    assert stale.par.value("outputresolution") == "useinput" and stale.par.value("inputfiltertype") == "nearest" and stale.bypass is False
+    _assert_adjustment_uniforms(net2, "p", ADJ_DOCS[0][1])
+
+
+def test_pass_format_follows_the_role_when_a_node_is_recycled(opt):
+    """An 8 bit pass node handed to a role that needs 16 bit (and back) must get the role's format written."""
+    net, comp, log, clock = opt
+    top_run = [base(), px("a", 1), px("b", 2)]
+    net.apply(top_run, W, H)
+    assert fmt(net, "mrg_L_base") == "rgba8fixed"
+    node = net._ops["mrg_L_base"]
+    net.apply(top_run + [adj("lv", LEVELS)], W, H)                      # an adjustment above: the same merged node needs 16 bit
+    assert net._ops["mrg_L_base"] is node and fmt(net, "mrg_L_base") == "rgba16fixed"
+    assert net._ops["blend_L_lv"].par.value("format") == "rgba8fixed"
+    net.apply([base()] + [px("q%d" % i, i) for i in range(1, 5)] + [adj("lv", LEVELS), px("z", 9, blend="multiply")], W, H)
+    assert fmt(net, "mrg_L_base") == "rgba16fixed" and fmt(net, "blend_L_lv") == "rgba16fixed"
+    net.apply([base(), px("a", 1)], W, H)                               # everything back to the pool, then 8 bit again
+    for _ in range(4):
+        net.tick()
+    net.apply(top_run, W, H)
+    assert fmt(net, "mrg_L_base") == "rgba8fixed"
+    for n, o in net._ops.items():
+        if n.startswith(("mrg_L_", "blend_L_", "xf_L_")):
+            assert o.par.value("format") == net._cache[n]["pars"]["format"]       # the cache never disagrees with the node
+
+
+@pytest.mark.parametrize("switch", ["EIGHT_BIT", "MERGE_RUNS", "CROP_BOXES", "SKIP_RULES"])
+def test_feature_switches_turn_one_optimisation_off(switch, monkeypatch):
+    monkeypatch.setattr(network, switch, False)
+    clock = fakenet.Clock()
+    comp, log = fakenet.make_comp()
+    net = DocNetwork(comp, GLSL, clock=clock)
+    st = [base(), px("a", 1), px("hid", 2, visible=False), px("b", 3, surfaceW=24, surfaceH=18, x=5.5, sx=1.5, sy=1.5),
+          shp("s", dict(RECT, x=10, y=10, w=20, h=10)), adj("lv", LEVELS), px("c", 4)]
+    net.apply(st, W, H)
+    ops_ = set(net._ops)
+    if switch == "EIGHT_BIT":
+        assert all(o.par.value("format") != "rgba8fixed" for n, o in net._ops.items() if n.startswith(("mrg_L_", "blend_L_", "xf_L_")))
+    if switch == "MERGE_RUNS":
+        assert not any(n.startswith("mrg_L_") for n in ops_)
+    if switch == "CROP_BOXES":
+        assert net.content_box("b") is None and "shapec_s" not in ops_
+        assert net._ops["xf_L_b"].par.value("resolutionw") == W
+    if switch == "SKIP_RULES":
+        assert plan(net)["skipped"] == 0
+        merged = [r for r in ops_ if r.startswith("mrg_L_")]
+        assert any(uL(net, m, k)[1] == 0.0 and ins(net, m)[1 + k] == "s2" for m in merged for k in range(8)) or "blend_L_hid" in ops_
+    # whatever is switched off, the network stays a complete chain to `out`
+    assert source_of(net, "out") in ops_
+
+
+def _stale_node(comp, name, optype="glslTOP", tags=(), **stale):
+    """A glsl node of a loaded file / rebuilt component that served another role (effect slot, shape ...)."""
+    n = comp.op("doc").create(optype, name)
+    n.tags = list(tags)
+    for k, v in dict(pixeldat="fxsrc_blur", format="rgba32float", vec0name="uP0", vec1name="uP1", vec2name="uP2", vec3name="uP3",
+                     vec4name="uPass", outputresolution="custom", inputfiltertype="mipmap").items():
+        setattr(n.par, k, stale.get(k, v))
+    return n
+
+
+def test_adopted_and_leftover_nodes_get_the_canonical_vector_names_and_every_plan_value(opt):
+    """Regression (live: after a component rebuild the layers of a resample pass stacked at the origin and adjustments were
+    wrong): the new DocNetwork adopts tagged nodes and re-pools untagged spares that last served as effect slots; blend /
+    resample / adjustment nodes write only vec0 (uParams) and vec1 (uXform) themselves, so uA / uB must have their names."""
+    net, comp, log, clock = opt
+    # nodes as a previous session left them: a tagged one for each role the new document will use, plus spares
+    roles = ["blend_L_lv", "xf_L_a", "blend_L_hs", "mrg_L_base"]
+    for r in roles:
+        _stale_node(comp, "g%d" % (100 + roles.index(r)) if not r.startswith("mrg") else "m77",
+                    "glslmultiTOP" if r.startswith("mrg") else "glslTOP", tags=["role:" + r])
+    _stale_node(comp, "g200")                                    # untagged spare that was an effect slot
+    _stale_node(comp, "g201")
+    st = [base(), px("a", 1, surfaceW=24, surfaceH=18, x=5.5, y=3.25, sx=1.5, sy=1.5), px("b", 2),
+          adj("lv", ADJ_DOCS[0][1], mask={"slot": 9, "enabled": True}), adj("hs", ADJ_DOCS[1][1])]
+    net2 = DocNetwork(comp, GLSL, clock=clock)                  # the rebuilt component: adopts what the doc holds
+    net2.apply(st, W, H)
+    for _ in range(6):
+        net2.tick()
+    net2.apply(st[:3] + [adj("lv", ADJ_DOCS[2][1]), adj("hs", ADJ_DOCS[1][1])], W, H)       # then a different document
+    adopted = [n for n in net2._ops if n.startswith(("blend_L_", "xf_L_", "mrg_L_"))]
+    assert {"blend_L_lv", "xf_L_a", "blend_L_hs"} <= set(adopted)
+    for name in adopted:
+        pv = net2._ops[name].par.value
+        assert (pv("vec0name"), pv("vec1name"), pv("pixeldat")) == ("uParams", "uXform", "blend_glsl"), name
+        if name.startswith("mrg_L_"):
+            assert pv("vec11name") == "uL7" and pv("vec4name") == "uL0", name
+        else:
+            assert (pv("vec2name"), pv("vec3name")) == ("uA", "uB"), name
+        assert pv("outputresolution") == ("custom" if name.startswith("xf_L_") else "useinput"), name
+        assert pv("inputfiltertype") == ("linear" if name == "xf_L_a" else "nearest"), name
+    # every parameter the plan wants is on the node (whatever the cache believes)
+    for name, spec in net2._desired.items():
+        op_ = net2._ops[name]
+        if op_.OPType not in ("glslTOP", "glslmultiTOP"):
+            continue
+        for k, v in spec.pars.items():
+            assert op_.par.value(k) == v, (name, k, op_.par.value(k), v)
+    _assert_adjustment_uniforms(net2, "lv", ADJ_DOCS[2][1])
+    pa = net2._ops["xf_L_a"].par.value
+    bx = net2.content_box("a")
+    assert (pa("vec2valuex"), pa("vec2valuey")) == (5.5 - bx[0], 3.25 - bx[1])  # the (crop-relative) translation reaches uA

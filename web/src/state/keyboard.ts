@@ -32,7 +32,7 @@ export function onKeyDown(store: Store, e: KeyLike): void {
     if (e.key === 'Escape') { store.commitText(); e.preventDefault(); }
     return;
   }
-  if (store.topDialog.peek() || store.canvasDialog.peek()) return; // dialogs own the keyboard (they close themselves on Escape)
+  if (store.topDialog.peek() || store.canvasDialog.peek() || store.fileDialog.peek() || store.selOpDialog.peek()) return; // dialogs own the keyboard (they close themselves on Escape)
   if (isTyping(e.target) || store.loadingDoc.peek()) return; // locked while loading TD's document
   const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
   const mod = e.ctrlKey || e.metaKey;
@@ -44,6 +44,10 @@ export function onKeyDown(store: Store, e: KeyLike): void {
     else if (key === 'd') store.deselect();
     else if (key === 'a') store.selectAll();
     else if (key === 'i' && e.shiftKey) store.invertSelection();
+    else if (key === 't' && !e.shiftKey) {
+      if (!store.hasEngine() || !store.canTransformSelection()) return;
+      if (store.beginTransformSelection()) { store.setTool('move'); store.wantMove.value = false; }
+    }
     else return;
     e.preventDefault();
     return;
@@ -59,6 +63,15 @@ export function onKeyDown(store: Store, e: KeyLike): void {
   if (!store.hasEngine()) return;
 
   switch (key) {
+    case 'Enter':
+      if (store.isFloating()) { store.commitFloating(); e.preventDefault(); }
+      else if (store.tool.peek() === 'crop' && store.cropBox.peek()) { store.applyCrop(); e.preventDefault(); }
+      return;
+    case 'Escape':
+      if (store.isFloating()) { store.cancelFloating(); e.preventDefault(); }
+      else if (store.cropBox.peek()) { store.cancelCrop(); e.preventDefault(); }
+      return;
+    case 'q': store.toggleQuickMask(); return;
     case '[': store.nudgeSize(-1); return;
     case ']': store.nudgeSize(1); return;
     case 'x': store.swapColours(); return;

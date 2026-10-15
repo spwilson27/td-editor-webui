@@ -136,6 +136,8 @@ st.net_mod = net_mod
 st.glsl = GLSL_SRC
 st.comp = c
 st.net = net_mod.DocNetwork(c, GLSL_SRC, shape_glsl=_rd({os.path.join(raster_dir, 'shape.glsl')!r}), effects=fx_mod, effect_shaders=fx_mod.load_shader_texts({fx_dir!r}){opt_arg})
+st.fx_mod = fx_mod
+st.fx_shaders = fx_mod.load_shader_texts({fx_dir!r})
 st.w, st.h = {doc_w}, {doc_h}
 _emit("ok")
 '''
@@ -2511,7 +2513,7 @@ c2.par.ext0object = "op('/project1/_netdev/ext_stub').module.Stub(me)"
 c2.par.ext0name = "Stub"
 c2.par.ext0promote = 1
 c2.initializeExtensions()
-st.net2 = st.net_mod.DocNetwork(c2, st.glsl, shape_glsl=open({os.path.join(raster_dir, 'shape.glsl')!r}, encoding="utf-8").read(), optimize=False)
+st.net2 = st.net_mod.DocNetwork(c2, st.glsl, shape_glsl=open({os.path.join(raster_dir, 'shape.glsl')!r}, encoding="utf-8").read(), effects=st.fx_mod, effect_shaders=st.fx_shaders, optimize=False)
 _emit("ok")
 """)
 

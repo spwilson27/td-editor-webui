@@ -62,7 +62,7 @@ describe('canvas size: anchors, no resampling', () => {
       expect(e.history().entries.slice(-1)[0].label).toBe('Canvas size');
       e.undo();
       expect([e.width, e.height]).toEqual([100, 100]);
-      expect(info(s.px).transform).toEqual({ x: 0, y: 0, sx: 1, sy: 1 });
+      expect(info(s.px).transform).toEqual({ x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
       expect(info(s.text).text).toMatchObject({ x: 10, y: 12 });
       expect(e.guides()).toEqual({ h: [30], v: [40] });
       expect(e.selection()).toEqual({ x: 20, y: 20, w: 30, h: 30 });
@@ -184,12 +184,12 @@ describe('adoptCanvas mode flip', () => {
   it('fixed -> input resets the base transform to identity without history', () => {
     e = newEngine(100, 100);
     e.adoptCanvas(100, 100, 'fixed');
-    e.setTransform('base', { x: 10, y: 10, sx: 2, sy: 2 });
+    e.setTransform('base', { x: 10, y: 10, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 });
     const n = e.history().entries.length;
     e.adoptCanvas(100, 100, 'input');
-    expect(info('base').transform).toEqual({ x: 0, y: 0, sx: 1, sy: 1 });
+    expect(info('base').transform).toEqual({ x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
     expect(e.history().entries).toHaveLength(n);
-    e.setTransform('base', { x: 4, y: 4, sx: 1, sy: 1 });
+    e.setTransform('base', { x: 4, y: 4, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
     e.adoptCanvas(100, 100, 'input'); // no flip: untouched
     expect(info('base').transform.x).toBe(4);
   });
@@ -214,16 +214,16 @@ describe('canvas mode', () => {
     e.setBaseSize(80, 60);
     e.setCanvasSize(200, 200, 'c');
     expect(e.canvasMode()).toBe('fixed');
-    e.setTransform('base', { x: 10, y: 10, sx: 2, sy: 2 });
+    e.setTransform('base', { x: 10, y: 10, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 });
     const n = e.history().entries.length;
     e.setCanvasMode('input');
     expect([e.width, e.height, e.canvasMode()]).toEqual([80, 60, 'input']);
-    expect(info('base').transform).toEqual({ x: 0, y: 0, sx: 1, sy: 1 });
+    expect(info('base').transform).toEqual({ x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
     expect(e.history().entries).toHaveLength(n + 1);
     expect(e.history().entries.slice(-1)[0].label).toBe('Follow input size');
     e.undo();
     expect([e.width, e.height, e.canvasMode()]).toEqual([200, 200, 'fixed']);
-    expect(info('base').transform).toEqual({ x: 10, y: 10, sx: 2, sy: 2 });
+    expect(info('base').transform).toEqual({ x: 10, y: 10, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 });
     e.redo();
     expect([e.width, e.height]).toEqual([80, 60]);
     e.setCanvasMode('input'); // already following: nothing
@@ -350,9 +350,9 @@ describe('snapping', () => {
     e = newEngine(400, 400);
     const other = e.addPixelLayer('o');
     e.doc.find(other); // 400x400 surface: bounds = the canvas; shrink it with a transform
-    e.setTransform(other, { x: 100, y: 120, sx: 0.5, sy: 0.25 }); // bounds 100..300 x 120..220
+    e.setTransform(other, { x: 100, y: 120, sx: 0.5, sy: 0.25, rot: 0, kx: 0, ky: 0 }); // bounds 100..300 x 120..220
     const mine = e.addPixelLayer('mine'); // active
-    e.setTransform(mine, { x: 10, y: 10, sx: 0.1, sy: 0.1 });
+    e.setTransform(mine, { x: 10, y: 10, sx: 0.1, sy: 0.1, rot: 0, kx: 0, ky: 0 });
     on({ guides: false, canvas: false });
     expect(e.snapPoint(103, 223, 1)).toMatchObject({ x: 100, y: 220, guideX: 100, guideY: 220 });
     expect(e.snapPoint(198, 172, 1)).toMatchObject({ x: 200, y: 170 }); // centres

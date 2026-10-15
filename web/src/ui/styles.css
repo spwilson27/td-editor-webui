@@ -21,18 +21,18 @@ html[data-td-panel],html[data-td-panel] body{background:transparent}
 
 /* Tool rail: full size like the mockup, compacting on short windows */
 #app .rail{width:52px;flex:none;display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 0;background:#2b2b2b;border-right:1px solid #161616;overflow-y:auto}
-#app .rail .tb{width:44px;height:40px;flex:none}
+#app .rail .tb{width:44px;height:33px;flex:none}
 #app .rail-sep{width:28px;height:1px;background:#444;margin:4px 0;flex:none}
-#app .rail-chips{position:relative;width:40px;height:40px;flex:none;margin-top:8px}
+#app .rail-chips{position:relative;width:40px;height:40px;flex:none;margin-top:6px}
 @media (max-height:859px){
   #app .rail{gap:1px;padding:4px 0}
-  #app .rail .tb{height:34px}
+  #app .rail .tb{height:30px}
   #app .rail-sep{margin:2px 0}
   #app .rail-chips{margin-top:4px}
 }
 @media (max-height:759px){
   #app .rail{gap:0}
-  #app .rail .tb{height:28px}
+  #app .rail .tb{height:25px}
   #app .rail-chips{height:34px;width:38px}
 }
 

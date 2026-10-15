@@ -7,7 +7,7 @@ describe('startup document', () => {
     const layers = e.layers();
     expect(layers.map((l) => l.name)).toEqual(['Layer 1', 'TD Input']);
     expect(layers[0]).toMatchObject({ kind: 'pixel', locked: false, visible: true, opacity: 1 });
-    expect(layers[1]).toMatchObject({ kind: 'base', locked: true });
+    expect(layers[1]).toMatchObject({ kind: 'input', input: 1, locked: true });
     expect(e.activeLayerId()).toBe(layers[0].id);
     expect(e.history()).toEqual({ entries: [], index: -1 });
   });

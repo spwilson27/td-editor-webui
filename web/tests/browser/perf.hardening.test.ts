@@ -51,13 +51,13 @@ function bigDoc(): Engine {
   }
   for (let i = 0; i < 8; i++) { // 1920x1080 surfaces scaled 2x
     const id = en.importImage(fill(1920, 1080, i), 1920, 1080, `scaled${i}`);
-    en.setTransform(id, { x: (i % 2) * 1900, y: Math.floor(i / 2) * 500, sx: 2, sy: 2 });
+    en.setTransform(id, { x: (i % 2) * 1900, y: Math.floor(i / 2) * 500, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 });
     ids.push(id);
     surfaceBytes += 1920 * 1080 * 4;
   }
   for (let i = 0; i < 8; i++) { // small, partly minified / enlarged
     const id = en.importImage(fill(800, 600, i + 10), 800, 600, `small${i}`);
-    en.setTransform(id, { x: 200 + i * 400, y: 300 + i * 150, sx: i % 2 ? 0.5 : 1.5, sy: i % 2 ? 0.5 : 1.5 });
+    en.setTransform(id, { x: 200 + i * 400, y: 300 + i * 150, sx: i % 2 ? 0.5 : 1.5, sy: i % 2 ? 0.5 : 1.5, rot: 0, kx: 0, ky: 0 });
     ids.push(id);
     surfaceBytes += 800 * 600 * 4;
   }

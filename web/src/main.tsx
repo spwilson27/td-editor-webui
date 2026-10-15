@@ -23,6 +23,7 @@ function boot() {
     setConnection: store.setConnection, setActive: store.setActive, setNotice: store.setNotice, setFatal: store.setFatal,
     setLoading: store.setLoading, setLatency: store.setLatency, setViewLatency: store.setViewLatency, setViewFrame: store.setViewFrame,
     setFonts: store.setFonts, docName: store.docName,
+    setInputs: store.setInputs, setFiles: store.setFiles, onFileResult: store.onFileResult,
   };
   store.clientKind.value = resolveClient(location.search);
   let bridge: Bridge;

@@ -37,6 +37,7 @@ class Env:
         self.x._now = self.clock
         self.x._cache_root = lambda: CACHE_ROOT
         self.x._sync_cache_writes = True
+        self.x._sync_file_ops = True   # project / PNG workers run inline
         self.o.ext = self.x
         self.n = 0
         self.opened = []
@@ -141,6 +142,11 @@ class Env:
         return self.s.messages(cid, "base")
 
 
+def IN(n, w=0, h=0):
+    """One `inputs` item: connected when it has a size."""
+    return {"input": n, "w": w, "h": h, "connected": w > 0}
+
+
 def wire_of(bands):
     """Reassemble the wire image from fetched bands."""
     return np.concatenate([np.frombuffer(p, np.uint8).reshape(h.h, h.w, 4) for h, p in bands])
@@ -164,8 +170,8 @@ def L(id, kind="pixel", slot=None, mask=None, **kw):
     return d
 
 
-DOC = [L("base", "base"), L("p1", slot=1), L("p2", slot=2, mask={"slot": 3, "enabled": True})]
-DOC_SIZED = [dict(l, surfaceW=64, surfaceH=32) if l["kind"] in ("base", "pixel") else l for l in DOC]  # as TD hands it to a client
+DOC = [L("base", "input", input=1), L("p1", slot=1), L("p2", slot=2, mask={"slot": 3, "enabled": True})]
+DOC_SIZED = [dict(l, surfaceW=64, surfaceH=32) if l["kind"] in ("input", "pixel") else l for l in DOC]  # as TD hands it to a client
 
 
 # ----------------------------------------------------------------------------- HTTP
@@ -209,8 +215,8 @@ def test_first_client_becomes_active_and_gets_hello(env):
     env.pump()
     a = env.connect("external")
     (hello,) = env.s.messages(a, "hello")
-    assert hello["protocol"] == 5 and hello["active"] is True and hello["hasInput"] is False
-    assert hello["doc"] == {"w": 64, "h": 32, "mode": "input"} and hello["baseSize"] == {"w": 0, "h": 0} and hello["maxSendFps"] == 30
+    assert hello["protocol"] == 6 and hello["active"] is True and hello["hasInput"] is False
+    assert hello["doc"] == {"w": 64, "h": 32, "mode": "input"} and hello["inputs"] == [IN(1)] and "baseSize" not in hello and hello["maxSendFps"] == 30
     assert hello["hasDocument"] is False and hello["rev"] is None
 
 
@@ -582,7 +588,7 @@ def test_no_input_output_is_the_network_at_doc_size(env):
     env.pump()
     assert env.o.switch.par.index.eval() == 1
     layers, w, h = env.o.net.applies[-1]
-    assert (w, h) == (64, 32) and [l["kind"] for l in layers] == ["base"]
+    assert (w, h) == (64, 32) and [l["kind"] for l in layers] == ["input"]
 
 
 def test_network_failure_keeps_passthrough_and_reports(env, capsys):
@@ -973,7 +979,7 @@ def test_input_resize_sends_docsize_and_basesize_new_base_and_keeps_surfaces(env
     env.pump()
     (ds,) = env.s.messages(a, "docSize")
     assert ds == {"t": "docSize", "w": 80, "h": 40, "hasInput": True, "mode": "input"}
-    assert env.s.messages(a, "baseSize")[-1] == {"t": "baseSize", "w": 80, "h": 40}
+    assert env.s.messages(a, "inputs")[-1] == {"t": "inputs", "items": [IN(1, 80, 40), IN(2)]}  # (+ the spare connector)
     # v5: surfaces keep their own size and pixels; nothing is reallocated or re-uploaded by a document resize
     assert all(b.shape == (32, 64, 4) for b in env.x.surfaces.values())
     assert (env.dump(a, 1)[1] == img).all() and len(env.top(1).uploads) == uploads
@@ -999,7 +1005,7 @@ def test_base_frame_is_the_input_size_not_the_document_size_in_fixed_mode(env):
     assert (h.doc_w, h.doc_h, h.w, h.h, len(payload)) == (80, 40, 80, 40, 80 * 40 * 4)
     env.set_input(60, 30, 3)  # input resolution change while Fixed: baseSize, no docSize, doc unchanged
     env.pump(20)
-    assert env.s.messages(a, "baseSize")[-1] == {"t": "baseSize", "w": 60, "h": 30}
+    assert env.s.messages(a, "inputs")[-1]["items"][0] == IN(1, 60, 30)
     assert not env.s.messages(a, "docSize") and (env.x.doc_w, env.x.doc_h) == (100, 60)
     assert (env.notices(a)[-1]["docW"], env.notices(a)[-1]["docH"]) == (60, 30)
 
@@ -1022,7 +1028,7 @@ def test_doc_size_change_does_not_touch_surfaces(env):
 def test_surfaces_are_allocated_at_their_own_sizes_and_masks_follow_their_layer(env):
     env.pump()
     a = env.connect("panel")
-    layers = [L("base", "base"), L("p1", slot=1, surfaceW=20, surfaceH=10, sx=2.0, sy=0.5, x=3.5, y=-2.25),
+    layers = [L("base", "input", input=1), L("p1", slot=1, surfaceW=20, surfaceH=10, sx=2.0, sy=0.5, x=3.5, y=-2.25),
               L("p2", slot=2, mask={"slot": 3, "enabled": True}, surfaceW=7, surfaceH=9)]
     env.doc(a, layers)
     assert {s: b.shape for s, b in env.x.surfaces.items()} == {1: (10, 20, 4), 2: (9, 7, 4), 3: (9, 7, 4)}
@@ -1042,7 +1048,7 @@ def test_surfaces_are_allocated_at_their_own_sizes_and_masks_follow_their_layer(
 def test_spec_size_change_reallocates_that_slot_only_and_drops_old_size_frames(env):
     env.pump()
     a = env.connect("panel")
-    layers = lambda w, h: [L("base", "base"), L("p1", slot=1, surfaceW=w, surfaceH=h), L("p2", slot=2, surfaceW=8, surfaceH=8)]
+    layers = lambda w, h: [L("base", "input", input=1), L("p1", slot=1, surfaceW=w, surfaceH=h), L("p2", slot=2, surfaceW=8, surfaceH=8)]
     env.doc(a, layers(16, 8), rev=1)
     px = wire_img(16, 8, 1, 255)
     env.surface(a, 1, (0, 0, 16, 8), px, dw=16, dh=8)
@@ -1092,7 +1098,7 @@ def test_input_disconnect_returns_to_doc_par_size(env):
     env.pump()
     assert (env.x.doc_w, env.x.doc_h, env.x.has_input) == (64, 32, False)
     assert env.s.messages(a, "docSize")[-1] == {"t": "docSize", "w": 64, "h": 32, "hasInput": False, "mode": "input"}
-    assert env.s.messages(a, "baseSize")[-1] == {"t": "baseSize", "w": 0, "h": 0}
+    assert env.s.messages(a, "inputs")[-1]["items"][0] == IN(1)
     assert env.o.net.applies[-1][1:] == (64, 32)
     assert env.o.switch.par.index.eval() == 1
 
@@ -1613,7 +1619,7 @@ def test_base_notice_fields_and_single_band_whole_frame_fetch(env):
     a = env.connect("panel")
     env.pump(10)
     (n,) = env.notices(a)
-    assert n == {"t": "base", "frameId": n["frameId"], "docW": 64, "docH": 32, "x": 0, "y": 0, "w": 64, "h": 32}
+    assert n == {"t": "base", "input": 1, "frameId": n["frameId"], "docW": 64, "docH": 32, "x": 0, "y": 0, "w": 64, "h": 32}
     ((h, payload),) = env.fetched[a]
     assert (h.type, h.frame_end, h.frame_id, h.x, h.y, h.w, h.h) == (P.TYPE_BASE, True, n["frameId"], 0, 0, 64, 32)
     assert np.abs(wire_of([(h, payload)]).astype(int) - np.floor(arr[::-1] * 255 + 0.5)).max() <= 1
@@ -2443,7 +2449,7 @@ def test_start_without_stored_document_applies_the_default_stack():
     e = Env()
     e.pump()
     assert e.x.doc_layers is None and e.x.doc_rev is None
-    assert [l["kind"] for l in e.o.net.applies[0][0]] == ["base"]
+    assert [l["kind"] for l in e.o.net.applies[0][0]] == ["input"]
     e.send(e.connect("panel"), {"t": "requestDoc"})
 
 
@@ -2751,7 +2757,7 @@ def test_surface_uploads_are_budgeted_per_pump_but_at_least_one():
     e = Env(tick=0.003)   # every clock read costs 3 ms
     e.pump()
     a = e.connect("panel")
-    layers = [L("base", "base")] + [L(f"p{i}", slot=i + 1) for i in range(6)]
+    layers = [L("base", "input", input=1)] + [L(f"p{i}", slot=i + 1) for i in range(6)]
     e.doc(a, layers)
     n = [len(e.top(i + 1).uploads) for i in range(6)]
     e.pump()
@@ -2927,7 +2933,7 @@ def test_cook_is_round_robin_so_a_busy_slot_cannot_starve_the_others():
     e = Env(tick=0.003)
     e.pump()
     a = e.connect("panel")
-    e.doc(a, [L("base", "base")] + [L(f"p{i}", slot=i + 1) for i in range(4)])
+    e.doc(a, [L("base", "input", input=1)] + [L(f"p{i}", slot=i + 1) for i in range(4)])
     e.pump(10)
     seen = set()
     for i in range(12):
@@ -3434,7 +3440,7 @@ def test_import_does_not_touch_documents_or_other_streams(env):
 def test_text_and_shape_layers_are_accepted_and_applied(env):
     env.pump()
     a = env.connect("panel")
-    layers = [L("base", "base"), TEXT("t1"), SHAPE("s1"), TEXT("t2", sx=2.0, sy=2.0), SHAPE("s2")]
+    layers = [L("base", "input", input=1), TEXT("t1"), SHAPE("s1"), TEXT("t2", sx=2.0, sy=2.0), SHAPE("s2")]
     env.doc(a, layers)
     assert env.x.doc_layers == layers and not env.s.messages(a, "error")
     assert not env.x.surfaces and env.o.net.applies[-1][0] == layers   # text / shape layers never own a surface
@@ -3443,15 +3449,15 @@ def test_text_and_shape_layers_are_accepted_and_applied(env):
 def test_text_or_shape_layer_with_a_slot_is_rejected(env):
     env.pump()
     a = env.connect("panel")
-    env.doc(a, [L("base", "base"), L("t1", "text", slot=3, text=TEXT("x")["text"], shape=None)])
-    env.doc(a, [L("base", "base"), L("s1", "shape", slot=4, text=None, shape=SHAPE("x")["shape"])])
+    env.doc(a, [L("base", "input", input=1), L("t1", "text", slot=3, text=TEXT("x")["text"], shape=None)])
+    env.doc(a, [L("base", "input", input=1), L("s1", "shape", slot=4, text=None, shape=SHAPE("x")["shape"])])
     assert len(env.s.messages(a, "error")) == 2 and env.x.doc_layers is None
 
 
 def test_stored_text_document_survives_a_restart(env):
     env.pump()
     a = env.connect("panel")
-    layers = [L("base", "base"), TEXT("t1"), SHAPE("s1")]
+    layers = [L("base", "input", input=1), TEXT("t1"), SHAPE("s1")]
     env.doc(a, layers, rev=5)
     env.pump(2)
     e2 = Env(like=env)
@@ -3597,7 +3603,7 @@ def test_set_canvas_fixed_updates_the_parameters_and_tells_the_others(env):
 def test_set_canvas_does_not_resample_or_reallocate_surfaces(env):
     env.pump()
     a = env.connect("panel")
-    env.doc(a, [L("base", "base"), L("p1", slot=1, surfaceW=40, surfaceH=20)])
+    env.doc(a, [L("base", "input", input=1), L("p1", slot=1, surfaceW=40, surfaceH=20)])
     img = wire_img(40, 20, 3, 255)
     env.surface(a, 1, (0, 0, 40, 20), img, dw=40, dh=20)
     env.pump()
@@ -3652,7 +3658,7 @@ def test_follow_input_doc_size_tracks_the_input_and_disconnect_uses_the_paramete
     env.set_input(80, 40)
     env.pump()
     a = env.connect("panel")
-    assert (env.x.doc_w, env.x.doc_h) == (80, 40) and env.s.messages(a, "hello")[0]["baseSize"] == {"w": 80, "h": 40}
+    assert (env.x.doc_w, env.x.doc_h) == (80, 40) and env.s.messages(a, "hello")[0]["inputs"][0] == IN(1, 80, 40)
     env.set_input(33, 22)
     env.pump()
     assert (env.x.doc_w, env.x.doc_h) == (33, 22) and env.s.messages(a, "docSize")[-1]["mode"] == "input"
@@ -3669,11 +3675,11 @@ def test_fixed_mode_ignores_the_input_size_and_uses_docw_doch(env):
     assert (env.x.doc_w, env.x.doc_h, env.x.in_w, env.x.in_h) == (120, 50, 80, 40)
     a = env.connect("panel")
     h = env.s.messages(a, "hello")[0]
-    assert h["doc"] == {"w": 120, "h": 50, "mode": "fixed"} and h["baseSize"] == {"w": 80, "h": 40} and h["hasInput"] is True
+    assert h["doc"] == {"w": 120, "h": 50, "mode": "fixed"} and h["inputs"][0] == IN(1, 80, 40) and h["hasInput"] is True
     env.o.inputs = []
     env.pump()
     assert (env.x.doc_w, env.x.doc_h) == (120, 50)
-    assert env.s.messages(a, "baseSize")[-1] == {"t": "baseSize", "w": 0, "h": 0}
+    assert env.s.messages(a, "inputs")[-1]["items"][0] == IN(1)
     assert env.s.messages(a, "docSize")[-1]["hasInput"] is False
 
 
@@ -3735,7 +3741,7 @@ def test_canvas_in_a_doc_message_does_not_override_the_parameter(env):
 
 
 def test_a_v4_stored_document_is_migrated(env):
-    old = {"rev": 2, "layers": [L("base", "base"), dict(L("t", "text", slot=3, text=TEXT("x")["text"], shape=None), rasterize=True)]}
+    old = {"rev": 2, "layers": [L("base", "input", input=1), dict(L("t", "text", slot=3, text=TEXT("x")["text"], shape=None), rasterize=True)]}
     env.o.doc_state.text = json.dumps(old)
     env.x.Start()
     env.pump(2)
@@ -3828,7 +3834,7 @@ def flatten_env(**kw):
     e = Env(**kw)
     e.pump()
     a = e.connect("panel")
-    e.doc(a, [L("base", "base"), TEXT("t1"), SHAPE("s1"), L("p1", slot=1)])
+    e.doc(a, [L("base", "input", input=1), TEXT("t1"), SHAPE("s1"), L("p1", slot=1)])
     return e, a
 
 
@@ -3920,7 +3926,7 @@ def sized_env():
     e = Env()
     e.pump()
     a = e.connect("panel")
-    layers = [L("base", "base"), L("p1", slot=1, surfaceW=20, surfaceH=10, sx=2.0, sy=2.0, x=3.5, y=1.25),
+    layers = [L("base", "input", input=1), L("p1", slot=1, surfaceW=20, surfaceH=10, sx=2.0, sy=2.0, x=3.5, y=1.25),
               L("p2", slot=2, mask={"slot": 3, "enabled": True}, surfaceW=7, surfaceH=9)]
     e.doc(a, layers, rev=8)
     e.imgs = {1: wire_img(20, 10, 21, 255), 2: wire_img(7, 9, 22, 200), 3: wire_img(7, 9, 23, 255)}
@@ -4005,7 +4011,7 @@ def test_a_restored_v4_document_without_surface_sizes_uses_the_document_size():
 def test_adjustment_mask_without_a_size_keeps_its_buffer_across_canvas_resize(env):
     env.pump()
     a = env.connect("panel")
-    layers = [L("base", "base"), L("adj", "adjustment", mask={"slot": 4, "enabled": True}, adjustment={"type": "invert"})]
+    layers = [L("base", "input", input=1), L("adj", "adjustment", mask={"slot": 4, "enabled": True}, adjustment={"type": "invert"})]
     env.doc(a, layers)
     assert env.x.surfaces[4].shape == (32, 64, 4)
     env.send(a, {"t": "setCanvas", "w": 128, "h": 64, "mode": "fixed"})
@@ -4064,7 +4070,7 @@ def test_doc_state_fills_in_missing_surface_sizes_for_the_client(env):
     env.set_input(80, 40)
     env.pump()
     a = env.connect("panel")
-    env.doc(a, [L("base", "base"), L("p1", slot=1), L("p2", slot=2, surfaceW=7, surfaceH=9)])
+    env.doc(a, [L("base", "input", input=1), L("p1", slot=1), L("p2", slot=2, surfaceW=7, surfaceH=9)])
     b = env.connect("external", fresh=True)
     env.send(b, {"t": "requestDoc"})
     got = {l["id"]: (l["surfaceW"], l["surfaceH"]) for l in env.s.messages(b, "docState")[0]["layers"]}
@@ -4075,7 +4081,7 @@ def test_doc_state_fills_in_missing_surface_sizes_for_the_client(env):
 # ----------------------------------------------------------------------------- review follow-ups (base layer in TD, baseSize, export)
 
 def base_of(env):
-    return next(l for l in env.x.doc_layers if l["kind"] == "base")
+    return next(l for l in env.x.doc_layers if l["kind"] == "input")
 
 
 def fixed_env_with_input(w=80, h=40):
@@ -4083,7 +4089,7 @@ def fixed_env_with_input(w=80, h=40):
     e.set_input(w, h)
     e.pump()
     a = e.connect("panel")
-    e.doc(a, [L("base", "base", surfaceW=w, surfaceH=h, x=30, y=10, sx=2.0, sy=2.0)], rev=3)
+    e.doc(a, [L("base", "input", input=1, surfaceW=w, surfaceH=h, x=30, y=10, sx=2.0, sy=2.0)], rev=3)
     e.send(a, {"t": "setCanvas", "w": 300, "h": 200, "mode": "fixed"})
     e.pump()
     return e, a
@@ -4131,16 +4137,16 @@ def test_fixed_mode_reconnect_of_an_input_does_not_rescale_from_a_stale_size():
     assert (b["surfaceW"], b["surfaceH"], b["sx"]) == (100, 100, 2.0)   # no input before: just the new size
 
 
-def test_explicit_base_size_message_follows_hello():
+def test_inputs_message_follows_hello_and_equals_hello_inputs():
     e = Env()
     e.set_input(80, 40)
     e.pump()
     a = e.connect("panel")
     kinds = [m["t"] for c, m in e.s.texts if c == a]
-    assert kinds.index("hello") < kinds.index("baseSize")
-    assert e.s.messages(a, "baseSize")[0] == {"t": "baseSize", "w": 80, "h": 40}
+    assert kinds.index("hello") < kinds.index("inputs") < kinds.index("files") < kinds.index("fonts")
+    assert e.s.messages(a, "inputs")[0]["items"] == e.s.messages(a, "hello")[0]["inputs"] == [IN(1, 80, 40), IN(2)]
     b = e.connect("external")
-    assert e.s.messages(b, "baseSize")[0]["w"] == 80
+    assert e.s.messages(b, "inputs")[0]["items"][0]["w"] == 80
 
 
 def test_zero_sized_input_is_ignored_only_in_follow_input_mode():
@@ -4156,7 +4162,7 @@ def test_zero_sized_input_is_ignored_only_in_follow_input_mode():
     e.pump()
     e.o.in1.width = e.o.in1.height = 0
     e.pump()
-    assert (e.x.doc_w, e.x.doc_h) == (200, 100) and e.x.in_w == 0   # Fixed: the document never depended on it
+    assert (e.x.doc_w, e.x.doc_h) == (200, 100) and e.x.in_w == 80   # Fixed: the document never depended on it
 
 
 def test_render_layer_first_read_after_readiness_is_discarded():
@@ -4475,3 +4481,21 @@ def test_a_cache_root_owned_by_someone_else_is_not_used(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "getuid", lambda: os.stat(tmp_path).st_uid + 1)
     a.x.onDestroyTD()
     assert not list(tmp_path.iterdir())
+
+
+def test_applied_is_sent_even_when_td_cooked_the_script_tops_before_the_pump():
+    """A downstream consumer (effect chain) can cook a surface's Script TOP right after the tile arrived: OnSurfaceCook clears the dirty flag,
+    the pump then finds nothing dirty -- the client must still get `applied` for its newest frame."""
+    e = Env()
+    e.pump()
+    a = e.connect("panel")
+    e.doc(a, DOC)
+    e.pump(2)
+    e.surface(a, 1, (0, 0, 64, 32), wire_img(64, 32, 4, 255))
+    e.o.net.tops[1].cook()   # TD's own cook (not the pump's forced one) writes the buffer and clears the dirty flag
+    assert 1 not in e.x._dirty
+    e.pump()
+    assert e.s.messages(a, "applied")[-1]["frameId"] == 1
+    n = len(e.s.messages(a, "applied"))
+    e.pump(3)
+    assert len(e.s.messages(a, "applied")) == n    # still only once per newest frame

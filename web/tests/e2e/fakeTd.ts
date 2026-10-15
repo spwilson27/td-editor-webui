@@ -8,12 +8,27 @@ import {
 } from '../../src/bridge/codec';
 import type { CanvasMode, Guides, LayerSpec } from '../../src/engine/types';
 
-export interface FakeTdOptions { token?: string; w: number; h: number; active?: boolean; hasInput?: boolean; maxSendFps?: number; fonts?: string[] }
+export interface FakeTdOptions {
+  token?: string; w: number; h: number; active?: boolean; hasInput?: boolean; maxSendFps?: number; fonts?: string[];
+  /** v6: the TD inputs (default: input 1 at w x h). Several inputs may differ in size. */
+  inputs?: { input: number; w: number; h: number }[];
+  projectFile?: string; pngFile?: string;
+}
+
+/** A saved project in the fake TD's in-memory file system (`saveProject` stores it, `openProject` restores it). */
+export interface FakeFile {
+  doc: { rev: number; layers: LayerSpec[]; guides: Guides; canvas: { mode: CanvasMode } };
+  surfaces: Map<number, Uint8ClampedArray>;
+  slotSizes: Map<number, { w: number; h: number }>;
+  w: number; h: number; mode: CanvasMode;
+}
+
+interface FakeInput { w: number; h: number; connected: boolean; stored: { id: number; bytes: Uint8Array } | null; pending: boolean }
 
 export interface FakeTop { path: string; w: number; h: number; rgba: Uint8Array }
 
 /**
- * A stand-in for the TouchDesigner web server DAT (protocol v5: per-slot surface sizes, guides + canvas in the stored doc, `setCanvas`/`baseSize`/`renderLayer`): WebSocket for JSON and SURFACE tiles (stored per
+ * A stand-in for the TouchDesigner web server DAT (protocol v6: several inputs with BASE frames per input, `inputs`, effects/transforms stored verbatim in the doc, `saveProject`/`openProject`/`exportPng` with an in-memory file map + `reload`/`files`, plus the v5 `setCanvas`/`renderLayer` features): WebSocket for JSON and SURFACE tiles (stored per
  * slot with the last `doc`), HTTP `GET /base` / `/surface` / `/view` / `/top`; `fonts` after `hello`; `listTops` / `importTop` over a registry of fake TOPs; `applied` replies per finished SURFACE frame.
  */
 export class FakeTd {
@@ -33,8 +48,22 @@ export class FakeTd {
   docStateDelayMs = 0;
   requestDocs = 0;
   /** v5: the TD Input resolution (BASE frames carry it), the canvas mode, and what `renderLayer` answers with. */
-  baseW: number;
-  baseH: number;
+  /** v6: TD inputs by index. */
+  inputs = new Map<number, FakeInput>();
+  /** Input 1's resolution (what the single-input tests call "the base"). */
+  get baseW(): number { return this.inputs.get(1)?.w ?? 0; }
+  get baseH(): number { return this.inputs.get(1)?.h ?? 0; }
+  /** v6 files: in-memory 'disk' by path, parameter values, and logs of the requests. */
+  savedFiles = new Map<string, FakeFile>();
+  exportedPngs: string[] = [];
+  /** Real TD behaviour: after `reload` the client's `doc` / SURFACE are ignored until it has sent `requestDoc`. */
+  awaitingRequestDoc = false;
+  ignoredAfterReload = { docs: 0, frames: 0 };
+  /** Delay the `reload` message itself (a stray edit can then be in flight). */
+  reloadDelayMs = 0;
+  projectFile: string;
+  pngFile: string;
+  fileRequests: Extract<WebMessage, { t: 'saveProject' | 'openProject' | 'exportPng' }>[] = [];
   mode: CanvasMode;
   setCanvasMessages: { w: number; h: number; mode: CanvasMode }[] = [];
   renderCalls: string[] = [];
@@ -66,7 +95,8 @@ export class FakeTd {
 
   /** BASE delivery bookkeeping. */
   noticesSent: number[] = [];
-  fetches: { frameId: number; status: number; origin?: string; acao?: string }[] = [];
+  noticesByInput: { input: number; frameId: number }[] = [];
+  fetches: { frameId: number; status: number; input: number; origin?: string; acao?: string }[] = [];
   badFetches = 0;
   /** Force every /base response to this status (404 / 403) instead of serving the frame. */
   baseStatus: number | null = null;
@@ -74,16 +104,15 @@ export class FakeTd {
   baseDelayMs = 0;
 
   private nextFrameId = 1;
-  private stored: { id: number; bytes: Uint8Array } | null = null;
-  private pending = false;
   private clientSeq = 0;
 
   private constructor(private http: Server, private wss: WebSocketServer, private opts: FakeTdOptions) {
     this.token = opts.token ?? 'tok-e2e';
     this.w = opts.w;
     this.h = opts.h;
-    this.baseW = opts.w;
-    this.baseH = opts.h;
+    for (const i of opts.inputs ?? [{ input: 1, w: opts.w, h: opts.h }]) this.inputs.set(i.input, { w: i.w, h: i.h, connected: true, stored: null, pending: false });
+    this.projectFile = opts.projectFile ?? '/tmp/fake.redoc';
+    this.pngFile = opts.pngFile ?? '/tmp/fake.png';
     this.mode = 'input';
     this.active = opts.active ?? true;
     wss.on('connection', (ws) => this.onConnection(ws));
@@ -147,34 +176,39 @@ export class FakeTd {
       return;
     }
     if (u.pathname !== '/base') { res.writeHead(404, cors).end(); return; }
+    const input = Number(q.get('input') ?? 1);
+    const inp = this.inputs.get(input);
     const answer = (status: number, body?: Uint8Array) => {
-      this.fetches.push({ frameId: Number(q.get('frameId')), status, origin: req.headers.origin, acao: cors['Access-Control-Allow-Origin'] });
+      this.fetches.push({ frameId: Number(q.get('frameId')), status, input, origin: req.headers.origin, acao: cors['Access-Control-Allow-Origin'] });
       res.writeHead(status, { ...cors, 'Content-Type': 'application/octet-stream' });
       res.end(body ? Buffer.from(body) : undefined);
     };
     if (q.get('token') !== this.token || q.get('client') !== this.clientId) { this.badFetches++; answer(403); return; }
     setTimeout(() => {
-      if (this.baseStatus !== null) { answer(this.baseStatus); this.pending = false; return; }
-      if (!this.stored) { answer(404); this.pending = false; return; }
-      const served = this.stored;
+      if (this.baseStatus !== null) { answer(this.baseStatus); if (inp) inp.pending = false; return; }
+      if (!inp || !inp.stored) { answer(404); if (inp) inp.pending = false; return; }
+      const served = inp.stored;
       answer(200, served.bytes);
-      this.pending = false;
-      if (this.stored.id > served.id) this.announce(); // a newer frame arrived meanwhile
+      inp.pending = false;
+      if (inp.stored && inp.stored.id > served.id) this.announce(input); // a newer frame arrived meanwhile
     }, this.baseDelayMs);
   }
 
-  private announce() {
-    if (!this.client || !this.stored) return;
-    if (this.pending) return; // one un-fetched notice per client; the stored frame is simply newer
-    this.pending = true;
-    this.noticesSent.push(this.stored.id);
-    this.send({ t: 'base', frameId: this.stored.id, docW: this.baseW, docH: this.baseH, x: 0, y: 0, w: this.baseW, h: this.baseH });
+  private announce(input: number) {
+    const inp = this.inputs.get(input);
+    if (!this.client || !inp || !inp.stored) return;
+    if (inp.pending) return; // one un-fetched notice per client and input; the stored frame is simply newer
+    inp.pending = true;
+    this.noticesSent.push(inp.stored.id);
+    this.noticesByInput.push({ input, frameId: inp.stored.id });
+    this.send({ t: 'base', frameId: inp.stored.id, input, docW: inp.w, docH: inp.h, x: 0, y: 0, w: inp.w, h: inp.h });
   }
 
   private onConnection(ws: WebSocket) {
     this.client = ws;
     this.connections++;
-    this.pending = false;
+    this.awaitingRequestDoc = false;
+    for (const i of this.inputs.values()) i.pending = false;
     this.viewPending = false;
     this.viewSubscribed = false;
     this.clientId = `client-${++this.clientSeq}`;
@@ -191,14 +225,18 @@ export class FakeTd {
             return;
           }
           this.send(this.hello());
+          this.send({ t: 'files', projectFile: this.projectFile, pngFile: this.pngFile });
           if (this.opts.fonts) this.send({ t: 'fonts', families: this.opts.fonts });
-          if (this.stored) this.announce();
+          for (const n of this.inputs.keys()) this.announce(n);
         }
-        if (m.t === 'requestBase') { this.pending = false; this.announce(); }
+        if (m.t === 'requestBase') for (const n of this.inputs.keys()) { this.inputs.get(n)!.pending = false; this.announce(n); }
+        if (m.t === 'chooseFile') this.onChooseFile(m);
+        if (m.t === 'saveProject' || m.t === 'openProject' || m.t === 'exportPng') this.onFileRequest(m);
+        if (m.t === 'doc' && this.awaitingRequestDoc) { this.ignoredAfterReload.docs++; return; }
         if (m.t === 'doc' && this.active) { this.doc = { rev: m.rev, layers: m.layers, guides: m.guides, canvas: m.canvas }; this.docMessages++; this.syncSlots(m.layers); }
         if (m.t === 'setCanvas' && this.active) this.onSetCanvas(m);
         if (m.t === 'renderLayer') this.onRenderLayer(m);
-        if (m.t === 'requestDoc') this.requestDocs++;
+        if (m.t === 'requestDoc') { this.requestDocs++; this.awaitingRequestDoc = false; }
         if (m.t === 'listTops') this.send({ t: 'tops', requestId: m.requestId, items: this.tops.map(({ path, w, h }) => ({ path, w, h })) });
         if (m.t === 'importTop') {
           const top = this.tops.find((x) => x.path === m.path);
@@ -224,6 +262,7 @@ export class FakeTd {
       const buf = data as Buffer;
       const r = decodeFrame(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
       if (!r.ok || r.frame.type !== FRAME_SURFACE || !this.active) return;
+      if (this.awaitingRequestDoc) { this.ignoredAfterReload.frames++; return; }
       const f = r.frame;
       const sz = this.slotSizes.get(f.slot);
       if (!sz || isStale(f, sz.w, sz.h)) return; // v5: the header carries the SURFACE size; a different size than the slot's is stale
@@ -244,10 +283,70 @@ export class FakeTd {
 
   hello(): TdMessage {
     return {
-      t: 'hello', protocol: 5, doc: { w: this.w, h: this.h, mode: this.mode }, hasInput: this.opts.hasInput ?? false, maxSendFps: this.opts.maxSendFps ?? 30,
-      baseSize: { w: this.baseW, h: this.baseH },
+      t: 'hello', protocol: 6, doc: { w: this.w, h: this.h, mode: this.mode }, hasInput: this.opts.hasInput ?? false, maxSendFps: this.opts.maxSendFps ?? 30,
+      inputs: this.inputList(),
       active: this.active, clientId: this.clientId, hasDocument: this.doc !== null, rev: this.doc?.rev ?? null,
     };
+  }
+
+  inputList(): { input: number; w: number; h: number; connected: boolean }[] {
+    return [...this.inputs].sort((a, b) => a[0] - b[0]).map(([input, i]) => ({ input, w: i.w, h: i.h, connected: i.connected }));
+  }
+
+  private onFileRequest(m: Extract<WebMessage, { t: 'saveProject' | 'openProject' | 'exportPng' }>) {
+    this.fileRequests.push(m);
+    const reply = (ok: boolean, path: string, msg?: string) => this.send({ t: 'fileResult', requestId: m.requestId, op: m.t, ok, path, ...(msg ? { msg } : {}) });
+    if (m.t === 'exportPng') {
+      const path = m.path ?? this.pngFile;
+      if (m.path) this.pngFile = m.path;
+      this.exportedPngs.push(path);
+      reply(true, path);
+      if (m.path) this.send({ t: 'files', projectFile: this.projectFile, pngFile: this.pngFile });
+      return;
+    }
+    const path = m.path ?? this.projectFile;
+    if (m.path) { this.projectFile = m.path; this.send({ t: 'files', projectFile: this.projectFile, pngFile: this.pngFile }); }
+    if (m.t === 'saveProject') {
+      if (!this.doc) { reply(false, path, 'No document to save'); return; }
+      this.savedFiles.set(path, {
+        doc: JSON.parse(JSON.stringify(this.doc)), surfaces: new Map([...this.surfaces].map(([k, v]) => [k, new Uint8ClampedArray(v)])),
+        slotSizes: new Map(this.slotSizes), w: this.w, h: this.h, mode: this.mode,
+      });
+      reply(true, path);
+      return;
+    }
+    const file = this.savedFiles.get(path);
+    if (!file) { reply(false, path, `File not found: ${path}`); return; }
+    const rev = (this.doc?.rev ?? 0) + 1;
+    this.doc = { ...JSON.parse(JSON.stringify(file.doc)), rev };
+    this.w = file.w; this.h = file.h; this.mode = file.mode;
+    this.slotSizes = new Map(file.slotSizes);
+    this.surfaces = new Map([...file.surfaces].map(([k, v]) => [k, new Uint8ClampedArray(v)]));
+    reply(true, path);
+    this.awaitingRequestDoc = true;
+    const to = this.client;
+    setTimeout(() => { if (this.client === to) this.send({ t: 'reload', rev }); }, this.reloadDelayMs);
+  }
+
+  /** v6 chooser: what the user "picks" (null = cancel) per purpose, and a log of the requests. */
+  choice: Record<string, string | null> = { placeImage: '/tmp/picked-photo.png', saveProject: '/tmp/chosen.redoc', openProject: '/tmp/chosen.redoc', exportPng: '/tmp/chosen.png' };
+  chooseRequests: Extract<WebMessage, { t: 'chooseFile' }>[] = [];
+  /** Size and colour of the image `placeImage` serves, and an error to answer instead (topError). */
+  placeSize = { w: 32, h: 16 };
+  placeColor: [number, number, number, number] = [40, 90, 220, 255];
+  placeFails: string | null = null;
+
+  private onChooseFile(m: Extract<WebMessage, { t: 'chooseFile' }>) {
+    this.chooseRequests.push(m);
+    const path = this.choice[m.purpose] ?? null;
+    this.send({ t: 'fileChosen', requestId: m.requestId, path });
+    if (m.purpose !== 'placeImage' || path === null) return;
+    if (this.placeFails) { this.send({ t: 'topError', requestId: m.requestId, msg: this.placeFails }); return; }
+    const { w, h } = this.placeSize;
+    const rgba = new Uint8Array(w * h * 4);
+    for (let i = 0; i < rgba.length; i += 4) rgba.set(this.placeColor, i);
+    this.topSnapshots.set(m.requestId, encodeFrame({ type: FRAME_TOP, frameEnd: true, slot: 0, frameId: 1, docW: w, docH: h, x: 0, y: 0, w, h }, rgba));
+    setTimeout(() => this.send({ t: 'topReady', requestId: m.requestId, w, h }), this.topDelayMs);
   }
 
   /** Allocate / free surface buffers for the slots a `doc` lists (pixel + mask), like the generated Script TOPs. */
@@ -270,9 +369,8 @@ export class FakeTd {
   private onSetCanvas(m: Extract<WebMessage, { t: 'setCanvas' }>) {
     this.setCanvasMessages.push({ w: m.w, h: m.h, mode: m.mode });
     this.mode = m.mode;
-    if (m.mode === 'input') { this.w = this.baseW; this.h = this.baseH; } else { this.w = m.w; this.h = m.h; }
-    this.stored = null;
-    this.pending = false;
+    if (m.mode === 'input') { this.w = this.baseW || this.w; this.h = this.baseH || this.h; } else { this.w = m.w; this.h = m.h; }
+    for (const i of this.inputs.values()) { i.stored = null; i.pending = false; }
     this.send({ t: 'docSize', w: this.w, h: this.h, hasInput: true, mode: this.mode });
   }
 
@@ -294,7 +392,11 @@ export class FakeTd {
   /** Pre-load a stored document as if TouchDesigner had restored it from its .toe (for the fresh-page load flow). */
   seedDocument(layers: LayerSpec[], rev = 1, fill: Record<number, [number, number, number, number]> = {}, guides: Guides = { h: [], v: [] }, canvas: { mode: CanvasMode } = { mode: 'input' }) {
     // like TD's own specs: pixel / base layers always state their surface size (default: the document size)
-    layers = layers.map((l) => ((l.kind === 'pixel' || l.kind === 'base') && l.surfaceW == null ? { ...l, surfaceW: this.baseW, surfaceH: this.baseH } : l));
+    layers = layers.map((l) => {
+      if (l.surfaceW != null || (l.kind !== 'pixel' && l.kind !== 'input')) return l;
+      const inp = l.kind === 'input' ? this.inputs.get(l.input ?? 1) : undefined;
+      return { ...l, surfaceW: inp?.w ?? this.baseW, surfaceH: inp?.h ?? this.baseH };
+    });
     this.doc = { rev, layers, guides, canvas };
     this.syncSlots(layers);
     for (const [slot, rgba] of Object.entries(fill)) {
@@ -326,31 +428,37 @@ export class FakeTd {
 
   setActive(active: boolean) { this.active = active; this.send({ t: 'active', active }); }
 
-  /** The input is disconnected while no page listens: the next hello carries baseSize 0x0. */
-  removeInput() { this.baseW = 0; this.baseH = 0; this.stored = null; }
-
-  /** The input resolution changes: in Follow Input mode the document follows (docSize), always a `baseSize`. The old BASE frame is gone. */
-  resize(w: number, h: number) {
-    this.baseW = w; this.baseH = h;
-    if (this.mode === 'input') { this.w = w; this.h = h; }
-    this.stored = null;
-    this.pending = false;
-    this.send({ t: 'baseSize', w, h });
-    if (this.mode === 'input') this.send({ t: 'docSize', w, h, hasInput: true, mode: this.mode });
+  /** The input is disconnected while no page listens: the next hello lists it as 0x0, not connected. */
+  removeInput(input = 1) {
+    const i = this.inputs.get(input);
+    if (!i) return;
+    i.w = 0; i.h = 0; i.connected = false; i.stored = null; i.pending = false;
   }
 
-  /** Stores a whole-document BASE frame (replacing any older one) and announces it if no notice is outstanding. */
-  setBase(rgba: Uint8Array) {
+  /** An input's resolution changes: always an `inputs` message; in Follow Input mode the document follows input 1 (docSize). The old BASE frame is gone. */
+  resize(w: number, h: number, input = 1) {
+    const i = this.inputs.get(input) ?? { w, h, connected: true, stored: null, pending: false };
+    this.inputs.set(input, i);
+    i.w = w; i.h = h; i.connected = true; i.stored = null; i.pending = false;
+    if (this.mode === 'input' && input === 1) { this.w = w; this.h = h; }
+    this.send({ t: 'inputs', items: this.inputList() });
+    if (this.mode === 'input' && input === 1) this.send({ t: 'docSize', w, h, hasInput: true, mode: this.mode });
+  }
+
+  /** Stores a whole-input BASE frame (replacing any older one of that input) and announces it if no notice for it is outstanding. */
+  setBase(rgba: Uint8Array, input = 1) {
+    const i = this.inputs.get(input)!;
     const id = this.nextFrameId++;
-    const bytes = encodeFrame({ type: FRAME_BASE, frameEnd: true, slot: 0, frameId: id, docW: this.baseW, docH: this.baseH, x: 0, y: 0, w: this.baseW, h: this.baseH }, rgba);
-    this.stored = { id, bytes };
-    this.announce();
+    const bytes = encodeFrame({ type: FRAME_BASE, frameEnd: true, slot: input, frameId: id, docW: i.w, docH: i.h, x: 0, y: 0, w: i.w, h: i.h }, rgba);
+    i.stored = { id, bytes };
+    this.announce(input);
   }
 
-  sendSolidBase(r: number, g: number, b: number) {
-    const px = new Uint8Array(this.baseW * this.baseH * 4);
-    for (let i = 0; i < px.length; i += 4) { px[i] = r; px[i + 1] = g; px[i + 2] = b; px[i + 3] = 255; }
-    this.setBase(px);
+  sendSolidBase(r: number, g: number, b: number, input = 1) {
+    const i = this.inputs.get(input)!;
+    const px = new Uint8Array(i.w * i.h * 4);
+    for (let k = 0; k < px.length; k += 4) { px[k] = r; px[k + 1] = g; px[k + 2] = b; px[k + 3] = 255; }
+    this.setBase(px, input);
   }
 
   dropClient() { this.client?.terminate(); }

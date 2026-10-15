@@ -45,7 +45,7 @@ describe('TopBar', () => {
     await settle();
     const open = [...document.querySelectorAll<HTMLElement>('[role=menuitem]')].find((b) => b.textContent!.startsWith('Open'))!;
     expect(open.getAttribute('aria-disabled')).toBe('true');
-    expect(open.title).toBe('Not in this version');
+    expect(open.title).toBe('Needs TouchDesigner');
     open.click();
     await settle();
     expect(document.querySelector('[role=menu]')).toBeTruthy();
@@ -153,7 +153,7 @@ describe('StatusBar and StandbyOverlay', () => {
   it('shows hint, active layer, connection state and notices', async () => {
     await mount(<StatusBar />, 'width:900px');
     expect(q('[data-status=hint]').textContent).toContain('Drag to paint');
-    expect(q('[data-status=layer]').textContent).toBe('TD Input');
+    expect(q('[data-status=layer]').textContent).toBe('TD Input 1');
     expect(q('[data-status=connection]').textContent).toContain('Standalone');
     store.setConnection('linked');
     store.setNotice('Layer is locked');
@@ -187,7 +187,7 @@ describe('StatusBar and StandbyOverlay', () => {
 describe('App', () => {
   it('mounts the whole editor with all regions', async () => {
     await mount(<App />, 'width:1600px;height:960px');
-    expect(document.querySelectorAll('[data-tool]').length).toBe(17);
+    expect(document.querySelectorAll('[data-tool]').length).toBe(19);
     expect(document.querySelector('[data-viewport]')).toBeTruthy();
     expect(document.querySelector('[data-wheel]')).toBeTruthy();
     expect(document.querySelector('[data-layer-list]')).toBeTruthy();

@@ -7,6 +7,8 @@ export interface HistoryItem {
   redo(): void;
   /** Consecutive pushes with the same key within `coalesceMs` merge into one entry (slider drags). */
   coalesceKey?: string;
+  /** Marks entries a later step may discard again (quick mask strokes), see discardTrailing. */
+  tag?: string;
 }
 
 interface Stored extends HistoryItem {
@@ -92,6 +94,21 @@ export class History {
     const target = Math.max(-1, Math.min(this.items.length - 1, Math.trunc(index)));
     while (this.cur > target) this.undo();
     while (this.cur < target) this.redo();
+  }
+
+  /** Remove every entry carrying `tag`, wherever it is (the redo tail and the other entries are kept; returns how many went). */
+  discardTagged(tag: string): number {
+    let removed = 0;
+    let cur = this.cur;
+    this.items = this.items.filter((it, i) => {
+      if (it.tag !== tag) return true;
+      this.total -= it.bytes;
+      removed++;
+      if (i <= this.cur) cur--;
+      return false;
+    });
+    this.cur = cur;
+    return removed;
   }
 
   clear(): void {

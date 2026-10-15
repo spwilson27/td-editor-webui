@@ -7,6 +7,11 @@ import { hsvToRgb, parseHex, rgbToHsl, rgbToHsv, toHex, type Hsv, type Rgb } fro
 import { BRUSHES, FALLBACK_FONTS, RECENT_DEFAULT, toolInfo } from './tools';
 import { fitView, screenToDoc, zoomAbout, clampZoom, type View } from './view';
 import { IDENTITY, isIdentity, remapShape, remapText, sameRect, transformFor } from './transform';
+import type { SliceCtx } from './slice';
+import { createToolsSlice } from './toolsSlice';
+import { createEffectsSlice } from './effectsSlice';
+import { createFilesSlice } from './filesSlice';
+import { createInputsSlice } from './inputsSlice';
 
 /** Per-viewer view toggles (v4). Guides themselves live in the document. */
 export const RULERS_KEY = 'raster-editor.view.rulers';
@@ -25,7 +30,7 @@ function saveFlag(key: string, on: boolean) {
 export interface GuideDrag { axis: 'h' | 'v'; index: number | null; pos: number; remove: boolean }
 
 /** What the store needs from the bridge; Flatten / canvas calls are optional (standalone, tests). */
-export type StoreBridge = Pick<Bridge, 'listTops' | 'importTop'> & Partial<Pick<Bridge, 'renderLayer' | 'setCanvas'>>;
+export type StoreBridge = Pick<Bridge, 'listTops' | 'importTop'> & Partial<Pick<Bridge, 'renderLayer' | 'setCanvas' | 'saveProject' | 'openProject' | 'exportPng' | 'chooseFile' | 'placeImageViaTd'>>;
 
 export const SHAPE_RENDERER_KEY = 'raster-editor.shapeRenderer';
 export type ShapeRenderer = 'sdf' | 'canvas';
@@ -45,6 +50,7 @@ export function createStore() {
   let stopSelSync: (() => void) | null = null;
   let stopSnapSync: (() => void) | null = null;
   let stopZoomSync: (() => void) | null = null;
+  let stopRetouchSync: (() => void) | null = null;
   let thumbTimer: ReturnType<typeof setTimeout> | null = null;
   let noticeTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -83,7 +89,7 @@ export function createStore() {
   const flattening = signal<string | null>(null);
 
   const colorTab = signal<'color' | 'swatches' | 'brushes'>('color');
-  const layerTab = signal<'layers' | 'history' | 'adjust'>('layers');
+  const layerTab = signal<'layers' | 'history' | 'adjust' | 'fx'>('layers');
 
   // v2: view mode (Local preview vs TouchDesigner output), client kind, latency readouts
   const viewMode = signal<'local' | 'td'>('local');
@@ -130,7 +136,18 @@ export function createStore() {
     noticeTimer = msg ? setTimeout(() => { notice.value = ''; }, 4000) : null;
   }
 
+  const ctx: SliceCtx = {
+    engine: () => { if (!engine) throw new Error('engine not attached'); return engine; },
+    hasEngine: () => engine !== null,
+    setNotice,
+    bridge: () => bridgeApi,
+    activeLayer: () => { const id = engine?.activeLayerId(); return engine?.layers().find((l) => l.id === id); },
+    linked: () => connection.peek() === 'linked',
+    setLayerTab: (t) => { layerTab.value = t; },
+  };
+
   const store = {
+    ...createToolsSlice(ctx), ...createEffectsSlice(ctx), ...createFilesSlice(ctx), ...createInputsSlice(ctx),
     tool, hsv, primary, secondary, alpha, recent, customSwatches, brush, brushPreset, fillTolerance,
     selOpts, textOpts, shapeOpts, fonts, textEdit, topDialog, shapeRenderer,
     /** Shape antialiasing: 'sdf' = same maths as TouchDesigner, 'canvas' = browser Canvas 2D. Persisted per viewer. */
@@ -220,6 +237,7 @@ export function createStore() {
         });
       });
       stopSelSync = effect(() => { e.setSelectionOptions(selOpts.value); });
+      stopRetouchSync = effect(() => { e.setCloneOptions(store.cloneOpts.value); e.setRetouchOptions(store.retouch.value); });
       stopSnapSync = effect(() => { e.setSnap(store.snapOptions()); });
       stopZoomSync = effect(() => { e.setViewZoom?.(view.value.zoom); });
       canvasMode.value = e.canvasMode();
@@ -233,7 +251,8 @@ export function createStore() {
       if (stopSelSync) stopSelSync();
       if (stopSnapSync) stopSnapSync();
       if (stopZoomSync) stopZoomSync();
-      stopSelSync = stopSnapSync = stopZoomSync = null;
+      if (stopRetouchSync) stopRetouchSync();
+      stopSelSync = stopSnapSync = stopZoomSync = stopRetouchSync = null;
       textEdit.value = null;
       if (thumbTimer) clearTimeout(thumbTimer);
       offEngine = stopContextSync = thumbTimer = null;
@@ -530,13 +549,13 @@ export function createStore() {
       if (engine.setLayerBox) { engine.setLayerBox(l.id, to); return; } // the engine maps the box itself (one drag = one history entry)
       if (l.kind === 'text' && l.text) engine.setText(l.id, remapText(l.text, from, to));
       else if (l.kind === 'shape' && l.shape) engine.setShape(l.id, remapShape(l.shape, from, to));
-      else if (l.kind === 'pixel' || l.kind === 'base') engine.setTransform(l.id, transformFor(l.transform, from, to));
+      else if (l.kind === 'pixel' || l.kind === 'input') engine.setTransform(l.id, transformFor(l.transform, from, to));
     },
     canEditTransform(l: LayerInfo | undefined): boolean {
-      return !!l && (l.kind === 'pixel' || l.kind === 'base' || l.kind === 'text' || l.kind === 'shape') && (!l.locked || l.kind === 'base');
+      return !!l && (l.kind === 'pixel' || l.kind === 'input' || l.kind === 'text' || l.kind === 'shape') && (!l.locked || l.kind === 'input');
     },
     canApplyTransform(l: LayerInfo | undefined): boolean { return !!l && l.kind === 'pixel' && !l.locked && !isIdentity(l.transform); },
-    canResetTransform(l: LayerInfo | undefined): boolean { return !!l && (l.kind === 'pixel' || l.kind === 'base') && (!l.locked || l.kind === 'base') && !isIdentity(l.transform); },
+    canResetTransform(l: LayerInfo | undefined): boolean { return !!l && (l.kind === 'pixel' || l.kind === 'input') && (!l.locked || l.kind === 'input') && !isIdentity(l.transform); },
     applyTransform() { const l = store.activeLayer(); if (l && store.canApplyTransform(l)) engine!.applyTransform(l.id); },
     resetTransform() { const l = store.activeLayer(); if (l && store.canResetTransform(l)) engine!.setTransform(l.id, IDENTITY); },
 
@@ -631,7 +650,16 @@ export function createStore() {
     async importFiles(files: Iterable<File>): Promise<void> {
       for (const f of files) if (f.type.startsWith('image/')) await store.importBlob(f, f.name || 'Image');
     },
-    placeImage() { store.openPlace?.(); },
+    /** Panel clients cannot use <input type=file>: TD shows its own chooser (chooseFile → topReady → import). */
+    placeImage() {
+      if (clientKind.peek() !== 'panel') { store.openPlace?.(); return; }
+      const b = bridgeApi;
+      if (!b?.placeImageViaTd || connection.peek() !== 'linked') { setNotice('Place Image needs the TouchDesigner connection in the panel'); return; }
+      b.placeImageViaTd().catch((err) => setNotice(`Place Image failed: ${err instanceof Error ? err.message : String(err)}`));
+    },
+    placeImageTitle(): string | undefined {
+      return clientKind.peek() === 'panel' ? 'Opens a TouchDesigner file chooser. Drag-and-drop works in Open in Browser; use File ▸ Place Image here' : undefined;
+    },
     /** Edit > Paste: reads image items from the async clipboard (Ctrl+V uses the paste event instead). */
     async pasteFromClipboard() {
       try {

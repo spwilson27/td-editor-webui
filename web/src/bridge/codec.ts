@@ -1,10 +1,12 @@
-// Pure encode/decode of docs/PROTOCOL.md (version 5). No sockets here.
+// Pure encode/decode of docs/PROTOCOL.md (version 6). No sockets here.
 import type { CanvasMode, Guides, LayerSpec } from '../engine/types';
+import type { FileOp, FileResult } from '../state/filesSlice';
+import type { InputItem } from '../state/inputsSlice';
 
 export const MAGIC = [0x52, 0x45, 0x46, 0x31]; // "REF1"
 export const HEADER_BYTES = 24;
 export const MAX_BAND_PAYLOAD = 2 * 1024 * 1024;
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 export const FRAME_BASE = 1;
 export const FRAME_SURFACE = 3;
 export const FRAME_SURFACE_DUMP = 4;
@@ -18,7 +20,7 @@ const VALID_TYPES: readonly number[] = [FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE
 export interface FrameHeader {
   type: FrameType;
   frameEnd: boolean;
-  slot: number; // surface slot (SURFACE / SURFACE_DUMP); 0 otherwise
+  slot: number; // surface slot (SURFACE / SURFACE_DUMP); v6: the input index 1..8 (BASE); 0 otherwise
   frameId: number;
   docW: number;
   docH: number;
@@ -32,7 +34,7 @@ export interface Frame extends FrameHeader {
   payload: Uint8Array; // view into the received buffer, w*h*4 bytes
 }
 
-export type FrameError = 'too-short' | 'bad-magic' | 'bad-type' | 'bad-rect' | 'bad-length';
+export type FrameError = 'too-short' | 'bad-magic' | 'bad-type' | 'bad-rect' | 'bad-length' | 'bad-slot';
 export type DecodedFrame = { ok: true; frame: Frame } | { ok: false; error: FrameError };
 
 const U16 = 0xffff;
@@ -42,6 +44,7 @@ function checkHeader(h: FrameHeader): void {
   if (!fields.every((n) => Number.isInteger(n) && n >= 0 && n <= U16)) throw new RangeError('frame field out of u16 range');
   if (h.w < 1 || h.h < 1 || h.x + h.w > h.docW || h.y + h.h > h.docH) throw new RangeError('frame rect outside document');
   if (!VALID_TYPES.includes(h.type)) throw new RangeError('bad frame type');
+  if (h.type === FRAME_BASE && !(h.slot >= 1 && h.slot <= 8)) throw new RangeError('BASE slot (input index) must be 1..8');
 }
 
 function writeHeader(view: DataView, bytes: Uint8Array, h: FrameHeader): void {
@@ -105,6 +108,7 @@ export function decodeFrame(data: ArrayBuffer | ArrayBufferView): DecodedFrame {
   const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const type = v.getUint8(4);
   if (!VALID_TYPES.includes(type)) return { ok: false, error: 'bad-type' };
+  if (type === FRAME_BASE) { const slot = v.getUint16(6, true); if (slot < 1 || slot > 8) return { ok: false, error: 'bad-slot' }; } // v6: BASE slot = input index
   const frame: Frame = {
     type: type as FrameType, frameEnd: (v.getUint8(5) & FLAG_FRAME_END) !== 0, slot: v.getUint16(6, true), frameId: v.getUint32(8, true),
     docW: v.getUint16(12, true), docH: v.getUint16(14, true),
@@ -124,6 +128,8 @@ export function isStale(f: FrameHeader, docW: number, docH: number): boolean {
 // ---- JSON messages ----
 
 export type ClientKind = 'panel' | 'external';
+export type ChoosePurpose = 'placeImage' | 'saveProject' | 'openProject' | 'exportPng';
+const PURPOSES: readonly string[] = ['placeImage', 'saveProject', 'openProject', 'exportPng'];
 export type ViewMode = 'local' | 'td';
 export type LogLevel = 'info' | 'warn' | 'error';
 
@@ -140,16 +146,24 @@ export type WebMessage =
   | { t: 'importTop'; requestId: string; path: string }
   | { t: 'setCanvas'; w: number; h: number; mode: CanvasMode } // v5
   | { t: 'renderLayer'; requestId: string; layerId: string } // v5: Flatten
+  | { t: 'saveProject'; requestId: string; path?: string } // v6
+  | { t: 'openProject'; requestId: string; path?: string }
+  | { t: 'exportPng'; requestId: string; path?: string }
+  | { t: 'chooseFile'; requestId: string; purpose: ChoosePurpose } // v6: TD shows a file chooser (panel clients have no file input)
   | { t: 'log'; level: LogLevel; msg: string };
 
 export type TdMessage =
-  | { t: 'hello'; protocol: number; doc: { w: number; h: number; mode?: CanvasMode }; hasInput: boolean; maxSendFps: number; active: boolean; clientId: string; hasDocument: boolean; rev: number | null; baseSize?: { w: number; h: number } }
+  | { t: 'hello'; protocol: number; doc: { w: number; h: number; mode?: CanvasMode }; hasInput: boolean; maxSendFps: number; active: boolean; clientId: string; hasDocument: boolean; rev: number | null; inputs?: InputItem[] }
   | { t: 'docState'; rev: number; layers: LayerSpec[]; docW: number; docH: number; guides: Guides; canvas: { mode: CanvasMode } }
-  | { t: 'base'; frameId: number; docW: number; docH: number; x: number; y: number; w: number; h: number }
+  | { t: 'base'; frameId: number; input: number; docW: number; docH: number; x: number; y: number; w: number; h: number }
   | { t: 'view'; frameId: number; docW: number; docH: number; w: number; h: number; appliedFrameId: number }
   | { t: 'applied'; frameId: number; tdFrame: number }
   | { t: 'docSize'; w: number; h: number; hasInput: boolean; mode: CanvasMode }
-  | { t: 'baseSize'; w: number; h: number } // v5: TD Input resolution (0x0 = no input)
+  | { t: 'inputs'; items: InputItem[] } // v6: TD inputs (connect / disconnect / resolution)
+  | { t: 'fileResult'; requestId?: string; op: FileOp; ok: boolean; path: string; msg?: string } // v6
+  | { t: 'fileChosen'; requestId: string; path: string | null } // null = cancelled
+  | { t: 'reload'; rev: number } // v6: TD replaced its document (Open Project)
+  | { t: 'files'; projectFile: string; pngFile: string } // v6
   | { t: 'active'; active: boolean }
   | { t: 'error'; msg: string }
   | { t: 'fonts'; families: string[] }
@@ -157,6 +171,7 @@ export type TdMessage =
   | { t: 'topReady'; requestId: string; w: number; h: number }
   | { t: 'topError'; requestId: string; msg: string };
 
+export type { FileOp, FileResult, InputItem };
 export interface TopItem { path: string; w: number; h: number }
 
 export function encodeMessage(m: WebMessage | TdMessage): string {
@@ -190,10 +205,35 @@ export function readCanvas(v: unknown): { mode: CanvasMode } {
   return { mode: isMode(c.mode) ? c.mode : 'input' };
 }
 
-function readBaseSize(v: unknown): { baseSize?: { w: number; h: number } } {
-  const b = (v && typeof v === 'object' ? v : null) as Record<string, unknown> | null;
-  return b && isNum(b.w) && isNum(b.h) && b.w >= 0 && b.h >= 0 && b.w <= U16 && b.h <= U16 ? { baseSize: { w: b.w, h: b.h } } : {};
+const isInputIndex = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 8;
+
+/** Strict list of `{input, w, h, connected}`; null when any item is malformed. w/h may be 0 (no input). */
+function readInputItems(v: unknown): InputItem[] | null {
+  if (!Array.isArray(v)) return null;
+  const out: InputItem[] = [];
+  for (const it of v as Record<string, unknown>[]) {
+    if (!it || typeof it !== 'object' || !isInputIndex(it.input) || !isNum(it.w) || !isNum(it.h) || it.w < 0 || it.h < 0 || it.w > U16 || it.h > U16 || !isBool(it.connected)) return null;
+    out.push({ input: it.input, w: it.w, h: it.h, connected: it.connected });
+  }
+  return out;
 }
+
+const FILE_OPS: readonly string[] = ['saveProject', 'openProject', 'exportPng'];
+
+/** v6 layer normalisation: a v5 `base` layer is input 1; missing rot/kx/ky = 0, effects = [], `input` is a number for input layers, else null. */
+export function normalizeLayer(l: LayerSpec): LayerSpec {
+  const raw = l as unknown as Record<string, unknown>;
+  const isInput = (raw.kind as string) === 'base' || raw.kind === 'input';
+  const n = (v: unknown) => (isNum(v) ? v : 0);
+  return {
+    ...l,
+    kind: isInput ? 'input' : l.kind,
+    rot: n(raw.rot), kx: n(raw.kx), ky: n(raw.ky),
+    input: isInput ? (isInputIndex(raw.input) ? raw.input : 1) : null,
+    effects: Array.isArray(raw.effects) ? (raw.effects as LayerSpec['effects']) : [],
+  };
+}
+export const normalizeLayers = (layers: LayerSpec[]): LayerSpec[] => layers.map(normalizeLayer);
 
 const isLayers = (v: unknown): v is LayerSpec[] =>
   Array.isArray(v) && v.every((l) => l !== null && typeof l === 'object' && isStr((l as LayerSpec).id) && isStr((l as LayerSpec).kind));
@@ -209,16 +249,16 @@ export function decodeTdMessage(text: string): TdMessage | null {
         ? {
           t: 'hello', protocol: o.protocol, doc: isMode(doc.mode) ? { w: doc.w, h: doc.h, mode: doc.mode } : { w: doc.w, h: doc.h }, hasInput: o.hasInput, maxSendFps: o.maxSendFps, active: o.active,
           clientId: isStr(o.clientId) ? o.clientId : '', hasDocument: o.hasDocument === true, rev: isNum(o.rev) ? o.rev : null,
-          ...readBaseSize(o.baseSize),
+          ...(o.inputs !== undefined && readInputItems(o.inputs) ? { inputs: readInputItems(o.inputs)! } : {}),
         }
         : null;
     case 'docState':
       return isNum(o.rev) && isLayers(o.layers) && isSize(o.docW) && isSize(o.docH)
-        ? { t: 'docState', rev: o.rev, layers: o.layers, docW: o.docW, docH: o.docH, guides: readGuides(o.guides), canvas: readCanvas(o.canvas) }
+        ? { t: 'docState', rev: o.rev, layers: normalizeLayers(o.layers), docW: o.docW, docH: o.docH, guides: readGuides(o.guides), canvas: readCanvas(o.canvas) }
         : null;
     case 'base':
       return isNum(o.frameId) && isSize(o.docW) && isSize(o.docH) && isNum(o.x) && isNum(o.y) && isSize(o.w) && isSize(o.h)
-        ? { t: 'base', frameId: o.frameId, docW: o.docW, docH: o.docH, x: o.x, y: o.y, w: o.w, h: o.h }
+        ? { t: 'base', frameId: o.frameId, input: isInputIndex(o.input) ? o.input : 1, docW: o.docW, docH: o.docH, x: o.x, y: o.y, w: o.w, h: o.h }
         : null;
     case 'view':
       return isNum(o.frameId) && isSize(o.docW) && isSize(o.docH) && isSize(o.w) && isSize(o.h)
@@ -228,8 +268,20 @@ export function decodeTdMessage(text: string): TdMessage | null {
       return isNum(o.frameId) ? { t: 'applied', frameId: o.frameId, tdFrame: isNum(o.tdFrame) ? o.tdFrame : 0 } : null;
     case 'docSize':
       return isSize(o.w) && isSize(o.h) && isBool(o.hasInput) ? { t: 'docSize', w: o.w, h: o.h, hasInput: o.hasInput, mode: isMode(o.mode) ? o.mode : 'input' } : null;
-    case 'baseSize':
-      return isNum(o.w) && isNum(o.h) && o.w >= 0 && o.h >= 0 && o.w <= U16 && o.h <= U16 ? { t: 'baseSize', w: o.w, h: o.h } : null;
+    case 'inputs': {
+      const items = readInputItems(o.items);
+      return items ? { t: 'inputs', items } : null;
+    }
+    case 'fileResult':
+      return isStr(o.op) && FILE_OPS.includes(o.op) && isBool(o.ok) && isStr(o.path)
+        ? { t: 'fileResult', ...(isStr(o.requestId) ? { requestId: o.requestId } : {}), op: o.op as FileOp, ok: o.ok, path: o.path, ...(isStr(o.msg) ? { msg: o.msg } : {}) }
+        : null;
+    case 'fileChosen':
+      return isStr(o.requestId) && (o.path === null || isStr(o.path)) ? { t: 'fileChosen', requestId: o.requestId, path: o.path } : null;
+    case 'reload':
+      return isNum(o.rev) ? { t: 'reload', rev: o.rev } : null;
+    case 'files':
+      return isStr(o.projectFile) && isStr(o.pngFile) ? { t: 'files', projectFile: o.projectFile, pngFile: o.pngFile } : null;
     case 'active':
       return isBool(o.active) ? { t: 'active', active: o.active } : null;
     case 'error':
@@ -263,7 +315,7 @@ export function decodeWebMessage(text: string): WebMessage | null {
         ? { t: 'ready', protocol: o.protocol, client: o.client, version: o.version, token: isStr(o.token) ? o.token : '', fresh: o.fresh === true }
         : null;
     case 'doc':
-      return isNum(o.rev) && isLayers(o.layers) ? { t: 'doc', rev: o.rev, layers: o.layers, guides: readGuides(o.guides), canvas: readCanvas(o.canvas) } : null;
+      return isNum(o.rev) && isLayers(o.layers) ? { t: 'doc', rev: o.rev, layers: normalizeLayers(o.layers), guides: readGuides(o.guides), canvas: readCanvas(o.canvas) } : null;
     case 'requestDoc':
       return { t: 'requestDoc' };
     case 'view': {
@@ -284,6 +336,12 @@ export function decodeWebMessage(text: string): WebMessage | null {
       return isMode(o.mode) && (o.mode === 'input' || (isSize(o.w) && isSize(o.h))) ? { t: 'setCanvas', w: isNum(o.w) ? o.w : 0, h: isNum(o.h) ? o.h : 0, mode: o.mode } : null;
     case 'renderLayer':
       return isStr(o.requestId) && isStr(o.layerId) ? { t: 'renderLayer', requestId: o.requestId, layerId: o.layerId } : null;
+    case 'saveProject':
+    case 'openProject':
+    case 'exportPng':
+      return isStr(o.requestId) ? { t: o.t, requestId: o.requestId, ...(isStr(o.path) ? { path: o.path } : {}) } : null;
+    case 'chooseFile':
+      return isStr(o.requestId) && isStr(o.purpose) && PURPOSES.includes(o.purpose) ? { t: 'chooseFile', requestId: o.requestId, purpose: o.purpose as ChoosePurpose } : null;
     case 'log':
       return (o.level === 'info' || o.level === 'warn' || o.level === 'error') && isStr(o.msg) ? { t: 'log', level: o.level, msg: o.msg } : null;
     default:

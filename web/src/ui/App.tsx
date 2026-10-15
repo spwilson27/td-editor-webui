@@ -3,6 +3,8 @@ import { store } from '../state/store';
 import { ContextBar } from './ContextBar';
 import { DocTabs } from './DocTabs';
 import { CanvasSizeDialog } from './CanvasSizeDialog';
+import { FileDialog } from './FileDialog';
+import { SelectionOpDialog } from './SelectionOpDialog';
 import { ImportTopDialog } from './ImportTopDialog';
 import { LoadingOverlay, StandbyOverlay } from './StandbyOverlay';
 import { Studio } from './Studio';
@@ -35,6 +37,8 @@ export function App() {
         onChange={(e) => { const i = e.target as HTMLInputElement; const files = [...(i.files ?? [])]; i.value = ''; void store.importFiles(files); }} />
       <ImportTopDialog />
       <CanvasSizeDialog />
+      <SelectionOpDialog />
+      <FileDialog />
       <LoadingOverlay />
       <StandbyOverlay />
     </div>

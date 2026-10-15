@@ -25,8 +25,8 @@ describe('mock bridge', () => {
     const bridge = startMockBridge(engine, {
       setConnection: (c) => log.push('conn:' + c), setActive: (a) => log.push('active:' + a), setNotice: () => {}, docName: doc,
     });
-    expect(engine.baseWrites).toEqual([{ rect: { x: 0, y: 0, w: 320, h: 180 }, len: 320 * 180 * 4 }]);
-    expect(engine.commits).toBe(1);
+    expect(engine.inputWrites).toEqual([{ input: 1, rect: { x: 0, y: 0, w: 320, h: 180 }, len: 320 * 180 * 4 }]);
+    expect(engine.inputCommits).toEqual([1]);
     expect(log).toEqual(['conn:standalone', 'active:true']);
     expect(doc.value).toBe('landscape.png');
     bridge.takeover();

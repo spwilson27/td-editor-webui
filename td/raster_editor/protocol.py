@@ -1,17 +1,20 @@
-"""TD <-> web wire protocol (docs/PROTOCOL.md, version 5). Pure python, no TD or numpy needed.
+"""TD <-> web wire protocol (docs/PROTOCOL.md, version 6). Pure python, no TD or numpy needed.
 
 Binary frames: 24-byte little-endian header + RGBA8 straight-alpha payload (top row first).
 JSON messages: text frames with a string field ``t``.
 """
 
 import json
+import math
+import re
 import struct
 from typing import Iterator, NamedTuple, Optional, Tuple
 
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
+APP_VERSION = "0.5.0"  # written to .redoc meta.json
 MAGIC = b"REF1"
 HEADER_SIZE = 24
-TYPE_BASE = 1  # TD -> web, GET /base
+TYPE_BASE = 1  # TD -> web, GET /base?input=N (v6: header slot = input index 1..8)
 # type 2 (v1/v2 COMPOSITE) is invalid in v3
 TYPE_SURFACE = 3  # web -> TD, WebSocket, one slot per frame
 TYPE_SURFACE_DUMP = 4  # TD -> web, GET /surface
@@ -22,7 +25,15 @@ MAX_TOPS = 2000  # `tops` list length
 MAX_TOP_DIM = 8192  # importTop: width and height limit
 MAX_TOP_PIXELS = 32_000_000  # importTop result: total pixels after the GPU downscale
 MAX_TEXT_CHARS = 100_000
-LAYER_KINDS = ("base", "pixel", "group", "adjustment", "text", "shape")
+MAX_INPUTS = 8  # TD Inputs (in1..in8)
+LAYER_KINDS = ("input", "base", "pixel", "group", "adjustment", "text", "shape")  # "base" = a v5 document, read as input 1
+SURFACE_KINDS = ("pixel", "input")  # kinds that carry surfaceW / surfaceH
+EFFECT_KINDS = ("pixel", "input", "text", "shape")  # layer kinds that may carry effects (groups / adjustments: none)
+MAX_EFFECTS = 32  # per layer
+MAX_SKEW_DEG = 85.0  # |kx|, |ky| above this are CLAMPED by parse_doc (like the engine and the network do)
+PROJECT_FORMAT = 1  # .redoc meta.json "format"
+PROJECT_EXT = ".redoc"
+PNG_EXT = ".png"
 SHAPE_TYPES = ("rect", "ellipse", "line", "polygon")
 FLAG_FRAME_END = 1
 MAX_PAYLOAD = 2 * 1024 * 1024  # bytes of pixel data per message
@@ -51,7 +62,7 @@ class Header(NamedTuple):
     y: int
     w: int
     h: int
-    slot: int = 0  # surface slot (SURFACE / SURFACE_DUMP); 0 for BASE, VIEW and TOP_IMAGE
+    slot: int = 0  # surface slot (SURFACE / SURFACE_DUMP), input index 1..8 (BASE); 0 for VIEW and TOP_IMAGE
 
     @property
     def frame_end(self) -> bool:
@@ -72,6 +83,8 @@ def validate_header(h: Header) -> None:
         raise ProtocolError(f"unknown frame type {h.type}")
     if not 0 <= h.slot <= 0xFFFF:
         raise ProtocolError(f"bad slot {h.slot}")
+    if h.type == TYPE_BASE and not 1 <= h.slot <= MAX_INPUTS:
+        raise ProtocolError(f"bad input index {h.slot} (BASE slot = input 1..{MAX_INPUTS})")
     if h.doc_w < 1 or h.doc_h < 1:
         raise ProtocolError(f"bad document size {h.doc_w}x{h.doc_h}")
     if h.w < 1 or h.h < 1:
@@ -179,19 +192,35 @@ def decode_json(text) -> dict:
 
 
 def hello(doc_w: int, doc_h: int, has_input: bool, max_send_fps: float, active: bool, client_id: str = "",
-          has_document: bool = False, rev=None, mode: str = "input", base_w: int = 0, base_h: int = 0) -> str:
-    """``doc`` also carries the canvas ``mode`` and ``baseSize`` the input's resolution (0x0 = no input); both are v5
-    additions the web side may use instead of waiting for the first base notice."""
+          has_document: bool = False, rev=None, mode: str = "input", inputs=None) -> str:
+    """``doc`` also carries the canvas ``mode``; ``inputs`` (v6, replaces ``baseSize``) is the list of
+    ``{input, w, h, connected}`` (see ``inputs_msg``). ``hasInput`` = TD input 1 is connected (it drives Follow Input)."""
     return encode_json({"t": "hello", "protocol": PROTOCOL_VERSION, "doc": {"w": doc_w, "h": doc_h, "mode": mode},
-                        "baseSize": {"w": int(base_w), "h": int(base_h)},
+                        "inputs": input_items(inputs or []),
                         "hasInput": bool(has_input), "maxSendFps": max_send_fps, "active": bool(active),
                         "clientId": client_id, "hasDocument": bool(has_document),
                         "rev": rev if has_document else None})
 
 
-def base_notice(frame_id: int, doc_w: int, doc_h: int) -> str:
-    """A BASE frame (whole document, one band) is ready: fetch it with GET /base (PROTOCOL.md §4)."""
-    return encode_json({"t": "base", "frameId": frame_id, "docW": doc_w, "docH": doc_h,
+def input_items(items) -> list:
+    """Normalise TD input state to ``[{input, w, h, connected}]`` sorted by input (a disconnected input is 0x0)."""
+    out = []
+    for i in sorted(items, key=lambda i: i["input"]):
+        conn = bool(i.get("connected"))
+        out.append({"input": int(i["input"]), "w": int(i["w"]) if conn else 0, "h": int(i["h"]) if conn else 0, "connected": conn})
+    return out
+
+
+def inputs_msg(items) -> str:
+    """TD -> web: every TD input connector that exists (connected or not, including the spare one) with its
+    resolution; sent after ``hello`` and on any connect / disconnect / resolution change. An input that is not
+    listed does not exist (treat as disconnected)."""
+    return encode_json({"t": "inputs", "items": input_items(items)})
+
+
+def base_notice(frame_id: int, doc_w: int, doc_h: int, input: int = 1) -> str:
+    """A BASE frame of ``input`` (whole input, one band) is ready: fetch it with GET /base?input=N (PROTOCOL.md §4)."""
+    return encode_json({"t": "base", "input": int(input), "frameId": frame_id, "docW": doc_w, "docH": doc_h,
                         "x": 0, "y": 0, "w": doc_w, "h": doc_h})
 
 
@@ -235,17 +264,31 @@ def doc_size(w: int, h: int, has_input: bool, mode: str = "input") -> str:
     return encode_json({"t": "docSize", "w": w, "h": h, "hasInput": bool(has_input), "mode": mode})
 
 
-def base_size(w: int, h: int) -> str:
-    """The TD Input resolution changed, or the input was (dis)connected (0x0 = no input)."""
-    return encode_json({"t": "baseSize", "w": int(w), "h": int(h)})
-
-
 def active(is_active: bool) -> str:
     return encode_json({"t": "active", "active": bool(is_active)})
 
 
 def error(msg: str) -> str:
     return encode_json({"t": "error", "msg": str(msg)})
+
+
+def file_result(request_id, op: str, ok: bool, path: str, msg=None) -> str:
+    """Outcome of saveProject / openProject / exportPng (also, without a requestId, for the TD pulses)."""
+    m = {"t": "fileResult", "op": op, "ok": bool(ok), "path": str(path)}
+    if request_id is not None:
+        m["requestId"] = request_id
+    if msg:
+        m["msg"] = str(msg)
+    return encode_json(m)
+
+
+def reload_msg(rev) -> str:
+    """The stored document was replaced (Open Project): drop the document and reload it with requestDoc."""
+    return encode_json({"t": "reload", "rev": rev})
+
+
+def files_msg(project_file: str, png_file: str) -> str:
+    return encode_json({"t": "files", "projectFile": str(project_file), "pngFile": str(png_file)})
 
 
 # --- web -> TD builders (used by fake clients and tests) and validators
@@ -278,6 +321,34 @@ def list_tops(request_id) -> str:
 
 def import_top(request_id, path: str) -> str:
     return encode_json({"t": "importTop", "requestId": request_id, "path": path})
+
+
+def _file_request(t: str, request_id, path) -> str:
+    m = {"t": t, "requestId": request_id}
+    if path is not None:
+        m["path"] = path
+    return encode_json(m)
+
+
+def save_project(request_id, path=None) -> str:
+    return _file_request("saveProject", request_id, path)
+
+
+def open_project(request_id, path=None) -> str:
+    return _file_request("openProject", request_id, path)
+
+
+def export_png(request_id, path=None) -> str:
+    return _file_request("exportPng", request_id, path)
+
+
+def choose_file(request_id, purpose: str) -> str:
+    return encode_json({"t": "chooseFile", "requestId": request_id, "purpose": purpose})
+
+
+def file_chosen(request_id, path) -> str:
+    """TD -> web: the file the user picked in TD's dialog (``null`` = cancelled / unavailable)."""
+    return encode_json({"t": "fileChosen", "requestId": request_id, "path": path})
 
 
 def request_doc() -> str:
@@ -382,29 +453,123 @@ def _check_guides(g):
         _check(isinstance(v, list) and len(v) <= MAX_GUIDES and all(_num(x) for x in v), f"guides.{k}")
 
 
+EFFECT_TYPES = ("dropShadow", "outerGlow", "innerGlow", "stroke", "bevel", "colorOverlay", "pixelSort", "glitch",
+                "chromaticAberration", "halftone")
+
+
+def _in_range(lo, hi):
+    return lambda v: _num(v) and lo <= v <= hi
+
+
+def _is_rgba(c):
+    return isinstance(c, dict) and all(_num(c.get(k)) and 0 <= c[k] <= 255 for k in "rgba")
+
+
+def _is_int(lo, hi):
+    return lambda v: _num(v) and v == int(v) and lo <= v <= hi
+
+
+def _one_of(*vals):
+    return lambda v: isinstance(v, str) and v in vals
+
+
+# type -> {field: predicate}: every field is required. Lengths are document pixels, angles degrees, colours straight
+# RGBA 0..255, opacity 0..1, bevel depth / glitch amount 0..100 (percent), pixelSort low / high 0..1, glitch seed an integer
+# (units: effects.py docstring). Other ranges are wide sanity bounds, not the UI's slider ranges.
+_EFFECT_FIELDS = {
+    "dropShadow": {"dx": _in_range(-4096, 4096), "dy": _in_range(-4096, 4096), "blur": _in_range(0, 512),
+                   "color": _is_rgba, "opacity": _in_range(0, 1)},
+    "outerGlow": {"size": _in_range(0, 512), "color": _is_rgba, "opacity": _in_range(0, 1)},
+    "innerGlow": {"size": _in_range(0, 512), "color": _is_rgba, "opacity": _in_range(0, 1)},
+    "stroke": {"width": _in_range(0, 512), "color": _is_rgba, "opacity": _in_range(0, 1),
+               "position": _one_of("inside", "center", "outside")},
+    "bevel": {"depth": _in_range(0, 100), "size": _in_range(0, 512), "angle": _in_range(-3600, 3600),
+              "highlight": _is_rgba, "shadow": _is_rgba},
+    "colorOverlay": {"color": _is_rgba, "opacity": _in_range(0, 1)},
+    "pixelSort": {"direction": _one_of("h", "v"), "low": _in_range(0, 1), "high": _in_range(0, 1),
+                  "key": _one_of("luma", "hue")},
+    "glitch": {"amount": _in_range(0, 100), "blockSize": _in_range(1, 4096), "seed": _is_int(0, 2 ** 31),
+               "rgbShift": _in_range(-1000, 1000)},
+    "chromaticAberration": {"amount": _in_range(-1000, 1000), "angle": _in_range(-3600, 3600)},
+    "halftone": {"cellSize": _in_range(1, 512), "angle": _in_range(-3600, 3600), "shape": _one_of("dot", "line")},
+}
+
+
+_EFFECT_TYPE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,47}$")
+
+
+def check_effect(e, what="effect") -> None:
+    """Validate one Effect (web/src/engine/types.ts): a ``type`` name, boolean ``enabled`` and, for the ten v5 effect types, every field
+    present and in range (extra fields are ignored). Any other type name is a filter of the filters library: only its shape is
+    checked here, the parameters are clamped by TD (effects.norm_params). Raises ProtocolError."""
+    _check(isinstance(e, dict), what)
+    typ = e.get("type")
+    _check(isinstance(typ, str) and _EFFECT_TYPE_NAME.match(typ) is not None, f"{what} type {typ!r}")
+    _check(_is_bool(e.get("enabled")), f"{what} {typ}.enabled")
+    if typ not in _EFFECT_FIELDS:
+        # a filter of the filters library (docs/FILTERS.md): its parameters are described, ranged and clamped by the shared
+        # spec shared/effects/<type>.filter.json (effects.norm_params); an unknown name draws nothing in TD
+        return
+    for field, pred in _EFFECT_FIELDS[typ].items():
+        _check(field in e and pred(e[field]), f"{what} {typ}.{field}")
+
+
+def check_effects(layer: dict) -> None:
+    ef = layer.get("effects")
+    if ef is None:
+        return
+    lid = layer.get("id")
+    _check(isinstance(ef, list) and len(ef) <= MAX_EFFECTS, f"layer {lid!r} effects (a list of at most {MAX_EFFECTS})")
+    if ef and layer.get("kind") not in EFFECT_KINDS:
+        raise ProtocolError(f"layer {lid!r}: {layer.get('kind')} layers cannot have effects")
+    for i, e in enumerate(ef):
+        check_effect(e, f"layer {lid!r} effects[{i}]")
+
+
+def migrate_layer(l: dict) -> dict:
+    """v5 -> v6: a ``base`` layer is read as ``input: 1`` (id and everything else kept). Other layers are returned as they are."""
+    if l.get("kind") == "base":
+        l = dict(l, kind="input", input=1)
+    return l
+
+
 def parse_doc(msg: dict):
     """Validate a ``doc`` message. Returns (rev, layers) or raises ProtocolError. Checks what the TD side
     relies on: a list of objects with string id / known kind, slot / mask slots as u16 ints, finite transform
-    numbers (x, y, sx, sy > 0), surface sizes (v5), text / shape specs, and that text / shape layers have no slot
-    (TD always renders them). The optional ``guides`` / ``canvas`` are validated too; read them with
-    ``doc_extras``."""
+    numbers (x, y, rot finite; sx, sy > 0; kx, ky finite and clamped to +-85), surface sizes, ``input`` 1..8 on input layers, effects
+    (per type and range, pixel / input / text / shape layers only), text / shape specs, and that text / shape / input
+    layers have no slot (TD renders them). A v5 ``base`` layer is migrated to ``input: 1`` (the returned list has
+    the migrated layers). The optional ``guides`` / ``canvas`` are validated too; read them with ``doc_extras``."""
     layers = msg.get("layers")
     if not isinstance(layers, list) or not _num(msg.get("rev")):
         raise ProtocolError("doc needs a numeric rev and a layers list")
     seen = set()
+    out = []
     for l in layers:
         if not isinstance(l, dict) or not isinstance(l.get("id"), str) or l.get("kind") not in LAYER_KINDS:
             raise ProtocolError("bad layer spec")
+        l = migrate_layer(l)
+        out.append(l)
         kind = l["kind"]
         if kind in ("text", "shape"):
             (check_text_spec if kind == "text" else check_shape_spec)(l.get(kind))
-            if l.get("slot") is not None:
-                raise ProtocolError(f"{kind} layer {l['id']!r}: text / shape layers have no surface slot")
-        for k in ("x", "y"):
+        if kind in ("text", "shape", "input") and l.get("slot") is not None:
+            raise ProtocolError(f"{kind} layer {l['id']!r}: {kind} layers have no surface slot")
+        if kind == "input":
+            n = l.get("input")
+            if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= MAX_INPUTS:
+                raise ProtocolError(f"input layer {l['id']!r}: bad input index {n!r} (1..{MAX_INPUTS})")
+        for k in ("x", "y", "rot"):
             _check_opt(l, k, _num, f"layer {l['id']!r}")
         for k in ("sx", "sy"):
             _check_opt(l, k, lambda v: _num(v) and 0 < v <= 1e6, f"layer {l['id']!r}")
-        if kind in ("pixel", "base"):
+        for k in ("kx", "ky"):
+            _check_opt(l, k, _num, f"layer {l['id']!r}")
+            if l.get(k) is not None and abs(l[k]) > MAX_SKEW_DEG:
+                l = dict(l, **{k: math.copysign(MAX_SKEW_DEG, l[k])})
+                out[-1] = l
+        check_effects(l)
+        if kind in SURFACE_KINDS:
             _check_surface_size(l)
         for s in (l.get("slot"), (l.get("mask") or {}).get("slot") if isinstance(l.get("mask"), dict) else None):
             if s is None:
@@ -419,7 +584,7 @@ def parse_doc(msg: dict):
     if msg.get("canvas") is not None:
         c = msg["canvas"]
         _check(isinstance(c, dict) and c.get("mode") in CANVAS_MODES, "canvas")
-    return msg["rev"], layers
+    return msg["rev"], out
 
 
 def doc_extras(msg: dict):
@@ -443,6 +608,27 @@ def parse_set_canvas(msg: dict):
         if not _num(v) or v != int(v) or not 1 <= v <= MAX_CANVAS_DIM:
             raise ProtocolError(f"bad canvas size {w!r}x{h!r} (1..{MAX_CANVAS_DIM})")
     return int(w), int(h), mode
+
+
+def parse_file_request(msg: dict):
+    """Validate ``saveProject`` / ``openProject`` / ``exportPng``; returns (requestId, path or None)."""
+    rid = _request_id(msg)
+    path = msg.get("path")
+    if path is not None and (not isinstance(path, str) or not 0 < len(path.strip()) <= 1024 or "\x00" in path):
+        raise ProtocolError("bad path")
+    return rid, (path.strip() if path is not None else None)
+
+
+CHOOSE_PURPOSES = ("placeImage", "openProject", "saveProject", "exportPng")
+IMAGE_EXTS = ("png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "tga", "exr", "hdr", "webp", "psd")
+
+
+def parse_choose_file(msg: dict):
+    """Validate ``chooseFile``; returns (requestId, purpose)."""
+    rid = _request_id(msg)
+    if msg.get("purpose") not in CHOOSE_PURPOSES:
+        raise ProtocolError(f"bad purpose {msg.get('purpose')!r} (one of {', '.join(CHOOSE_PURPOSES)})")
+    return rid, msg["purpose"]
 
 
 def parse_render_layer(msg: dict):

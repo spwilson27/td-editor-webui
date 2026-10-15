@@ -1,15 +1,17 @@
 import { remapShape, remapText, transformFor } from '../../src/state/transform';
 import type {
+  CloneOptions, DodgeBurnRange, Effect,
   AdjustmentSpec, AdjustmentType, Anchor, BlendMode, CanvasMode, DocSpec, EditorEngine, EngineEvent, Guides, HistoryEntry, LayerInfo, LayerSpec, LayerTransform,
   PaintTarget, Rect, SelectionOptions, ShapeSpec, ShapeType, SnapOptions, TextSpec, ToolContext, ToolId, ToolPointer,
 } from '../../src/engine/types';
 
 interface FakeLayer {
-  id: string; name: string; kind: 'pixel' | 'group' | 'base' | 'adjustment' | 'text' | 'shape'; visible: boolean; locked: boolean;
+  id: string; name: string; kind: 'pixel' | 'group' | 'input' | 'adjustment' | 'text' | 'shape'; visible: boolean; locked: boolean;
   opacity: number; blend: BlendMode; expanded: boolean; parent: string | null; colour: string;
   slot: number | null; mask: { slot: number; enabled: boolean } | null; adjustment: AdjustmentSpec | null;
   text?: TextSpec | null; shape?: ShapeSpec | null;
-  x: number; y: number; sx: number; sy: number; surfaceW: number | null; surfaceH: number | null;
+  x: number; y: number; sx: number; sy: number; rot: number; kx: number; ky: number;
+  input: number | null; effects: Effect[]; surfaceW: number | null; surfaceH: number | null;
 }
 
 export const DEFAULT_ADJUSTMENTS: Record<AdjustmentType, AdjustmentSpec> = {
@@ -62,7 +64,7 @@ export class FakeEngine implements EditorEngine {
   constructor(width = 64, height = 48) {
     this.width = width;
     this.height = height;
-    this.store = [{ id: 'base', name: 'TD Input', kind: 'base', visible: true, locked: true, opacity: 1, blend: 'normal', expanded: false, parent: null, colour: '#9cc3e4', slot: null, mask: null, adjustment: null, x: 0, y: 0, sx: 1, sy: 1, surfaceW: width, surfaceH: height }];
+    this.store = [{ id: 'base', name: 'TD Input 1', kind: 'input', visible: true, locked: true, opacity: 1, blend: 'normal', expanded: false, parent: null, colour: '#9cc3e4', slot: null, mask: null, adjustment: null, x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0, input: 1, effects: [], surfaceW: width, surfaceH: height }];
     this.active = 'base';
   }
 
@@ -90,7 +92,9 @@ export class FakeEngine implements EditorEngine {
       depth: this.depth(l), expanded: l.kind === 'group' ? l.expanded : undefined, parentId: l.parent,
       slot: l.slot, mask: l.mask ? { ...l.mask } : null, adjustment: l.adjustment,
       text: l.text ?? null, shape: l.shape ?? null,
-      transform: { x: l.x, y: l.y, sx: l.sx, sy: l.sy }, surfaceW: l.surfaceW, surfaceH: l.surfaceH,
+      transform: { x: l.x, y: l.y, sx: l.sx, sy: l.sy, rot: l.rot, kx: l.kx, ky: l.ky },
+      input: l.input, inputConnected: l.kind === 'input' ? (this.inputState.get(l.input ?? 0)?.connected ?? true) : null,
+      effects: l.effects.map((e) => ({ ...e })), surfaceW: l.surfaceW, surfaceH: l.surfaceH,
     }));
   }
   activeLayerId() { return this.active; }
@@ -101,7 +105,7 @@ export class FakeEngine implements EditorEngine {
     const above = this.store.find((l) => l.id === this.active)!;
     const idx = this.store.indexOf(above) + 1;
     const slot = kind === 'pixel' ? this.nextSlot++ : null;
-    this.store.splice(idx, 0, { id, name, kind, visible: true, locked: false, opacity: 1, blend: 'normal', expanded: true, parent: above.parent, colour: '#' + ((this.nextId * 5000011) & 0xffffff).toString(16).padStart(6, '0'), slot, mask: null, adjustment, x: 0, y: 0, sx: 1, sy: 1, surfaceW: kind === 'pixel' ? this.width : null, surfaceH: kind === 'pixel' ? this.height : null, ...extra });
+    this.store.splice(idx, 0, { id, name, kind, visible: true, locked: false, opacity: 1, blend: 'normal', expanded: true, parent: above.parent, colour: '#' + ((this.nextId * 5000011) & 0xffffff).toString(16).padStart(6, '0'), slot, mask: null, adjustment, x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0, input: null, effects: [], surfaceW: kind === 'pixel' ? this.width : null, surfaceH: kind === 'pixel' ? this.height : null, ...extra });
     this.active = id;
     this.push(kind === 'group' ? 'New group' : kind === 'adjustment' ? 'New adjustment' : 'New pixel layer');
     const prevActive = above.id;
@@ -159,7 +163,7 @@ export class FakeEngine implements EditorEngine {
       for (const l of this.store.filter((x) => x.parent === parent)) {
         layers.push({
           id: l.id, kind: l.kind, parentId: l.parent, name: l.name, visible: l.visible, opacity: l.opacity, blend: l.blend,
-          x: l.x, y: l.y, sx: l.sx, sy: l.sy, slot: l.slot, mask: l.mask ? { ...l.mask } : null, adjustment: l.adjustment,
+          x: l.x, y: l.y, sx: l.sx, sy: l.sy, rot: l.rot, kx: l.kx, ky: l.ky, input: l.input, effects: l.effects.map((e) => ({ ...e })), slot: l.slot, mask: l.mask ? { ...l.mask } : null, adjustment: l.adjustment,
           text: l.text ?? null, shape: l.shape ?? null, surfaceW: l.surfaceW, surfaceH: l.surfaceH,
         });
         if (l.kind === 'group') walk(l.id);
@@ -199,7 +203,7 @@ export class FakeEngine implements EditorEngine {
     this.surfaces.clear();
     const kids = new Map<string, FakeLayer>();
     this.store = spec.layers.map((l) => {
-      const f: FakeLayer = { id: l.id, name: l.name, kind: l.kind as FakeLayer['kind'], visible: l.visible, locked: l.kind === 'base', opacity: l.opacity, blend: l.blend, expanded: true, parent: l.parentId, colour: '#778899', slot: l.slot, mask: l.mask ? { ...l.mask } : null, adjustment: l.adjustment, text: l.text, shape: l.shape, x: l.x, y: l.y, sx: l.sx, sy: l.sy, surfaceW: l.surfaceW, surfaceH: l.surfaceH };
+      const f: FakeLayer = { id: l.id, name: l.name, kind: l.kind as FakeLayer['kind'], visible: l.visible, locked: l.kind === 'input', opacity: l.opacity, blend: l.blend, expanded: true, parent: l.parentId, colour: '#778899', slot: l.slot, mask: l.mask ? { ...l.mask } : null, adjustment: l.adjustment, text: l.text, shape: l.shape, x: l.x, y: l.y, sx: l.sx, sy: l.sy, rot: l.rot ?? 0, kx: l.kx ?? 0, ky: l.ky ?? 0, input: l.input ?? (l.kind === 'input' ? 1 : null), effects: (l.effects ?? []).map((e) => ({ ...e })), surfaceW: l.surfaceW, surfaceH: l.surfaceH };
       kids.set(l.id, f);
       return f;
     });
@@ -222,9 +226,9 @@ export class FakeEngine implements EditorEngine {
   addGroup(name = `Group ${this.nextId}`) { return this.add('group', name); }
   deleteLayer(id: string) {
     const l = this.store.find((x) => x.id === id);
-    if (!l || l.kind === 'base') return;
+    if (!l) return;
     this.store = this.store.filter((x) => x.id !== id && x.parent !== id);
-    if (this.active === id) this.active = this.store[this.store.length - 1].id;
+    if (this.active === id) this.active = this.store[this.store.length - 1]?.id ?? '';
     this.calls.push(`delete:${id}`);
     this.push('Delete layer');
     this.changed();
@@ -260,7 +264,7 @@ export class FakeEngine implements EditorEngine {
   /** Not in the v4 contract (needs report): resize the base (TD Input) surface when the input resolution changes. */
   setBaseSize(w: number, h: number) {
     this.baseSizes.push({ w, h });
-    const b = this.store.find((x) => x.kind === 'base')!;
+    const b = this.store.find((x) => x.kind === 'input')!;
     b.surfaceW = w; b.surfaceH = h;
     this.changed();
   }
@@ -385,7 +389,7 @@ export class FakeEngine implements EditorEngine {
   // ---- v4: transforms, canvas, guides, snapping ----
   setTransform(id: string, t: LayerTransform) {
     const l = this.store.find((x) => x.id === id)!;
-    l.x = t.x; l.y = t.y; l.sx = t.sx; l.sy = t.sy;
+    l.x = t.x; l.y = t.y; l.sx = t.sx; l.sy = t.sy; l.rot = t.rot; l.kx = t.kx; l.ky = t.ky;
     this.calls.push(`setTransform:${id}:${JSON.stringify(t)}`);
     this.push('Transform');
     this.changed();
@@ -393,7 +397,7 @@ export class FakeEngine implements EditorEngine {
   applyTransform(id: string) {
     const l = this.store.find((x) => x.id === id)!;
     l.surfaceW = Math.round((l.surfaceW ?? 0) * l.sx); l.surfaceH = Math.round((l.surfaceH ?? 0) * l.sy);
-    l.sx = 1; l.sy = 1;
+    l.sx = 1; l.sy = 1; l.rot = 0; l.kx = 0; l.ky = 0;
     this.calls.push(`applyTransform:${id}`);
     this.push('Apply transform');
     this.changed();
@@ -401,7 +405,7 @@ export class FakeEngine implements EditorEngine {
   layerBounds(id: string): Rect | null {
     const l = this.store.find((x) => x.id === id);
     if (!l) return null;
-    if (l.kind === 'pixel' || l.kind === 'base') return { x: l.x, y: l.y, w: (l.surfaceW ?? this.width) * l.sx, h: (l.surfaceH ?? this.height) * l.sy };
+    if (l.kind === 'pixel' || l.kind === 'input') return { x: l.x, y: l.y, w: (l.surfaceW ?? this.width) * l.sx, h: (l.surfaceH ?? this.height) * l.sy };
     if (l.kind === 'text' && l.text) {
       const t = l.text, lines = t.text.split('\n');
       return { x: t.x, y: t.y, w: Math.max(...lines.map((q) => q.length), 1) * t.size * 0.6, h: lines.length * t.size * t.lineHeight };
@@ -420,7 +424,7 @@ export class FakeEngine implements EditorEngine {
     const dx = (w - this.width) * ax, dy = (h - this.height) * ay;
     const prev = { w: this.width, h: this.height, mode: this.mode };
     this.canvasUndo(prev, dx, dy);
-    for (const l of this.store) if (l.kind === 'pixel' || l.kind === 'base') { l.x += dx; l.y += dy; }
+    for (const l of this.store) if (l.kind === 'pixel' || l.kind === 'input') { l.x += dx; l.y += dy; }
     this.width = w; this.height = h; this.canvas = null; this.mode = 'fixed';
     this.calls.push(`setCanvasSize:${w}x${h}:${anchor}`);
     this.push('Canvas size');
@@ -431,7 +435,7 @@ export class FakeEngine implements EditorEngine {
   private pendingCanvasUndo: (() => void) | null = null;
   private canvasUndo(prev: { w: number; h: number; mode: CanvasMode }, dx: number, dy: number) {
     this.pendingCanvasUndo = () => {
-      for (const l of this.store) if (l.kind === 'pixel' || l.kind === 'base') { l.x -= dx; l.y -= dy; }
+      for (const l of this.store) if (l.kind === 'pixel' || l.kind === 'input') { l.x -= dx; l.y -= dy; }
       this.width = prev.w; this.height = prev.h; this.mode = prev.mode; this.canvas = null;
       this.emit({ type: 'resize', width: prev.w, height: prev.h });
     };
@@ -444,7 +448,7 @@ export class FakeEngine implements EditorEngine {
     this.calls.push(`setLayerBox:${id}:${JSON.stringify(box)}`);
     if (l.kind === 'text' && l.text) this.setText(id, remapText(l.text, from, box));
     else if (l.kind === 'shape' && l.shape) this.setShape(id, remapShape(l.shape, from, box));
-    else this.setTransform(id, transformFor({ x: l.x, y: l.y, sx: l.sx, sy: l.sy }, from, box));
+    else this.setTransform(id, transformFor({ x: l.x, y: l.y, sx: l.sx, sy: l.sy, rot: l.rot, kx: l.kx, ky: l.ky }, from, box));
   };
   adoptCanvas(w: number, h: number, mode: CanvasMode) {
     this.width = w; this.height = h; this.canvas = null; this.mode = mode;
@@ -499,5 +503,85 @@ export class FakeEngine implements EditorEngine {
     const bx = best([r.x, r.x + r.w / 2, r.x + r.w], this.snapLines('x')), by = best([r.y, r.y + r.h / 2, r.y + r.h], this.snapLines('y'));
     return { dx: bx.d, dy: by.d, guideX: bx.g, guideY: by.g };
   }
+
+  // ---- v5: retouch tools, crop, floating selection, quick mask, selection ops, effects, inputs ----
+  cloneOpts: CloneOptions = { aligned: true, sampleAll: false };
+  retouchOpts: { strength: number; sharpen: boolean; burn: boolean; range: DodgeBurnRange; exposure: number } = { strength: 0.5, sharpen: false, burn: false, range: 'midtones', exposure: 0.5 };
+  cropped: Rect[] = [];
+  floatingState: { bounds: Rect; transform: LayerTransform } | null = null;
+  quickMaskOn = false;
+  inputState = new Map<number, { w: number; h: number; connected: boolean }>([[1, { w: 0, h: 0, connected: true }]]);
+  inputWrites: { input: number; rect: Rect; len: number }[] = [];
+  inputCommits: number[] = [];
+  liftable = true;
+  setCloneOptions(o: CloneOptions) { this.cloneOpts = o; this.calls.push(`cloneOptions:${JSON.stringify(o)}`); }
+  setRetouchOptions(o: FakeEngine['retouchOpts']) { this.retouchOpts = o; this.calls.push(`retouchOptions:${JSON.stringify(o)}`); }
+  cropTo(rect: Rect) {
+    this.cropped.push(rect);
+    this.calls.push(`cropTo:${JSON.stringify(rect)}`);
+    this.width = rect.w; this.height = rect.h; this.canvas = null;
+    this.push('Crop');
+    this.emit({ type: 'resize', width: rect.w, height: rect.h });
+    this.changed();
+  }
+  liftSelection() {
+    this.calls.push('liftSelection');
+    const r = this.selectionRect;
+    if (!r || !this.liftable) return false;
+    this.floatingState = { bounds: { ...r }, transform: { x: r.x, y: r.y, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 } };
+    this.emit({ type: 'selection' });
+    return true;
+  }
+  floating() { return this.floatingState ? { bounds: { ...this.floatingState.bounds }, transform: { ...this.floatingState.transform } } : null; }
+  floatingSize() { return this.floatingState ? { w: this.floatingState.bounds.w, h: this.floatingState.bounds.h } : null; }
+  setFloatingTransform(t: LayerTransform) {
+    if (!this.floatingState) return;
+    this.floatingState.transform = { ...t };
+    this.calls.push(`setFloatingTransform:${JSON.stringify(t)}`);
+    this.emit({ type: 'selection' });
+  }
+  commitFloating() { this.calls.push('commitFloating'); if (this.floatingState) { this.floatingState = null; this.push('Transform selection'); this.emit({ type: 'selection' }); this.changed(); } }
+  cancelFloating() { this.calls.push('cancelFloating'); this.floatingState = null; this.emit({ type: 'selection' }); }
+  setQuickMask(on: boolean) { this.quickMaskOn = on; this.calls.push(`quickMask:${on}`); this.emit({ type: 'selection' }); }
+  quickMask() { return this.quickMaskOn; }
+  modifySelection(op: 'grow' | 'shrink' | 'smooth' | 'feather' | 'border', px: number) {
+    this.calls.push(`modifySelection:${op}:${px}`);
+    const r = this.selectionRect;
+    if (r && (op === 'grow' || op === 'shrink')) {
+      const d = op === 'grow' ? px : -px;
+      this.selectionRect = { x: r.x - d, y: r.y - d, w: Math.max(0, r.w + 2 * d), h: Math.max(0, r.h + 2 * d) };
+    }
+    this.push(`Selection ${op}`);
+    this.emit({ type: 'selection' });
+  }
+  setEffects(id: string, effects: Effect[]) {
+    this.store.find((x) => x.id === id)!.effects = effects.map((e) => ({ ...e }));
+    this.calls.push(`setEffects:${id}:${JSON.stringify(effects)}`);
+    this.push('Layer effects');
+    this.changed();
+  }
+  setInputs(items: Array<{ input: number; w: number; h: number; connected: boolean }>) {
+    this.calls.push(`setInputs:${JSON.stringify(items)}`);
+    this.inputState = new Map(items.map((i) => [i.input, { w: i.w, h: i.h, connected: i.connected }]));
+    for (const it of items) {
+      if (it.connected && !this.store.some((l) => l.kind === 'input' && l.input === it.input)) {
+        this.store.unshift({ id: `in${it.input}`, name: `TD Input ${it.input}`, kind: 'input', visible: true, locked: true, opacity: 1, blend: 'normal', expanded: false, parent: null, colour: '#9cc3e4', slot: null, mask: null, adjustment: null, x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0, input: it.input, effects: [], surfaceW: it.w, surfaceH: it.h });
+      }
+      const l = this.store.find((x) => x.kind === 'input' && x.input === it.input);
+      if (l && it.connected) { l.surfaceW = it.w; l.surfaceH = it.h; }
+    }
+    this.changed();
+  }
+  addInputLayer(input: number) {
+    this.calls.push(`addInputLayer:${input}`);
+    const id = `in${input}`;
+    const st = this.inputState.get(input) ?? { w: this.width, h: this.height, connected: true };
+    this.store.push({ id, name: `TD Input ${input}`, kind: 'input', visible: true, locked: true, opacity: 1, blend: 'normal', expanded: false, parent: null, colour: '#9cc3e4', slot: null, mask: null, adjustment: null, x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0, input, effects: [], surfaceW: st.w || this.width, surfaceH: st.h || this.height });
+    this.push('Add input layer');
+    this.changed();
+    return id;
+  }
+  writeInput(input: number, rect: Rect, rgba: Uint8Array | Uint8ClampedArray) { this.inputWrites.push({ input, rect, len: rgba.length }); }
+  commitInput(input: number) { this.inputCommits.push(input); }
   dispose() { this.listeners.clear(); }
 }

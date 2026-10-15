@@ -4,7 +4,7 @@ import { reframeSel, NO_SEL } from '../../src/engine/selection';
 import { scaleSpec, shapeBox } from '../../src/engine/textShape';
 import type { Anchor, ShapeSpec, TextSpec } from '../../src/engine/types';
 
-const T = { x: 10, y: 20, sx: 2, sy: 0.5 };
+const T = { x: 10, y: 20, sx: 2, sy: 0.5, rot: 0, kx: 0, ky: 0 };
 
 describe('layer <-> document mapping', () => {
   it('maps points and rects both ways', () => {
@@ -20,10 +20,10 @@ describe('layer <-> document mapping', () => {
   });
 
   it('aligned transforms (scale 1, whole-pixel offset) dirty exactly their pixels; others grow by the filter footprint', () => {
-    expect(isAligned({ x: 3, y: -4, sx: 1, sy: 1 })).toBe(true);
-    expect(isAligned({ x: 3.5, y: 0, sx: 1, sy: 1 })).toBe(false);
-    expect(isAligned({ x: 0, y: 0, sx: 2, sy: 1 })).toBe(false);
-    expect(dirtyDoc({ x: 3, y: -4, sx: 1, sy: 1 }, { x: 10, y: 10, w: 5, h: 6 })).toEqual({ x: 13, y: 6, w: 5, h: 6 });
+    expect(isAligned({ x: 3, y: -4, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 })).toBe(true);
+    expect(isAligned({ x: 3.5, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 })).toBe(false);
+    expect(isAligned({ x: 0, y: 0, sx: 2, sy: 1, rot: 0, kx: 0, ky: 0 })).toBe(false);
+    expect(dirtyDoc({ x: 3, y: -4, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 }, { x: 10, y: 10, w: 5, h: 6 })).toEqual({ x: 13, y: 6, w: 5, h: 6 });
     const d = dirtyDoc(T, { x: 10, y: 10, w: 4, h: 4 }); // mapped: x 30..38, y 25..27
     expect(d.x).toBeLessThanOrEqual(30 - 2 - 2);
     expect(d.x + d.w).toBeGreaterThanOrEqual(38 + 2 + 2);
@@ -34,23 +34,23 @@ describe('layer <-> document mapping', () => {
 
   it('innerLayerRect: layer pixels whose centres are inside the document rect', () => {
     // identity: exactly the rect
-    expect(innerLayerRect({ x: 0, y: 0, sx: 1, sy: 1 }, { x: 5, y: 6, w: 7, h: 8 })).toEqual({ x: 5, y: 6, w: 7, h: 8 });
+    expect(innerLayerRect({ x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 }, { x: 5, y: 6, w: 7, h: 8 })).toEqual({ x: 5, y: 6, w: 7, h: 8 });
     // 2x at offset 10: pixel u covers doc 10 + 2u .. 12 + 2u, centre 11 + 2u
-    expect(innerLayerRect({ x: 10, y: 10, sx: 2, sy: 2 }, { x: 40, y: 40, w: 20, h: 20 })).toEqual({ x: 15, y: 15, w: 10, h: 10 });
+    expect(innerLayerRect({ x: 10, y: 10, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 }, { x: 40, y: 40, w: 20, h: 20 })).toEqual({ x: 15, y: 15, w: 10, h: 10 });
     // 0.5x: pixel u covers 0.5u .. 0.5u + 0.5, centre 0.5u + 0.25
-    expect(innerLayerRect({ x: 0, y: 0, sx: 0.5, sy: 0.5 }, { x: 0, y: 0, w: 10, h: 10 })).toEqual({ x: 0, y: 0, w: 20, h: 20 });
+    expect(innerLayerRect({ x: 0, y: 0, sx: 0.5, sy: 0.5, rot: 0, kx: 0, ky: 0 }, { x: 0, y: 0, w: 10, h: 10 })).toEqual({ x: 0, y: 0, w: 20, h: 20 });
     // empty when no centre falls inside
-    expect(innerLayerRect({ x: 0, y: 0, sx: 10, sy: 10 }, { x: 1, y: 1, w: 3, h: 3 }).w).toBe(0);
+    expect(innerLayerRect({ x: 0, y: 0, sx: 10, sy: 10, rot: 0, kx: 0, ky: 0 }, { x: 1, y: 1, w: 3, h: 3 }).w).toBe(0);
     // negative origin
-    expect(innerLayerRect({ x: -5, y: -5, sx: 1, sy: 1 }, { x: 0, y: 0, w: 10, h: 10 })).toEqual({ x: 5, y: 5, w: 10, h: 10 });
+    expect(innerLayerRect({ x: -5, y: -5, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 }, { x: 0, y: 0, w: 10, h: 10 })).toEqual({ x: 5, y: 5, w: 10, h: 10 });
   });
 
   it('cleanXf clamps the scale to a positive range and rejects non-finite numbers', () => {
-    expect(cleanXf({ x: 1, y: 2, sx: 3, sy: 4 })).toEqual({ x: 1, y: 2, sx: 3, sy: 4 });
-    const c = cleanXf({ x: 0, y: 0, sx: -1, sy: 0 });
+    expect(cleanXf({ x: 1, y: 2, sx: 3, sy: 4, rot: 0, kx: 0, ky: 0 })).toEqual({ x: 1, y: 2, sx: 3, sy: 4, rot: 0, kx: 0, ky: 0 });
+    const c = cleanXf({ x: 0, y: 0, sx: -1, sy: 0, rot: 0, kx: 0, ky: 0 });
     expect(c && c.sx > 0 && c.sy > 0).toBe(true);
-    expect(cleanXf({ x: NaN, y: 0, sx: 1, sy: 1 })).toBeNull();
-    expect(cleanXf({ x: 0, y: 0, sx: Infinity, sy: 1 })).toBeNull();
+    expect(cleanXf({ x: NaN, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 })).toBeNull();
+    expect(cleanXf({ x: 0, y: 0, sx: Infinity, sy: 1, rot: 0, kx: 0, ky: 0 })).toBeNull();
   });
 });
 

@@ -1,4 +1,4 @@
-# TD ⇄ Web protocol (version 5; see §6–7 for the v4/v5 additions)
+# TD ⇄ Web protocol (version 6; see §6–8 for the v4/v5/v6 additions)
 
 One WebSocket per browser client, served by the COMP's Web Server DAT at
 `ws://127.0.0.1:<Port>/ws`. Text messages are JSON; binary WebSocket messages are SURFACE tiles
@@ -228,3 +228,46 @@ Further v5 details (TD implementation):
 | TD → web | `fileResult` | `requestId`, `op`, `ok`, `path`, `msg?` | outcome of the above (also sent, without `requestId`, when the pulses are used in TD) |
 | TD → web | `reload` | `rev` | the stored document was replaced (Open Project): every client drops its document and reloads via `requestDoc` |
 | TD → web | `files` | `projectFile`, `pngFile` | current parameter values (after `hello` and on change) for the UI's dialogs |
+
+### 8.1 TD implementation details (v6)
+
+- **`inputs`** lists every TD input connector that exists (`in1..inN`: the connected ones, the disconnected ones and the one spare
+  unconnected connector behind the last connected one), `{input, w, h, connected}` sorted by input; a disconnected input is `0x0`. An input
+  that is not listed no longer exists (treat it as disconnected). `hello.inputs` is the same list; `baseSize` is gone.
+  `hello.hasInput` / `docSize.hasInput` = **input 1** is connected (Follow Input uses input 1 only).
+- **BASE** (`GET /base?token&client&input=N`, default 1): frame header `slot` = N (1..8, validated: a BASE frame with slot 0 or > 8 is
+  invalid), `docW/docH` = that input's size. Per input: newest frame only, at most one un-fetched `base` notice per client and input,
+  a client that has not fetched an input's notice for 10 s is stalled for **that input** only (fetching it resumes), `404` for an
+  unconnected input (clears that input's notice). `requestBase {input?}` re-announces one input (or all). A resolution change or
+  (re)connect starts a new stream and notice for that input; a disconnect drops its frame.
+- **Input layers in TD's stored document:** an input's resolution change updates the stored layer's `surfaceW/H` (and, for Fixed canvas or
+  any input but 1, rescales `sx/sy` so the displayed box is kept); a reconnect after a disconnect keeps `x, y, sx, sy, rot, kx, ky`
+  and only takes the new surface size. Switching to Follow Input resets input 1's transform (x, y, rot, kx, ky = 0, sx, sy = 1).
+  `docState` fills in missing input surface sizes with the live input size. Before any client sent a document TD's default stack
+  has one input layer (`id: "input<N>"`) per connected input (input 1 alone when none is connected).
+- **`parse_doc` validation:** `kind: "base"` is migrated to `input: 1` (id kept); `input` must be 1..8 and an input layer has no `slot`;
+  `rot` any finite number; `kx, ky` finite and **clamped to ±85°**; `effects` only on pixel / input / text / shape layers (≤ 32 per layer),
+  every field of the effect's type is required and range-checked (colours RGBA 0..255, `opacity` 0..1, bevel `depth` 0..100, pixelSort
+  `low/high` 0..1, glitch `amount` 0..100 and integer `seed`, `blockSize` 1..4096, lengths ≥ 0 and ≤ 512 (TD clamps to 128), `position` /
+  `direction` / `key` / `shape` enums). An invalid doc is answered with `error` and changes nothing.
+- **Files.** Paths: `path` (or the `Projectfile` / `Pngfile` parameter when omitted) is absolute or relative to the project folder; the
+  ending `.redoc` / `.png` is added when missing; a given path is written to the parameter first (and `files` is broadcast). The
+  operations run one at a time and are refused (`fileResult ok:false`, `msg`) while TD restores the document, while another file
+  operation runs, or when the editor is inactive. `fileResult` goes to the requester only (to every client for a pulse).
+  - `saveProject`: snapshot on TD's main thread, PNG encode + zip + atomic rename in a worker. `openProject`: read / validate /
+    decode in a worker (damaged or invalid files change nothing), then TD replaces its document (rev = max(old, file) + 1, canvas mode
+    and Docw/Doch from the file, input layers' surface sizes follow the live inputs) and sends `reload {rev}` to **every** client; until a
+    client sends `requestDoc` TD ignores its `doc` messages and SURFACE tiles (they were produced for the old document). `exportPng`:
+    TD's output (`out1`, document size) read back with the budgeted delayed readback, un-premultiplied per `Premultiplied`, written as
+    8-bit RGBA PNG.
+  - `.redoc` = zip: `meta.json {format: 1, app, version, slots}`, `doc.json {rev, layers (with surfaceW/H), guides, canvas:{mode},
+    width, height}`, `surfaces/<slot>.png` (straight RGBA8, masks grey). Readers refuse `format` > 1.
+- **`chooseFile {requestId, purpose}`** (`placeImage | openProject | saveProject | exportPng`; web → TD) and **`fileChosen {requestId, path}`**
+  (TD → web; `path: null` = cancelled / no dialog available). The windowless panel browser cannot open file pickers, so the page asks TD:
+  the pump (not the server callback) calls TD's native `ui.chooseFile` -- **modal: it blocks TD's main thread (output cook, all clients) until
+  the user answers**. One pending dialog per client (a second request is answered with `path: null`). For `openProject` / `saveProject` /
+  `exportPng` the page then sends the matching file message with that path. For `placeImage` TD, after `fileChosen`, loads the image with a
+  temporary Movie File In TOP (png jpg jpeg tif tiff bmp gif tga exr hdr webp psd, ≤ 512 MB; 10 s to load) and serves it as a TOP import:
+  `topReady {requestId, w, h}` + `GET /top?...&requestId=` (frame type 6), or `topError {requestId, msg}`.
+  Test-only: with `Panelquery` containing `test=1` the message may carry `testPath` (string, or null = cancel) which replaces the dialog.
+- `Status` shows file results for 10 s and `effects unavailable: ...` when the network could not load the layer effects.

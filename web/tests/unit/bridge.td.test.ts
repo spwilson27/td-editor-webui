@@ -47,7 +47,7 @@ class FakeSocket {
 }
 
 const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({
-  t: 'hello', protocol: 5, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
+  t: 'hello', protocol: 6, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
 });
 
 interface TestStatus {
@@ -91,13 +91,13 @@ beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(100000); FakeSocket.all 
 afterEach(() => { bridge?.dispose(); vi.useRealTimers(); });
 
 describe('tdBridge session', () => {
-  it('sends ready{protocol 5, fresh} after open', () => {
+  it('sends ready{protocol 6, fresh} after open', () => {
     start();
     expect(status.conn).toEqual(['reconnecting']);
     expect(sock().url).toBe('ws://td:9980/ws');
     expect(sock().binaryType).toBe('arraybuffer');
     sock().open();
-    expect(sock().json()).toEqual([{ t: 'ready', protocol: 5, client: 'panel', version: '0.1.0', token: 'tok-123', fresh: true }]);
+    expect(sock().json()).toEqual([{ t: 'ready', protocol: 6, client: 'panel', version: '0.1.0', token: 'tok-123', fresh: true }]);
   });
 
   it('becomes linked on hello and pushes doc + every surface in full when TD has no document', () => {
@@ -157,10 +157,10 @@ describe('tdBridge session', () => {
 });
 
 const spec = (over: Partial<LayerSpec> & { id: string }): LayerSpec => ({
-  kind: 'pixel', parentId: null, name: over.id, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot: null, mask: null, adjustment: null, text: null, shape: null, sx: 1, sy: 1, surfaceW: null, surfaceH: null, ...over,
+  kind: 'pixel', parentId: null, name: over.id, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, rot: 0, kx: 0, ky: 0, input: null, effects: [], slot: null, mask: null, adjustment: null, text: null, shape: null, sx: 1, sy: 1, surfaceW: null, surfaceH: null, ...over,
 });
 const tdLayers: LayerSpec[] = [
-  spec({ id: 'base', kind: 'base' }),
+  spec({ id: 'base', kind: 'input', input: 1 }),
   spec({ id: 'p1', slot: 1, mask: { slot: 2, enabled: true } }),
   spec({ id: 'a1', kind: 'adjustment', adjustment: { type: 'invert' }, mask: { slot: 3, enabled: false } }),
   spec({ id: 'p2', slot: 4 }), spec({ id: 'p3', slot: 5 }), spec({ id: 'p4', slot: 6 }),
@@ -488,7 +488,7 @@ describe('tdBridge doc messages', () => {
     expect(n()).toBe(base + 1);
     const m = at(sock().json().filter((x) => x.t === 'doc'), -1) as Extract<WebMessage, { t: 'doc' }>;
     expect(m.rev).toBe(engine.docSpec().rev);
-    expect(m.layers.map((l) => l.kind)).toEqual(['base', 'pixel', 'adjustment']);
+    expect(m.layers.map((l) => l.kind)).toEqual(['input', 'pixel', 'adjustment']);
     vi.advanceTimersByTime(500);
     expect(n()).toBe(base + 1);
     engine.setLayerProps('L1', { opacity: 0.3 });
@@ -896,7 +896,7 @@ describe('tdBridge view stream (external client)', () => {
     fm!.calls[0].settle(okBytes(viewBody(64, 48, 77)));
     await flushP();
     expect(status.viewFrames).toEqual([{ w: 64, h: 48, first: [77, 77, 77, 77], age: 30 }]);
-    expect(engine.baseWrites).toEqual([]);
+    expect(engine.inputWrites).toEqual([]);
   });
 
   it('keeps one fetch in flight; newer notices cause exactly one more with the newest id', async () => {
@@ -987,9 +987,9 @@ class FetchMock {
   })) as unknown as typeof fetch;
 }
 const flush = flushP;
-const baseFrame = (docW: number, docH: number, v: number, frameId = 1) =>
-  encodeBands({ type: FRAME_BASE, frameId, docW, docH, rect: { x: 0, y: 0, w: docW, h: docH }, pixels: new Uint8Array(docW * docH * 4).fill(v), maxPayload: 1 << 30 }).next().value as Uint8Array;
-const notice = (frameId: number, w = 64, h = 48): TdMessage => ({ t: 'base', frameId, docW: w, docH: h, x: 0, y: 0, w, h });
+const baseFrame = (docW: number, docH: number, v: number, frameId = 1, input = 1) =>
+  encodeBands({ type: FRAME_BASE, slot: input, frameId, docW, docH, rect: { x: 0, y: 0, w: docW, h: docH }, pixels: new Uint8Array(docW * docH * 4).fill(v), maxPayload: 1 << 30 }).next().value as Uint8Array;
+const notice = (frameId: number, w = 64, h = 48, input = 1): TdMessage => ({ t: 'base', frameId, input, docW: w, docH: h, x: 0, y: 0, w, h });
 
 describe('tdBridge base pull (HTTP)', () => {
   let fm: FetchMock;
@@ -1006,7 +1006,7 @@ describe('tdBridge base pull (HTTP)', () => {
     startF();
     sock().tell(notice(5));
     await flush();
-    expect(fm.calls.map((c) => c.url)).toEqual(['http://td:9980/base?token=tok%201&client=c1&frameId=5']);
+    expect(fm.calls.map((c) => c.url)).toEqual(['http://td:9980/base?token=tok%201&client=c1&frameId=5&input=1']);
   });
 
   it('applies a fetched frame and commits once; header frameId may be newer than the notice', async () => {
@@ -1015,8 +1015,8 @@ describe('tdBridge base pull (HTTP)', () => {
     await flush();
     fm.calls[0].settle(ok(baseFrame(64, 48, 9, 8)));
     await flush();
-    expect(engine.baseWrites).toEqual([{ rect: { x: 0, y: 0, w: 64, h: 48 }, len: 64 * 48 * 4 }]);
-    expect(engine.commits).toBe(1);
+    expect(engine.inputWrites).toEqual([{ input: 1, rect: { x: 0, y: 0, w: 64, h: 48 }, len: 64 * 48 * 4 }]);
+    expect(engine.inputCommits.length).toBe(1);
   });
 
   it('drops stale-size and malformed bodies', async () => {
@@ -1033,8 +1033,8 @@ describe('tdBridge base pull (HTTP)', () => {
     await flush();
     fm.calls[2].settle(ok(new Uint8Array(5)));
     await flush();
-    expect(engine.baseWrites.length).toBe(0);
-    expect(engine.commits).toBe(0);
+    expect(engine.inputWrites.length).toBe(0);
+    expect(engine.inputCommits.length).toBe(0);
   });
 
   it('ignores 404 quietly (no retry, no notice, no fatal)', async () => {
@@ -1045,7 +1045,7 @@ describe('tdBridge base pull (HTTP)', () => {
     await vi.advanceTimersByTimeAsync(5000);
     expect(fm.calls.length).toBe(1);
     expect(status.notices).toEqual([]);
-    expect(engine.baseWrites.length).toBe(0);
+    expect(engine.inputWrites.length).toBe(0);
   });
 
   it('treats 403 like a token error: fatal message, no reconnecting', async () => {
@@ -1089,7 +1089,7 @@ describe('tdBridge base pull (HTTP)', () => {
     await vi.advanceTimersByTimeAsync(500);
     fm.calls[1].settle(ok(baseFrame(64, 48, 3)));
     await flush();
-    expect(engine.commits).toBe(1);
+    expect(engine.inputCommits.length).toBe(1);
   });
 
   it('keeps one fetch in flight; notices arriving meanwhile cause exactly one more fetch with the newest id', async () => {
@@ -1107,7 +1107,7 @@ describe('tdBridge base pull (HTTP)', () => {
     fm.calls[1].settle(ok(baseFrame(64, 48, 2)));
     await flush();
     expect(fm.calls.length).toBe(2);
-    expect(engine.commits).toBe(2);
+    expect(engine.inputCommits.length).toBe(2);
   });
 
   it('a docSize while fetching voids the in-flight result, even at an unchanged size, and fetches again (TD counted it as fetched)', async () => {
@@ -1117,11 +1117,11 @@ describe('tdBridge base pull (HTTP)', () => {
     sock().tell({ t: 'docSize', w: 64, h: 48, hasInput: true, mode: 'input' });
     fm.calls[0].settle(ok(baseFrame(64, 48, 1)));
     await flush();
-    expect(engine.commits).toBe(0);
+    expect(engine.inputCommits.length).toBe(0);
     expect(fm.calls.length).toBe(2); // re-fetch without waiting for a notice
     fm.calls[1].settle(ok(baseFrame(64, 48, 2)));
     await flush();
-    expect(engine.commits).toBe(1);
+    expect(engine.inputCommits.length).toBe(1);
     expect(fm.calls.length).toBe(2); // exactly one more, no loop
   });
 
@@ -1139,7 +1139,7 @@ describe('tdBridge base pull (HTTP)', () => {
     await flush();
     fm.calls[2].settle(ok(baseFrame(20, 10, 3)));
     await flush();
-    expect(engine.commits).toBe(1);
+    expect(engine.inputCommits.length).toBe(1);
   });
 
   it('aborts a hung fetch after 10 s and treats it as a network error (retry once, then requestBase)', async () => {
@@ -1202,10 +1202,10 @@ describe('tdBridge base pull (HTTP)', () => {
     sock().tell(notice(2, 20, 10));
     fm.calls[0].settle(ok(baseFrame(64, 48, 1)));
     await flush();
-    expect(engine.baseWrites.length).toBe(0);
+    expect(engine.inputWrites.length).toBe(0);
     fm.calls[1].settle(ok(baseFrame(20, 10, 4)));
     await flush();
-    expect(engine.baseWrites).toEqual([{ rect: { x: 0, y: 0, w: 20, h: 10 }, len: 800 }]);
+    expect(engine.inputWrites).toEqual([{ input: 1, rect: { x: 0, y: 0, w: 20, h: 10 }, len: 800 }]);
   });
 
   it('drops a result that arrives after the socket was lost or the bridge disposed', async () => {
@@ -1215,7 +1215,7 @@ describe('tdBridge base pull (HTTP)', () => {
     sock().close();
     fm.calls[0].settle(ok(baseFrame(64, 48, 1)));
     await flush();
-    expect(engine.commits).toBe(0);
+    expect(engine.inputCommits.length).toBe(0);
     vi.advanceTimersByTime(500);
     sock().open();
     sock().tell(hello());
@@ -1224,7 +1224,7 @@ describe('tdBridge base pull (HTTP)', () => {
     bridge.dispose();
     fm.calls[1].settle(ok(baseFrame(64, 48, 1)));
     await flush();
-    expect(engine.commits).toBe(0);
+    expect(engine.inputCommits.length).toBe(0);
   });
 
   it('never acks and ignores binary WebSocket messages from TD', async () => {
@@ -1233,7 +1233,7 @@ describe('tdBridge base pull (HTTP)', () => {
     sock().binary(f);
     sock().tell(notice(1));
     await flush();
-    expect(engine.baseWrites.length).toBe(0);
+    expect(engine.inputWrites.length).toBe(0);
     expect(sock().json().some((m) => (m as { t: string }).t === 'ack')).toBe(false);
   });
 
@@ -1463,7 +1463,7 @@ describe('tdBridge v4 review fixes', () => {
     id: 't1', kind: 'text', slot: null,
     text: { text: 'Hi', font: 'Arial', size: 20, color: { r: 0, g: 0, b: 0, a: 255 }, align: 'left', bold: false, italic: false, lineHeight: 1.2, x: 0, y: 0, boxWidth: null }, ...over,
   });
-  const loadLayers = [spec({ id: 'base', kind: 'base' }), spec({ id: 'p1', slot: 1 }), textLayer()];
+  const loadLayers = [spec({ id: 'base', kind: 'input', input: 1 }), spec({ id: 'p1', slot: 1 }), textLayer()];
 
   it('v5: a load never fetches or pushes anything for text / shape layers (they own no surface)', async () => {
     start(64, 48);
@@ -1548,11 +1548,11 @@ describe('tdBridge v5: canvas, base size, per-slot sizes, flatten', () => {
     vi.advanceTimersByTime(100);
     const n = sock().frames().length, docs = sock().json().filter((m) => m.t === 'doc').length;
     engine.addGuide('h', 5);
-    engine.setTransform('L1', { x: 3, y: 4, sx: 2, sy: 2 });
+    engine.setTransform('L1', { x: 3, y: 4, sx: 2, sy: 2, rot: 30, kx: 0, ky: 0 });
     vi.advanceTimersByTime(200);
     expect(sock().frames().length).toBe(n);
     expect(sock().json().filter((m) => m.t === 'doc').length).toBeGreaterThan(docs);
-    expect(last('doc').layers.find((l) => l.id === 'L1')).toMatchObject({ x: 3, y: 4, sx: 2, sy: 2 });
+    expect(last('doc').layers.find((l) => l.id === 'L1')).toMatchObject({ x: 3, y: 4, sx: 2, sy: 2, rot: 30 });
     expect(last('doc').guides.h).toEqual([5]);
   });
 
@@ -1590,30 +1590,41 @@ describe('tdBridge v5: canvas, base size, per-slot sizes, flatten', () => {
     expect(engine.canvasMode()).toBe('fixed');
   });
 
-  it('baseSize resizes the base surface (once), 0x0 means no input, and BASE frames carry the base size', async () => {
+  it('inputs go to engine.setInputs (copy) and status.setInputs; BASE frames correct a differing size', async () => {
     startV5();
-    sock().tell({ t: 'baseSize', w: 128, h: 96 });
-    sock().tell({ t: 'baseSize', w: 128, h: 96 });
-    sock().tell({ t: 'baseSize', w: 0, h: 0 }); // no input any more: forwarded, the engine keeps a placeholder
-    sock().tell({ t: 'baseSize', w: 0, h: 0 });
-    expect(engine.baseSizes).toEqual([{ w: 128, h: 96 }, { w: 0, h: 0 }]);
-    sock().tell({ t: 'base', frameId: 1, docW: 200, docH: 100, x: 0, y: 0, w: 200, h: 100 });
+    const seen: unknown[] = [];
+    (status as unknown as { setInputs: (i: unknown) => void }).setInputs = (i) => seen.push(i);
+    const items = [{ input: 1, w: 128, h: 96, connected: true }, { input: 2, w: 0, h: 0, connected: false }];
+    sock().tell({ t: 'inputs', items });
+    expect(engine.calls.filter((c) => c.startsWith('setInputs:')).slice(-1)[0]).toBe(`setInputs:${JSON.stringify(items)}`);
+    expect(seen).toEqual([items]);
+    const n = engine.calls.filter((c) => c.startsWith('setInputs:')).length;
+    sock().tell({ t: 'base', frameId: 1, input: 1, docW: 200, docH: 100, x: 0, y: 0, w: 200, h: 100 });
     await flushP();
     fm.calls[0].settle(okBytes(baseFrame(200, 100, 5)));
     await flushP();
-    expect(engine.baseSizes[engine.baseSizes.length - 1]).toEqual({ w: 200, h: 100 });
-    expect(engine.baseWrites).toEqual([{ rect: { x: 0, y: 0, w: 200, h: 100 }, len: 200 * 100 * 4 }]);
-    expect(engine.commits).toBe(1);
+    const calls = engine.calls.filter((c) => c.startsWith('setInputs:'));
+    expect(calls).toHaveLength(n + 1); // corrected once
+    expect(calls.slice(-1)[0]).toBe(`setInputs:${JSON.stringify([{ input: 1, w: 200, h: 100, connected: true }, items[1]])}`);
+    expect(engine.inputWrites).toEqual([{ input: 1, rect: { x: 0, y: 0, w: 200, h: 100 }, len: 200 * 100 * 4 }]);
+    expect(engine.inputCommits).toEqual([1]);
+    // a frame of the announced size does not touch the list again
+    sock().tell({ t: 'base', frameId: 2, input: 1, docW: 200, docH: 100, x: 0, y: 0, w: 200, h: 100 });
+    await flushP();
+    fm.calls[1].settle(okBytes(baseFrame(200, 100, 6, 2)));
+    await flushP();
+    expect(engine.calls.filter((c) => c.startsWith('setInputs:'))).toHaveLength(n + 1);
+    expect(engine.inputCommits).toEqual([1, 1]);
   });
 
-  it('a baseSize while a BASE fetch is in flight voids that result and fetches again', async () => {
+  it('an inputs message while a BASE fetch is in flight voids that result and fetches again', async () => {
     startV5();
     sock().tell(notice(1));
     await flushP();
-    sock().tell({ t: 'baseSize', w: 10, h: 10 });
+    sock().tell({ t: 'inputs', items: [{ input: 1, w: 10, h: 10, connected: true }] });
     fm.calls[0].settle(okBytes(baseFrame(64, 48, 1)));
     await flushP();
-    expect(engine.baseWrites).toHaveLength(0);
+    expect(engine.inputWrites).toHaveLength(0);
     expect(fm.calls).toHaveLength(2);
   });
 
@@ -1634,7 +1645,7 @@ describe('tdBridge v5: canvas, base size, per-slot sizes, flatten', () => {
 
   it('loading a document: per-slot stale checks use the spec sizes and the guides / canvas reach the engine', async () => {
     startV5(undefined, { hasDocument: true, rev: 7 });
-    const layers = [spec({ id: 'base', kind: 'base', surfaceW: 64, surfaceH: 48 }), spec({ id: 'p1', slot: 1, surfaceW: 20, surfaceH: 10, mask: { slot: 2, enabled: true } })];
+    const layers = [spec({ id: 'base', kind: 'input', input: 1, surfaceW: 64, surfaceH: 48 }), spec({ id: 'p1', slot: 1, surfaceW: 20, surfaceH: 10, mask: { slot: 2, enabled: true } })];
     sock().tell({ ...(docState(3, layers) as Extract<TdMessage, { t: 'docState' }>), guides: { h: [4], v: [8] }, canvas: { mode: 'fixed' } });
     await flushP();
     expect(engine.loaded[0]).toMatchObject({ guides: { h: [4], v: [8] }, canvas: { mode: 'fixed' } });
@@ -1749,22 +1760,431 @@ describe('tdBridge v5 review fixes', () => {
     expect(engine.replaced).toHaveLength(0);
   });
 
-  it('hello.baseSize updates the base (0x0 = input removed while the page was away)', () => {
-    startR(undefined, { baseSize: { w: 0, h: 0 } });
-    expect(engine.baseSizes).toEqual([{ w: 0, h: 0 }]);
-    sock().tell(hello({ doc: { w: 64, h: 48 }, baseSize: { w: 100, h: 50 } }));
-    expect(engine.baseSizes.slice(-1)[0]).toEqual({ w: 100, h: 50 });
+  it('hello.inputs updates the inputs (an input removed while the page was away)', () => {
+    startR(undefined, { inputs: [{ input: 1, w: 0, h: 0, connected: false }] });
+    expect(engine.calls.filter((c) => c.startsWith('setInputs:'))).toEqual(['setInputs:[{"input":1,"w":0,"h":0,"connected":false}]']);
+    sock().tell(hello({ doc: { w: 64, h: 48 }, inputs: [{ input: 1, w: 100, h: 50, connected: true }] }));
+    expect(engine.calls.filter((c) => c.startsWith('setInputs:')).slice(-1)[0]).toBe('setInputs:[{"input":1,"w":100,"h":50,"connected":true}]');
   });
 
-  it('hello.baseSize is deferred while the document loads', async () => {
-    startR(undefined, { hasDocument: true, rev: 7, baseSize: { w: 100, h: 50 } });
-    expect(engine.baseSizes).toEqual([]);
+  it('hello.inputs and inputs are deferred while the document loads', async () => {
+    startR(undefined, { hasDocument: true, rev: 7, inputs: [{ input: 1, w: 100, h: 50, connected: true }] });
+    sock().tell({ t: 'inputs', items: [{ input: 1, w: 100, h: 50, connected: true }, { input: 2, w: 8, h: 8, connected: true }] });
+    expect(engine.calls.some((c) => c.startsWith('setInputs:'))).toBe(false);
     sock().tell(docState(7));
     await flushP();
+    expect(engine.calls.some((c) => c.startsWith('setInputs:'))).toBe(false); // still loading surfaces
     for (let i = 0; i < 4; i++) {
       for (const c of [...fm!.calls]) c.settle(okBytes(dump(Number(new URL(c.url).searchParams.get('slot')), 64, 48, 1)));
       await flushP();
     }
-    expect(engine.baseSizes).toEqual([{ w: 100, h: 50 }]);
+    const calls = engine.calls.filter((c) => c.startsWith('setInputs:'));
+    expect(calls).toEqual(['setInputs:[{"input":1,"w":100,"h":50,"connected":true},{"input":2,"w":8,"h":8,"connected":true}]']); // newest list only
+  });
+});
+
+describe('tdBridge v6 inputs (per-input BASE)', () => {
+  let fmv: FetchMock;
+  const startI = () => {
+    fmv = new FetchMock();
+    engine = new FakeEngine(64, 48);
+    status = makeStatus();
+    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 't', fetch: fmv.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
+    connectActive({ inputs: [{ input: 1, w: 64, h: 48, connected: true }, { input: 2, w: 32, h: 16, connected: true }] });
+  };
+  const inputOf = (c: { url: string }) => Number(new URL(c.url).searchParams.get('input'));
+
+  it('hello.inputs reach the engine; each input is fetched with its own input query param', async () => {
+    startI();
+    expect(engine.calls.filter((c) => c.startsWith('setInputs:'))).toHaveLength(1);
+    sock().tell(notice(4, 64, 48, 1));
+    sock().tell(notice(9, 32, 16, 2));
+    await flushP();
+    expect(fmv.calls.map((c) => c.url)).toEqual([
+      'http://td:9980/base?token=t&client=c1&frameId=4&input=1',
+      'http://td:9980/base?token=t&client=c1&frameId=9&input=2',
+    ]);
+  });
+
+  it('two inputs interleave: results land in their own input and commit once each', async () => {
+    startI();
+    sock().tell(notice(1, 64, 48, 1));
+    sock().tell(notice(2, 32, 16, 2));
+    await flushP();
+    fmv.calls[1].settle(okBytes(baseFrame(32, 16, 7, 2, 2))); // input 2 finishes first
+    await flushP();
+    expect(engine.inputWrites).toEqual([{ input: 2, rect: { x: 0, y: 0, w: 32, h: 16 }, len: 32 * 16 * 4 }]);
+    expect(engine.inputCommits).toEqual([2]);
+    fmv.calls[0].settle(okBytes(baseFrame(64, 48, 8, 1, 1)));
+    await flushP();
+    expect(engine.inputWrites.map((w) => w.input)).toEqual([2, 1]);
+    expect(engine.inputCommits).toEqual([2, 1]);
+    expect(engine.calls.filter((c) => c.startsWith('setInputs:'))).toHaveLength(1); // sizes matched the announcement
+  });
+
+  it('single flight per input, newest notice wins; the other input is not blocked', async () => {
+    startI();
+    sock().tell(notice(1, 64, 48, 1));
+    sock().tell(notice(2, 64, 48, 1));
+    sock().tell(notice(3, 64, 48, 1));
+    sock().tell(notice(10, 32, 16, 2));
+    await flushP();
+    expect(fmv.calls.map(inputOf)).toEqual([1, 2]);
+    fmv.calls[0].settle(okBytes(baseFrame(64, 48, 1)));
+    await flushP();
+    expect(fmv.calls).toHaveLength(3);
+    expect(fmv.calls[2].url).toContain('frameId=3&input=1');
+    fmv.calls[2].settle(okBytes(baseFrame(64, 48, 2)));
+    fmv.calls[1].settle(okBytes(baseFrame(32, 16, 2, 10, 2)));
+    await flushP();
+    expect(fmv.calls).toHaveLength(3);
+    expect(engine.inputCommits.slice().sort()).toEqual([1, 1, 2]);
+  });
+
+  it('drops a frame whose header slot is not the requested input', async () => {
+    startI();
+    sock().tell(notice(1, 64, 48, 1));
+    await flushP();
+    fmv.calls[0].settle(okBytes(baseFrame(64, 48, 1, 1, 2)));
+    await flushP();
+    expect(engine.inputWrites).toEqual([]);
+    expect(engine.inputCommits).toEqual([]);
+  });
+
+  it('a BASE frame of another size updates the known list (connected stays true) and an unknown input is added', async () => {
+    startI();
+    sock().tell(notice(1, 40, 30, 2));
+    sock().tell(notice(1, 8, 8, 3));
+    await flushP();
+    fmv.calls[0].settle(okBytes(baseFrame(40, 30, 1, 1, 2)));
+    await flushP();
+    fmv.calls[1].settle(okBytes(baseFrame(8, 8, 1, 1, 3)));
+    await flushP();
+    const last = engine.calls.filter((c) => c.startsWith('setInputs:')).slice(-1)[0];
+    expect(JSON.parse(last.slice('setInputs:'.length))).toEqual([
+      { input: 1, w: 64, h: 48, connected: true }, { input: 2, w: 40, h: 30, connected: true }, { input: 3, w: 8, h: 8, connected: true },
+    ]);
+  });
+
+  it('a socket loss resets per-input state: a late result is dropped and a new notice fetches again', async () => {
+    startI();
+    sock().tell(notice(1, 64, 48, 1));
+    await flushP();
+    sock().close();
+    fmv.calls[0].settle(okBytes(baseFrame(64, 48, 1)));
+    await flushP();
+    expect(engine.inputCommits).toEqual([]);
+    vi.advanceTimersByTime(500);
+    sock().open();
+    sock().tell(hello({ inputs: [{ input: 1, w: 64, h: 48, connected: true }] }));
+    sock().tell(notice(2, 64, 48, 1));
+    await flushP();
+    expect(fmv.calls).toHaveLength(2);
+    fmv.calls[1].settle(okBytes(baseFrame(64, 48, 1, 2)));
+    await flushP();
+    expect(engine.inputCommits).toEqual([1]);
+  });
+
+  it('a v5 peer (protocol 5 hello) is refused', () => {
+    startI();
+    const before = status.notices.length;
+    sock().tell(hello({ protocol: 5 }));
+    expect(status.notices.length).toBe(before + 1);
+    expect(status.notices.slice(-1)[0]).toMatch(/mismatch/i);
+  });
+});
+
+describe('tdBridge v6 files and reload', () => {
+  let fmf: FetchMock;
+  const startF6 = (prep?: (e: FakeEngine) => void, over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}) => {
+    fmf = new FetchMock();
+    engine = new FakeEngine(64, 48);
+    prep?.(engine);
+    status = makeStatus();
+    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 't', fetch: fmf.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
+    connectActive(over);
+  };
+  const lastOf = <K extends WebMessage['t']>(t: K) => sock().json().filter((m) => m.t === t).slice(-1)[0] as Extract<WebMessage, { t: K }>;
+  const finishLoad = async () => {
+    for (let i = 0; i < 4; i++) {
+      for (const c of [...fmf.calls]) if (!c.signal?.aborted) c.settle(okBytes(dump(Number(new URL(c.url).searchParams.get('slot')), 64, 48, 1)));
+      await flushP();
+    }
+  };
+
+  it('files updates status.setFiles', () => {
+    startF6();
+    const got: unknown[] = [];
+    (status as unknown as { setFiles: (f: unknown) => void }).setFiles = (f) => got.push(f);
+    sock().tell({ t: 'files', projectFile: '/a.redoc', pngFile: '/a.png' });
+    expect(got).toEqual([{ projectFile: '/a.redoc', pngFile: '/a.png' }]);
+  });
+
+  it.each([['saveProject'], ['openProject'], ['exportPng']] as const)('%s: request with a requestId, resolved by the matching fileResult (also when ok is false)', async (op) => {
+    startF6();
+    const p = bridge[op]('/x/y');
+    const req = lastOf(op);
+    expect(req).toMatchObject({ t: op, path: '/x/y' });
+    expect(req.requestId).toMatch(/^f\d+$/);
+    sock().tell({ t: 'fileResult', requestId: req.requestId, op, ok: false, path: '/x/y', msg: 'nope' });
+    await expect(p).resolves.toEqual({ op, ok: false, path: '/x/y', msg: 'nope' });
+    const p2 = bridge[op]();
+    const req2 = lastOf(op);
+    expect('path' in req2).toBe(false);
+    expect(req2.requestId).not.toBe(req.requestId);
+    sock().tell({ t: 'fileResult', requestId: req2.requestId, op, ok: true, path: '/default' });
+    await expect(p2).resolves.toEqual({ op, ok: true, path: '/default' });
+  });
+
+  it('a fileResult nobody waits for (pulse in TD) goes to status.onFileResult; a matched one does not', async () => {
+    startF6();
+    const got: unknown[] = [];
+    (status as unknown as { onFileResult: (r: unknown) => void }).onFileResult = (r) => got.push(r);
+    sock().tell({ t: 'fileResult', op: 'exportPng', ok: true, path: '/p.png' });
+    sock().tell({ t: 'fileResult', requestId: 'f999', op: 'saveProject', ok: true, path: '/q' });
+    expect(got).toEqual([{ op: 'exportPng', ok: true, path: '/p.png' }, { op: 'saveProject', ok: true, path: '/q' }]);
+    const p = bridge.saveProject();
+    sock().tell({ t: 'fileResult', requestId: lastOf('saveProject').requestId, op: 'saveProject', ok: true, path: '/r' });
+    await p;
+    expect(got).toHaveLength(2);
+  });
+
+  it('rejects when not connected, on a 60 s timeout, and on disconnect', async () => {
+    startF6();
+    const p = bridge.exportPng().catch((e: Error) => e.message);
+    await vi.advanceTimersByTimeAsync(59999);
+    sock().tell({ t: 'files', projectFile: '', pngFile: '' }); // unrelated traffic
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await p).toMatch(/did not answer/);
+    const p2 = bridge.openProject().catch((e: Error) => e.message);
+    sock().close();
+    expect(await p2).toMatch(/Disconnected/);
+    await expect(bridge.saveProject()).rejects.toThrow(/Not connected/);
+    await expect(bridge.openProject()).rejects.toThrow(/Not connected/);
+    await expect(bridge.exportPng()).rejects.toThrow(/Not connected/);
+  });
+
+  it('save / export first send the pending doc and every dirty surface (rate limit ignored), then the request; open does not', async () => {
+    startF6(withLayer);
+    vi.advanceTimersByTime(100);
+    await flushP();
+    const base = sock().sent.length;
+    engine.setLayerProps('L1', { opacity: 0.5 }); // doc pending (raf not run yet)
+    engine.fillSurface(1, { x: 1, y: 1, w: 2, h: 2 }, [1, 2, 3, 255]); // dirty, rate limited
+    const p = bridge.saveProject();
+    const sent = sock().all().slice(base);
+    expect(sent.map((s) => ('json' in s ? s.json.t : `frame${s.frame.slot}`))).toEqual(['doc', 'frame1', 'saveProject']);
+    const docMsg = (sent[0] as { json: Extract<WebMessage, { t: 'doc' }> }).json;
+    expect(docMsg.layers.find((l) => l.id === 'L1')?.opacity).toBe(0.5);
+    sock().tell({ t: 'fileResult', requestId: lastOf('saveProject').requestId, op: 'saveProject', ok: true, path: '/s' });
+    await p;
+    // nothing is sent twice afterwards
+    vi.advanceTimersByTime(500);
+    expect(sock().all().slice(base).map((s) => ('json' in s ? s.json.t : 'frame'))).toEqual(['doc', 'frame', 'saveProject']);
+    // export also syncs; openProject does not
+    engine.fillSurface(1, { x: 5, y: 5, w: 1, h: 1 }, [9, 9, 9, 255]);
+    void bridge.exportPng().catch(() => {});
+    expect(sock().all().slice(-2).map((s) => ('json' in s ? s.json.t : 'frame'))).toEqual(['frame', 'exportPng']);
+    engine.fillSurface(1, { x: 6, y: 6, w: 1, h: 1 }, [9, 9, 9, 255]);
+    void bridge.openProject().catch(() => {});
+    expect(at(sock().all(), -1)).toMatchObject({ json: { t: 'openProject' } });
+  });
+
+  it('a standby or loading page sends no doc / surfaces before a save', async () => {
+    startF6(withLayer, { active: false, hasDocument: true, rev: 2 });
+    engine.fillSurface(1, { x: 0, y: 0, w: 2, h: 2 }, [1, 1, 1, 255]);
+    const p = bridge.saveProject().catch(() => {});
+    expect(sock().json().map((m) => m.t)).toEqual(['ready', 'saveProject']);
+    expect(sock().frames()).toEqual([]);
+    void p;
+  });
+
+  it('reload: an active page drops its document and reloads via requestDoc with the loading state', async () => {
+    startF6(withLayer, { hasDocument: true, rev: 7 });
+    sock().tell(docState(7, [tdLayers[0], tdLayers[1]]));
+    await flushP();
+    await finishLoad();
+    expect(at(status.loading, -1)).toBe(false);
+    expect(engine.loaded).toHaveLength(1);
+    const req = sock().json().filter((m) => m.t === 'requestDoc').length;
+    engine.fillSurface(1, { x: 0, y: 0, w: 2, h: 2 }, [1, 1, 1, 255]); // dirty, never to be sent after the reload
+    sock().tell({ t: 'reload', rev: 8 });
+    expect(at(status.loading, -1)).toBe(true);
+    expect(sock().json().filter((m) => m.t === 'requestDoc').length).toBe(req + 1);
+    vi.advanceTimersByTime(500);
+    expect(sock().frames()).toEqual([]);
+    const docs = sock().json().filter((m) => m.t === 'doc').length;
+    engine.setLayerProps('p1', { opacity: 0.2 }); // locked while loading: nothing pushed
+    vi.advanceTimersByTime(500);
+    expect(sock().json().filter((m) => m.t === 'doc').length).toBe(docs);
+    sock().tell(docState(8, [tdLayers[0], tdLayers[1]]));
+    await flushP();
+    await finishLoad();
+    expect(engine.loaded).toHaveLength(2);
+    expect(engine.loaded[1].rev).toBe(8);
+    expect(at(status.loading, -1)).toBe(false);
+    expect(sock().frames()).toEqual([]);
+  });
+
+  it('reload during a load cancels it: the old document is not completed', async () => {
+    startF6(withLayer, { hasDocument: true, rev: 7 });
+    sock().tell(docState(7, [tdLayers[0], tdLayers[1]]));
+    await flushP();
+    const commits = engine.surfaceCommits;
+    sock().tell({ t: 'reload', rev: 9 });
+    for (const c of fmf.calls) c.settle(okBytes(dump(Number(new URL(c.url).searchParams.get('slot')), 64, 48, 1)));
+    await flushP();
+    expect(engine.surfaceWrites).toEqual([]);
+    expect(at(status.loading, -1)).toBe(true);
+    expect(engine.surfaceCommits).toBe(commits);
+    sock().tell(docState(9, [tdLayers[0]]));
+    await flushP();
+    expect(engine.loaded).toHaveLength(2);
+    expect(at(status.loading, -1)).toBe(false);
+  });
+
+  it('inputs applied at load completion that auto-create layers are pushed to TD as a doc', async () => {
+    startF6(undefined, { hasDocument: true, rev: 7, inputs: [{ input: 1, w: 64, h: 48, connected: true }, { input: 2, w: 8, h: 8, connected: true }] });
+    sock().tell(docState(7, [tdLayers[0], tdLayers[1]])); // TD's document has input 1 only
+    await flushP();
+    expect(sock().json().some((m) => m.t === 'doc')).toBe(false); // nothing pushed while loading
+    await finishLoad();
+    const docs = sock().json().filter((m): m is Extract<WebMessage, { t: 'doc' }> => m.t === 'doc');
+    expect(docs).toHaveLength(1);
+    expect(docs[0].layers.some((l) => l.kind === 'input' && l.input === 2)).toBe(true);
+    expect(docs[0].rev).toBe(engine.docSpec().rev);
+  });
+
+  it('reload re-applies the known inputs (engine + status) once the reload load completes, incl. a pending inputs message', async () => {
+    startF6(undefined, { hasDocument: true, rev: 7, inputs: [{ input: 1, w: 64, h: 48, connected: true }] });
+    const seen: unknown[] = [];
+    (status as unknown as { setInputs: (i: unknown) => void }).setInputs = (i) => seen.push(i);
+    sock().tell(docState(7, [tdLayers[0], tdLayers[1]]));
+    await flushP();
+    await finishLoad();
+    const setCalls = () => engine.calls.filter((c) => c.startsWith('setInputs:')).length;
+    const n = setCalls(), m = seen.length;
+    sock().tell({ t: 'reload', rev: 8 });
+    expect(setCalls()).toBe(n); // not before the load completes
+    sock().tell(docState(8, [tdLayers[0], tdLayers[1]]));
+    await flushP();
+    expect(setCalls()).toBe(n);
+    await finishLoad();
+    expect(setCalls()).toBe(n + 1);
+    expect(seen.length).toBe(m + 1);
+    expect(seen[seen.length - 1]).toEqual([{ input: 1, w: 64, h: 48, connected: true }]);
+    // an inputs message arriving during the reload is applied instead (and only once)
+    sock().tell({ t: 'reload', rev: 9 });
+    sock().tell({ t: 'inputs', items: [{ input: 1, w: 64, h: 48, connected: false }] });
+    expect(setCalls()).toBe(n + 1);
+    sock().tell(docState(9, [tdLayers[0], tdLayers[1]]));
+    await flushP();
+    await finishLoad();
+    expect(setCalls()).toBe(n + 2);
+    expect(engine.calls.filter((c) => c.startsWith('setInputs:')).slice(-1)[0]).toBe('setInputs:[{"input":1,"w":64,"h":48,"connected":false}]');
+  });
+
+  it('reload on a standby page defers: the next takeover loads TD\'s document', async () => {
+    startF6(withLayer, { active: false, hasDocument: true, rev: 3 });
+    sock().tell({ t: 'reload', rev: 4 });
+    expect(sock().json().map((m) => m.t)).toEqual(['ready']);
+    expect(status.loading).not.toContain(true);
+    sock().tell({ t: 'active', active: true });
+    expect(at(sock().json(), -1)).toEqual({ t: 'requestDoc' });
+    expect(at(status.loading, -1)).toBe(true);
+  });
+});
+
+describe('tdBridge v6 chooseFile / placeImageViaTd', () => {
+  let fmc: FetchMock;
+  const startC = () => {
+    fmc = new FetchMock();
+    engine = new FakeEngine(64, 48);
+    status = makeStatus();
+    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 't', fetch: fmc.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
+    connectActive();
+  };
+  const lastChoose = () => sock().json().filter((m) => m.t === 'chooseFile').slice(-1)[0] as Extract<WebMessage, { t: 'chooseFile' }>;
+  const top = (w: number, h: number) => encodeFrame({ type: FRAME_TOP, frameEnd: true, slot: 0, frameId: 1, docW: w, docH: h, x: 0, y: 0, w, h }, new Uint8Array(w * h * 4));
+
+  it.each(['saveProject', 'openProject', 'exportPng'] as const)('chooseFile(%s) resolves with the path or null when cancelled', async (purpose) => {
+    startC();
+    const p = bridge.chooseFile(purpose);
+    expect(lastChoose()).toMatchObject({ t: 'chooseFile', purpose });
+    sock().tell({ t: 'fileChosen', requestId: lastChoose().requestId, path: '/x/a.redoc' });
+    await expect(p).resolves.toBe('/x/a.redoc');
+    const p2 = bridge.chooseFile(purpose);
+    sock().tell({ t: 'fileChosen', requestId: lastChoose().requestId, path: null });
+    await expect(p2).resolves.toBeNull();
+  });
+
+  it('chooseFile rejects when offline, on disconnect and after 5 minutes', async () => {
+    startC();
+    const p = bridge.chooseFile('openProject').catch((e: Error) => e.message);
+    await vi.advanceTimersByTimeAsync(299999);
+    sock().tell({ t: 'files', projectFile: '', pngFile: '' });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await p).toMatch(/did not answer/);
+    const p2 = bridge.chooseFile('exportPng').catch((e: Error) => e.message);
+    sock().close();
+    expect(await p2).toMatch(/Disconnected/);
+    await expect(bridge.chooseFile('saveProject')).rejects.toThrow(/Not connected/);
+    await expect(bridge.placeImageViaTd()).rejects.toThrow(/Not connected/);
+  });
+
+  it('placeImageViaTd: fileChosen names the layer, topReady fetches /top and imports it', async () => {
+    startC();
+    const p = bridge.placeImageViaTd();
+    const req = lastChoose();
+    expect(req.purpose).toBe('placeImage');
+    sock().tell({ t: 'fileChosen', requestId: req.requestId, path: '/pics/My Photo.png' });
+    expect(fmc.calls).toHaveLength(0);
+    sock().tell({ t: 'topReady', requestId: req.requestId, w: 6, h: 4 });
+    await flushP();
+    expect(fmc.calls.map((c) => c.url)).toEqual([`http://td:9980/top?token=t&client=c1&requestId=${req.requestId}`]);
+    fmc.calls[0].settle(okBytes(top(6, 4)));
+    const id = await p;
+    expect(id).toBeTruthy();
+    expect(engine.imported).toEqual([{ w: 6, h: 4, name: 'My Photo.png', len: 6 * 4 * 4 }]);
+  });
+
+  it('placeImageViaTd: a Windows path is named by its basename; without fileChosen the layer is called Image', async () => {
+    startC();
+    let p = bridge.placeImageViaTd();
+    sock().tell({ t: 'fileChosen', requestId: lastChoose().requestId, path: 'C:\\pics\\cat.jpg' });
+    sock().tell({ t: 'topReady', requestId: lastChoose().requestId, w: 2, h: 2 });
+    await flushP();
+    fmc.calls[0].settle(okBytes(top(2, 2)));
+    await p;
+    p = bridge.placeImageViaTd();
+    sock().tell({ t: 'topReady', requestId: lastChoose().requestId, w: 2, h: 2 });
+    await flushP();
+    fmc.calls[1].settle(okBytes(top(2, 2)));
+    await p;
+    expect(engine.imported.map((i) => i.name)).toEqual(['cat.jpg', 'Image']);
+  });
+
+  it('placeImageViaTd: cancelled resolves null (nothing fetched or imported); topError, disconnect and timeout reject', async () => {
+    startC();
+    const p = bridge.placeImageViaTd();
+    sock().tell({ t: 'fileChosen', requestId: lastChoose().requestId, path: null });
+    await expect(p).resolves.toBeNull();
+    expect(fmc.calls).toHaveLength(0);
+    expect(engine.imported).toEqual([]);
+
+    const p2 = bridge.placeImageViaTd().catch((e: Error) => e.message);
+    sock().tell({ t: 'topError', requestId: lastChoose().requestId, msg: 'unreadable image' });
+    expect(await p2).toBe('unreadable image');
+
+    const p3 = bridge.placeImageViaTd().catch((e: Error) => e.message);
+    await vi.advanceTimersByTimeAsync(299999);
+    sock().tell({ t: 'files', projectFile: '', pngFile: '' });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await p3).toMatch(/did not answer/);
+
+    const p4 = bridge.placeImageViaTd().catch((e: Error) => e.message);
+    sock().close();
+    expect(await p4).toMatch(/Disconnected/);
+    expect(engine.imported).toEqual([]);
   });
 });

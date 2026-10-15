@@ -1,19 +1,21 @@
 import type {
-  AdjustmentSpec, AdjustmentType, Anchor, BlendMode, BrushSettings, CanvasMode, DocSpec, EditorEngine, EngineEvent, Guides, HistoryEntry,
-  LayerInfo, LayerTransform, PaintTarget, Rect, RGBA, SelectionOptions, ShapeSpec, ShapeType, SnapOptions, TextSpec, ToolContext, ToolId,
-  ToolPointer,
+  AdjustmentSpec, AdjustmentType, Anchor, BlendMode, BrushSettings, CanvasMode, CloneOptions, DocSpec, Effect, EditorEngine, EngineEvent,
+  Guides, HistoryEntry, LayerInfo, LayerTransform, PaintTarget, Rect, RGBA, SelectionOptions, ShapeSpec, ShapeType, SnapOptions, TextSpec,
+  ToolContext, ToolId, ToolPointer,
 } from './types';
 import { ADJUSTMENT_NAMES, clampAdjustment, defaultAdjustment, isIdentity, sameAdjustment } from './adjustments';
 import { Compositor } from './compositor';
 import { History } from './history';
 import {
-  BASE_ID, Document, isPixel, isVector, layerBox, layerExtent, layerXf, snapshotSurfaces, specBounds, specSame, surfaceDocBounds,
-  type AdjustmentLayer, type EditTarget, type GroupLayer, type Layer, type Mask, type PixelLayer, type ShapeLayer, type StructureSnapshot,
-  type TextLayer, type VectorLayer,
+  BASE_ID, cloneEffect, Document, floatingBounds, isPixel, isVector, layerBox, layerExtent, layerXf, MAX_INPUTS, snapshotSurfaces, specBounds,
+  specSame, surfaceDocBounds,
+  type AdjustmentLayer, type EditTarget, type GroupLayer, type InputState, type Layer, type Mask, type PixelLayer,
+  type ShapeLayer, type StructureSnapshot, type TextLayer, type VectorLayer,
 } from './model';
 import {
-  invert as invertSel, materialize, NO_SEL, rectSel, reframeSel, selectAllState, tracePath, type SelState,
+  boundsOfAlpha, invert as invertSel, materialize, NO_SEL, rectSel, reframeSel, selectAllState, tracePath, type SelState,
 } from './selection';
+import { modifySel, type SelOp } from './selectionOps';
 import {
   drawText, sameSpec, sanitizeShape, sanitizeText, scaleSpec, shapeBounds, textBounds, textBox, translateShape, translateText,
 } from './textShape';
@@ -21,12 +23,17 @@ import { clearShapeCache, drawShapeWith, setShapeCacheBudget } from './shapeSdf'
 import type { Patch } from './tiles';
 import { clipToSize, equal, intersect, isEmpty, union } from './rect';
 import { createSurface, releaseSurface, resampled, type Surface } from './surface';
+
+const copyXfLayer = (l: Xf): Xf => ({ x: l.x, y: l.y, sx: l.sx, sy: l.sy, rot: l.rot, kx: l.kx, ky: l.ky });
 import {
-  anchorOffset, cleanXf, dirtyDoc, drawMapped, IDENT, isAligned, outerRect, sameXf, type Xf,
+  anchorOffset, applyMat, cleanXf, decompose, dirtyDoc, docRectPolygon, drawMapped, IDENT, innerLayerRect, invMat, isAligned, isAxis, matOf,
+  mulMat, outerRect, sameXf, toDoc, type Xf,
 } from './xform';
 import type { Host, Scratch, Tool } from './tools/host';
 import { StrokeTool } from './tools/paint';
 import { FillTool, GradientTool, MoveTool, PickerTool } from './tools/others';
+import { BlurTool, CloneTool, DEFAULT_RETOUCH, DodgeTool, SmudgeTool, type RetouchOptions } from './tools/retouch';
+import { TileBackup } from './tiles';
 import { LassoTool, MarqueeTool, WandTool } from './tools/select';
 
 const MAX_BRUSH = 1000;
@@ -35,6 +42,8 @@ const MAX_IMPORT = 8192; // longest side of an imported image kept at native res
 const MAX_PIXELS = 8192 * 8192; // largest surface a bake (applyTransform) may produce
 const MAX_GUIDES = 512;
 const PAINT_TOOLS: ToolId[] = ['brush', 'pencil', 'eraser', 'fill', 'gradient'];
+const SELECT_TOOLS: ToolId[] = ['marquee', 'lasso', 'wand'];
+const MAX_EFFECTS = 32;
 const BLENDS: ReadonlySet<string> = new Set<BlendMode>([
   'normal', 'multiply', 'screen', 'overlay', 'soft-light', 'hard-light', 'darken', 'lighten',
   'color-dodge', 'color-burn', 'difference', 'exclusion', 'hue', 'saturation', 'color', 'luminosity',
@@ -72,6 +81,97 @@ function shiftedMask(old: Surface, w: number, h: number, dx: number, dy: number)
   return s;
 }
 
+/** A pixel layer with every v5 field at its default. */
+function newPixelLayer(id: string, name: string, surface: Surface, over: Partial<PixelLayer> = {}): PixelLayer {
+  return {
+    id, kind: 'pixel', name, visible: true, locked: false, opacity: 1, blend: 'normal', effects: [], surface,
+    x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0, slot: null, mask: null, ...over,
+  };
+}
+
+function newInputLayer(id: string, input: number, surface: Surface): PixelLayer {
+  return newPixelLayer(id, `TD Input ${input}`, surface, { kind: 'input', input, locked: true });
+}
+
+const EFFECT_NAME = /^[A-Za-z][A-Za-z0-9]{0,47}$/;
+const fnum = (v: unknown, lo: number, hi: number, def: number): number => {
+  const n = typeof v === 'number' ? v : Number.NaN;
+  return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : def;
+};
+const fint = (v: unknown, lo: number, hi: number, def: number): number => Math.round(fnum(v, lo, hi, def));
+const fpick = <T extends string>(v: unknown, ok: readonly T[], def: T): T => (ok.includes(v as T) ? (v as T) : def);
+function frgba(c: unknown, def: RGBA): RGBA {
+  const o = c && typeof c === 'object' ? (c as Record<string, unknown>) : {};
+  return { r: fnum(o.r, 0, 255, def.r), g: fnum(o.g, 0, 255, def.g), b: fnum(o.b, 0, 255, def.b), a: fnum(o.a, 0, 255, def.a) };
+}
+const BLACK: RGBA = { r: 0, g: 0, b: 0, a: 255 };
+const WHITE: RGBA = { r: 255, g: 255, b: 255, a: 255 };
+
+/**
+ * One effect with every field present and inside the ranges TouchDesigner accepts (td/raster_editor/protocol.py _EFFECT_FIELDS):
+ * missing / non-finite values take defaults, numbers are clamped. A type outside the ten v5 effects (a v6 filter) is kept verbatim
+ * (opaque parameters, deep copy, `enabled` as a boolean): TD owns its parameters. null = not an effect (no valid type name).
+ */
+export function sanitizeEffect(e: unknown): Effect | null {
+  if (!e || typeof e !== 'object') return null;
+  const o = e as Record<string, unknown>;
+  const type = o.type;
+  if (typeof type !== 'string' || !EFFECT_NAME.test(type)) return null;
+  const enabled = o.enabled !== false;
+  switch (type) {
+    case 'dropShadow':
+      return { enabled, type, dx: fnum(o.dx, -4096, 4096, 4), dy: fnum(o.dy, -4096, 4096, 4), blur: fnum(o.blur, 0, 512, 6), color: frgba(o.color, BLACK), opacity: fnum(o.opacity, 0, 1, 0.75) };
+    case 'outerGlow':
+    case 'innerGlow':
+      return { enabled, type, size: fnum(o.size, 0, 512, 8), color: frgba(o.color, WHITE), opacity: fnum(o.opacity, 0, 1, 0.75) };
+    case 'stroke':
+      return { enabled, type, width: fnum(o.width, 0, 512, 2), color: frgba(o.color, BLACK), position: fpick(o.position, ['inside', 'center', 'outside'] as const, 'outside'), opacity: fnum(o.opacity, 0, 1, 1) };
+    case 'bevel':
+      return { enabled, type, depth: fnum(o.depth, 0, 100, 50), size: fnum(o.size, 0, 512, 4), angle: fnum(o.angle, -3600, 3600, 120), highlight: frgba(o.highlight, WHITE), shadow: frgba(o.shadow, BLACK) };
+    case 'colorOverlay':
+      return { enabled, type, color: frgba(o.color, { r: 255, g: 0, b: 0, a: 255 }), opacity: fnum(o.opacity, 0, 1, 1) };
+    case 'pixelSort':
+      return { enabled, type, direction: fpick(o.direction, ['h', 'v'] as const, 'h'), low: fnum(o.low, 0, 1, 0.25), high: fnum(o.high, 0, 1, 0.75), key: fpick(o.key, ['luma', 'hue'] as const, 'luma') };
+    case 'glitch':
+      return { enabled, type, amount: fnum(o.amount, 0, 100, 30), blockSize: fnum(o.blockSize, 1, 4096, 16), seed: fint(o.seed, 0, 2 ** 31, 1), rgbShift: fnum(o.rgbShift, -1000, 1000, 4) };
+    case 'chromaticAberration':
+      return { enabled, type, amount: fnum(o.amount, -1000, 1000, 4), angle: fnum(o.angle, -3600, 3600, 0) };
+    case 'halftone':
+      return { enabled, type, cellSize: fnum(o.cellSize, 1, 512, 8), angle: fnum(o.angle, -3600, 3600, 45), shape: fpick(o.shape, ['dot', 'line'] as const, 'dot') };
+    default: {
+      const c = cloneEffect(o as unknown as Effect) as unknown as Record<string, unknown>;
+      c.enabled = enabled;
+      return c as unknown as Effect;
+    }
+  }
+}
+
+/** Validated copy of an effect stack (entries without a valid type name are dropped, see sanitizeEffect). */
+function sanitizeEffects(list: unknown): Effect[] {
+  if (!Array.isArray(list)) return [];
+  const out: Effect[] = [];
+  for (const e of list.slice(0, MAX_EFFECTS)) {
+    const c = sanitizeEffect(e);
+    if (c) out.push(c);
+  }
+  return out;
+}
+const sameEffects = (a: Effect[], b: Effect[]): boolean => a.length === b.length && JSON.stringify(a) === JSON.stringify(b);
+
+/** Content equality of two selection states of a document `w` wide (alpha arrays are compared by value, a rect-only state is full coverage). */
+function selEqual(a: SelState, b: SelState, w: number): boolean {
+  if (a === b) return true;
+  if (!equal(a.rect, b.rect)) return false;
+  const r = a.rect;
+  if (!r) return true;
+  for (let y = r.y; y < r.y + r.h; y++) {
+    for (let x = r.x; x < r.x + r.w; x++) {
+      if ((a.alpha ? a.alpha[y * w + x] : 255) !== (b.alpha ? b.alpha[y * w + x] : 255)) return false;
+    }
+  }
+  return true;
+}
+
 const copyGuides = (g: Guides): Guides => ({ h: g.h.slice(), v: g.v.slice() });
 const sameGuides = (a: Guides, b: Guides): boolean =>
   a.h.length === b.h.length && a.v.length === b.v.length && a.h.every((n, i) => n === b.h[i]) && a.v.every((n, i) => n === b.v[i]);
@@ -89,7 +189,7 @@ export class Engine implements EditorEngine, Host {
   private tools: Partial<Record<ToolId, Tool>>;
   private active: Tool | null = null;
   private last: ToolPointer | null = null;
-  private baseDirty: Rect | null = null;
+  private inputDirty = new Map<number, Rect>(); // writeInput areas (input surface space) waiting for commitInput
   private layerCount = 0;
   private groupCount = 0;
   private version = 0; // bumped on every visible change; keys the group thumbnail cache
@@ -115,17 +215,24 @@ export class Engine implements EditorEngine, Host {
   private snap: SnapOptions = { enabled: false, guides: true, canvas: true, layers: true, threshold: 6 };
   private zoom = 1; // viewport zoom, for the move tool's snapping threshold (setViewZoom)
   private boxSession: { id: string; spec0: TextSpec | ShapeSpec; box0: Rect; last: TextSpec | ShapeSpec } | null = null;
-  private baseHasInput = true; // false after setBaseSize(0, 0): the TD Input surface is an empty placeholder
-  private baseFitPending = true; // the next setBaseSize may place the TD Input (fixed canvas: fit + centre)
+  private announced = new Set<number>(); // inputs TD has listed as connected since the document was (re)loaded
+  private placePending = new Set<number>([1]); // inputs whose first real size may still place their (initial) layer
+  private cloneOpts: CloneOptions = { aligned: true, sampleAll: false };
+  private retouchOpts: RetouchOptions = { ...DEFAULT_RETOUCH };
+  private cloneTool: CloneTool;
+  private qm: { surface: Surface; layer: PixelLayer; selBefore: SelState } | null = null; // quick mask session
+  private qmVersion = 0;
+  private qmMaskCache: { version: number; mask: { rect: Rect; alpha: Uint8Array } | null } | null = null;
 
   constructor(width: number, height: number) {
     const w = clampDim(width);
     const h = clampDim(height);
-    const base: PixelLayer = {
-      id: BASE_ID, kind: 'base', name: 'TD Input', visible: true, locked: true, opacity: 1, blend: 'normal',
-      surface: createSurface(w, h), x: 0, y: 0, sx: 1, sy: 1, slot: null, mask: null,
-    };
+    const surface = createSurface(w, h);
+    const base = newInputLayer(BASE_ID, 1, surface);
+    base.name = 'TD Input';
     this.doc = new Document(w, h, base);
+    this.doc.inputs.set(1, { w, h, connected: true, surface });
+    this.doc.inputLayers.add(base);
     this.scratch = this.makeScratch();
     this.compositor = new Compositor(this.doc, (rect) => this.emit({ type: 'composite', rect }));
     this.tools = {
@@ -139,7 +246,12 @@ export class Engine implements EditorEngine, Host {
       fill: new FillTool(this),
       gradient: new GradientTool(this),
       picker: new PickerTool(this),
+      smudge: new SmudgeTool(this, () => this.retouchOpts),
+      blur: new BlurTool(this, () => this.retouchOpts),
+      dodge: new DodgeTool(this, () => this.retouchOpts),
     };
+    this.cloneTool = new CloneTool(this, () => this.cloneOpts);
+    this.tools.clone = this.cloneTool;
   }
 
   get width(): number { return this.doc.width; }
@@ -161,12 +273,14 @@ export class Engine implements EditorEngine, Host {
   context(): ToolContext { return this.ctx; }
 
   editableLayer(): EditTarget | null {
+    if (this.qm) return this.qmTarget(this.qm);
     const l = this.doc.active();
     const toMask = l !== null && l.kind !== 'group' && l.mask !== null && this.paintTarget().target === 'mask';
     const why = !l || l.kind === 'group' ? 'Select a pixel layer'
       : isVector(l) && !toMask ? 'Flatten the layer to paint on it'
         : l.kind === 'adjustment' && !toMask ? 'Select a pixel layer or a mask'
-          : !l.visible ? 'Layer is hidden' : l.locked ? 'Layer is locked' : null;
+          : l.kind === 'input' && !toMask ? 'The TD Input cannot be painted on (its mask can)'
+            : !l.visible ? 'Layer is hidden' : l.locked && !(l.kind === 'input' && toMask) ? 'Layer is locked' : null;
     if (why || !l || l.kind === 'group') {
       this.emit({ type: 'notice', message: why ?? 'Select a pixel layer' });
       return null;
@@ -177,12 +291,16 @@ export class Engine implements EditorEngine, Host {
   movableLayer(): PixelLayer | VectorLayer | null {
     const l = this.doc.active();
     // The lock protects the pixels; the TD Input is always locked but may be moved and scaled like any layer.
-    const why = !l || l.kind === 'group' || l.kind === 'adjustment' ? 'Select a pixel layer to move' : !l.visible ? 'Layer is hidden' : l.locked && l.kind !== 'base' ? 'Layer is locked' : null;
+    const why = !l || l.kind === 'group' || l.kind === 'adjustment' ? 'Select a pixel layer to move' : !l.visible ? 'Layer is hidden' : l.locked && l.kind !== 'input' ? 'Layer is locked' : null;
     if (why || !l || l.kind === 'group' || l.kind === 'adjustment') {
       this.emit({ type: 'notice', message: why ?? 'Select a pixel layer to move' });
       return null;
     }
     return l;
+  }
+
+  private qmTarget(q: NonNullable<Engine['qm']>): EditTarget {
+    return { layer: q.layer, isMask: true, quick: true, surface: q.surface, slot: null, tf: IDENT };
   }
 
   private makeTarget(layer: PixelLayer | AdjustmentLayer | VectorLayer, mask: boolean): EditTarget {
@@ -204,6 +322,12 @@ export class Engine implements EditorEngine, Host {
   }
 
   paintChanged(target: EditTarget, layerRect: Rect): void {
+    if (target.quick) {
+      // quick mask: nothing to composite; the viewport redraws its overlay from quickMaskSource()
+      this.qmVersion++;
+      this.emit({ type: 'selection' });
+      return;
+    }
     if (target.layer.kind === 'pixel') target.layer.pristine = false;
     this.changed(dirtyDoc(target.tf, layerRect));
     if (target.slot === null) return;
@@ -218,14 +342,20 @@ export class Engine implements EditorEngine, Host {
 
   pushPatch(label: string, target: EditTarget, patches: Patch[]): void {
     const apply = (which: 'before' | 'after') => () => {
+      if (target.quick && this.qm?.layer !== target.layer) return; // that quick mask session is over
       for (const p of patches) {
         target.surface.ctx.putImageData(p[which], p.rect.x, p.rect.y);
         this.paintChanged(target, p.rect);
       }
     };
     const bytes = patches.reduce((n, p) => n + p.before.data.length + p.after.data.length, 0);
-    this.hist.push({ label, bytes, undo: apply('before'), redo: apply('after') });
+    this.hist.push({ label, bytes, undo: apply('before'), redo: apply('after'), tag: target.quick ? 'qm' : undefined });
     this.emit({ type: 'history' });
+  }
+
+  compositeCanvas(rect: Rect): CanvasImageSource {
+    this.compositor.ensure(rect);
+    return this.compositor.surface.canvas as CanvasImageSource;
   }
 
   /**
@@ -268,7 +398,7 @@ export class Engine implements EditorEngine, Host {
    * surface is touched or resampled, history is cleared. The canvas mode is not changed (see adoptCanvas).
    */
   resize(width: number, height: number): void {
-    this.finishStroke();
+    this.settleForCanvas();
     const w = clampDim(width);
     const h = clampDim(height);
     if (w === this.doc.width && h === this.doc.height) return;
@@ -301,9 +431,7 @@ export class Engine implements EditorEngine, Host {
     if (this.doc.canvasMode !== mode) {
       this.doc.canvasMode = mode === 'fixed' ? 'fixed' : 'input';
       if (this.doc.canvasMode === 'input') { // following the input: it fills the canvas again (as setCanvasMode('input'))
-        const base = this.doc.find(BASE_ID) as PixelLayer;
-        base.x = base.y = 0;
-        base.sx = base.sy = 1;
+        this.resetPrimary();
         this.compositor.invalidate(null);
       }
       this.bumpSpec();
@@ -343,7 +471,7 @@ export class Engine implements EditorEngine, Host {
     this.dropSelCaches();
     this.sel = newSel;
     this.doc.selection = newSel.rect;
-    this.baseDirty = null;
+    this.inputDirty.clear();
     this.surfaceDirty = null;
     if (nw !== ow || nh !== oh) this.compositor.resize();
     else this.compositor.invalidate(null);
@@ -390,30 +518,50 @@ export class Engine implements EditorEngine, Host {
     const ow = this.doc.width;
     const oh = this.doc.height;
     if (nw === ow && nh === oh && this.doc.canvasMode === 'fixed') return;
-    this.finishStroke();
+    this.settleForCanvas();
     const { dx, dy } = anchorOffset(anchor, ow, oh, nw, nh);
+    this.reframeEntry('Canvas size', nw, nh, dx, dy);
+  }
+
+  /** The canvas becomes `rect` (integer, may reach outside the old canvas): everything shifts by -rect.xy, nothing is resampled. Fixed canvas mode; history. */
+  cropTo(rect: Rect): void {
+    if (![rect.x, rect.y, rect.w, rect.h].every(Number.isFinite)) return;
+    const x = Math.round(rect.x);
+    const y = Math.round(rect.y);
+    const nw = clampDim(rect.w);
+    const nh = clampDim(rect.h);
+    if (x === 0 && y === 0 && nw === this.doc.width && nh === this.doc.height && this.doc.canvasMode === 'fixed') return;
+    this.settleForCanvas();
+    this.reframeEntry('Crop', nw, nh, -x, -y);
+  }
+
+  private settleForCanvas(): void {
+    this.finishStroke();
+    if (this.qm) this.setQuickMask(false);
+  }
+
+  private reframeEntry(label: string, nw: number, nh: number, dx: number, dy: number): void {
     const sBefore = this.doc.snapshot();
     const cBefore = this.canvasState();
-    const prev = { w: ow, h: oh, sel: this.sel };
+    const prev = { w: this.doc.width, h: this.doc.height, sel: this.sel };
     this.doc.canvasMode = 'fixed';
     this.reframe(nw, nh, dx, dy);
     this.announceCanvas(prev);
-    this.canvasEntry('Canvas size', sBefore, cBefore);
+    this.canvasEntry(label, sBefore, cBefore);
   }
 
   setCanvasMode(mode: CanvasMode): void {
     if (mode === this.doc.canvasMode) return;
-    this.finishStroke();
+    this.settleForCanvas();
     const sBefore = this.doc.snapshot();
     const cBefore = this.canvasState();
     const prev = { w: this.doc.width, h: this.doc.height, sel: this.sel };
     if (mode === 'input') {
       this.doc.canvasMode = 'input';
-      const base = this.doc.find(BASE_ID) as PixelLayer;
-      base.x = base.y = 0;
-      base.sx = base.sy = 1;
-      const w = this.baseHasInput ? base.surface.width : this.doc.width;
-      const h = this.baseHasInput ? base.surface.height : this.doc.height;
+      const st = this.doc.inputs.get(1);
+      this.resetPrimary();
+      const w = st && st.connected ? st.w : this.doc.width;
+      const h = st && st.connected ? st.h : this.doc.height;
       this.reframe(clampDim(w), clampDim(h), 0, 0);
     } else {
       this.doc.canvasMode = 'fixed';
@@ -425,44 +573,184 @@ export class Engine implements EditorEngine, Host {
 
   canvasMode(): CanvasMode { return this.doc.canvasMode; }
 
-  /**
-   * The TD Input resolution changed (BASE frames with a new docW/docH, or 0 x 0 = no input). The base surface is reallocated
-   * (empty until its BASE frames arrive), no history. The very first time an input appears the base is placed: identity when
-   * the canvas follows the input, otherwise fitted (contain) and centred in the canvas.
-   */
-  setBaseSize(w: number, h: number): void {
-    const base = this.doc.find(BASE_ID) as PixelLayer;
-    const has = w >= 1 && h >= 1;
-    const nw = has ? clampDim(w) : 1;
-    const nh = has ? clampDim(h) : 1;
-    if (nw === base.surface.width && nh === base.surface.height && has === this.baseHasInput) return;
-    const old = base.surface;
-    if (has && this.baseHasInput && !this.baseFitPending && this.doc.canvasMode === 'fixed') {
-      // fixed canvas: the input keeps the document-space box it showed (its resolution changed, not its size on the canvas)
-      base.sx = (base.sx * old.width) / nw;
-      base.sy = (base.sy * old.height) / nh;
+  // ---- TD inputs (v5) ----
+
+  /** The layer that follows input 1 in Follow Input mode: the lowest input layer referencing input 1. */
+  private primaryInput(): PixelLayer | null {
+    let out: PixelLayer | null = null;
+    for (const l of this.doc.all()) if (l.kind === 'input' && l.input === 1) out = l;
+    return out;
+  }
+
+  /** Follow Input: input 1 fills the canvas again. */
+  private resetPrimary(): void {
+    const p = this.primaryInput();
+    if (!p) return;
+    p.x = p.y = 0;
+    p.sx = p.sy = 1;
+    p.rot = p.kx = p.ky = 0;
+  }
+
+  /** Where a freshly created / first-sized input layer goes: identity (Follow Input + input 1, or same size), otherwise fit (contain) and centre. */
+  private placeInput(l: PixelLayer): void {
+    const nw = l.surface.width;
+    const nh = l.surface.height;
+    const { width: dw, height: dh } = this.doc;
+    l.rot = l.kx = l.ky = 0;
+    if ((this.doc.canvasMode === 'input' && l.input === 1) || (nw === dw && nh === dh)) {
+      l.x = l.y = 0;
+      l.sx = l.sy = 1;
+      return;
     }
-    base.surface = createSurface(nw, nh);
-    releaseSurface(old);
-    this.baseHasInput = has;
-    this.baseDirty = null;
-    if (has && this.baseFitPending) {
-      this.baseFitPending = false;
-      if (this.doc.canvasMode === 'fixed' && (nw !== this.doc.width || nh !== this.doc.height)) {
-        const k = Math.min(this.doc.width / nw, this.doc.height / nh);
-        base.sx = base.sy = k;
-        base.x = Math.round((this.doc.width - nw * k) / 2);
-        base.y = Math.round((this.doc.height - nh * k) / 2);
-      } else {
-        base.x = base.y = 0;
-        base.sx = base.sy = 1;
+    const k = Math.min(dw / nw, dh / nh);
+    l.sx = l.sy = k;
+    l.x = Math.round((dw - nw * k) / 2);
+    l.y = Math.round((dh - nh * k) / 2);
+  }
+
+  private inputState(n: number, connected: boolean): InputState {
+    let st = this.doc.inputs.get(n);
+    if (!st) {
+      st = { w: 1, h: 1, connected, surface: createSurface(1, 1) };
+      this.doc.inputs.set(n, st);
+    }
+    return st;
+  }
+
+  /** Give input `n` a new surface size: every layer referencing it (also deleted ones kept by history) gets the new surface; masks are resampled. */
+  private resizeInput(n: number, nw: number, nh: number, keepBox: boolean): void {
+    const st = this.inputState(n, true);
+    const old = st.surface;
+    const surface = createSurface(nw, nh);
+    const oldMasks: Surface[] = [];
+    for (const l of this.doc.inputLayers) {
+      if (l.input !== n) continue;
+      if (keepBox) { // the input changed resolution, not its size on the canvas
+        l.sx = (l.sx * old.width) / nw;
+        l.sy = (l.sy * old.height) / nh;
+      }
+      l.surface = surface;
+      if (l.mask && (l.mask.surface.width !== nw || l.mask.surface.height !== nh)) {
+        oldMasks.push(l.mask.surface);
+        l.mask.surface = resampled(l.mask.surface, nw, nh, true);
       }
     }
+    oldMasks.forEach(releaseSurface);
+    releaseSurface(old);
+    st.surface = surface;
+    st.w = nw;
+    st.h = nh;
+    this.inputDirty.delete(n);
+  }
+
+  /** Is any input layer in the stack referencing input `n`? */
+  private inputReferenced(n: number): boolean {
+    return this.doc.all().some((l) => l.kind === 'input' && l.input === n);
+  }
+
+  /**
+   * TD told us which inputs exist (`items` is the full list; inputs not listed count as disconnected), no history.
+   *  - a newly connected input nothing references gets a locked "TD Input N" layer (placeInput), above the topmost input layer
+   *    (or at the bottom when there is none); that layer is not in history, snapshots taken earlier keep it (Document.restore);
+   *  - a size change reallocates the shared surface of the input (empty until its frames arrive) and, in a fixed canvas, keeps the
+   *    box the layers showed (a Follow Input canvas puts input 1 back to identity);
+   *  - a disconnected input keeps its layers (and placement); they render nothing and report inputConnected = false.
+   */
+  setInputs(items: Array<{ input: number; w: number; h: number; connected: boolean }>): void {
+    const incoming = new Map<number, { w: number; h: number; connected: boolean }>();
+    for (const it of items ?? []) {
+      const n = Math.trunc(it.input);
+      if (!(n >= 1 && n <= MAX_INPUTS)) continue;
+      incoming.set(n, { w: Number(it.w) || 0, h: Number(it.h) || 0, connected: !!it.connected && it.w >= 1 && it.h >= 1 });
+    }
+    let layersChanged = false;
+    let touched = false;
+    const created: PixelLayer[] = [];
+    for (let n = 1; n <= MAX_INPUTS; n++) {
+      const it = incoming.get(n) ?? { w: 0, h: 0, connected: false };
+      const known = this.doc.inputs.get(n);
+      if (!known && !it.connected) continue;
+      const st = this.inputState(n, false);
+      const wasConnected = known ? known.connected : false;
+      if (it.connected) {
+        const nw = clampDim(it.w);
+        const nh = clampDim(it.h);
+        const sized = known ? nw !== st.surface.width || nh !== st.surface.height : false;
+        if (!known) {
+          releaseSurface(st.surface);
+          st.surface = createSurface(nw, nh); // replaces the 1 x 1 placeholder
+          st.w = nw;
+          st.h = nh;
+        } else if (sized) {
+          const place = this.placePending.has(n);
+          const keepBox = !place; // the box on the canvas is kept (Follow Input puts input 1 back to identity below)
+          this.resizeInput(n, nw, nh, keepBox);
+          if (place) {
+            for (const l of this.doc.inputLayers) if (l.input === n) this.placeInput(l);
+          } else if (this.doc.canvasMode === 'input') this.resetPrimary();
+          layersChanged = true;
+          touched = true;
+        } else if (this.placePending.has(n) && !wasConnected) {
+          for (const l of this.doc.inputLayers) if (l.input === n) this.placeInput(l);
+        }
+        this.placePending.delete(n);
+        st.connected = true;
+        const first = !this.announced.has(n);
+        this.announced.add(n);
+        if (!wasConnected || first) {
+          touched = true;
+          layersChanged = true;
+          if (!this.inputReferenced(n)) {
+            const layer = newInputLayer(this.doc.newId(), n, st.surface);
+            this.doc.inputLayers.add(layer);
+            this.placeInput(layer);
+            created.push(layer);
+          }
+        }
+      } else if (st.connected) {
+        this.announced.delete(n);
+        st.connected = false;
+        touched = true;
+        layersChanged = true;
+      }
+    }
+    for (const layer of created) this.insertAutoLayer(layer);
+    if (!touched && !layersChanged) return;
     this.version++;
+    this.thumbs.clear();
     this.compositor.invalidate(null);
     this.emit({ type: 'pixels', rect: this.docRect() });
     this.emit({ type: 'structure' });
     this.syncSpec(true);
+  }
+
+  /** Put a layer created from a TD input into the root stack without a history entry. */
+  private insertAutoLayer(layer: PixelLayer): void {
+    const kids = this.doc.root.children;
+    let at = kids.length; // bottom
+    for (let i = 0; i < kids.length; i++) {
+      if (kids[i].kind === 'input') { at = i; break; } // topmost input layer: go above it
+    }
+    kids.splice(at, 0, layer);
+    this.doc.autoLayers.push({ layer, stamp: this.doc.nextStamp(), fromBottom: kids.length - at });
+    if (!this.doc.activeId) this.doc.activeId = layer.id;
+  }
+
+  /** Add (again) a layer showing TD input `n` (1..8) above the active layer; history entry. Returns its id. */
+  addInputLayer(input: number): string {
+    const n = Math.min(MAX_INPUTS, Math.max(1, Math.trunc(Number(input)) || 1));
+    const st = this.inputState(n, false);
+    const layer = newInputLayer(this.doc.newId(), n, st.surface);
+    this.doc.inputLayers.add(layer);
+    this.placeInput(layer);
+    this.insertAboveActive('Add input layer', layer, outerRect(surfaceDocBounds(layer)));
+    return layer.id;
+  }
+
+  /** @deprecated v4 shim: the size of input 1 (0 x 0 = disconnected). Use setInputs. */
+  setBaseSize(w: number, h: number): void {
+    const items = [...this.doc.inputs].filter(([n]) => n !== 1).map(([n, st]) => ({ input: n, w: st.w, h: st.h, connected: st.connected }));
+    this.setInputs([{ input: 1, w, h, connected: w >= 1 && h >= 1 }, ...items]);
   }
 
   /** Viewport zoom (screen px per document px), used by the move tool's snapping threshold. Default 1. */
@@ -593,11 +881,9 @@ export class Engine implements EditorEngine, Host {
   }
 
   addPixelLayer(name?: string): string {
-    const layer: PixelLayer = {
-      id: this.doc.newId(), kind: 'pixel', name: name ?? `Layer ${++this.layerCount}`, visible: true, locked: false,
-      opacity: 1, blend: 'normal', surface: createSurface(this.doc.width, this.doc.height), x: 0, y: 0, sx: 1, sy: 1,
-      slot: this.doc.newSlot(), mask: null, pristine: true,
-    };
+    const layer = newPixelLayer(this.doc.newId(), name ?? `Layer ${++this.layerCount}`, createSurface(this.doc.width, this.doc.height), {
+      slot: this.doc.newSlot(), pristine: true,
+    });
     this.freshSlots.add(layer.slot as number);
     this.insertAboveActive('Add layer', layer, false);
     return layer.id;
@@ -607,7 +893,7 @@ export class Engine implements EditorEngine, Host {
     const adjustment = defaultAdjustment(type);
     const layer: AdjustmentLayer = {
       id: this.doc.newId(), kind: 'adjustment', name: ADJUSTMENT_NAMES[type], visible: true, locked: false,
-      opacity: 1, blend: 'normal', adjustment, mask: null,
+      opacity: 1, blend: 'normal', adjustment, mask: null, effects: [],
     };
     this.insertAboveActive('Add adjustment', layer, isIdentity(adjustment) ? false : null);
     return layer.id;
@@ -626,13 +912,13 @@ export class Engine implements EditorEngine, Host {
 
   addMask(layerId: string): number {
     const l = this.doc.find(layerId);
-    if (!l || l.kind === 'group' || l.kind === 'base') {
+    if (!l || l.kind === 'group') {
       this.emit({ type: 'notice', message: 'Masks need a pixel or adjustment layer' });
       return -1;
     }
     if (l.mask) return l.mask.slot;
     // A pixel layer's mask has the size of its surface (layer space); other layers' masks are document sized.
-    const mask: Mask = { slot: this.doc.newSlot(), surface: l.kind === 'pixel' ? whiteMask(l.surface.width, l.surface.height) : whiteMask(this.doc.width, this.doc.height), enabled: true };
+    const mask: Mask = { slot: this.doc.newSlot(), surface: isPixel(l) ? whiteMask(l.surface.width, l.surface.height) : whiteMask(this.doc.width, this.doc.height), enabled: true };
     this.structural('Add mask', () => { l.mask = mask; }, false); // white: nothing visible changes
     return mask.slot;
   }
@@ -659,7 +945,7 @@ export class Engine implements EditorEngine, Host {
       this.emit({ type: 'notice', message: 'Layer has no mask' });
       t = 'pixels';
     }
-    this.finishStroke();
+    this.finishStroke(this.doc.activeId !== layerId);
     const was = this.paintTarget();
     this.doc.activeId = layerId;
     this.maskTargetLayer = t === 'mask' ? layerId : null;
@@ -676,21 +962,20 @@ export class Engine implements EditorEngine, Host {
   addGroup(name?: string): string {
     const group: GroupLayer = {
       id: this.doc.newId(), kind: 'group', name: name ?? `Group ${++this.groupCount}`, visible: true, locked: false,
-      opacity: 1, blend: 'normal', children: [], expanded: true,
+      opacity: 1, blend: 'normal', children: [], expanded: true, effects: [],
     };
     this.insertAboveActive('Add group', group, false);
     return group.id;
   }
 
   deleteLayer(id: string): void {
-    if (id === BASE_ID) return this.emit({ type: 'notice', message: 'The base layer cannot be deleted' });
     const loc = this.doc.locate(id);
     if (!loc) return;
     this.structural('Delete layer', () => {
       loc.parent.children.splice(loc.index, 1);
       if (!this.doc.find(this.doc.activeId)) {
         const next = loc.parent.children[loc.index] ?? loc.parent.children[loc.index - 1] ?? (loc.parent === this.doc.root ? null : loc.parent);
-        this.doc.activeId = (next ?? this.doc.root.children[0]).id;
+        this.doc.activeId = (next ?? this.doc.root.children[0])?.id ?? null;
       }
     });
     this.thumbs.forEach((_, k) => { if (!this.doc.find(k)) this.thumbs.delete(k); });
@@ -699,13 +984,12 @@ export class Engine implements EditorEngine, Host {
   moveLayer(id: string, targetParentId: string | null, index: number): void {
     const loc = this.doc.locate(id);
     const layer = this.doc.find(id);
-    if (!loc || !layer || id === BASE_ID) return;
+    if (!loc || !layer) return;
     const target = targetParentId === null ? this.doc.root : this.doc.find(targetParentId);
     if (!target || target.kind !== 'group') return;
     if (layer.kind === 'group' && (target === layer || this.isInside(layer, target))) return;
     const others = target.children.length - (target === loc.parent ? 1 : 0);
-    const max = others - (target === this.doc.root ? 1 : 0); // the base layer stays at the bottom of the root
-    const at = Math.max(0, Math.min(Math.trunc(index) || 0, max));
+    const at = Math.max(0, Math.min(Math.trunc(index) || 0, others));
     if (target === loc.parent && at === loc.index) return;
     this.structural('Move layer', () => {
       loc.parent.children.splice(loc.index, 1);
@@ -719,7 +1003,7 @@ export class Engine implements EditorEngine, Host {
     const next: LayerProps = { ...props };
     if (next.opacity !== undefined) next.opacity = clamp01(next.opacity);
     if (next.name !== undefined) next.name = String(next.name);
-    if (l.kind === 'base') delete next.locked; // the base layer stays locked: it is TouchDesigner's input
+    if (l.kind === 'input') delete next.locked; // an input layer stays locked: its pixels are TouchDesigner's
     if (l.kind === 'adjustment') delete next.blend; // adjustments have no blend mode
     const keys = (Object.keys(next) as (keyof LayerProps)[]).filter((k) => {
       if (next[k] === undefined) return false;
@@ -742,10 +1026,7 @@ export class Engine implements EditorEngine, Host {
 
   flattenToNewLayer(): string {
     this.compositor.ensure(null);
-    const layer: PixelLayer = {
-      id: this.doc.newId(), kind: 'pixel', name: 'Flattened', visible: true, locked: false, opacity: 1, blend: 'normal',
-      surface: createSurface(this.doc.width, this.doc.height), x: 0, y: 0, sx: 1, sy: 1, slot: this.doc.newSlot(), mask: null,
-    };
+    const layer = newPixelLayer(this.doc.newId(), 'Flattened', createSurface(this.doc.width, this.doc.height), { slot: this.doc.newSlot() });
     layer.surface.ctx.drawImage(this.compositor.surface.canvas as CanvasImageSource, 0, 0);
     this.structural('Flatten', () => {
       this.doc.root.children.unshift(layer);
@@ -805,7 +1086,9 @@ export class Engine implements EditorEngine, Host {
     c.beginPath();
     c.rect(ox, oy, w, h);
     c.clip();
-    c.drawImage(px.surface.canvas as CanvasImageSource, ox + px.x * k, oy + px.y * k, px.surface.width * px.sx * k, px.surface.height * px.sy * k);
+    const m = matOf(px);
+    c.transform(k * m.a, k * m.b, k * m.c, k * m.d, ox + k * m.e, oy + k * m.f);
+    c.drawImage(px.surface.canvas as CanvasImageSource, 0, 0);
     c.restore();
   }
 
@@ -829,7 +1112,9 @@ export class Engine implements EditorEngine, Host {
     c.beginPath();
     c.rect(ox, oy, w, h);
     c.clip();
-    c.drawImage(m.canvas as CanvasImageSource, ox + t.x * k, oy + t.y * k, m.width * t.sx * k, m.height * t.sy * k); // white with alpha = grey on black
+    const mt = matOf(t);
+    c.transform(k * mt.a, k * mt.b, k * mt.c, k * mt.d, ox + k * mt.e, oy + k * mt.f);
+    c.drawImage(m.canvas as CanvasImageSource, 0, 0); // white with alpha = grey on black
     c.restore();
   }
 
@@ -924,21 +1209,44 @@ export class Engine implements EditorEngine, Host {
 
   setPreviewEnabled(enabled: boolean): void { this.compositor.setEnabled(enabled); }
 
-  /** Replace the whole document. Surfaces start empty (masks fully visible); pixels arrive through writeSurface. */
+  /**
+   * Replace the whole document. Surfaces start empty (masks fully visible); pixels arrive through writeSurface. A v5 `base` layer
+   * is read as input 1 (id kept); missing rot / kx / ky / input / effects take their defaults. Input surfaces (TouchDesigner's
+   * live frames) are kept when their size matches.
+   */
   loadDocument(spec: DocSpec): void {
     const plan = this.validateSpec(spec);
     this.finishStroke();
+    this.cancelFloating();
+    if (this.qm) this.setQuickMask(false);
     const w = clampDim(spec.width);
     const h = clampDim(spec.height);
     const resized = w !== this.doc.width || h !== this.doc.height;
-    const oldBase = this.doc.find(BASE_ID) as PixelLayer;
-    const baseSpec = plan[0];
-    const bw = baseSpec.surfaceW as number;
-    const bh = baseSpec.surfaceH as number;
-    const keepBase = oldBase.surface.width === bw && oldBase.surface.height === bh;
-    for (const l of this.doc.pixelLayers()) if (l !== oldBase) releaseSurface(l.surface);
-    if (!keepBase) releaseSurface(oldBase.surface);
+    for (const l of this.doc.pixelLayers()) if (l.kind === 'pixel') releaseSurface(l.surface);
     for (const m of this.doc.masks()) releaseSurface(m.surface);
+    for (const l of this.doc.inputLayers) if (l.mask) releaseSurface(l.mask.surface); // (also those of deleted layers)
+    this.doc.inputLayers.clear();
+    this.doc.autoLayers.length = 0;
+    // input surfaces: one per referenced input, sized as the document says
+    const wanted = new Map<number, { w: number; h: number }>();
+    for (const sp of plan) {
+      if (sp.kind === 'base' as string || sp.kind === 'input') {
+        const n = sp.kind === 'input' ? (sp.input as number) : 1;
+        if (!wanted.has(n)) wanted.set(n, { w: sp.surfaceW as number, h: sp.surfaceH as number });
+      }
+    }
+    wanted.forEach((sz, n) => {
+      const st = this.doc.inputs.get(n);
+      if (st && st.surface.width === sz.w && st.surface.height === sz.h) return;
+      if (st) {
+        releaseSurface(st.surface);
+        st.surface = createSurface(sz.w, sz.h);
+        st.w = sz.w;
+        st.h = sz.h;
+      } else {
+        this.doc.inputs.set(n, { w: sz.w, h: sz.h, connected: true, surface: createSurface(sz.w, sz.h) });
+      }
+    });
     this.doc.width = w;
     this.doc.height = h;
     const kids = new Map<string | null, Layer[]>([[null, []]]);
@@ -952,11 +1260,13 @@ export class Engine implements EditorEngine, Host {
     for (const sp of plan) {
       const num = /^L(\d+)$/.exec(sp.id);
       if (num) maxId = Math.max(maxId, Number(num[1]));
+      const isInput = sp.kind === 'input' || (sp.kind as string) === 'base';
       const common = {
-        id: sp.kind === 'base' ? BASE_ID : sp.id, name: String(sp.name), visible: !!sp.visible, locked: sp.kind === 'base',
+        id: sp.id, name: String(sp.name), visible: !!sp.visible, locked: isInput,
         opacity: clamp01(Number(sp.opacity)), blend: (BLENDS.has(sp.blend) ? sp.blend : 'normal') as BlendMode,
+        effects: sp.kind === 'group' || sp.kind === 'adjustment' ? [] : sanitizeEffects(sp.effects),
       };
-      const xf = cleanXf({ x: sp.x, y: sp.y, sx: sp.sx ?? 1, sy: sp.sy ?? 1 }) as Xf;
+      const xf = cleanXf({ x: sp.x, y: sp.y, sx: sp.sx ?? 1, sy: sp.sy ?? 1, rot: sp.rot ?? 0, kx: sp.kx ?? 0, ky: sp.ky ?? 0 }) as Xf;
       let layer: Layer;
       if (sp.kind === 'group') {
         layer = { ...common, kind: 'group', children: [], expanded: true };
@@ -968,10 +1278,12 @@ export class Engine implements EditorEngine, Host {
         layer = sp.kind === 'text'
           ? ({ ...v, kind: 'text', spec: sanitizeText(sp.text as TextSpec) } as TextLayer)
           : ({ ...v, kind: 'shape', spec: sanitizeShape(sp.shape as ShapeSpec) } as ShapeLayer);
-      } else if (sp.kind === 'base') {
-        layer = oldBase;
-        Object.assign(oldBase, common, xf, { slot: null, mask: null, surface: keepBase ? oldBase.surface : createSurface(bw, bh) });
-        this.baseHasInput = true;
+      } else if (isInput) {
+        const n = sp.kind === 'input' ? (sp.input as number) : 1;
+        const st = this.doc.inputs.get(n) as InputState;
+        const il = { ...common, ...xf, kind: 'input' as const, input: n, surface: st.surface, slot: null, mask: mk(sp.mask, st.surface.width, st.surface.height) } as PixelLayer;
+        this.doc.inputLayers.add(il);
+        layer = il;
       } else {
         maxSlot = Math.max(maxSlot, sp.slot as number);
         const sw = sp.surfaceW as number;
@@ -989,8 +1301,9 @@ export class Engine implements EditorEngine, Host {
     this.doc.reseed(maxId, maxSlot);
     this.doc.guides = copyGuides(spec.guides ?? { h: [], v: [] });
     this.doc.canvasMode = spec.canvas?.mode === 'fixed' ? 'fixed' : 'input';
-    this.baseFitPending = false; // the document says where the TD Input sits
-    if (!this.doc.find(this.doc.activeId)) this.doc.activeId = this.doc.root.children[0]?.id ?? BASE_ID;
+    this.announced.clear(); // TD's next inputs list creates layers for connected inputs the document lacks
+    this.placePending.clear(); // the document says where the TD Inputs sit
+    if (!this.doc.find(this.doc.activeId)) this.doc.activeId = this.doc.root.children[0]?.id ?? null;
     this.maskTargetLayer = null;
     if (resized) this.compositor.resize();
     else this.compositor.invalidate(null);
@@ -1000,7 +1313,7 @@ export class Engine implements EditorEngine, Host {
     this.dropSelCaches();
     this.sel = NO_SEL;
     this.doc.selection = null;
-    this.baseDirty = null;
+    this.inputDirty.clear();
     this.surfaceDirty = null;
     this.freshSlots.clear();
     this.knownSlots.clear(); // every slot counts as new: a 'surface' event for each
@@ -1014,7 +1327,7 @@ export class Engine implements EditorEngine, Host {
 
   private validateSpec(spec: DocSpec): DocSpec['layers'] {
     const bad = (m: string): never => { throw new RangeError(`loadDocument: ${m}`); };
-    if (!spec || !Array.isArray(spec.layers) || !spec.layers.length) bad('no layers');
+    if (!spec || !Array.isArray(spec.layers)) bad('no layers');
     if (!(spec.width >= 1 && spec.height >= 1)) bad('bad size');
     const g = spec.guides;
     if (g !== undefined) {
@@ -1031,53 +1344,69 @@ export class Engine implements EditorEngine, Host {
     };
     const dim = (n: unknown): boolean => Number.isInteger(n) && (n as number) >= 1 && (n as number) <= MAX_DIM;
     const area = (l: { surfaceW: number | null; surfaceH: number | null }): boolean => (l.surfaceW as number) * (l.surfaceH as number) <= MAX_PIXELS;
-    spec.layers.forEach((l, i) => {
-      if ((l.kind === 'base') !== (i === 0)) bad('exactly one base layer, first');
+    const fin = (n: unknown): boolean => n === undefined || n === null || (typeof n === 'number' && Number.isFinite(n));
+    // the input number a layer shows (a legacy `base` layer is input 1)
+    const inputOf = (l: DocSpec['layers'][number]): number => (l.kind === 'input' ? (l.input as number) : 1);
+    spec.layers.forEach((l) => {
       if (ids.has(l.id)) bad(`duplicate id ${l.id}`);
       ids.add(l.id);
-      if (i === 0 ? l.parentId !== null : l.parentId !== null && !groups.has(l.parentId)) bad(`bad parent of ${l.id}`);
-      if (l.kind === 'pixel' || l.kind === 'base') {
+      if (l.parentId !== null && l.parentId !== undefined && !groups.has(l.parentId)) bad(`bad parent of ${l.id}`);
+      if (l.parentId === undefined) (l as { parentId: string | null }).parentId = null;
+      const legacyBase = (l.kind as string) === 'base';
+      if (l.kind === 'pixel' || l.kind === 'input' || legacyBase) {
         if (!Number.isFinite(l.x) || !Number.isFinite(l.y)) bad(`bad position of ${l.id}`);
+        if (!cleanXf({ x: l.x, y: l.y, sx: l.sx > 0 ? l.sx : 1, sy: l.sy > 0 ? l.sy : 1, rot: l.rot ?? 0, kx: l.kx ?? 0, ky: l.ky ?? 0 })) bad(`bad (singular) transform of ${l.id}`);
         if (!(Number.isFinite(l.sx) && Number.isFinite(l.sy) && l.sx > 0 && l.sy > 0)) bad(`bad scale of ${l.id}`);
+        if (!fin(l.rot) || !fin(l.kx) || !fin(l.ky)) bad(`bad rotation / skew of ${l.id}`);
         if (!dim(l.surfaceW) || !dim(l.surfaceH)) bad(`bad surface size of ${l.id}`);
         if (!area(l)) bad(`surface of ${l.id} is too large`);
       }
+      if (l.effects !== undefined && !Array.isArray(l.effects)) bad(`bad effects of ${l.id}`);
       if (l.kind === 'group') groups.add(l.id);
       else if (l.kind === 'pixel') take(l.slot);
-      else if (l.kind === 'adjustment') { if (!l.adjustment || !(l.adjustment.type in ADJUSTMENT_NAMES)) bad(`adjustment ${l.id}`); }
+      else if (l.kind === 'input' || legacyBase) {
+        const n = inputOf(l);
+        if (!Number.isInteger(n) || n < 1 || n > MAX_INPUTS) bad(`bad input number of ${l.id}`);
+      } else if (l.kind === 'adjustment') { if (!l.adjustment || !(l.adjustment.type in ADJUSTMENT_NAMES)) bad(`adjustment ${l.id}`); }
       else if (l.kind === 'text' || l.kind === 'shape') {
         const sp = l.kind === 'text' ? l.text : l.shape;
         if (!sp || typeof sp !== 'object') bad(`${l.kind} spec of ${l.id}`);
         try { if (l.kind === 'text') sanitizeText(l.text as TextSpec); else sanitizeShape(l.shape as ShapeSpec); } catch { bad(`${l.kind} spec of ${l.id}`); }
         if (l.slot !== null && l.slot !== undefined) bad(`${l.kind} layer ${l.id} cannot own a surface`);
-      } else if (l.kind !== 'base') bad(`unknown kind ${String(l.kind)}`);
-      if (l.mask && l.kind !== 'group' && l.kind !== 'base') take(l.mask.slot);
-      else if (l.mask) bad(`${l.kind} layers cannot have masks`);
+      } else bad(`unknown kind ${String(l.kind)}`);
+      if (l.mask && l.kind !== 'group') take(l.mask.slot);
+      else if (l.mask) bad('groups cannot have masks');
     });
     return spec.layers;
   }
 
-  // ---- Base layer ----
+  // ---- TD input frames ----
 
-  /** Straight RGBA rows of the TD Input in its own pixel space (rects lie inside the base surface, see setBaseSize). */
-  writeBase(rect: Rect, rgba: Uint8Array | Uint8ClampedArray): void {
+  /** Straight RGBA rows of TD input `input` in its own pixel space (rects lie inside its surface, see setInputs). Records no history. */
+  writeInput(input: number, rect: Rect, rgba: Uint8Array | Uint8ClampedArray): void {
     const ints = [rect.x, rect.y, rect.w, rect.h].every(Number.isInteger);
-    if (!ints || rect.w < 0 || rect.h < 0) throw new RangeError('writeBase: rect must be integers with non-negative size');
+    if (!ints || rect.w < 0 || rect.h < 0) throw new RangeError('writeInput: rect must be integers with non-negative size');
     const need = rect.w * rect.h * 4;
-    if (rgba.length < need) throw new RangeError(`writeBase: need ${need} bytes, got ${rgba.length}`);
-    const base = this.doc.find(BASE_ID) as PixelLayer;
-    const clip = clipToSize(rect, base.surface.width, base.surface.height);
+    if (rgba.length < need) throw new RangeError(`writeInput: need ${need} bytes, got ${rgba.length}`);
+    const st = this.doc.inputs.get(input);
+    if (!st) return;
+    const clip = clipToSize(rect, st.surface.width, st.surface.height);
     if (!clip) return;
     const view = new Uint8ClampedArray(rgba.buffer as ArrayBuffer, rgba.byteOffset, need);
-    base.surface.ctx.putImageData(new ImageData(view, rect.w, rect.h), rect.x, rect.y, clip.x - rect.x, clip.y - rect.y, clip.w, clip.h);
-    this.baseDirty = union(this.baseDirty, dirtyDoc(base, clip));
+    st.surface.ctx.putImageData(new ImageData(view, rect.w, rect.h), rect.x, rect.y, clip.x - rect.x, clip.y - rect.y, clip.w, clip.h);
+    this.inputDirty.set(input, union(this.inputDirty.get(input) ?? null, clip) as Rect);
   }
 
-  commitBase(): void {
-    if (!this.baseDirty) return;
-    const r = this.baseDirty;
-    this.baseDirty = null;
-    this.changed(r);
+  /** Publish the frames written to input `input` (after FRAME_END): recomposite everywhere a layer shows it. */
+  commitInput(input: number): void {
+    const r = this.inputDirty.get(input);
+    if (!r) return;
+    this.inputDirty.delete(input);
+    let d: Rect | null = null;
+    for (const l of this.doc.all()) {
+      if (l.kind === 'input' && l.input === input) d = union(d, dirtyDoc(l, r));
+    }
+    if (d) this.changed(d);
   }
 
   // ---- Output ----
@@ -1111,8 +1440,16 @@ export class Engine implements EditorEngine, Host {
 
   selection(): Rect | null { return this.sel.rect && { ...this.sel.rect }; }
 
+  /** Quick mask edits the selection through painting: the selection commands wait. */
+  private selectionBusy(): boolean {
+    if (!this.qm) return false;
+    this.emit({ type: 'notice', message: 'Leave Quick Mask first' });
+    return true;
+  }
+
   setSelection(rect: Rect | null): void {
     this.finishStroke();
+    if (this.selectionBusy()) return;
     const r = rect && clipToSize(rect, this.doc.width, this.doc.height);
     const next = r && !isEmpty(r) ? rectSel(r) : NO_SEL;
     if (sameSel(next, this.sel)) return;
@@ -1131,6 +1468,17 @@ export class Engine implements EditorEngine, Host {
 
   /** Coverage of the selection, document sized (a shared array: do not modify). */
   selectionMask(): { rect: Rect; alpha: Uint8Array } | null {
+    if (this.qm) { // the quick mask's current coverage (cached until the next paint merge)
+      if (this.qmMaskCache?.version === this.qmVersion) return this.qmMaskCache.mask;
+      const W = this.doc.width;
+      const d = this.qm.surface.ctx.getImageData(0, 0, W, this.doc.height).data;
+      const alpha = new Uint8Array(W * this.doc.height);
+      for (let i = 0; i < alpha.length; i++) alpha[i] = d[i * 4 + 3];
+      const rect = boundsOfAlpha(alpha, W, this.docRect());
+      const mask = rect ? { rect, alpha } : null;
+      this.qmMaskCache = { version: this.qmVersion, mask };
+      return mask;
+    }
     const s = this.sel;
     if (!s.rect) return null;
     if (s.alpha) return { rect: { ...s.rect }, alpha: s.alpha };
@@ -1139,29 +1487,38 @@ export class Engine implements EditorEngine, Host {
   }
 
   selectionPath(): Array<Array<{ x: number; y: number }>> {
+    if (this.qm) return []; // no marching ants while the selection is edited as a mask
+    const f = this.doc.floating;
+    if (f) { // a floating selection's outline is its (transformed) buffer rect
+      const m = matOf(f.t);
+      return [[applyMat(m, 0, 0), applyMat(m, f.buf.width, 0), applyMat(m, f.buf.width, f.buf.height), applyMat(m, 0, f.buf.height)]];
+    }
     this.selPathCache ??= tracePath(this.sel, this.doc.width);
     return this.selPathCache.map((l) => l.map((p) => ({ ...p })));
   }
 
   selectAll(): void {
     this.finishStroke();
+    if (this.selectionBusy()) return;
     this.changeSelection('Select all', selectAllState(this.doc.width, this.doc.height));
   }
 
   deselect(): void {
     this.finishStroke();
+    if (this.selectionBusy()) return;
     this.changeSelection('Deselect', NO_SEL);
   }
 
   invertSelection(): void {
     this.finishStroke();
+    if (this.selectionBusy()) return;
     if (!this.sel.rect) return;
     this.changeSelection('Invert selection', invertSel(this.sel, this.doc.width, this.doc.height));
   }
 
   maskFromSelection(layerId: string): void {
     const l = this.doc.find(layerId);
-    if (!l || l.kind === 'group' || l.kind === 'base') {
+    if (!l || l.kind === 'group') {
       this.emit({ type: 'notice', message: 'Masks need a pixel or adjustment layer' });
       return;
     }
@@ -1170,7 +1527,7 @@ export class Engine implements EditorEngine, Host {
       this.emit({ type: 'notice', message: 'Make a selection first' });
       return;
     }
-    const px = l.kind === 'pixel' ? l : null;
+    const px = isPixel(l) ? l : null;
     const surface = px ? createSurface(px.surface.width, px.surface.height, true) : createSurface(this.doc.width, this.doc.height, true);
     if (!px || isAligned(px)) {
       const o = px ? px : IDENT;
@@ -1182,7 +1539,8 @@ export class Engine implements EditorEngine, Host {
       cov.ctx.putImageData(this.coverageImage(s), 0, 0);
       const c = surface.ctx;
       c.imageSmoothingEnabled = true;
-      c.setTransform(1 / px.sx, 0, 0, 1 / px.sy, -px.x / px.sx, -px.y / px.sy);
+      const inv = invMat(matOf(px));
+      c.setTransform(inv.a, inv.b, inv.c, inv.d, inv.e, inv.f);
       c.drawImage(cov.canvas as CanvasImageSource, r.x, r.y);
       c.setTransform(1, 0, 0, 1, 0, 0);
       releaseSurface(cov);
@@ -1207,10 +1565,11 @@ export class Engine implements EditorEngine, Host {
     this.emit({ type: 'history' });
   }
 
-  selectionAlpha(): Uint8Array | null { return this.sel.alpha; }
+  selectionAlpha(): Uint8Array | null { return this.qm ? null : this.sel.alpha; }
 
   /** Canvas whose alpha is the coverage (rgb white); built on first use after a selection change, only for non-rect selections. */
   selectionCanvas(): Surface | null {
+    if (this.qm) return null;
     const s = this.sel;
     if (!s.rect || !s.alpha) return null;
     if (this.selCanvasFor === s && this.selCanvas) return this.selCanvas;
@@ -1348,7 +1707,7 @@ export class Engine implements EditorEngine, Host {
     const first = clean.text.split('\n')[0].trim();
     const layer: TextLayer = {
       id: this.doc.newId(), kind: 'text', name: first ? first.slice(0, 24) : `Text ${++this.textCount}`, visible: true, locked: false,
-      opacity: 1, blend: 'normal', spec: clean, mask: null,
+      opacity: 1, blend: 'normal', spec: clean, mask: null, effects: [],
     };
     this.insertAboveActive('Add text', layer, textBounds(clean));
     return layer.id;
@@ -1365,7 +1724,7 @@ export class Engine implements EditorEngine, Host {
     const names = { rect: 'Rectangle', ellipse: 'Ellipse', line: 'Line', polygon: spec.type === 'polygon' && spec.innerRatio < 1 ? 'Star' : 'Polygon' };
     return {
       id: this.doc.newId(), kind: 'shape', name: `${names[spec.type]} ${++this.shapeCount}`, visible: true, locked: false,
-      opacity: 1, blend: 'normal', spec, mask: null,
+      opacity: 1, blend: 'normal', spec, mask: null, effects: [],
     };
   }
 
@@ -1411,10 +1770,7 @@ export class Engine implements EditorEngine, Host {
     const mask: Mask | null = !l.mask ? null
       : l.mask.surface.width === w && l.mask.surface.height === h ? l.mask
         : { slot: l.mask.slot, enabled: l.mask.enabled, surface: shiftedMask(l.mask.surface, w, h, 0, 0) };
-    const px: PixelLayer = {
-      id: l.id, kind: 'pixel', name: l.name, visible: l.visible, locked: l.locked, opacity: l.opacity, blend: l.blend,
-      surface, x: 0, y: 0, sx: 1, sy: 1, slot: this.doc.newSlot(), mask,
-    };
+    const px = newPixelLayer(l.id, l.name, surface, { visible: l.visible, locked: l.locked, opacity: l.opacity, blend: l.blend, effects: l.effects, slot: this.doc.newSlot(), mask });
     const area = union(specBounds(l), { x: 0, y: 0, w, h }) as Rect;
     this.structural('Flatten layer', () => { loc.parent.children[loc.index] = px; }, l.visible && l.opacity > 0 ? area : false);
   }
@@ -1497,10 +1853,7 @@ export class Engine implements EditorEngine, Host {
     const k = iw > dw || ih > dh ? Math.min(dw / iw, dh / ih) : 1;
     const x = Math.round((dw - iw * k) / 2); // whole pixels (see cleanXf)
     const y = Math.round((dh - ih * k) / 2);
-    const layer: PixelLayer = {
-      id: this.doc.newId(), kind: 'pixel', name: String(name || 'Image'), visible: true, locked: false, opacity: 1, blend: 'normal',
-      surface, x, y, sx: k, sy: k, slot: this.doc.newSlot(), mask: null,
-    };
+    const layer = newPixelLayer(this.doc.newId(), String(name || 'Image'), surface, { x, y, sx: k, sy: k, slot: this.doc.newSlot() });
     this.insertAboveActive('Import image', layer, outerRect(surfaceDocBounds(layer)));
     if (k < 1) this.emit({ type: 'notice', message: `Image scaled to fit (${w}\u00d7${h} \u2192 ${Math.round(iw * k)}\u00d7${Math.round(ih * k)})` });
     return layer.id;
@@ -1523,29 +1876,48 @@ export class Engine implements EditorEngine, Host {
     if (!l || !isPixel(l)) return;
     const c = cleanXf(t);
     if (!c || sameXf(l, c)) return;
-    if (l.locked && l.kind !== 'base') return this.emit({ type: 'notice', message: 'Layer is locked' });
+    if (l.locked && l.kind !== 'input') return this.emit({ type: 'notice', message: 'Layer is locked' });
     this.finishStroke();
     const before = this.doc.snapshot();
     const old = outerRect(surfaceDocBounds(l));
-    l.x = c.x; l.y = c.y; l.sx = c.sx; l.sy = c.sy;
+    l.x = c.x; l.y = c.y; l.sx = c.sx; l.sy = c.sy; l.rot = c.rot; l.kx = c.kx; l.ky = c.ky;
     const now = outerRect(surfaceDocBounds(l));
     this.commitStructure('Transform', before, `xform:${id}`, l.visible && l.opacity > 0 ? (union(old, now) as Rect) : false);
   }
 
   /**
-   * Fit a layer's box to `box` (document px): pixel / base layers get the transform that maps their surface onto it;
+   * Fit a layer's box to `box` (document px): pixel / input layers get the transform that maps their surface onto it;
    * text / shape layers scale their geometry (scaleSpec) from where they were when the drag began. Calls within a second
    * on the same layer form one drag (the scale always starts from the original geometry, so nothing accumulates) and one
    * history entry.
+   *
+   * Rotated / skewed pixel layers: `box` is their document-space bounding box (layerBounds). A pure move translates x, y;
+   * a uniform resize scales sx, sy (rotation and skew are kept); a non-uniform resize applies the document-space scale to
+   * the affine and re-expresses it as rot + kx (ky = 0, see decompose): the shape on screen is exact.
    */
   setLayerBox(id: string, box: Rect): void {
     const l = this.doc.find(id);
     if (!l || ![box.x, box.y, box.w, box.h].every(Number.isFinite) || !(box.w > 0) || !(box.h > 0)) return;
     if (isPixel(l)) {
-      // A pure move keeps sx / sy exactly (no ulp churn); other scales are rounded to 1e-9.
-      const fit = (b: number, n: number, cur: number): number => (Math.abs(b - cur * n) < 1e-6 ? cur : Math.round((b / n) * 1e9) / 1e9);
-      this.setTransform(id, { x: box.x, y: box.y, sx: fit(box.w, l.surface.width, l.sx), sy: fit(box.h, l.surface.height, l.sy) });
-      return;
+      if (isAxis(l)) {
+        // A pure move keeps sx / sy exactly (no ulp churn); other scales are rounded to 1e-9.
+        const fit = (b: number, n: number, cur: number): number => (Math.abs(b - cur * n) < 1e-6 ? cur : Math.round((b / n) * 1e9) / 1e9);
+        this.setTransform(id, { x: box.x, y: box.y, sx: fit(box.w, l.surface.width, l.sx), sy: fit(box.h, l.surface.height, l.sy), rot: 0, kx: 0, ky: 0 });
+        return;
+      }
+      const b0 = surfaceDocBounds(l);
+      if (!(b0.w > 0 && b0.h > 0)) return;
+      const fx = box.w / b0.w;
+      const fy = box.h / b0.h;
+      const same = (a: number, b: number): boolean => Math.abs(a - b) < 1e-9 * Math.max(1, Math.abs(a));
+      // new translation: the layer origin keeps its place relative to the bounding box
+      const x = box.x + (l.x - b0.x) * fx;
+      const y = box.y + (l.y - b0.y) * fy;
+      if (same(fx, 1) && same(fy, 1)) return this.setTransform(id, { ...copyXfLayer(l), x: l.x + (box.x - b0.x), y: l.y + (box.y - b0.y) });
+      if (same(fx, fy)) return this.setTransform(id, { ...copyXfLayer(l), x, y, sx: l.sx * fx, sy: l.sy * fy });
+      const m = matOf(l);
+      const d = decompose({ a: m.a * fx, b: m.b * fy, c: m.c * fx, d: m.d * fy, e: x, f: y });
+      return this.setTransform(id, d);
     }
     if (!isVector(l)) return;
     if (l.locked) return this.emit({ type: 'notice', message: 'Layer is locked' });
@@ -1560,38 +1932,83 @@ export class Engine implements EditorEngine, Host {
     s0.last = l.spec;
   }
 
-  /** Bake the transform of a pixel layer (and its mask): resample into a surface of the transformed size, identity scale; one history entry. */
+  /**
+   * Bake the transform of a pixel layer (and its mask): resample into a surface covering the layer's document-space bounding
+   * box at identity scale / rotation / skew; one history entry. Scale-only layers keep the v4 result (surface of
+   * round(w * sx) x round(h * sy) at the same position). Rotation / skew: the surface is first scaled, then drawn under
+   * R . K into the bounding box (whole pixels, anchored at floor of the box origin).
+   */
   applyTransform(id: string): void {
     const l = this.doc.find(id);
     if (!l || l.kind === 'group') return;
     if (l.kind !== 'pixel') {
-      this.emit({ type: 'notice', message: l.kind === 'base' ? 'The TD Input cannot be baked' : 'Only pixel layers can be baked' });
+      this.emit({ type: 'notice', message: l.kind === 'input' ? 'The TD Input cannot be baked' : 'Only pixel layers can be baked' });
       return;
     }
     if (l.locked) return this.emit({ type: 'notice', message: 'Layer is locked' });
-    if (l.sx === 1 && l.sy === 1) return;
-    const nw = Math.max(1, Math.round(l.surface.width * l.sx));
-    const nh = Math.max(1, Math.round(l.surface.height * l.sy));
-    if (nw > MAX_DIM || nh > MAX_DIM || nw * nh > MAX_PIXELS) {
-      this.emit({ type: 'notice', message: 'The transformed layer would be too large' });
-      return;
-    }
-    this.finishStroke();
-    const surface = resampled(l.surface, nw, nh);
-    const mask: Mask | null = l.mask ? { slot: l.mask.slot, enabled: l.mask.enabled, surface: resampled(l.mask.surface, nw, nh, true) } : null;
+    if (l.sx === 1 && l.sy === 1 && isAxis(l)) return;
     const old = outerRect(surfaceDocBounds(l));
+    let surface: Surface;
+    let mask: Mask | null = null;
+    let x = l.x;
+    let y = l.y;
+    if (isAxis(l)) {
+      const nw = Math.max(1, Math.round(l.surface.width * l.sx));
+      const nh = Math.max(1, Math.round(l.surface.height * l.sy));
+      if (nw > MAX_DIM || nh > MAX_DIM || nw * nh > MAX_PIXELS) {
+        this.emit({ type: 'notice', message: 'The transformed layer would be too large' });
+        return;
+      }
+      this.finishStroke();
+      surface = resampled(l.surface, nw, nh);
+      mask = l.mask ? { slot: l.mask.slot, enabled: l.mask.enabled, surface: resampled(l.mask.surface, nw, nh, true) } : null;
+    } else {
+      const bb = surfaceDocBounds(l);
+      const ox = Math.floor(bb.x);
+      const oy = Math.floor(bb.y);
+      const nw = Math.ceil(bb.x + bb.w) - ox;
+      const nh = Math.ceil(bb.y + bb.h) - oy;
+      if (nw < 1 || nh < 1 || nw > MAX_DIM || nh > MAX_DIM || nw * nh > MAX_PIXELS) {
+        this.emit({ type: 'notice', message: 'The transformed layer would be too large' });
+        return;
+      }
+      this.finishStroke();
+      surface = this.bakeAffine(l.surface, l, nw, nh, ox, oy, false);
+      mask = l.mask ? { slot: l.mask.slot, enabled: l.mask.enabled, surface: this.bakeAffine(l.mask.surface, l, nw, nh, ox, oy, true) } : null;
+      x = ox;
+      y = oy;
+    }
     this.structural('Apply transform', () => {
       l.surface = surface;
       l.mask = mask;
+      l.x = x;
+      l.y = y;
       l.sx = 1;
       l.sy = 1;
+      l.rot = l.kx = l.ky = 0;
     }, l.visible && l.opacity > 0 ? (union(old, outerRect(surfaceDocBounds(l))) as Rect) : false);
+  }
+
+  /** `src` drawn under the layer's affine into a new nw x nh surface whose top-left is document pixel (ox, oy). */
+  private bakeAffine(src: Surface, t: Xf, nw: number, nh: number, ox: number, oy: number, readback: boolean): Surface {
+    // scale first (staged downscale keeps quality), then rotate / skew the scaled copy: remaining mapping = T . R . K . diag(fx, fy)
+    const sw = Math.max(1, Math.round(src.width * t.sx));
+    const sh = Math.max(1, Math.round(src.height * t.sy));
+    const scaled = sw === src.width && sh === src.height ? src : resampled(src, sw, sh);
+    const m = matOf({ ...t, sx: (src.width * t.sx) / sw, sy: (src.height * t.sy) / sh });
+    const out = createSurface(nw, nh, readback);
+    out.ctx.imageSmoothingEnabled = true;
+    out.ctx.imageSmoothingQuality = 'high';
+    out.ctx.transform(m.a, m.b, m.c, m.d, m.e - ox, m.f - oy);
+    out.ctx.drawImage(scaled.canvas as CanvasImageSource, 0, 0);
+    if (scaled !== src) releaseSurface(scaled);
+    return out;
   }
 
   // ---- Tools ----
 
   setTool(id: ToolId): void {
-    this.finishStroke();
+    this.finishStroke(false); // the UI switches to the move tool to transform a floating selection
     this.toolId = id;
   }
 
@@ -1608,6 +2025,11 @@ export class Engine implements EditorEngine, Host {
   pointerDown(p: ToolPointer): void {
     this.finishStroke();
     this.last = p;
+    if (this.qm && SELECT_TOOLS.includes(this.toolId)) {
+      this.active = null;
+      this.emit({ type: 'notice', message: 'Leave Quick Mask to use the selection tools' });
+      return;
+    }
     this.active = (p.alt && PAINT_TOOLS.includes(this.toolId) ? this.tools.picker : this.tools[this.toolId]) ?? null;
     this.active?.down(p);
   }
@@ -1628,11 +2050,13 @@ export class Engine implements EditorEngine, Host {
   // ---- History ----
 
   undo(): void {
+    if (this.doc.floating) return this.cancelFloating(); // undo while floating = cancel (Esc)
     this.finishStroke();
     if (this.hist.undo()) this.emit({ type: 'history' });
   }
 
   redo(): void {
+    if (this.doc.floating) return this.cancelFloating();
     this.finishStroke();
     if (this.hist.redo()) this.emit({ type: 'history' });
   }
@@ -1642,6 +2066,7 @@ export class Engine implements EditorEngine, Host {
   }
 
   jumpTo(index: number): void {
+    if (this.doc.floating) this.cancelFloating();
     this.finishStroke();
     const before = this.hist.index;
     this.hist.jumpTo(index);
@@ -1655,6 +2080,9 @@ export class Engine implements EditorEngine, Host {
   }
 
   dispose(): void {
+    this.cancelFloating();
+    if (this.qm) releaseSurface(this.qm.surface);
+    this.qm = null;
     this.finishStroke();
     this.compositor.dispose();
     Object.values(this.scratch).forEach(releaseSurface);
@@ -1666,6 +2094,312 @@ export class Engine implements EditorEngine, Host {
     this.listeners.clear();
   }
 
+  // ---- v5: base aliases (the contract still lists them) ----
+
+  /** @deprecated use writeInput(1, ...). */
+  writeBase(rect: Rect, rgba: Uint8Array | Uint8ClampedArray): void { this.writeInput(1, rect, rgba); }
+  /** @deprecated use commitInput(1). */
+  commitBase(): void { this.commitInput(1); }
+
+  // ---- v5: effects ----
+
+  setEffects(id: string, effects: Effect[]): void {
+    const l = this.doc.find(id);
+    if (!l || l.kind === 'group' || l.kind === 'adjustment') return;
+    const next = sanitizeEffects(effects);
+    if (sameEffects(next, l.effects)) return;
+    this.finishStroke();
+    const before = this.doc.snapshot();
+    const old = layerExtent(l, this.docRect());
+    l.effects = next;
+    const ext = union(old, layerExtent(l, this.docRect()));
+    this.commitStructure('Layer effects', before, `fx:${id}`, l.visible && l.opacity > 0 ? ext : false);
+  }
+
+  // ---- v5: retouch options ----
+
+  setCloneOptions(o: CloneOptions): void {
+    this.cloneOpts = { aligned: !!o.aligned, sampleAll: !!o.sampleAll };
+  }
+
+  setRetouchOptions(o: { strength: number; sharpen: boolean; burn: boolean; range: 'shadows' | 'midtones' | 'highlights'; exposure: number }): void {
+    this.retouchOpts = {
+      strength: clamp01(Number(o.strength)), sharpen: !!o.sharpen, burn: !!o.burn,
+      range: o.range === 'shadows' || o.range === 'highlights' ? o.range : 'midtones', exposure: clamp01(Number(o.exposure)),
+    };
+  }
+
+  /** The point the clone tool samples now (while stroking) or was last Alt-clicked at (document px); null before the first Alt-click. */
+  cloneSource(): { x: number; y: number } | null {
+    return this.cloneTool.sourcePoint();
+  }
+
+  // ---- v5: floating selection ----
+
+  private floatEvents(): void {
+    this.version++;
+    this.emit({ type: 'selection' });
+    this.emit({ type: 'structure' });
+  }
+
+  /**
+   * Cut the selected pixels (weighted by the selection coverage) of the active pixel layer into a floating selection that
+   * starts where the pixels were, under the layer's own transform. While it floats the layer shows a hole, the compositor draws
+   * the buffer above the layer, TouchDesigner is not told (no 'surface' events) and any other edit commits it; undo / redo
+   * cancel it. Returns false (with a notice) when there is nothing to lift.
+   */
+  liftSelection(): boolean {
+    if (this.doc.floating) this.commitFloating();
+    this.finishStroke();
+    const l = this.doc.active();
+    const why = this.qm ? 'Leave Quick Mask first'
+      : !l || l.kind !== 'pixel' ? 'Select a pixel layer to transform its selection'
+        : this.paintTarget().target === 'mask' ? 'Select the layer pixels, not the mask'
+          : !l.visible ? 'Layer is hidden' : l.locked ? 'Layer is locked' : !this.sel.rect ? 'Make a selection first' : null;
+    if (why || !l || l.kind !== 'pixel') {
+      this.emit({ type: 'notice', message: why ?? 'Nothing to lift' });
+      return false;
+    }
+    const sel = this.sel.rect as Rect;
+    const lr = intersect({ x: 0, y: 0, w: l.surface.width, h: l.surface.height }, innerLayerRect(l, sel));
+    if (!lr) return false;
+    // coverage in layer pixels: the selection mapped into the layer's space
+    const cov = createSurface(lr.w, lr.h, true);
+    const cc = cov.ctx;
+    cc.imageSmoothingEnabled = true;
+    const selCanvas = this.selectionCanvas();
+    if (selCanvas) {
+      cc.imageSmoothingQuality = 'low';
+      const m = invMat(matOf(l));
+      cc.transform(m.a, m.b, m.c, m.d, m.e - lr.x, m.f - lr.y);
+      cc.drawImage(selCanvas.canvas as CanvasImageSource, 0, 0);
+    } else {
+      const poly = docRectPolygon(l, sel);
+      cc.fillStyle = '#fff';
+      cc.beginPath();
+      cc.moveTo(poly[0].x - lr.x, poly[0].y - lr.y);
+      for (let i = 1; i < 4; i++) cc.lineTo(poly[i].x - lr.x, poly[i].y - lr.y);
+      cc.closePath();
+      cc.fill();
+    }
+    cc.setTransform(1, 0, 0, 1, 0, 0);
+    // outside the canvas nothing is selected (axis-aligned layers: the AABB is exact; rotated: clip to the canvas)
+    if (!isAxis(l)) {
+      cc.globalCompositeOperation = 'destination-in';
+      cc.beginPath();
+      const poly = docRectPolygon(l, this.docRect());
+      cc.moveTo(poly[0].x - lr.x, poly[0].y - lr.y);
+      for (let i = 1; i < 4; i++) cc.lineTo(poly[i].x - lr.x, poly[i].y - lr.y);
+      cc.closePath();
+      cc.fillStyle = '#fff';
+      cc.fill();
+      cc.globalCompositeOperation = 'source-over';
+    }
+    const any = cc.getImageData(0, 0, lr.w, lr.h).data;
+    let has = false;
+    for (let i = 3; i < any.length; i += 4) if (any[i] > 0) { has = true; break; }
+    if (!has) {
+      releaseSurface(cov);
+      this.emit({ type: 'notice', message: 'Nothing to lift' });
+      return false;
+    }
+    const buf = createSurface(lr.w, lr.h, true);
+    buf.ctx.drawImage(l.surface.canvas as CanvasImageSource, lr.x, lr.y, lr.w, lr.h, 0, 0, lr.w, lr.h);
+    buf.ctx.globalCompositeOperation = 'destination-in';
+    buf.ctx.drawImage(cov.canvas as CanvasImageSource, 0, 0);
+    buf.ctx.globalCompositeOperation = 'source-over';
+    const tb = new TileBackup(l);
+    tb.cover(lr);
+    const sc = l.surface.ctx;
+    sc.save();
+    sc.globalCompositeOperation = 'destination-out';
+    sc.drawImage(cov.canvas as CanvasImageSource, lr.x, lr.y);
+    sc.restore();
+    const o = toDoc(l, lr.x, lr.y);
+    const t0: Xf = { x: o.x, y: o.y, sx: l.sx, sy: l.sy, rot: l.rot, kx: l.kx, ky: l.ky };
+    this.doc.floating = { layer: l, buf, cov, rect: lr, t0, t: { ...t0 }, tb, selBefore: this.sel };
+    this.changed(dirtyDoc(l, lr));
+    this.floatEvents();
+    return true;
+  }
+
+  /** The floating selection: `bounds` = document-space bounding box under the current transform, `transform` maps the buffer (see floatingSize) to the document. */
+  floating(): { bounds: Rect; transform: LayerTransform } | null {
+    const f = this.doc.floating;
+    return f ? { bounds: floatingBounds(f), transform: { ...f.t } } : null;
+  }
+
+  /** Size of the floating buffer in its own pixels (the transform box is this rect under `floating().transform`). */
+  floatingSize(): { w: number; h: number } | null {
+    const f = this.doc.floating;
+    return f ? { w: f.buf.width, h: f.buf.height } : null;
+  }
+
+  setFloatingTransform(t: LayerTransform): void {
+    const f = this.doc.floating;
+    if (!f) return;
+    const rot = t.rot ?? 0;
+    const kx = t.kx ?? 0;
+    const ky = t.ky ?? 0;
+    if (![t.x, t.y, t.sx, t.sy, rot, kx, ky].every(Number.isFinite)) return;
+    const c = cleanXf(t);
+    if (!c) return; // singular skew
+    const next: Xf = { ...c, x: t.x, y: t.y }; // the position of a floating selection is not snapped to whole pixels
+    if (sameXf(f.t, next)) return;
+    const old = outerRect(floatingBounds(f));
+    f.t = next;
+    this.changed(union(old, outerRect(floatingBounds(f))) as Rect);
+    this.floatEvents();
+  }
+
+  /** Resample the floating buffer into its layer (source-over; the hole stays where it was cut) and select its footprint; one history entry. */
+  commitFloating(): void {
+    const f = this.doc.floating;
+    if (!f) return;
+    this.doc.floating = null;
+    const l = f.layer;
+    if (sameXf(f.t, f.t0)) {
+      // unmoved: put the cut pixels back exactly (a feathered cut is not undone by drawing the buffer over the hole); nothing to record
+      f.tb.restore(f.rect);
+      f.tb.dispose();
+      releaseSurface(f.buf);
+      releaseSurface(f.cov);
+      this.changed(dirtyDoc(l, f.rect));
+      this.floatEvents();
+      return;
+    }
+    const X = mulMat(invMat(matOf(l)), matOf(f.t)); // buffer -> layer pixels
+    const box = (() => {
+      const pts = [applyMat(X, 0, 0), applyMat(X, f.buf.width, 0), applyMat(X, f.buf.width, f.buf.height), applyMat(X, 0, f.buf.height)];
+      const x0 = Math.floor(Math.min(...pts.map((p) => p.x))) - 1;
+      const y0 = Math.floor(Math.min(...pts.map((p) => p.y))) - 1;
+      const x1 = Math.ceil(Math.max(...pts.map((p) => p.x))) + 1;
+      const y1 = Math.ceil(Math.max(...pts.map((p) => p.y))) + 1;
+      return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    })();
+    const area = intersect(box, { x: 0, y: 0, w: l.surface.width, h: l.surface.height });
+    if (area) f.tb.cover(area);
+    const unmoved = sameXf(f.t, f.t0);
+    const c = l.surface.ctx;
+    c.save();
+    c.imageSmoothingEnabled = true;
+    c.imageSmoothingQuality = 'high';
+    c.transform(X.a, X.b, X.c, X.d, X.e, X.f);
+    c.drawImage(f.buf.canvas as CanvasImageSource, 0, 0);
+    c.restore();
+    // the selection follows the floating pixels
+    let selAfter = f.selBefore;
+    if (!unmoved) {
+      const win = createSurface(this.doc.width, this.doc.height, true);
+      const m = matOf(f.t);
+      win.ctx.imageSmoothingEnabled = true;
+      win.ctx.transform(m.a, m.b, m.c, m.d, m.e, m.f);
+      win.ctx.drawImage(f.cov.canvas as CanvasImageSource, 0, 0);
+      const d = win.ctx.getImageData(0, 0, win.width, win.height).data;
+      const alpha = new Uint8Array(win.width * win.height);
+      for (let i = 0; i < alpha.length; i++) alpha[i] = d[i * 4 + 3];
+      releaseSurface(win);
+      const rect = boundsOfAlpha(alpha, this.doc.width, this.docRect());
+      selAfter = rect ? { rect, alpha } : NO_SEL;
+    }
+    const patches = f.tb.patches();
+    releaseSurface(f.buf);
+    releaseSurface(f.cov);
+    const target = this.makeTarget(l, false);
+    const selBefore = f.selBefore;
+    const apply = (which: 'before' | 'after') => () => {
+      for (const p of patches) {
+        target.surface.ctx.putImageData(p[which], p.rect.x, p.rect.y);
+        this.paintChanged(target, p.rect);
+      }
+      this.setSel(which === 'before' ? selBefore : selAfter);
+    };
+    const bytes = patches.reduce((n, p) => n + p.before.data.length + p.after.data.length, 0) + (selAfter.alpha?.length ?? 0) + (selBefore.alpha?.length ?? 0);
+    this.hist.push({ label: 'Transform selection', bytes, undo: apply('before'), redo: apply('after') });
+    for (const p of patches) this.paintChanged(target, p.rect);
+    this.changed(union(outerRect(floatingBounds(f)), dirtyDoc(l, f.rect)) as Rect);
+    if (!selEqual(selAfter, this.sel, this.doc.width)) this.setSel(selAfter);
+    this.floatEvents();
+    this.emit({ type: 'history' });
+  }
+
+  /** Put the cut pixels back and drop the floating selection (no history). */
+  cancelFloating(): void {
+    const f = this.doc.floating;
+    if (!f) return;
+    this.doc.floating = null;
+    f.tb.restore(f.rect);
+    f.tb.dispose();
+    releaseSurface(f.buf);
+    releaseSurface(f.cov);
+    this.changed(union(outerRect(floatingBounds(f)), dirtyDoc(f.layer, f.rect)) as Rect);
+    this.floatEvents();
+  }
+
+  // ---- v5: quick mask ----
+
+  /**
+   * Quick mask on: the selection becomes a document-sized mask (alpha = coverage) that every paint tool edits (white adds, black
+   * removes, the eraser removes). The viewport draws it red from quickMaskSource(). Off: the mask becomes the selection (one
+   * history entry when it changed). While it is on 'selection' events follow every paint merge, selectionPath() is empty,
+   * the selection tools and selection commands are disabled (a notice) and the strokes are not kept in history afterwards.
+   */
+  setQuickMask(on: boolean): void {
+    if (on === !!this.qm) return;
+    this.finishStroke();
+    if (on) {
+      const surface = createSurface(this.doc.width, this.doc.height, true);
+      if (this.sel.rect) surface.ctx.putImageData(this.coverageImage(this.sel), this.sel.rect.x, this.sel.rect.y);
+      const layer = newPixelLayer('quickmask', 'Quick Mask', surface);
+      this.qm = { surface, layer, selBefore: this.sel };
+      this.qmVersion++;
+      this.doc.selection = null; // paint tools are not clipped by the selection while it is being edited
+      this.dropSelCaches();
+      this.emit({ type: 'selection' });
+      return;
+    }
+    const q = this.qm as NonNullable<Engine['qm']>;
+    const W = this.doc.width;
+    const H = this.doc.height;
+    const d = q.surface.ctx.getImageData(0, 0, W, H).data;
+    const alpha = new Uint8Array(W * H);
+    for (let i = 0; i < alpha.length; i++) alpha[i] = d[i * 4 + 3];
+    const rect = boundsOfAlpha(alpha, W, this.docRect());
+    const next: SelState = rect ? { rect, alpha } : NO_SEL;
+    this.qm = null;
+    this.qmMaskCache = null;
+    releaseSurface(q.surface);
+    const dropped = this.hist.discardTagged('qm'); // the strokes of this session; redo history stays unless the selection changed
+    const before = q.selBefore;
+    this.sel = before;
+    this.doc.selection = before.rect;
+    this.dropSelCaches();
+    if (!selEqual(before, next, W)) {
+      this.setSel(next);
+      this.commitSelection('Quick mask', before);
+    } else {
+      this.emit({ type: 'selection' });
+    }
+    if (dropped) this.emit({ type: 'history' });
+  }
+
+  quickMask(): boolean { return this.qm !== null; }
+
+  /** The quick mask as a document-sized canvas (rgb white, alpha = coverage) for the viewport's red overlay; null when quick mask is off. Changes are announced by 'selection' events. */
+  quickMaskSource(): CanvasImageSource | null {
+    return this.qm ? (this.qm.surface.canvas as CanvasImageSource) : null;
+  }
+
+  // ---- v5: selection modifiers ----
+
+  modifySelection(op: 'grow' | 'shrink' | 'smooth' | 'feather' | 'border', px: number): void {
+    this.finishStroke();
+    if (this.qm) return this.emit({ type: 'notice', message: 'Leave Quick Mask first' });
+    if (!this.sel.rect) return this.emit({ type: 'notice', message: 'Make a selection first' });
+    if (!Number.isFinite(px) || px <= 0) return;
+    this.changeSelection(`${op[0].toUpperCase()}${op.slice(1)} selection`, modifySel(this.sel, op as SelOp, px, this.doc.width, this.doc.height));
+  }
+
   // ---- internals ----
 
   /** Tool scratch: stroke / backup start tiny and grow to the surface being edited (reserveScratch); the tip is fixed size. */
@@ -1675,7 +2409,9 @@ export class Engine implements EditorEngine, Host {
     };
   }
 
-  private finishStroke(): void {
+  /** End the stroke in progress; `commit`: also commit a floating selection (edits do, tool / view changes and read-only calls never do). */
+  private finishStroke(commit = true): void {
+    if (commit && this.doc.floating) this.commitFloating(); // any other edit commits a floating selection
     const t = this.active;
     const p = this.last;
     this.active = null;
@@ -1686,7 +2422,7 @@ export class Engine implements EditorEngine, Host {
 
   private structureChanged(dirty: Rect | null | false, specChanged: boolean): void {
     this.version++;
-    if (dirty !== false) this.compositor.invalidate(dirty);
+    if (dirty !== false) this.compositor.invalidate(dirty, true); // layer properties / transforms: layer contents are unchanged
     this.emit({ type: 'structure' });
     this.syncSpec(specChanged);
   }

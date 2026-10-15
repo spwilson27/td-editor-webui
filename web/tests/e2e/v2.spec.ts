@@ -16,10 +16,10 @@ const open = async (page: Page, client: 'panel' | 'external' = 'panel') => {
 const hook = <T,>(page: Page, fn: string, ...args: unknown[]) =>
   page.evaluate(([f, a]) => (window as any).__editorTest[f as string](...(a as unknown[])), [fn, args] as const) as Promise<T>;
 const layer = (id: string, over: Partial<LayerSpec>): LayerSpec => ({
-  id, kind: 'pixel', parentId: null, name: id, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot: null, mask: null, adjustment: null, text: null, shape: null, sx: 1, sy: 1,
-  surfaceW: !over.kind || over.kind === 'pixel' || over.kind === 'base' ? 160 : null, surfaceH: !over.kind || over.kind === 'pixel' || over.kind === 'base' ? 90 : null, ...over,
+  id, kind: 'pixel', parentId: null, name: id, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, rot: 0, kx: 0, ky: 0, input: null, effects: [], slot: null, mask: null, adjustment: null, text: null, shape: null, sx: 1, sy: 1,
+  surfaceW: !over.kind || over.kind === 'pixel' || over.kind === 'input' ? 160 : null, surfaceH: !over.kind || over.kind === 'pixel' || over.kind === 'input' ? 90 : null, ...over,
 });
-const baseLayer = () => layer('base', { kind: 'base', name: 'TD Input' });
+const baseLayer = () => layer('base', { kind: 'input', input: 1, name: 'TD Input' });
 const mainPixel = (page: Page, fx: number, fy: number) => page.locator('[data-viewport] canvas').first().evaluate((c: HTMLCanvasElement, [x, y]) => {
   return Array.from(c.getContext('2d')!.getImageData(Math.round(c.width * x), Math.round(c.height * y), 1, 1).data);
 }, [fx, fy]);
@@ -61,7 +61,7 @@ test('painting sends SURFACE tiles; adjustment + mask edits round-trip into the 
   await page.getByLabel('Radius').fill('25');
   await td.waitFor(() => td.doc?.layers.some((l) => l.adjustment?.type === 'blur' && (l.adjustment as any).radius === 25) ?? false);
   const stored = td.doc!.layers;
-  expect(stored.map((l) => l.kind)).toEqual(['base', 'pixel', 'adjustment']);
+  expect(stored.map((l) => l.kind)).toEqual(['input', 'pixel', 'adjustment']);
   const paintLayer = stored[1];
   expect(paintLayer.mask).toMatchObject({ enabled: true });
   expect(td.surfaces.has(paintLayer.mask!.slot)).toBe(true);
@@ -237,7 +237,9 @@ test('/surface 500: the page stays locked, retries the load, and never pushes; r
   // TD recovers
   td.surfaceStatus = null;
   await expect(page.locator('[data-loading-doc]')).toBeHidden({ timeout: 15000 });
-  expect(td.docMessages).toBe(0);
+  // v6: the input resized to 80x60 while the load failed; once loaded, that correction of the input layer is the only thing pushed (a doc, never pixels)
+  expect(td.docMessages).toBeLessThanOrEqual(1);
+  if (td.docMessages === 1) expect(td.doc!.layers.find((l) => l.kind === 'input')).toMatchObject({ surfaceW: 80, surfaceH: 60 });
   expect(td.frames.length).toBe(0);
   expect(td.surfacePixel(4, 10, 10)).toEqual([7, 7, 7, 7]);
 });

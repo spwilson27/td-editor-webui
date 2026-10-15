@@ -9,7 +9,7 @@
       "size": 104,
       "header": {
         "type": 1,
-        "slot": 0,
+        "slot": 1,
         "flags": 1,
         "frameEnd": true,
         "frameId": 1,
@@ -177,7 +177,7 @@
       "size": 96,
       "header": {
         "type": 1,
-        "slot": 0,
+        "slot": 2,
         "flags": 1,
         "frameEnd": true,
         "frameId": 31,
@@ -193,7 +193,29 @@
         "w": 5,
         "h": 4
       },
-      "note": "v5: BASE docW/docH = the input size (6x3), not the document size (5x4); not stale"
+      "note": "v5/v6: BASE docW/docH = the input size (6x3), not the document size (5x4); not stale; v6: slot = the input index (2 here)"
+    },
+    {
+      "name": "base_input8",
+      "file": "base_input8.bin",
+      "frame": "base_input8",
+      "valid": true,
+      "size": 56,
+      "header": {
+        "type": 1,
+        "slot": 8,
+        "flags": 1,
+        "frameEnd": true,
+        "frameId": 4294967294,
+        "docW": 4,
+        "docH": 2,
+        "x": 0,
+        "y": 0,
+        "w": 4,
+        "h": 2
+      },
+      "payloadSha256": "1769e453a53231d0e51bb8720c4a435ad19792ac69b5f29dd0555e7d932b436b",
+      "note": "v6: BASE for input 8 (the highest); slot = input index"
     },
     {
       "name": "surface_dump_layer",
@@ -347,6 +369,22 @@
       "valid": false,
       "size": 10,
       "error": "message too short"
+    },
+    {
+      "name": "invalid_base_input0",
+      "file": "invalid_base_input0.bin",
+      "frame": "invalid",
+      "valid": false,
+      "size": 40,
+      "error": "v6: a BASE frame's slot is its input index 1..8 (0 is invalid)"
+    },
+    {
+      "name": "invalid_base_input9",
+      "file": "invalid_base_input9.bin",
+      "frame": "invalid",
+      "valid": false,
+      "size": 40,
+      "error": "v6: a BASE frame's slot is its input index 1..8 (9 is invalid)"
     }
   ]
 }

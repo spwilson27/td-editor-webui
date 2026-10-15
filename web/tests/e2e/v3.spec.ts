@@ -110,8 +110,8 @@ test('Import from TouchDesigner: a TOP larger than the document is scaled to fit
   await expect(page.locator('[data-status=notice]')).toContainText('No TOP at /does/not/exist');
 });
 
-test('Place Image… uses a file chooser; the image becomes a layer and is sent to TD', async ({ page }) => {
-  await open(page);
+test('Place Image… uses a file chooser; the image becomes a layer and is sent to TD (external browser)', async ({ page }) => {
+  await open(page, { client: 'external' });
   await page.getByRole('button', { name: 'File', exact: true }).click();
   const chooser = page.waitForEvent('filechooser');
   await page.getByRole('menuitem', { name: /Place Image/ }).click();
@@ -300,10 +300,10 @@ for (const [w, h] of [[1600, 960], [1280, 800]] as const) {
 test('a fresh page loading TD\'s document: text layers own no slot, nothing is fetched or pushed for them', async ({ page }) => {
   td = await FakeTd.start({ w: 160, h: 90 });
   const text = { text: 'AB', font: 'Arial', size: 40, color: { r: 0, g: 0, b: 0, a: 255 }, align: 'left', bold: false, italic: false, lineHeight: 1.2, x: 20, y: 20, boxWidth: null };
-  const base = { parentId: null, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, sx: 1, sy: 1, surfaceW: null, surfaceH: null, mask: null, adjustment: null, shape: null } as const;
+  const base = { parentId: null, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0, effects: [] as never[], surfaceW: null, surfaceH: null, mask: null, adjustment: null, shape: null } as const;
   td.seedDocument([
-    { ...base, id: 'base', kind: 'base', name: 'TD Input', slot: null, text: null },
-    { ...base, id: 'tx', kind: 'text', name: 'AB', slot: null, text: text as never },
+    { ...base, id: 'base', kind: 'input', input: 1, name: 'TD Input', slot: null, text: null } as LayerSpec,
+    { ...base, id: 'tx', kind: 'text', input: null, name: 'AB', slot: null, text: text as never },
   ], 5);
   page.on('pageerror', (e) => { throw e; });
   await page.goto(`/?test=1&client=panel&ws=${encodeURIComponent(td.url)}&token=${td.token}`);

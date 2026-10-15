@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ShapeSpec, TextSpec } from '../../src/engine/types';
 import {
-  editBounds, handlePoint, hitBox, hitGuide, isIdentity, moveRect, remapShape, remapText, rulerStep, rulerTicks, scaleRect, transformFor,
+  IDENTITY, editBounds, handlePoint, hitBox, hitGuide, isIdentity, moveRect, remapShape, remapText, rulerStep, rulerTicks, scaleRect, transformFor,
 } from '../../src/state/transform';
 
 const R = { x: 100, y: 50, w: 200, h: 100 };
@@ -57,12 +57,20 @@ describe('transform box geometry', () => {
 });
 
 describe('mapping a layer onto new bounds', () => {
+  it('isIdentity sees rotation and skew', () => {
+    const id = { x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 };
+    expect(isIdentity({ ...id, rot: 1 })).toBe(false);
+    expect(isIdentity({ ...id, kx: 1 })).toBe(false);
+    expect(isIdentity({ ...id, ky: -1 })).toBe(false);
+    expect(IDENTITY).toEqual(id);
+  });
+
   it('transformFor: pixel layer scales about the box origin and follows it', () => {
-    const t = { x: 100, y: 50, sx: 1, sy: 1 };
-    expect(transformFor(t, R, { x: 100, y: 50, w: 400, h: 200 })).toEqual({ x: 100, y: 50, sx: 2, sy: 2 });
-    expect(transformFor(t, R, { x: 10, y: 20, w: 200, h: 100 })).toEqual({ x: 10, y: 20, sx: 1, sy: 1 });
-    expect(isIdentity({ x: 0, y: 0, sx: 1, sy: 1 })).toBe(true);
-    expect(isIdentity({ x: 0, y: 0, sx: 1.01, sy: 1 })).toBe(false);
+    const t = { x: 100, y: 50, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 };
+    expect(transformFor(t, R, { x: 100, y: 50, w: 400, h: 200 })).toEqual({ x: 100, y: 50, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 });
+    expect(transformFor(t, R, { x: 10, y: 20, w: 200, h: 100 })).toEqual({ x: 10, y: 20, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
+    expect(isIdentity({ x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 })).toBe(true);
+    expect(isIdentity({ x: 0, y: 0, sx: 1.01, sy: 1, rot: 0, kx: 0, ky: 0 })).toBe(false);
   });
 
   const text: TextSpec = { text: 'Hi', font: 'Arial', size: 20, color: rgba, align: 'left', bold: false, italic: false, lineHeight: 1.2, x: 100, y: 50, boxWidth: 100 };
@@ -87,7 +95,7 @@ describe('mapping a layer onto new bounds', () => {
   });
 
   it('degenerate source bounds leave the layer alone', () => {
-    const t = { x: 1, y: 2, sx: 3, sy: 4 };
+    const t = { x: 1, y: 2, sx: 3, sy: 4, rot: 0, kx: 0, ky: 0 };
     expect(transformFor(t, { x: 0, y: 0, w: 0, h: 5 }, R)).toBe(t);
   });
 });

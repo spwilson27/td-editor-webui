@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pytest
 
@@ -266,3 +268,201 @@ def test_masks_fill_white_in_the_new_area():
     arr[..., 3] = 1.0
     out = F.from_float(arr, 4, 3, white=True)
     assert (out[1:, :3] == (0, 0, 0, 255)).all() and (out[0] == 255).all() and (out[:, 3] == 255).all()
+
+
+# ---- PNG / .redoc codecs (v6)
+
+import os  # noqa: E402
+import struct  # noqa: E402
+import zipfile  # noqa: E402
+import zlib  # noqa: E402
+
+import pytest  # noqa: E402
+
+
+def rndwh(w, h, seed=0):
+    return rnd(h, w, seed)
+
+
+@pytest.mark.parametrize("w,h", [(1, 1), (1, 7), (9, 1), (5, 4), (257, 3), (64, 64)])
+def test_png_roundtrip_is_lossless(w, h):
+    a = rndwh(w, h, w * 31 + h)
+    png = F.encode_png(a)
+    assert png[:8] == F.PNG_SIGNATURE and F.png_size(png) == (w, h)
+    assert (F.decode_png(png) == a).all()
+
+
+def test_png_is_a_standard_png_readable_by_other_decoders():
+    pil = pytest.importorskip("PIL.Image")
+    import io
+    a = rndwh(33, 17, 3)
+    im = pil.open(io.BytesIO(F.encode_png(a)))
+    assert im.mode == "RGBA" and im.size == (33, 17) and (np.asarray(im) == a).all()
+
+
+def test_png_decoder_handles_every_filter_type_and_rgb():
+    """Hand-built PNGs with filter 0..4 (as other encoders write them), RGBA and RGB."""
+    def build(rows, bpp, ctype, w, h):
+        raw = b"".join(bytes([ft]) + bytes(r) for ft, r in rows)
+        ihdr = struct.pack(">IIBBBBB", w, h, 8, ctype, 0, 0, 0)
+        return F.PNG_SIGNATURE + F._chunk(b"IHDR", ihdr) + F._chunk(b"IDAT", zlib.compress(raw)) \
+            + F._chunk(b"IEND", b"")
+
+    rng = np.random.RandomState(5)
+    for bpp, ctype in ((4, 6), (3, 2)):
+        w, h = 6, 5
+        img = rng.randint(0, 256, (h, w, bpp), dtype=np.uint8)
+        rows, prev = [], np.zeros((w, bpp), np.int32)
+        for y in range(h):
+            ft = y % 5
+            cur = img[y].astype(np.int32)
+            f = np.zeros_like(cur)
+            for x in range(w):
+                a = cur[x - 1] if x else np.zeros(bpp, np.int32)
+                b = prev[x]
+                c = prev[x - 1] if x else np.zeros(bpp, np.int32)
+                if ft == 0:
+                    pred = 0
+                elif ft == 1:
+                    pred = a
+                elif ft == 2:
+                    pred = b
+                elif ft == 3:
+                    pred = (a + b) // 2
+                else:
+                    p = a + b - c
+                    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                    pred = np.where((pa <= pb) & (pa <= pc), a, np.where(pb <= pc, b, c))
+                f[x] = (cur[x] - pred) & 255
+            rows.append((ft, f.astype(np.uint8).reshape(-1)))
+            prev = cur
+        got = F.decode_png(build(rows, bpp, ctype, w, h))
+        want = img if bpp == 4 else np.dstack([img, np.full((h, w, 1), 255, np.uint8)])
+        assert (got == want).all(), f"filters on {bpp} channels"
+
+
+def test_png_decoder_rejects_damage_and_unsupported_variants():
+    png = F.encode_png(rndwh(4, 4))
+    bad = [b"", b"not a png at all, just text of some length ........", png[:-5], png[:19] + bytes([png[19] ^ 1]) + png[20:],
+           png[:40] + bytes([png[40] ^ 1]) + png[41:]]
+    for data in bad:
+        with pytest.raises(F.FileFormatError):
+            F.decode_png(data)
+    def with_ihdr(depth, ctype, interlace):
+        ihdr = struct.pack(">IIBBBBB", 4, 4, depth, ctype, 0, 0, interlace)
+        return F.PNG_SIGNATURE + F._chunk(b"IHDR", ihdr) + F._chunk(b"IDAT", zlib.compress(bytes(80))) \
+            + F._chunk(b"IEND", b"")
+    for args in ((16, 6, 0), (8, 3, 0), (8, 0, 0), (8, 6, 1)):
+        with pytest.raises(F.FileFormatError, match="unsupported"):
+            F.decode_png(with_ihdr(*args))
+    with pytest.raises(F.FileFormatError, match="outside the limit"):
+        F.decode_png(png, max_pixels=10)
+
+
+def test_png_decoder_does_not_inflate_more_than_the_header_says():
+    ihdr = struct.pack(">IIBBBBB", 2, 2, 8, 6, 0, 0, 0)
+    bomb = F.PNG_SIGNATURE + F._chunk(b"IHDR", ihdr) + F._chunk(b"IDAT", zlib.compress(bytes(10 ** 7))) \
+        + F._chunk(b"IEND", b"")
+    with pytest.raises(F.FileFormatError, match="wrong length"):
+        F.decode_png(bomb)
+
+
+def test_buffer_straight_conversion_roundtrips_for_opaque_and_masks():
+    straight = rndwh(7, 5, 2)
+    straight[..., 3] = 255
+    for premult in (True, False):
+        buf = F.straight_to_buffer(straight, premult)
+        assert buf[0].tolist() == straight[-1].tolist()  # TD order: bottom row first
+        assert (F.buffer_to_straight(buf, premult) == straight).all()
+
+
+def test_buffer_to_straight_unpremultiplies_like_to_wire():
+    buf = F.premultiply_u8(rndwh(11, 6, 4))
+    want = F.WireConverter().to_wire(buf, True)
+    assert (F.buffer_to_straight(buf, True) == want).all()
+
+
+def doc_bytes(**kw):
+    return json.dumps({"rev": 3, "layers": [], **kw})
+
+
+def test_redoc_roundtrip_and_layout(tmp_path):
+    path = str(tmp_path / "a.redoc")
+    imgs = {1: rndwh(8, 4, 1), 7: rndwh(3, 3, 2), 300: rndwh(1, 1, 3)}
+    meta = {"format": 1, "app": "t", "version": "9"}
+    F.write_redoc(path, doc_bytes(x=1), ((s, imgs[s]) for s in imgs), meta)
+    assert sorted(os.listdir(tmp_path)) == ["a.redoc"]  # no .part left
+    with zipfile.ZipFile(path) as z:
+        assert sorted(z.namelist()) == ["doc.json", "meta.json", "surfaces/1.png", "surfaces/300.png", "surfaces/7.png"]
+        assert z.getinfo("surfaces/1.png").compress_type == zipfile.ZIP_STORED
+    doc, got_meta, pngs = F.read_redoc(path)
+    assert doc["x"] == 1 and got_meta == meta and sorted(pngs) == [1, 7, 300]
+    for s, png in pngs.items():
+        assert (F.decode_png(png) == imgs[s]).all()
+
+
+def test_redoc_accepts_a_dict_document(tmp_path):
+    path = str(tmp_path / "d.redoc")
+    F.write_redoc(path, {"rev": 1, "layers": []}, [], {"format": 1})
+    assert F.read_redoc(path)[0] == {"rev": 1, "layers": []}
+
+
+def test_failed_redoc_write_keeps_the_old_file_and_leaves_no_temp(tmp_path):
+    path = str(tmp_path / "keep.redoc")
+    F.write_redoc(path, doc_bytes(v="old"), [], {"format": 1})
+    def boom():
+        yield 1, rndwh(2, 2)
+        raise RuntimeError("disk on fire")
+    with pytest.raises(RuntimeError):
+        F.write_redoc(path, doc_bytes(v="new"), boom(), {"format": 1})
+    assert F.read_redoc(path)[0]["v"] == "old" and os.listdir(tmp_path) == ["keep.redoc"]
+    def refuse(a, b):
+        raise OSError("rename refused")
+    with pytest.raises(OSError):
+        F.write_redoc(path, doc_bytes(v="new"), [], {"format": 1}, replace=refuse)
+    assert os.listdir(tmp_path) == ["keep.redoc"]
+
+
+def test_png_file_write_is_atomic(tmp_path):
+    path = str(tmp_path / "o.png")
+    a = rndwh(5, 3, 9)
+    F.write_png_file(path, a)
+    assert os.listdir(tmp_path) == ["o.png"] and (F.decode_png(open(path, "rb").read()) == a).all()
+    with pytest.raises(OSError):
+        F.write_png_file(path, a, replace=lambda x, y: (_ for _ in ()).throw(OSError("no")))
+    assert os.listdir(tmp_path) == ["o.png"]
+
+
+def make_zip(path, entries):
+    with zipfile.ZipFile(path, "w") as z:
+        for name, data in entries.items():
+            z.writestr(name, data)
+
+
+@pytest.mark.parametrize("entries,match", [
+    ({"meta.json": '{"format":1}'}, "no doc.json"),
+    ({"doc.json": "{}"}, "no meta.json"),
+    ({"doc.json": "{}", "meta.json": "nope"}, "damaged"),
+    ({"doc.json": "{}", "meta.json": "{}"}, "format version"),
+    ({"doc.json": "{}", "meta.json": '{"format":2}'}, "not supported"),
+    ({"doc.json": "{}", "meta.json": '{"format":0}'}, "not supported"),
+    ({"doc.json": "[]", "meta.json": '{"format":1}'}, "not an object"),
+])
+def test_read_redoc_rejects_bad_containers(tmp_path, entries, match):
+    path = str(tmp_path / "b.redoc")
+    make_zip(path, entries)
+    with pytest.raises(F.FileFormatError, match=match):
+        F.read_redoc(path)
+
+
+def test_read_redoc_rejects_non_zip_missing_and_ignores_foreign_entries(tmp_path):
+    bad = tmp_path / "x.redoc"
+    bad.write_bytes(b"this is not a zip file")
+    with pytest.raises(F.FileFormatError, match="not a project"):
+        F.read_redoc(str(bad))
+    with pytest.raises(F.FileFormatError):
+        F.read_redoc(str(tmp_path / "missing.redoc"))
+    ok = str(tmp_path / "ok.redoc")
+    make_zip(ok, {"doc.json": "{}", "meta.json": '{"format":1}', "../evil.png": b"x", "surfaces/a.png": b"x",
+                  "surfaces/1.png": F.encode_png(rndwh(2, 2)), "notes.txt": "hi"})
+    assert sorted(F.read_redoc(ok)[2]) == [1]

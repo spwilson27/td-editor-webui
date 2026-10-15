@@ -362,9 +362,10 @@ describe('maskFromSelection', () => {
     expect(slot).not.toBe(old);
     expect(maskAt(e, slot, 10, 15)).toBe(255); // doc (20,20) = layer space (10,15)
     expect(maskAt(e, slot, 20, 20)).toBe(0);
-    e.maskFromSelection('base');
+    e.maskFromSelection('base'); // the input may have a mask
+    expect(e.layers().find((l) => l.id === 'base')?.mask).not.toBeNull();
     e.maskFromSelection(e.addGroup());
-    expect(notices.length).toBe(3);
+    expect(notices.length).toBe(2);
   });
 });
 

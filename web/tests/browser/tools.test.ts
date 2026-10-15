@@ -404,14 +404,14 @@ describe('locked, hidden and unsupported cases', () => {
     expect(notices).toContain('Layer is hidden');
   });
 
-  it('painting on the base layer is always refused, even after trying to unlock it', () => {
+  it('painting on the input layer is always refused, even after trying to unlock it', () => {
     e = newEngine(20, 20);
     e.setToolContext(brushCtx());
     const notices: string[] = [];
     e.on((ev) => ev.type === 'notice' && notices.push(ev.message));
     stroke(e, 'brush', [[10, 10]]);
     expect(px(e, 10, 10)).toEqual([0, 0, 0, 0]);
-    expect(notices).toEqual(['Layer is locked']);
+    expect(notices).toEqual(['The TD Input cannot be painted on (its mask can)']);
     e.setLayerProps('base', { locked: false });
     stroke(e, 'brush', [[10, 10]]);
     expect(px(e, 10, 10)).toEqual([0, 0, 0, 0]);
@@ -428,7 +428,7 @@ describe('locked, hidden and unsupported cases', () => {
     expect(notices).toEqual(['Select a pixel layer']);
   });
 
-  it.each(['crop', 'clone', 'smudge', 'text', 'hand', 'zoom'] as ToolId[])('%s is a no-op', (tool) => {
+  it.each(['crop', 'text', 'hand', 'zoom'] as ToolId[])('%s is a no-op', (tool) => {
     const id = paintSetup();
     const n = e.history().entries.length;
     stroke(e, tool, [[10, 10], [30, 30]]);

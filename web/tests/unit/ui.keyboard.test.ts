@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { isTyping, onKeyDown, onKeyUp, type KeyLike } from '../../src/state/keyboard';
 import { createStore } from '../../src/state/store';
+import { TOOLS } from '../../src/state/tools';
 import { FakeEngine } from '../browser/fakeEngine';
 
 let store: ReturnType<typeof createStore>;
@@ -38,9 +39,13 @@ describe('keyboard shortcuts', () => {
   });
 
   it('disabled tools do not activate and raise a notice', () => {
-    press('c');
-    expect(store.tool.value).toBe('brush');
-    expect(store.notice.value).toMatch(/not available/);
+    const crop = TOOLS.find((t) => t.id === 'crop')!;
+    crop.enabled = false;
+    try {
+      press('c');
+      expect(store.tool.value).toBe('brush');
+      expect(store.notice.value).toMatch(/not available/);
+    } finally { crop.enabled = true; }
   });
 
   it('selects the v3 tools: L lasso, W wand, T text, U shape', () => {
@@ -171,5 +176,99 @@ describe('keyboard hardening', () => {
     expect(store.spaceHeld.value).toBe(true);
     store.releaseStaleSpace(2100);
     expect(store.spaceHeld.value).toBe(false);
+  });
+});
+
+describe('v5 keys', () => {
+  it('C S R Y O select crop, clone, smudge, blur, dodge', () => {
+    for (const [k, id] of [['c', 'crop'], ['s', 'clone'], ['r', 'smudge'], ['y', 'blur'], ['o', 'dodge']] as const) {
+      press(k);
+      expect(store.tool.value).toBe(id);
+      expect(engine.tool).toBe(id);
+    }
+  });
+
+  it('Q toggles Quick Mask on the engine', () => {
+    press('q'); expect(engine.quickMask()).toBe(true);
+    press('q'); expect(engine.quickMask()).toBe(false);
+    expect(engine.calls.filter((c) => c.startsWith('quickMask:'))).toEqual(['quickMask:true', 'quickMask:false']);
+  });
+
+  describe('Ctrl/Cmd+T', () => {
+    beforeEach(() => { engine.setActiveLayer(engine.addPixelLayer('P')); });
+
+    it('lifts the selection of a pixel layer into a floating selection and switches to Move', () => {
+      engine.setSelection({ x: 10, y: 10, w: 30, h: 20 });
+      const e = press('t', { ctrlKey: true });
+      expect(e.preventDefault).toHaveBeenCalled();
+      expect(engine.calls).toContain('liftSelection');
+      expect(engine.floating()).not.toBeNull();
+      expect(store.tool.value).toBe('move');
+      expect(store.wantMove.value).toBe(false);
+    });
+
+    it('does nothing without a selection (and leaves the browser default alone)', () => {
+      const e = press('t', { metaKey: true });
+      expect(e.preventDefault).not.toHaveBeenCalled();
+      expect(engine.calls).not.toContain('liftSelection');
+      expect(store.tool.value).toBe('brush');
+    });
+
+    it('does nothing on a non-pixel layer', () => {
+      engine.setActiveLayer('base');
+      engine.setSelection({ x: 1, y: 1, w: 5, h: 5 });
+      press('t', { ctrlKey: true });
+      expect(engine.floating()).toBeNull();
+    });
+
+    it('a plain T is still the text tool', () => {
+      press('t'); expect(store.tool.value).toBe('text');
+    });
+  });
+
+  describe('Enter / Esc', () => {
+    it('commit / cancel a floating selection', () => {
+      engine.setActiveLayer(engine.addPixelLayer('P'));
+      engine.setSelection({ x: 10, y: 10, w: 30, h: 20 });
+      press('t', { ctrlKey: true });
+      const e = press('Enter');
+      expect(e.preventDefault).toHaveBeenCalled();
+      expect(engine.calls).toContain('commitFloating');
+      expect(engine.floating()).toBeNull();
+      press('t', { ctrlKey: true });
+      press('Escape');
+      expect(engine.calls).toContain('cancelFloating');
+      expect(engine.floating()).toBeNull();
+    });
+
+    it('Enter applies the crop box, Esc drops it', () => {
+      store.setTool('crop');
+      store.cropBox.value = { x: 10, y: 20, w: 100, h: 50 };
+      press('Enter');
+      expect(engine.cropped).toEqual([{ x: 10, y: 20, w: 100, h: 50 }]);
+      expect(store.cropBox.value).toBeNull();
+      store.cropBox.value = { x: 1, y: 1, w: 20, h: 20 };
+      press('Escape');
+      expect(store.cropBox.value).toBeNull();
+      expect(engine.cropped.length).toBe(1);
+    });
+
+    it('Enter without anything pending is inert', () => {
+      const e = press('Enter');
+      expect(e.preventDefault).not.toHaveBeenCalled();
+    });
+  });
+
+  it('the file and selection-op dialogs own the keyboard', () => {
+    store.selOpDialog.value = 'grow';
+    press('e');
+    expect(store.tool.value).toBe('brush');
+    store.selOpDialog.value = null;
+    store.fileDialog.value = { op: 'exportPng', path: '', busy: false, result: null } as never;
+    press('e');
+    expect(store.tool.value).toBe('brush');
+    store.fileDialog.value = null;
+    press('e');
+    expect(store.tool.value).toBe('eraser');
   });
 });

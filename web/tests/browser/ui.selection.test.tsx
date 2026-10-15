@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { store } from '../../src/state/store';
 import { ContextBar } from '../../src/ui/ContextBar';
+import { SelectionOpDialog } from '../../src/ui/SelectionOpDialog';
 import { TopBar } from '../../src/ui/TopBar';
 import { Viewport } from '../../src/ui/Viewport';
 import type { FakeEngine } from './fakeEngine';
@@ -132,5 +133,100 @@ describe('marching ants for arbitrary selections', () => {
     await settle();
     expect(engine.pointers.map((p) => p.kind)).toEqual(['down', 'move', 'move', 'move', 'up']);
     expect(some(20, 10)).toBe(false); // preview gone after release
+  });
+});
+
+describe('Select > Grow / Shrink / Smooth / Feather / Border dialog', () => {
+  beforeEach(async () => {
+    engine.setSelection({ x: 5, y: 5, w: 20, h: 20 });
+    engine.calls.length = 0;
+    store.selOpDialog.value = null;
+    await mount(<><TopBar /><SelectionOpDialog /></>);
+  });
+  afterEach(() => { store.selOpDialog.value = null; });
+
+  const open = async (item: string) => {
+    [...document.querySelectorAll<HTMLElement>('button')].find((b) => b.textContent === 'Select')!.click();
+    await settle();
+    menuItem(item).click();
+    await settle();
+  };
+  const input = () => q<HTMLInputElement>('[data-selop-field]');
+  const type = async (v: string) => { input().value = v; input().dispatchEvent(new Event('input', { bubbles: true })); await settle(); };
+  const enter = async () => { input().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); await settle(); };
+
+  it('opens with a per-op title and a default of 4 px, focused', async () => {
+    expect(document.querySelector('[data-selop-dialog]')).toBeNull();
+    for (const [item, title] of [['Grow', 'Grow Selection'], ['Shrink', 'Shrink Selection'], ['Smooth', 'Smooth Selection'], ['Feather', 'Feather Selection'], ['Border', 'Border Selection']] as const) {
+      await open(item);
+      expect(q('[role=dialog]').textContent).toContain(title);
+      expect(input().value).toBe('4');
+      expect(document.activeElement).toBe(input());
+      store.selOpDialog.value = null;
+      await settle();
+    }
+  });
+
+  it('OK applies the op with the px value and closes', async () => {
+    await open('Grow');
+    await type('12');
+    q('[data-selop-ok]').click();
+    await settle();
+    expect(engine.calls).toContain('modifySelection:grow:12');
+    expect(document.querySelector('[data-selop-dialog]')).toBeNull();
+  });
+
+  it('Enter applies; Esc and Cancel close without applying', async () => {
+    await open('Shrink');
+    await enter();
+    expect(engine.calls).toContain('modifySelection:shrink:4');
+    expect(store.selOpDialog.value).toBeNull();
+    await open('Border');
+    input().dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await settle();
+    expect(document.querySelector('[data-selop-dialog]')).toBeNull();
+    await open('Smooth');
+    q('[data-selop-cancel]').click();
+    await settle();
+    expect(document.querySelector('[data-selop-dialog]')).toBeNull();
+    expect(engine.calls.filter((c) => c.startsWith('modifySelection'))).toEqual(['modifySelection:shrink:4']);
+  });
+
+  it('validates the range: feather accepts 0, the others need 1..200 (engine MAX_SEL_PX)', async () => {
+    await open('Feather');
+    await type('0');
+    expect(q('[data-selop-ok]').getAttribute('aria-disabled')).toBe('false');
+    await enter();
+    expect(engine.calls).toContain('modifySelection:feather:0');
+    await open('Grow');
+    await type('0');
+    expect(q('[data-selop-ok]').getAttribute('aria-disabled')).toBe('true');
+    await enter();
+    await type('201');
+    await enter();
+    await type('');
+    await enter();
+    expect(engine.calls.filter((c) => c.startsWith('modifySelection:grow'))).toEqual([]);
+    expect(store.selOpDialog.value).toBe('grow');
+    await type('200');
+    await enter();
+    expect(engine.calls).toContain('modifySelection:grow:200');
+  });
+
+  it('a stray key does not reach the shortcuts while the dialog is open', async () => {
+    const { installKeyboard } = await import('../../src/state/keyboard');
+    const off = installKeyboard(store);
+    await open('Grow');
+    const before = store.tool.value;
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'e', bubbles: true }));
+    expect(store.tool.value).toBe(before);
+    off();
+  });
+
+  it('is not offered without a selection', async () => {
+    engine.setSelection(null);
+    await settle();
+    store.openSelectionOp('grow');
+    expect(store.selOpDialog.value).toBeNull();
   });
 });

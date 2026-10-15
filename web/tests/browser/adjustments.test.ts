@@ -36,7 +36,7 @@ describe('adjustment layers: formulas (see adjustments.ts)', () => {
     const a = e.addAdjustment('levels');
     const b = e.addPixelLayer();
     const c = e.addAdjustment('blur');
-    expect(e.layers().map((l) => [l.id, l.kind, l.name])).toEqual([[c, 'adjustment', 'Blur'], [b, 'pixel', 'Layer 1'], [a, 'adjustment', 'Levels'], ['base', 'base', 'TD Input']]);
+    expect(e.layers().map((l) => [l.id, l.kind, l.name])).toEqual([[c, 'adjustment', 'Blur'], [b, 'pixel', 'Layer 1'], [a, 'adjustment', 'Levels'], ['base', 'input', 'TD Input']]);
     expect(e.activeLayerId()).toBe(c);
     expect(e.layers()[0].adjustment).toEqual({ type: 'blur', radius: 4 });
     expect(e.history().entries.map((x) => x.label)).toEqual(['Add adjustment', 'Add layer', 'Add adjustment']);

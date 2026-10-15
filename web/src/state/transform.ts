@@ -45,7 +45,7 @@ export function scaleRect(r: Rect, h: Handle, dx: number, dy: number, o: ScaleOp
 export function transformFor(t: LayerTransform, from: Rect, to: Rect): LayerTransform {
   if (from.w <= 0 || from.h <= 0) return t;
   const kx = to.w / from.w, ky = to.h / from.h;
-  return { x: to.x + (t.x - from.x) * kx, y: to.y + (t.y - from.y) * ky, sx: t.sx * kx, sy: t.sy * ky };
+  return { ...t, x: to.x + (t.x - from.x) * kx, y: to.y + (t.y - from.y) * ky, sx: t.sx * kx, sy: t.sy * ky };
 }
 
 const kOf = (kx: number, ky: number) => (Math.abs(kx - 1) < 1e-9 ? ky : Math.abs(ky - 1) < 1e-9 ? kx : Math.sqrt(kx * ky));
@@ -79,8 +79,8 @@ export function remapShape(s: ShapeSpec, from: Rect, to: Rect): ShapeSpec {
 }
 
 export const sameRect = (a: Rect, b: Rect, eps = 1e-6) => Math.abs(a.x - b.x) < eps && Math.abs(a.y - b.y) < eps && Math.abs(a.w - b.w) < eps && Math.abs(a.h - b.h) < eps;
-export const isIdentity = (t: LayerTransform) => t.x === 0 && t.y === 0 && t.sx === 1 && t.sy === 1;
-export const IDENTITY: LayerTransform = { x: 0, y: 0, sx: 1, sy: 1 };
+export const isIdentity = (t: LayerTransform) => t.x === 0 && t.y === 0 && t.sx === 1 && t.sy === 1 && !t.rot && !t.kx && !t.ky;
+export const IDENTITY: LayerTransform = { x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 };
 
 export type BoundsField = 'x' | 'y' | 'w' | 'h';
 /** Context-bar field edit: the new bounds. Width / height keep the top-left corner; `lock` keeps the aspect ratio. */

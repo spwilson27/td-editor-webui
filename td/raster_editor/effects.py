@@ -1019,18 +1019,37 @@ def shader_uses_input2(name):
     return bool(sp and sp.get("in2"))
 
 
-def load_shader_texts(directory=None):
-    """{shader name: common.glsl [+ filterlib.glsl, blurlib.glsl] + shader} read from shared/effects (or ``directory``)."""
-    d = directory or _shared_dir()
+def shader_stems():
+    """Every shared/effects/<stem>.glsl a built component needs: common, all shaders and their include libraries."""
+    stems = {"common"}
+    for t in shader_names():
+        stems.add(t)
+        stems.update(shader_includes(t))
+    return sorted(stems)
 
+
+def load_shader_texts_from(texts):
+    """{shader name: common + includes + shader} from ``texts`` = {stem: glsl source} (the embedded ``fx_<stem>`` DATs of a built
+    component, or the files of shared/effects). Raises KeyError naming the missing stem."""
     def rd(n):
-        with open(os.path.join(d, n + ".glsl"), encoding="utf-8") as f:
-            return f.read()
+        if n not in texts:
+            raise KeyError(f"shader source {n}.glsl is missing")
+        return texts[n]
     common = rd("common")
     out = {}
     for t in shader_names():
         out[t] = common + "\n" + "".join(rd(i) + "\n" for i in shader_includes(t)) + rd(t)
     return out
+
+
+def load_shader_texts(directory=None):
+    """{shader name: common.glsl [+ filterlib.glsl, blurlib.glsl] + shader} read from shared/effects (or ``directory``)."""
+    d = directory or _shared_dir()
+    texts = {}
+    for stem in shader_stems():
+        with open(os.path.join(d, stem + ".glsl"), encoding="utf-8") as f:
+            texts[stem] = f.read()
+    return load_shader_texts_from(texts)
 
 
 # --------------------------------------------------------------------------- TD node chain

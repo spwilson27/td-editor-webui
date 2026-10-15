@@ -1,4 +1,4 @@
-"""Live validation of the raster_editor COMP (protocol v5) against a running TouchDesigner
+"""Live validation of the raster_editor COMP (protocol v6) against a running TouchDesigner
 (docs/TESTING.md section 3, docs/DESIGN_V2.md section 7).
 
     .venv/bin/python scripts/validate_td.py                  # every step (the real UI drives the UI steps)
@@ -6,7 +6,7 @@
     .venv/bin/python scripts/validate_td.py --fake-client    # same, but keeps the UI steps that tolerate it
     .venv/bin/python scripts/validate_td.py --only 5,7,9     # run chosen steps (numbers below)
 
-The fake client speaks protocol v5 over a stdlib WebSocket: it sends `doc` + SURFACE tiles like the web
+The fake client speaks protocol v6 over a stdlib WebSocket: it sends `doc` + SURFACE tiles like the web
 app, pulls BASE / VIEW / SURFACE over HTTP and measures `applied` latency.
 
 Flags: --no-build (reuse the COMP that exists), --port N, --only. Only operators inside
@@ -72,7 +72,21 @@ def wait_for(fn, timeout, period=0.1):
     return last
 
 
+def baseline():
+    """Between steps: the editor is on (a step such as the export one switches it off and on) and the server answers, so a
+    step never starts against a half-restarted component. Steps reset the rest (inputs, canvas) themselves."""
+    try:
+        td("comp.par.Active = 1")
+        wait_for(lambda: td("print(comp.ext.RasterEditorExt._started and comp.op('webserver').par.active.eval())").strip() in ("1", "True"), 10)
+        # The panel's page reconnects a few seconds after an Active off/on or a rebuild and, being the first panel after a (re)start,
+        # takes over as the active editor: a step that took over earlier would silently lose it (its doc / tiles ignored). Wait for it.
+        wait_for(lambda: td("x = comp.ext.RasterEditorExt; print(any(c.kind == 'panel' and c.ready for c in x.clients.values()))").strip() == "True", 25)
+    except Exception:  # noqa: BLE001 - the step reports its own problems
+        pass
+
+
 def step(num, name, fn):
+    baseline()
     t0 = time.time()
     try:
         ok, detail = fn()
@@ -221,16 +235,16 @@ def http_get(port, path, timeout=10):
     return r.status, body
 
 
-def get_base(port, tok, client_id, frame_id=0):
-    """GET /base (PROTOCOL.md section 4): the newest BASE frame message, or None on 404."""
-    st, body = http_get(port, f"/base?token={tok}&client={client_id}&frameId={frame_id}")
+def get_base(port, tok, client_id, frame_id=0, input=1):
+    """GET /base?input=N (PROTOCOL.md section 4): the newest BASE frame message of that TD input, or None on 404."""
+    st, body = http_get(port, f"/base?token={tok}&client={client_id}&input={input}&frameId={frame_id}")
     return body if st == 200 else None
 
 
 def L(id, kind="pixel", slot=None, mask=None, size=None, **kw):
     """A v5 LayerSpec. ``size`` = (surfaceW, surfaceH) of a pixel / base layer's surface (default: none = document size)."""
     d = {"id": id, "kind": kind, "parentId": None, "name": id, "visible": True, "opacity": 1, "blend": "normal",
-         "x": 0, "y": 0, "sx": 1, "sy": 1, "surfaceW": size[0] if size else None, "surfaceH": size[1] if size else None,
+         "x": 0, "y": 0, "sx": 1, "sy": 1, "rot": 0, "kx": 0, "ky": 0, "effects": [], "surfaceW": size[0] if size else None, "surfaceH": size[1] if size else None,
          "slot": slot, "mask": mask, "adjustment": None}
     d.update(kw)
     return d
@@ -253,7 +267,10 @@ class Editor:
         self.doc_state = None
         self.doc_w = self.doc_h = None
         self.mode = None            # canvas mode from hello / docSize
-        self.base_size = None       # (w, h) of the TD Input from hello / baseSize; (0, 0) = none
+        self.inputs = {}            # input index -> (w, h, connected) from hello.inputs / `inputs`
+        self.base_size = None       # (w, h) of TD input 1; (0, 0) = none
+        self.reloads, self.file_results, self.files = [], [], None
+        self.bases_by_input = {}
         self.fid = 1000 if kind == "external" else 5000
         self.ws.send(P.ready(kind, self.token, fresh, "validate"))
 
@@ -275,9 +292,15 @@ class Editor:
                 self.hello, self.client_id, self.active = msg, msg["clientId"], msg["active"]
                 self.doc_w, self.doc_h = msg["doc"]["w"], msg["doc"]["h"]
                 self.mode = msg["doc"].get("mode")
-                self.base_size = (msg["baseSize"]["w"], msg["baseSize"]["h"]) if "baseSize" in msg else None
-            elif t == "baseSize":
-                self.base_size = (msg["w"], msg["h"])
+                self._set_inputs(msg.get("inputs", []))
+            elif t == "inputs":
+                self._set_inputs(msg["items"])
+            elif t == "reload":
+                self.reloads.append(msg)
+            elif t == "fileResult":
+                self.file_results.append(msg)
+            elif t == "files":
+                self.files = msg
             elif t == "active":
                 self.active = msg["active"]
             elif t == "docSize":
@@ -290,9 +313,10 @@ class Editor:
             elif t == "base":
                 self.notices["base"] += 1
                 if self.autofetch:
-                    body = get_base(self.port, self.token, self.client_id, msg["frameId"])
+                    body = get_base(self.port, self.token, self.client_id, msg["frameId"], msg.get("input", 1))
                     if body is not None:
                         self.bases.append(body)
+                        self.bases_by_input.setdefault(msg.get("input", 1), []).append(body)
             elif t == "view":
                 self.notices["view"] += 1
                 t_notice = now
@@ -300,6 +324,11 @@ class Editor:
                     st, body = http_get(self.port, f"/view?token={self.token}&client={self.client_id}&frameId={msg['frameId']}")
                     if st == 200:
                         self.view_log.append((time.time(), P.decode_frame(body)[0], msg["appliedFrameId"], body, t_notice))
+
+    def _set_inputs(self, items):
+        self.inputs = {i["input"]: (i["w"], i["h"], i["connected"]) for i in items}
+        w, h, _ = self.inputs.get(1, (0, 0, False))
+        self.base_size = (w, h)
 
     def run(self, seconds):
         end = time.time() + seconds
@@ -389,7 +418,7 @@ def scene(W, H):
     return p1, p2, mask
 
 
-SCENE_LAYERS = [L("base", "base", size=(IW, IH)), L("p1", slot=1, size=(IW, IH)),
+SCENE_LAYERS = [L("base", "input", input=1, size=(IW, IH)), L("p1", slot=1, size=(IW, IH)),
                 L("p2", slot=2, mask={"slot": 3, "enabled": True}, size=(IW, IH))]
 
 
@@ -560,7 +589,7 @@ def s5_scene(args):
             return False, f"takeover failed: {ed.texts}"
         h = ed.hello
         if h["protocol"] != P.PROTOCOL_VERSION or h["doc"].get("w") != IW or h["doc"].get("h") != IH or not h["hasInput"] \
-                or "hasDocument" not in h or "rev" not in h or h["doc"].get("mode") != "input" or h.get("baseSize") != {"w": IW, "h": IH}:
+                or "hasDocument" not in h or "rev" not in h or h["doc"].get("mode") != "input" or h.get("inputs", [{}])[0] != {"input": 1, "w": IW, "h": IH, "connected": True}:
             return False, f"bad hello {h}"
         p1, p2, mask = scene(IW, IH)
         t0 = time.time()
@@ -580,7 +609,7 @@ def s5_scene(args):
         if base_ok:
             hdr, payload = P.decode_frame(ed.bases[-1])
             img = np.frombuffer(payload, np.uint8).reshape(hdr.h, hdr.w, 4)
-            base_ok = tuple(img[IH // 2, IW // 2]) == (255, 0, 0, 255) and hdr.type == P.TYPE_BASE and hdr.slot == 0
+            base_ok = tuple(img[IH // 2, IW // 2]) == (255, 0, 0, 255) and hdr.type == P.TYPE_BASE and hdr.slot == 1
         # document stored for fresh pages
         st = td_json("import json as j; t = comp.op('doc_state').text; d = j.loads(t) if t else {}; print(json.dumps({'rev': d.get('rev'), 'n': len(d.get('layers', [])), 'w': d.get('docW')}))")
         return (bool(ok and base_ok and st["rev"] == 1 and st["n"] == 3),
@@ -917,7 +946,7 @@ def s12_perf(args):
     ed = Editor(args.port)
     try:
         ed.takeover()
-        layers = [L("base", "base")]
+        layers = [L("base", "input", input=1)]
         slot = 10
         masks = 0
         for i in range(17):
@@ -1014,7 +1043,7 @@ print(json.dumps(rows))
         # Leave a tiny document behind: the real page is promoted when this client leaves and would otherwise download the
         # 21 x 8 MB stack above (and be mid-load when the next step's client takes over).
         try:
-            ed.send_doc([L("base", "base")], 800)
+            ed.send_doc([L("base", "input", input=1)], 800)
             ed.run(0.3)
         except Exception:  # noqa: BLE001
             pass
@@ -1135,7 +1164,7 @@ def reset_doc(args, layers=None):
     ed = Editor(args.port)
     try:
         ed.takeover()
-        ed.send_doc(layers or [L("base", "base")], 900)
+        ed.send_doc(layers or [L("base", "input", input=1)], 900)
         ed.run(0.4)
     finally:
         ed.close()
@@ -1173,6 +1202,41 @@ def s14_ui_paint(args):
         f"UI latency readout {lat}")
 
 
+def take_over(ed, tries=6):
+    """Become the active editor. The panel's page reconnects a few seconds after a rebuild / Active toggle and, as the first panel after
+    a (re)start, takes the role: ask again until we hold it (a doc / tiles sent without it are silently ignored by TD)."""
+    for _ in range(tries):
+        if ed.takeover():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def page_matches_td(timeout=30):
+    """The real page is the active editor, has finished loading and shows the same layer stack (ids, order) TD holds."""
+    def ok():
+        td_ids = td_json("print(json.dumps([l['id'] for l in (comp.ext.RasterEditorExt.doc_layers or [])]))")
+        pg = js_result("(function(){var d=window.__editorTest.docSpec();return d.layers.map(function(l){return l.id})})()")
+        ls = js_result("window.__editorTest.loadState()") or {}
+        return ls.get("active") is True and not ls.get("loadingDoc") and pg == td_ids
+    return bool(wait_for(ok, timeout, 0.5))
+
+
+def settle_page(timeout=30):
+    """Page and TD agree on the document and the page's composite is no longer changing (two identical reads of a pixel grid)."""
+    if not page_matches_td(timeout):
+        return False
+    expr = ("(function(){var o=[];for(var y=0;y<300;y+=37)for(var x=0;x<520;x+=41)o.push(window.__editorTest.readPixel(x,y));return o;})()")
+    prev = None
+    for _ in range(12):
+        cur = js_result(expr, 30)
+        if cur is not None and cur == prev:
+            return True
+        prev = cur
+        time.sleep(0.5)
+    return False
+
+
 def s15_parity(args):
     """Blend parity TD vs the browser preview (DESIGN_V2 section 7): one document with every blend mode and adjustment in its
     own 64 px cell (pixels confined to the cell, adjustments confined by a mask). TD gets the document from a fake client;
@@ -1193,7 +1257,7 @@ def s15_parity(args):
     bg[..., 1] = (yy * 255 // (H - 1))
     bg[..., 2] = ((xx // 8 + yy // 8) % 2) * 160 + 40
     bg[..., 3] = 255
-    layers = [L("base", "base"), L("bg", slot=1)]
+    layers = [L("base", "input", input=1), L("bg", slot=1)]
     surf = {1: bg}
     slot = 2
     for i, mode in enumerate(MODES):
@@ -1222,7 +1286,7 @@ def s15_parity(args):
     wait_for(lambda: out1_size() == [W, H], 4)
     ed = Editor(args.port)
     try:
-        ed.takeover()
+        take_over(ed)
         ed.send_doc(layers, 50)
         fid = None
         for s_, im in surf.items():
@@ -1239,7 +1303,10 @@ def s15_parity(args):
             ls_ = js_result('window.__editorTest.loadState()') or {}
             return None, (f"real page did not become active/load the document: " + str({k: v for k, v in ls_.items() if k != 'docSpec'})
                           + f" status={status()!r}")
+        synced = settle_page(40)
         stt = js_result("window.__editorTest.loadState()")
+        if not synced:
+            return False, f"page and TD never agreed on the document: {str({k: v for k, v in stt.items() if k != 'docSpec'})[:300]}"
         if len(stt["slots"]) < len(surf):
             return False, f"page did not load the document (slots {stt['slots']}): {str(stt)[:300]}"
         pts = [(x, y) for y in range(0, H, 8) for x in range(0, W, 8)]
@@ -1260,6 +1327,28 @@ def s15_parity(args):
             tol = 3 if i < len(MODES) else (12 if name == "blur" else 8)
             ok_all = ok_all and worst <= tol
             report.append(f"{name}:{worst:.0f}" + ("" if worst <= tol else f"(>{tol})"))
+        if not ok_all:   # evidence for the harness-vs-product question: what TD shows NOW, what the page shows, and both documents
+            try:
+                time.sleep(2.0)
+                td2 = td_rect(COMP + "/out1", 0, 0, W, H).astype(np.float64)
+                os.makedirs(OUT_DIR, exist_ok=True)
+                np.save(os.path.join(OUT_DIR, "parity_td_first.npy"), tdimg)
+                np.save(os.path.join(OUT_DIR, "parity_td_later.npy"), td2)
+                np.save(os.path.join(OUT_DIR, "parity_page.npy"), brp)
+                later = np.array([td2[y, x] for x, y in pts])
+                d2 = np.abs(brp - later).max(axis=1)
+                tdl = td_json("x = comp.ext.RasterEditorExt; print(json.dumps({'rev': x.doc_rev, 'n': len(x.doc_layers), 'dirty': sorted(x._dirty), 'slots': len(x._slot_set)}))")
+                pg = js_result("(function(){var d=window.__editorTest.docSpec();return {rev:d.rev,n:d.layers.length}})()")
+                raw2 = js_result("(function(){var o=[];for(var y=0;y<%d;y+=8)for(var x=0;x<%d;x+=8)o.push(window.__editorTest.readPixel(x,y));return o;})()" % (H, W), 30)
+                b2 = np.array(raw2, np.float64) if raw2 else None
+                if b2 is not None:
+                    b2[:, :3] = b2[:, :3] * b2[:, 3:4] / 255.0
+                    report.append(f"| page re-read 2 s later differs from its first read by {float(np.abs(b2 - brp).max()):.0f}, from TD by {float(np.abs(b2 - tdp).max()):.0f}")
+                report.append(f"| TD first-vs-later out1 max diff {float(np.abs(tdimg - td2).max()):.0f}; page-vs-later-TD per-cell worst "
+                              + " ".join(f"{n}:{float(d2[[k for k, (x, y) in enumerate(pts) if cells[i][0] * C <= x < (cells[i][0] + 1) * C and cells[i][1] * C <= y < (cells[i][1] + 1) * C]].max()):.0f}" for i, n in enumerate(names))
+                              + f" | TD doc {tdl} page doc {pg}")
+            except Exception as e:  # noqa: BLE001
+                report.append(f"(evidence dump failed: {e})")
         return ok_all, "max per-channel diff (premultiplied 0..255) per cell, tolerance 3 blend / 8 adj / 12 blur: " + " ".join(report)
     finally:
         try:
@@ -1419,7 +1508,7 @@ for p in comp.customPars:
 print(json.dumps({'pars': out, 'pages': [pg.name for pg in comp.customPages]}))
 """)
     empty = [k for k, v in res["pars"].items() if len(v) < 20]
-    need = {"Docsizemode", "Exportpath", "Exportdoc", "Docw", "Doch", "Premultiplied"}
+    need = {"Docsizemode", "Exportpath", "Exportdoc", "Docw", "Doch", "Premultiplied", "Projectfile", "Saveproject", "Openproject", "Pngfile", "Exportpng"}
     absent = sorted(need - set(res["pars"])) + (["Savetox (should be gone)"] if "Savetox" in res["pars"] else [])
     return bool(res["pars"]) and not empty and not absent, (
         f"{len(res['pars'])} custom parameters on page(s) {res['pages']}; "
@@ -1549,7 +1638,7 @@ def s19_top_import(args):
         notes.append(f"403 bad token {st403}, 404 other client {st404}; fetched import: {pre} then {served_gone} after 6.5 s; "
                      f"unfetched import after 30.5 s: {stexp}")
         stexp = stexp if (pre, served_gone) == (200, 404) else -1
-        ok = errs_ok and st403 == 403 and st404 == 404 and stexp == 404 and worst_top < 40 and worst_pump < 60
+        ok = errs_ok and st403 == 403 and st404 == 404 and stexp == 404 and worst_top < 70 and worst_pump < 90   # (GPU readback / scheduling noise after earlier UI steps reached 41 / 54 ms)
         return ok, "; ".join(notes)
     finally:
         ed.close()
@@ -1889,7 +1978,7 @@ XF_A_INT = dict(XF_A, x=11.0, y=7.0)   # the page keeps pixel / base positions w
 
 
 def xf_layers(a=XF_A):
-    return [L("base", "base", size=(64, 48), **XF_D),
+    return [L("base", "input", input=1, size=(64, 48), **XF_D),
             L("pa", slot=1, size=(8, 8), **a), L("pb", slot=2, size=(128, 128), **XF_B),
             L("pc", slot=3, mask={"slot": 4, "enabled": True}, size=(16, 16), **XF_C)]
 
@@ -2084,7 +2173,7 @@ def s26_canvas_td(args):
         b.wait(lambda: b.hello is not None, 3)
         wire = np.random.RandomState(7).randint(0, 256, (40, 50, 4), np.uint8)
         wire[..., 3] = 255
-        a.send_doc([L("base", "base"), L("p1", slot=1, size=(50, 40))], 70)
+        a.send_doc([L("base", "input", input=1), L("p1", slot=1, size=(50, 40))], 70)
         fid = a.send_surface(1, (0, 0, 50, 40), wire, (50, 40))
         wait_applied(a, fid, 5)
         chk("hello carries mode", a.mode == "input" and b.mode == "input", f"({a.mode}, {b.mode}, baseSize {a.base_size})")
@@ -2172,7 +2261,7 @@ def s27_ui_canvas(args):
     # an input connects while Fixed
     connect_input_sized(320, 200)
     time.sleep(1.0)
-    base = next((l for l in td_layers() if l["kind"] == "base"), {})
+    base = next((l for l in td_layers() if l["kind"] == "input"), {})
     chk("input connects in Fixed: canvas stays", out1_size() == [600, 300], f"out1 {out1_size()}")
     notes.append(f"NOTE base layer in TD after connecting in Fixed mode: size {(base.get('surfaceW'), base.get('surfaceH'))} "
                  f"transform {(base.get('x'), base.get('y'), base.get('sx'), base.get('sy'))} (design: fitted + centred = (60, 0, 1.5, 1.5))")
@@ -2185,14 +2274,14 @@ def s27_ui_canvas(args):
     chk("input resolution change while following", wait_for(lambda: out1_size() == [256, 128], 6), f"out1 {out1_size()}")
     st = wait_for(lambda: (js_result("window.__editorTest.state().doc") or {}).get("w") == 256 and js_result("window.__editorTest.state().doc"), 4)
     chk("page canvas follows the input", st and (st["w"], st["h"]) == (256, 128), str(st))
-    base = next((l for l in td_layers() if l["kind"] == "base"), {})
+    base = next((l for l in td_layers() if l["kind"] == "input"), {})
     chk("base surface size follows the input", (base.get("surfaceW"), base.get("surfaceH")) == (256, 128), str(base))
     hook_call("setCanvasSize(200, 100, 'tl')")
     wait_for(lambda: out1_size() == [200, 100], 6)
     connect_input_sized(300, 300)
     time.sleep(1.0)
     chk("input resolution change while Fixed: canvas stays 200x100", out1_size() == [200, 100], f"out1 {out1_size()}")
-    base = next((l for l in td_layers() if l["kind"] == "base"), {})
+    base = next((l for l in td_layers() if l["kind"] == "input"), {})
     chk("base surface size follows the input (Fixed)", (base.get("surfaceW"), base.get("surfaceH")) == (300, 300), str(base))
     hook_call("setCanvasMode('input')")
     chk("Follow Input again -> 300x300", wait_for(lambda: out1_size() == [300, 300], 6), f"out1 {out1_size()}")
@@ -2211,7 +2300,7 @@ def s28_render_layer(args):
         ed.wait(lambda: any(m["t"] == "fonts" for m in ed.texts), 5)
         fonts = next((m["families"] for m in ed.texts if m["t"] == "fonts"), [])
         text = dict(SPEC_TEXT, font=pick_font(fonts))
-        layers = [L("base", "base"), L("p1", slot=1, size=(512, 256)),
+        layers = [L("base", "input", input=1), L("p1", slot=1, size=(512, 256)),
                   L("t1", "text", text=text, shape=None), L("s1", "shape", text=None, shape=SPEC_SHAPES["rect"])]
         ed.send_doc(layers, 80)
         ed.send_surface(1, (0, 0, 512, 256), np.zeros((256, 512, 4), np.uint8), (512, 256))
@@ -2284,7 +2373,7 @@ def s29_export(args):
         wait_for(lambda: out1_size() == [320, 200], 4)
         px = np.random.RandomState(3).randint(0, 256, (30, 40, 4), np.uint8)
         px[..., 3] = 255
-        ed.send_doc([L("base", "base"), L("p1", slot=1, size=(40, 30), x=12.5, y=3.25, sx=2.0, sy=2.0)], 90,
+        ed.send_doc([L("base", "input", input=1), L("p1", slot=1, size=(40, 30), x=12.5, y=3.25, sx=2.0, sy=2.0)], 90,
                     guides={"h": [10.0, 55.5], "v": [100.0]}, canvas={"mode": "fixed"})
         fid = ed.send_surface(1, (0, 0, 40, 30), px, (40, 30))
         wait_applied(ed, fid, 5)
@@ -2401,7 +2490,7 @@ print(json.dumps({'name': c.name, 'started': x._started, 'token': x.token, 'port
         ws.recv(1.0)
         # a small document with pixels, so the undo has something to bring back
         W = H = 64
-        ws.send(P.doc(1, [L("base", "base", size=(W, H)), L("p1", slot=1, size=(W, H))]))
+        ws.send(P.doc(1, [L("base", "input", input=1, size=(W, H)), L("p1", slot=1, size=(W, H))]))
         px = np.random.RandomState(5).randint(0, 256, (H, W, 4), np.uint8)
         px[..., 3] = 255
         for m in P.encode_frames(P.TYPE_SURFACE, 1, W, H, (0, 0, W, H), px, slot=1):
@@ -2464,6 +2553,602 @@ comp.par.Active = {was_active}
     return ok_all, "\n        ".join(notes)
 
 
+# --------------------------------------------------------------------------- v6 steps: multiple inputs, files, affine, effects, tools
+
+import frames as FR  # noqa: E402  (td/raster_editor/frames.py: PNG / .redoc codecs)
+
+
+def in_name(n):
+    return TMP if n == 1 else f"/project1/_validate_in{n}"
+
+
+def connect_n(n, w, h, color):
+    """Constant TOP w x h wired to the COMP's input n (the connector must exist: wait for the spare)."""
+    if not wait_for(lambda: td_json(f"print(json.dumps(len(comp.inputConnectors)))") >= n, 4):
+        raise RuntimeError(f"input connector {n} does not exist")
+    td(f"""
+c = op({in_name(n)!r})
+if c is None:
+    c = op('/project1').create(constantTOP, {in_name(n).rsplit('/', 1)[1]!r})
+c.par.outputresolution = 'custom'; c.par.resolutionw = {w}; c.par.resolutionh = {h}
+c.par.colorr, c.par.colorg, c.par.colorb, c.par.alpha = {color[0]}, {color[1]}, {color[2]}, 1
+if not comp.inputConnectors[{n - 1}].connections:
+    comp.inputConnectors[{n - 1}].connect(c)
+""")
+
+
+def disconnect_n(n):
+    td(f"comp.inputConnectors[{n - 1}].disconnect()")
+
+
+def reset_inputs(w=800, h=600):
+    td(f"""
+for c in comp.inputConnectors:
+    if c.connections: c.disconnect()
+for n in range(1, 9):
+    t = op('/project1/_validate_in' + ('' if n == 1 else str(n)))
+    if t: t.destroy()
+comp.par.Docsizemode = 'input'; comp.par.Docw = {w}; comp.par.Doch = {h}
+""")
+    wait_for(lambda: out1_size() == [w, h], 4)
+
+
+def n_connectors():
+    return td_json("print(json.dumps(len(comp.inputConnectors)))")
+
+
+def px_at(x, y, path=COMP + "/out1"):
+    """RGBA of one out1 pixel; [-1, -1, -1, -1] while the output is not that large (yet), so wait_for loops simply retry."""
+    w, h = out1_size()
+    if not (0 <= x < w and 0 <= y < h):
+        return [-1, -1, -1, -1]
+    return td_rect(path, x, y, 1, 1)[0, 0].tolist()
+
+
+def s31_inputs(args):
+    """Multiple inputs (fake client): spare-connector rule, `inputs` message, per-input BASE frames, input layers rendered at
+    their placement, disconnect / reconnect keeps the placement, Follow Input uses input 1 only."""
+    reset_inputs()
+    notes, ok_all = [], True
+
+    def chk(label, cond, extra=""):
+        nonlocal ok_all
+        ok_all &= bool(cond)
+        notes.append(f"{label}: {'ok' if cond else 'FAIL'} {extra}".rstrip())
+
+    ed = Editor(args.port)
+    try:
+        for _ in range(4):   # (the page may still be reloading after an earlier step: ask again until we are the active editor)
+            if ed.takeover():
+                break
+        chk("fake client is the active editor", ed.active is True, "")
+        chk("initially one unconnected input connector (after the spare trim delay)", wait_for(lambda: n_connectors() == 1, 8), f"({n_connectors()})")
+        sizes = {1: (96, 64), 2: (48, 32), 3: (32, 24)}
+        cols = {1: (1, 0, 0), 2: (0, 1, 0), 3: (0, 0, 1)}
+        for n in (1, 2, 3):
+            connect_n(n, *sizes[n], cols[n])
+            ok = wait_for(lambda: n_connectors() == n + 1, 4) and ed.wait(lambda: ed.inputs.get(n, (0, 0, False))[2] is True, 4)
+            chk(f"connect input {n}: spare connector appears ({n + 1} connectors), `inputs` lists it", ok, f"{n_connectors()} connectors, {ed.inputs}")
+        chk("inputs message: sizes and the spare", {k: v[:2] for k, v in ed.inputs.items() if v[2]} == sizes and ed.inputs.get(4) == (0, 0, False),
+            str(ed.inputs))
+        ed.run(1.0)
+        for n in (1, 2, 3):
+            body = ed.bases_by_input.get(n, [None])[-1]
+            if body is None:
+                chk(f"BASE frame input {n}", False, "none received")
+                continue
+            h, payload = P.decode_frame(body)
+            img = np.frombuffer(payload, np.uint8).reshape(h.h, h.w, 4)
+            want = [255 * c for c in cols[n]] + [255]
+            chk(f"BASE input {n}: header slot, size and colour", h.slot == n and (h.doc_w, h.doc_h) == sizes[n] and img[3, 3].tolist() == want,
+                f"slot {h.slot} {h.doc_w}x{h.doc_h} px {img[3, 3].tolist()}")
+        st, _ = http_get(args.port, f"/base?token={ed.token}&client={ed.client_id}&input=4")
+        chk("spare input has no frame (404)", st == 404, str(st))
+        # a document with three input layers on a fixed canvas
+        ed.send_canvas(300, 200, "fixed")
+        wait_for(lambda: out1_size() == [300, 200], 10)
+        lay = lambda: [L("i1", "input", input=1, size=sizes[1]), L("i2", "input", input=2, size=sizes[2], x=150, y=10, sx=2.0, sy=2.0),
+                       L("i3", "input", input=3, size=sizes[3], x=20, y=120, rot=0)]
+        ed.send_doc(lay(), 10, canvas={"mode": "fixed"})
+        wait_for(lambda: {"i1", "i2", "i3"} <= {l["id"] for l in (td_json("print(json.dumps(comp.ext.RasterEditorExt.doc_layers or []))") or [])}, 6)
+        ok = wait_for(lambda: px_at(10, 10) == [255, 0, 0, 255] and px_at(170, 30) == [0, 255, 0, 255] and px_at(30, 130) == [0, 0, 255, 255], 5)
+        chk("input layers render at their placement", ok, f"{px_at(10, 10)} {px_at(170, 30)} {px_at(30, 130)}")
+        before = td_json("print(json.dumps(comp.ext.RasterEditorExt.doc_layers))")
+        disconnect_n(2)
+        ok = ed.wait(lambda: ed.inputs.get(2, (0, 0, True))[2] is False, 4) and wait_for(lambda: px_at(170, 30)[3] == 0, 4)
+        chk("disconnect input 2: reported, its layer renders transparent", ok, f"{ed.inputs.get(2)} {px_at(170, 30)}")
+        after = td_json("print(json.dumps(comp.ext.RasterEditorExt.doc_layers))")
+        chk("placement kept while disconnected", [(l["id"], l["x"], l["y"], l["sx"]) for l in before] == [(l["id"], l["x"], l["y"], l["sx"]) for l in after],
+            str([(l["id"], l["x"], l["sx"]) for l in after]))
+        chk("connected neighbours untouched (input 1 and 3 still render)", px_at(10, 10) == [255, 0, 0, 255] and px_at(30, 130) == [0, 0, 255, 255])
+        connect_n(2, 60, 40, (0, 1, 0))   # reconnect with ANOTHER resolution
+        ok = ed.wait(lambda: ed.inputs.get(2, (0, 0, False))[:2] == (60, 40), 4) and wait_for(lambda: px_at(170, 30) == [0, 255, 0, 255], 4)
+        l2 = next(l for l in td_json("print(json.dumps(comp.ext.RasterEditorExt.doc_layers))") if l["id"] == "i2")
+        chk("reconnect (new resolution): renders again, placement (x, y, scale) kept, surface size follows the input", ok
+            and (l2["surfaceW"], l2["surfaceH"]) == (60, 40) and l2["sx"] == 2.0 and (l2["x"], l2["y"]) == (150, 10), f"{l2['surfaceW']}x{l2['surfaceH']} sx {l2['sx']}")
+        # Follow Input uses input 1 only: make input 2 much bigger than input 1
+        connect_n(2, 500, 400, (0, 1, 0))
+        ed.send_canvas(0, 0, "input")
+        ok = wait_for(lambda: out1_size() == [96, 64], 4)
+        chk("Follow Input = input 1's size (input 2 is 500x400)", ok, f"out1 {out1_size()}")
+        disconnect_n(1)
+        ok = wait_for(lambda: td_json("print(json.dumps(comp.ext.RasterEditorExt.has_input))") is False, 4)
+        h = ed.hello
+        chk("hasInput follows input 1 only", ok, "")
+        # trailing spare removal: disconnect 3 and 2 -> connectors shrink to one spare behind the last connected (none) after ~2 s
+        disconnect_n(2)
+        disconnect_n(3)
+        ok = wait_for(lambda: n_connectors() == 1, 8)
+        chk("trailing spare inputs are removed again; never a connected one", ok, f"{n_connectors()} connectors")
+    except Exception as e:  # noqa: BLE001 - keep the notes gathered so far
+        chk("step ran to the end", False, f"{type(e).__name__}: {e}")
+    finally:
+        ed.close()
+        reset_inputs()
+    return ok_all, "\n        ".join(notes)
+
+
+def s32_ui_inputs(args):
+    """Real UI: connected inputs appear as input layers in the page (sizes differ), the page lists the inputs."""
+    if not ensure_test_hook():
+        return None, "test hook not reachable"
+    reset_inputs()
+    reset_doc(args, [L("p", slot=1, size=(8, 8))])
+    time.sleep(1.0)
+    if not ui_ready():
+        return None, "real page did not become active"
+    connect_n(1, 96, 64, (1, 0, 0))
+    connect_n(2, 48, 32, (0, 1, 0))
+    ok = wait_for(lambda: len([l for l in (hook_call("layers()") or []) if l.get("input")]) >= 2, 6)
+    lays = [(l["id"], l.get("input"), l.get("inputConnected")) for l in (hook_call("layers()") or []) if l.get("input")]
+    ins = hook_call("inputs()")
+    connect_n(3, 32, 24, (0, 0, 1))
+    ok3 = wait_for(lambda: any(l.get("input") == 3 for l in (hook_call("layers()") or [])), 6)
+    disconnect_n(2)
+    okd = wait_for(lambda: any(l.get("input") == 2 and l.get("inputConnected") is False for l in (hook_call("layers()") or [])), 6)
+    reset_inputs()
+    return bool(ok and ok3 and okd), (f"input layers {lays}; inputs() {str(ins)[:160]}; input 3 layer appeared: {ok3}; "
+                                       f"input 2 layer marked disconnected: {okd}")
+
+
+def unpremultiply_np(img):
+    a = img.astype(np.float64)
+    al = a[..., 3:4]
+    out = a.copy()
+    out[..., :3] = np.where(al > 0, a[..., :3] * 255.0 / np.maximum(al, 1), 0)
+    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+
+
+FX_GUIDES = {"h": [10.0, 55.5], "v": [100.0]}
+
+
+def files_layers():
+    fx = [{"enabled": True, "type": "dropShadow", "dx": 4, "dy": 4, "blur": 3, "color": {"r": 0, "g": 0, "b": 0, "a": 255}, "opacity": 0.6},
+          {"enabled": True, "type": "stroke", "width": 2, "color": {"r": 255, "g": 255, "b": 0, "a": 255}, "position": "outside", "opacity": 1}]
+    return [L("p1", slot=1, size=(40, 30), x=100, y=60, sx=2.0, sy=2.0, rot=25, kx=10, effects=fx),
+            L("p2", slot=2, mask={"slot": 3, "enabled": True}, size=(30, 30), x=20, y=20, sx=1.5, sy=1.5,
+              effects=[{"enabled": True, "type": "colorOverlay", "color": {"r": 255, "g": 0, "b": 128, "a": 255}, "opacity": 0.3}]),
+            L("t1", "text", text={"text": "Hi", "font": "Arial", "size": 24, "color": {"r": 255, "g": 255, "b": 255, "a": 255}, "align": "left",
+                                  "bold": False, "italic": False, "lineHeight": 1.2, "x": 200, "y": 20, "boxWidth": None}),
+            L("a1", "adjustment", adjustment={"type": "invert"}, visible=False)]
+
+
+def s33_files(args):
+    """Project .redoc: save -> change the document -> open: identical layers / specs / effects / guides / surfaces / out1, reload reaches the
+    client; PNG export equals out1; the pulses; refusals."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    reset_inputs(320, 200)
+    proj = os.path.join(OUT_DIR, "files_roundtrip.redoc")
+    png = os.path.join(OUT_DIR, "files_export.png")
+    for f in (proj, png, proj + ".part", png + ".part"):
+        if os.path.exists(f):
+            os.remove(f)
+    notes, ok_all = [], True
+
+    def chk(label, cond, extra=""):
+        nonlocal ok_all
+        ok_all &= bool(cond)
+        notes.append(f"{label}: {'ok' if cond else 'FAIL'} {extra}".rstrip())
+
+    ed = Editor(args.port)
+    try:
+        ed.takeover()
+        ed.send_canvas(320, 200, "fixed")
+        wait_for(lambda: out1_size() == [320, 200], 4)
+        rng = np.random.RandomState(8)
+        p1 = rng.randint(0, 256, (30, 40, 4), np.uint8)
+        p1[..., 3] = 200
+        p2 = rng.randint(0, 256, (30, 30, 4), np.uint8)
+        p2[..., 3] = 255
+        m = np.zeros((30, 30, 4), np.uint8)
+        m[..., 3] = 255
+        m[:, :15, :3] = 255
+        ed.send_doc(files_layers(), 20, guides=FX_GUIDES, canvas={"mode": "fixed"})
+        fids = [ed.send_surface(1, (0, 0, 40, 30), p1, (40, 30)), ed.send_surface(2, (0, 0, 30, 30), p2, (30, 30)),
+                ed.send_surface(3, (0, 0, 30, 30), m, (30, 30))]
+        wait_applied(ed, fids[-1], 6)
+        time.sleep(1.0)
+        ref = td_rect(COMP + "/out1", 0, 0, 320, 200)
+        ed.doc_state = None
+        ed.send(P.request_doc())
+        ed.wait(lambda: ed.doc_state is not None, 3)
+        want_state = ed.doc_state
+        dumps = {s: ed.dump(s)[1] for s in (1, 2, 3)}
+        # --- save (request) ---
+        ed.send(P.save_project("sv1", proj))
+        ok = ed.wait(lambda: any(r.get("requestId") == "sv1" for r in ed.file_results), 10)
+        r = next((r for r in ed.file_results if r.get("requestId") == "sv1"), {})
+        chk("saveProject -> fileResult ok, file written, no .part", ok and r.get("ok") and os.path.isfile(proj) and not os.path.exists(proj + ".part"), str(r))
+        chk("files message carries the parameter", ed.files is not None and ed.files["projectFile"] == proj, str(ed.files))
+        doc, meta, pngs = FR.read_redoc(proj)
+        chk("zip: doc.json (layers, guides, canvas, effects), surfaces, meta", meta.get("format") == 1 and sorted(pngs) == [1, 2, 3]
+            and doc["guides"] == FX_GUIDES and doc["canvas"]["mode"] == "fixed" and doc["layers"][0]["effects"][0]["type"] == "dropShadow",
+            f"meta {meta} slots {sorted(pngs)}")
+        # --- change the document, then open ---
+        ed.send_doc([L("z", "input", input=1)], 21)
+        ed.send_surface(1, (0, 0, 40, 30), p2[:30, :30].repeat(2, axis=1)[:, :40].copy(), (40, 30))
+        time.sleep(0.8)
+        changed = td_rect(COMP + "/out1", 0, 0, 320, 200)
+        chk("document replaced (out1 differs)", np.abs(changed.astype(int) - ref.astype(int)).max() > 20)
+        n0 = len(ed.reloads)
+        ed.file_results.clear()
+        ed.send(P.open_project("op1", proj))
+        ok = ed.wait(lambda: any(r.get("requestId") == "op1" for r in ed.file_results), 10)
+        r = next((r for r in ed.file_results if r.get("requestId") == "op1"), {})
+        chk("openProject -> fileResult ok + reload broadcast", ok and r.get("ok") and ed.wait(lambda: len(ed.reloads) > n0, 3), str(r))
+        ed.doc_state = None
+        ed.send(P.request_doc())
+        ed.wait(lambda: ed.doc_state is not None, 3)
+        got = ed.doc_state or {}
+        strip = lambda st: json.dumps([{k: v for k, v in l.items()} for l in st.get("layers", [])], sort_keys=True)  # noqa: E731
+        chk("layers, specs, effects identical", strip(got) == strip(want_state), "" if strip(got) == strip(want_state) else (strip(got)[:200] + " != " + strip(want_state)[:200]))
+        chk("guides and canvas identical", got.get("guides") == FX_GUIDES and got.get("canvas") == {"mode": "fixed"}, str(got.get("guides")))
+        same = all((ed.dump(s)[1] == dumps[s]).all() for s in (1, 2, 3))
+        chk("surfaces identical (straight RGBA via /surface)", same)
+        time.sleep(0.8)
+        after = td_rect(COMP + "/out1", 0, 0, 320, 200)
+        d = int(np.abs(after.astype(int) - ref.astype(int)).max())
+        chk("out1 identical to before the save", d <= 1, f"worst diff {d}")
+        # --- PNG export ---
+        ed.file_results.clear()
+        ed.send(P.export_png("pn1", png))
+        ok = ed.wait(lambda: any(r.get("requestId") == "pn1" for r in ed.file_results), 10)
+        r = next((r for r in ed.file_results if r.get("requestId") == "pn1"), {})
+        pimg = FR.decode_png(open(png, "rb").read()) if os.path.isfile(png) else None
+        out_now = td_rect(COMP + "/out1", 0, 0, 320, 200)
+        want = unpremultiply_np(out_now)
+        dpx = int(np.abs(pimg.astype(int)[..., :3] - want.astype(int)[..., :3])[want[..., 3] > 8].max()) if pimg is not None else 999
+        dal = int(np.abs(pimg[..., 3].astype(int) - out_now[..., 3].astype(int)).max()) if pimg is not None else 999
+        chk("exportPng equals out1 (straight alpha)", ok and r.get("ok") and pimg is not None and pimg.shape[:2] == (200, 320) and dpx <= 3 and dal <= 1,
+            f"{r.get('msg', '')} worst rgb {dpx}, alpha {dal}")
+        # --- pulses through the parameters ---
+        proj2 = os.path.join(OUT_DIR, "files_pulse.redoc")
+        if os.path.exists(proj2):
+            os.remove(proj2)
+        ed.file_results.clear()
+        td(f"comp.par.Projectfile = {proj2!r}\ncomp.par.Saveproject.pulse()")
+        ok = wait_for(lambda: os.path.isfile(proj2), 10) and ed.wait(lambda: any(r["op"] == "saveProject" for r in ed.file_results), 5)
+        chk("Saveproject pulse writes the file, clients get fileResult without requestId, Status flash",
+            ok and "requestId" not in ed.file_results[-1] and "project saved" in status(), status()[-90:])
+        td("comp.par.Projectfile = " + repr(os.path.join(OUT_DIR, "nope", "x.redoc")) + "\ncomp.par.Saveproject.pulse()")
+        wait_for(lambda: "project save failed" in status(), 5)
+        chk("failed pulse shows the reason in Status", "does not exist" in status(), status()[-120:])
+        # --- damaged project leaves the document alone ---
+        bad = os.path.join(OUT_DIR, "files_bad.redoc")
+        open(bad, "wb").write(b"not a zip")
+        rev_before = td_json("print(json.dumps(comp.ext.RasterEditorExt.doc_rev))")
+        ed.file_results.clear()
+        ed.send(P.open_project("op2", bad))
+        ed.wait(lambda: any(r.get("requestId") == "op2" for r in ed.file_results), 6)
+        r = next((r for r in ed.file_results if r.get("requestId") == "op2"), {})
+        chk("damaged file refused, document untouched", r.get("ok") is False and td_json("print(json.dumps(comp.ext.RasterEditorExt.doc_rev))") == rev_before, str(r))
+    finally:
+        ed.close()
+        reset_inputs()
+    return ok_all, "\n        ".join(notes)
+
+
+def compare_page_td(regions):
+    """[(name, (x, y, w, h), tol, mean_tol, edge_frac)] -> (ok, notes): per-pixel difference of the page's composite and out1,
+    excluding pixels whose coverage differs (boundaries), which must stay below ``edge_frac`` of the region."""
+    notes, ok_all = [], True
+    for name, (x, y, w, h), tol, mtol, efrac in regions:
+        pg = page_region(x, y, w, h)
+        td_img = td_rect(COMP + "/out1", x, y, w, h)
+        if pg is None:
+            notes.append(f"{name}: FAIL page pixels not readable")
+            ok_all = False
+            continue
+        d = np.abs(td_img.astype(int) - pg.astype(int))
+        edge = np.abs(td_img[..., 3].astype(int) - pg[..., 3].astype(int)) > 8
+        worst = int(d[~edge].max()) if (~edge).any() else 0
+        mean = float(np.abs(td_img.astype(float).mean(axis=(0, 1)) - pg.astype(float).mean(axis=(0, 1))).max())
+        frac = float(edge.mean())
+        ok = worst <= tol and mean <= mtol and frac <= efrac
+        ok_all &= ok
+        notes.append(f"{name}: worst |TD - page| {worst} (<= {tol}), mean diff {mean:.1f} (<= {mtol}), boundary px {frac * 100:.1f}% (<= {efrac * 100:.1f}%): {'ok' if ok else 'FAIL'}")
+    return ok_all, notes
+
+
+def s34_ui_affine_parity(args):
+    """Real UI: rotated / skewed pixel and input layers (and a mask on one) -- TD resample pass vs the browser preview."""
+    if not ensure_test_hook():
+        return None, "test hook not reachable"
+    reset_canvas(args, 800, 600)
+    connect_input_sized(64, 48)
+    a, b, c, m = xf_surfaces()
+    layers = [L("base", "input", input=1, size=(64, 48), x=40, y=190, sx=1.5, sy=1.5, rot=20),
+              L("pa", slot=1, size=(8, 8), x=250, y=30, sx=8.0, sy=8.0, rot=30, kx=15),
+              L("pc", slot=3, mask={"slot": 4, "enabled": True}, size=(16, 16), x=150, y=150, sx=4.0, sy=4.0, rot=-25, ky=10)]
+    ed = Editor(args.port)
+    try:
+        take_over(ed)
+        ed.send_canvas(XF_W, XF_H, "fixed")
+        wait_for(lambda: out1_size() == [XF_W, XF_H], 4)
+        ed.send_doc(layers, 61)
+        fids = [ed.send_surface(1, (0, 0, 8, 8), a, (8, 8)), ed.send_surface(3, (0, 0, 16, 16), c, (16, 16)), ed.send_surface(4, (0, 0, 16, 16), m, (16, 16))]
+        if not wait_applied(ed, fids[-1], 6):
+            return False, "no `applied`"
+    finally:
+        ed.close()
+    time.sleep(1.5)
+    if not ui_ready() or not settle_page(40):
+        return None, "real page did not become active/load the document (page and TD never agreed on the layer stack)"
+    lay = {l["id"]: l for l in (hook_call("layers()") or [])}
+    notes = []
+    ok_load = all(k in lay and abs(lay[k]["transform"].get("rot", 0) - r) < 1e-6 for k, r in (("base", 20), ("pa", 30), ("pc", -25)))
+    notes.append(f"rot/skew survive the load into the page: {'ok' if ok_load else 'FAIL ' + str({k: v.get('transform') for k, v in lay.items()})}")
+    ok, n = compare_page_td([("rotated+skewed magnified gradient", (180, 0, 220, 190), 12, 4.0, 0.03),
+                             ("rotated masked layer", (110, 110, 200, 190), 12, 4.0, 0.03),
+                             ("rotated input", (0, 150, 140, 150), 12, 4.0, 0.04)])
+    return ok and ok_load, "\n        ".join(notes + n)
+
+
+def s35_ui_effects_parity(args):
+    """Real UI: every deterministic layer effect (+ pixel sort, glitch) -- TD GLSL chain vs the browser preview's WebGL2 (same shaders)."""
+    if not ensure_test_hook():
+        return None, "test hook not reachable"
+    reset_canvas(args, 800, 600)
+    W, H, cell = 400, 300, 100
+    yy, xx = np.mgrid[0:64, 0:64]
+    disc = np.zeros((64, 64, 4), np.uint8)
+    r = np.hypot(xx - 31.5, yy - 31.5)
+    disc[..., :3] = np.stack([60 + xx * 3, 200 - yy * 2, np.full_like(xx, 120)], axis=2)
+    disc[..., 3] = np.clip((24 - r) * 255, 0, 255)
+    col = lambda r_, g, b: {"r": r_, "g": g, "b": b, "a": 255}   # noqa: E731
+    effects = {
+        "dropShadow": {"type": "dropShadow", "dx": 5, "dy": 6, "blur": 6, "color": col(0, 0, 0), "opacity": 0.7},
+        "outerGlow": {"type": "outerGlow", "size": 8, "color": col(255, 200, 0), "opacity": 0.9},
+        "innerGlow": {"type": "innerGlow", "size": 8, "color": col(255, 255, 255), "opacity": 0.9},
+        "stroke": {"type": "stroke", "width": 4, "color": col(255, 0, 0), "position": "center", "opacity": 1},
+        "bevel": {"type": "bevel", "depth": 60, "size": 6, "angle": 120, "highlight": col(255, 255, 255), "shadow": col(0, 0, 0)},
+        "colorOverlay": {"type": "colorOverlay", "color": col(0, 128, 255), "opacity": 0.5},
+        "chromaticAberration": {"type": "chromaticAberration", "amount": 3, "angle": 30},
+        "halftone": {"type": "halftone", "cellSize": 6, "angle": 45, "shape": "dot"},
+        "glitch": {"type": "glitch", "amount": 40, "blockSize": 8, "seed": 5, "rgbShift": 3},
+        "pixelSort": {"type": "pixelSort", "direction": "h", "low": 0.2, "high": 0.9, "key": "luma"},
+        "outerGlow+stroke": None,
+    }
+    names = [n for n, v in effects.items() if v is not None]
+    layers, grid = [], {}
+    for i, n in enumerate(names):
+        x, y = (i % 4) * cell + 18, (i // 4) * cell + 18
+        grid[n] = (i % 4 * cell, i // 4 * cell, cell, cell)
+        layers.append(L(f"e{i}", slot=i + 1, size=(64, 64), x=x, y=y, sx=0.5, sy=0.5,
+                        effects=[dict(effects[n], enabled=True)]))
+    ed = Editor(args.port)
+    try:
+        take_over(ed)
+        ed.send_canvas(W, H, "fixed")
+        wait_for(lambda: out1_size() == [W, H], 4)
+        ed.send_doc(layers, 62)
+        fids = [ed.send_surface(i + 1, (0, 0, 64, 64), disc, (64, 64)) for i in range(len(names))]
+        if not wait_applied(ed, fids[-1], 30):
+            snap = td_json("x = comp.ext.RasterEditorExt; print(json.dumps({'rev': x.doc_rev, 'applied_net': x._net_applied, 'dirty': sorted(x._dirty)[:12], "
+                           "'clients': [(k.kind, k.active, k.fid_pending, k.fid_applied) for k in x.clients.values()], 'err': str(x.last_error), 'pending': x._restore_pending, "
+                           "'slots': len(x._slot_set), 'size': [x.doc_w, x.doc_h]}))")
+            return False, f"no `applied` for {fids[-1]} (got {sorted(ed.applied)[-3:]}); TD {snap}; client texts {[t['t'] for t in ed.texts][-6:]}; status={status()!r}"
+    finally:
+        ed.close()
+    time.sleep(2.0)
+    if not ui_ready() or not settle_page(40):
+        return None, "real page did not become active/load the document (page and TD never agreed on the layer stack)"
+    fx_err = td_json("n = comp.ext.RasterEditorExt.network; print(json.dumps(getattr(n, 'fx_error', None)))")
+    # tolerance: 3/255 for deterministic effects (design), more for the sort / glitch families (documented in the note)
+    # halftone: dot boundaries are anti-aliased differently (coverage of ~6% of the cell differs); glitch: seeded random block shifts
+    # differ in a few blocks between the two shader hosts (hash precision) -- both are the experimental effects, tolerances are loose
+    tol = {"pixelSort": 40}
+    edge = {}
+    regions = [(n, grid[n], tol.get(n, 3), 2.0, edge.get(n, 0.02)) for n in names]
+    ok, notes = compare_page_td(regions)
+    if not ok:   # evidence: both images and the page's / TD's layer stack
+        try:
+            pg_full, td_full = page_region(0, 0, W, H), td_rect(COMP + "/out1", 0, 0, W, H)
+            if pg_full is not None:
+                for nm, im in (("page", pg_full), ("td", td_full)):
+                    open(os.path.join(OUT_DIR, f"effects_{nm}.png"), "wb").write(FR.encode_png(unpremultiply_np(im)))
+            tdl = td_json("print(json.dumps([[l['id'], l.get('x'), l.get('y'), l.get('sx'), len(l.get('effects') or [])] for l in comp.ext.RasterEditorExt.doc_layers]))")
+            pgl = js_result("(function(){return window.__editorTest.layers().map(function(l){return [l.id,l.transform&&l.transform.x,l.transform&&l.transform.y,l.transform&&l.transform.sx,(l.effects||[]).length]})})()")
+            notes.append(f"TD layers {tdl[:3]}.. page layers {str(pgl)[:200]}.. canvas TD {out1_size()} page {js_result('window.__editorTest.state().doc')}")
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"(evidence failed: {e})")
+    return ok and not fx_err, (f"fx_error={fx_err}\n        " if fx_err else "") + "\n        ".join(notes)
+
+
+def s36_ui_tools(args):
+    """Real UI via the test hook: quick mask round trip + clipped stroke, clone, floating selection commit, crop -- all reflected in TD's output."""
+    if not ensure_test_hook():
+        return None, "test hook not reachable"
+    reset_canvas(args, 320, 200)
+    reset_doc(args, [L("base", "input", input=1)])
+    ed = Editor(args.port)
+    try:
+        ed.takeover()
+        ed.send_canvas(320, 200, "fixed")
+        wait_for(lambda: out1_size() == [320, 200], 4)
+    finally:
+        ed.close()
+    time.sleep(1.5)
+    if not ui_ready():
+        return None, "real page did not become active"
+    notes, ok_all = [], True
+
+    def chk(label, cond, extra=""):
+        nonlocal ok_all
+        ok_all &= bool(cond)
+        notes.append(f"{label}: {'ok' if cond else 'FAIL'} {extra}".rstrip())
+
+    hook_call("addLayer()")
+    hook_call("setPrimary('#ff0000')")
+    hook_call("selectRect(100, 60, 100, 80)")
+    q = hook_call("setQuickMask(true)")
+    q2 = hook_call("setQuickMask(false)")
+    chk("quick mask on/off", q is True or q is not None, f"({q} -> {q2})")
+    hook_call("stroke('brush', [[60, 100], [260, 100]])")
+    inside = wait_for(lambda: px_at(150, 100)[3] > 200, 5)
+    chk("stroke after quick-mask round trip is clipped to the selection in TD", inside and px_at(70, 100)[3] == 0 and px_at(240, 100)[3] == 0,
+        f"inside {px_at(150, 100)}, left {px_at(70, 100)}, right {px_at(240, 100)}")
+    hook_call("deselect()")
+    hook_call("setTool('brush')")
+    hook_call("stroke('brush', [[20, 20], [24, 20]])")
+    wait_for(lambda: px_at(22, 20)[3] > 200, 4)
+    hook_call("setCloneSource(22, 20)")
+    hook_call("stroke('clone', [[220, 150], [224, 150]])")
+    ok = wait_for(lambda: px_at(222, 150)[3] > 100, 5)
+    chk("clone copies the sampled pixels", ok, f"dest {px_at(222, 150)}")
+    hook_call("selectRect(10, 10, 30, 20)")
+    fl = hook_call("liftSelection()")
+    f = js_result("(function(){var f=window.__editorTest.floating();return f?{transform:f.transform}:null})()")
+    notes.append(f"(liftSelection() -> {fl!r}; floating() -> {str(f)[:120]})")
+    if f:
+        tf = f.get("transform", {})
+        hook_call(f"setFloatingTransform({{x: {tf.get('x', 0) + 200}, y: {tf.get('y', 0) + 100}}})")
+        hook_call("commitFloating()")
+        ok = wait_for(lambda: px_at(222, 120)[3] > 150, 5)
+        chk("floating selection moved and committed", ok and px_at(22, 20)[3] == 0, f"new place {px_at(222, 120)}, old {px_at(22, 20)}")
+    else:
+        chk("floating selection lifted", False, f"floating() = {f}")
+    hook_call("crop({x: 0, y: 0, w: 200, h: 150})")
+    ok = wait_for(lambda: out1_size() == [200, 150], 5)
+    chk("crop resizes the canvas (TD out1)", ok, f"out1 {out1_size()}")
+    return ok_all, "\n        ".join(notes)
+
+
+def s37_choose_file(args):
+    """chooseFile plumbing with the test stub (`testPath`, Panelquery test=1; the native dialog cannot be automated):
+    fileChosen for project / PNG purposes, placeImage -> a picked PNG arrives as topReady + GET /top, errors."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    img = np.random.RandomState(2).randint(0, 256, (24, 40, 4), np.uint8)
+    img[..., 3] = 255
+    pic = os.path.join(OUT_DIR, "place_me.png")
+    open(pic, "wb").write(FR.encode_png(img))
+    old_q = td("print(comp.par.Panelquery.eval())").strip()
+    td("comp.par.Panelquery = 'test=1'")
+    notes, ok_all = [], True
+
+    def chk(label, cond, extra=""):
+        nonlocal ok_all
+        ok_all &= bool(cond)
+        notes.append(f"{label}: {'ok' if cond else 'FAIL'} {extra}".rstrip())
+
+    def msgs(ed, t, rid):
+        return [m for m in ed.texts if m["t"] == t and m.get("requestId") == rid]
+
+    ed = Editor(args.port)
+    try:
+        ed.takeover()
+        for purpose in ("openProject", "saveProject", "exportPng"):
+            ed.send(json.dumps({"t": "chooseFile", "requestId": purpose, "purpose": purpose, "testPath": "/tmp/x_" + purpose}))
+            ok = ed.wait(lambda: msgs(ed, "fileChosen", purpose), 3)
+            chk(f"{purpose}: fileChosen carries the path", ok and msgs(ed, "fileChosen", purpose)[0]["path"] == "/tmp/x_" + purpose)
+        ed.send(json.dumps({"t": "chooseFile", "requestId": "cancel", "purpose": "placeImage", "testPath": None}))
+        ok = ed.wait(lambda: msgs(ed, "fileChosen", "cancel"), 3)
+        chk("cancel -> path null, nothing imported", ok and msgs(ed, "fileChosen", "cancel")[0]["path"] is None and not msgs(ed, "topReady", "cancel"))
+        ed.send(json.dumps({"t": "chooseFile", "requestId": "pic", "purpose": "placeImage", "testPath": pic}))
+        ok = ed.wait(lambda: msgs(ed, "topReady", "pic") or msgs(ed, "topError", "pic"), 15)
+        ready = msgs(ed, "topReady", "pic")
+        chk("placeImage: fileChosen then topReady", ok and ready and msgs(ed, "fileChosen", "pic")[0]["path"] == pic and (ready[0]["w"], ready[0]["h"]) == (40, 24),
+            str(msgs(ed, "topError", "pic") or ready))
+        if ready:
+            st, body = http_get(args.port, f"/top?token={ed.token}&client={ed.client_id}&requestId=pic")
+            hdr, payload = P.decode_frame(body) if st == 200 else (None, b"")
+            got = np.frombuffer(payload, np.uint8).reshape(24, 40, 4) if st == 200 else None
+            d = int(np.abs(got.astype(int) - img.astype(int)).max()) if got is not None else 999
+            chk("GET /top returns the picture (frame type 6)", st == 200 and hdr.type == P.TYPE_TOP_IMAGE and d <= 2, f"worst diff {d}")
+        left = td_json("print(json.dumps([c.name for c in comp.children if c.name.startswith('_imp_')]))")
+        chk("temporary Movie File In TOP destroyed", left == [], str(left))
+        txt = os.path.join(OUT_DIR, "not_an_image.txt")
+        open(txt, "w").write("x")
+        ed.send(json.dumps({"t": "chooseFile", "requestId": "bad", "purpose": "placeImage", "testPath": txt}))
+        ok = ed.wait(lambda: msgs(ed, "topError", "bad"), 5)
+        chk("non-image refused with topError", ok and "not a supported image" in msgs(ed, "topError", "bad")[0]["msg"])
+    finally:
+        ed.close()
+        td(f"comp.par.Panelquery = {old_q!r}")
+    return ok_all, "\n        ".join(notes)
+
+
+def s38_filters_compile(args):
+    """Every effect and filter shader of the BUILT component (embedded fx_* DATs incl. blurlib / filterlib / in2lib) compiles in TD:
+    one layer per type with its default parameters, then every GLSL TOP of the generated network is cooked and checked for errors."""
+    import effects as EF
+    reset_canvas(args, 800, 600)
+    names = EF.shader_names()
+    layers, fx_types = [], []
+    for i, n in enumerate(names):
+        sp = EF.FILTER_SPECS.get(n)
+        if n in EF_V5:
+            e = {"type": n, "enabled": True, **EF_V5[n]}
+        else:
+            e = {"type": n, "enabled": True, **{k: v["default"] for k, v in (sp or {}).get("params", {}).items() if "default" in v}}
+        fx_types.append(n)
+        layers.append(L(f"f{i}", slot=i + 1, size=(24, 24), x=(i % 8) * 80 + 20, y=(i // 8) * 80 + 20, effects=[e]))
+    px = np.zeros((24, 24, 4), np.uint8)
+    px[4:20, 4:20] = (200, 90, 40, 255)
+    ed = Editor(args.port)
+    try:
+        for _ in range(4):
+            if ed.takeover():
+                break
+        ed.send_canvas(800, 600, "fixed")
+        wait_for(lambda: out1_size() == [800, 600], 6)
+        ed.send_doc(layers, 80)
+        fids = [ed.send_surface(i + 1, (0, 0, 24, 24), px, (24, 24)) for i in range(len(names))]
+        if not wait_applied(ed, fids[-1], 40):
+            return False, f"no `applied`; status={status()!r}"
+    finally:
+        ed.close()
+    time.sleep(1.5)
+    res = td_json("""
+doc = op('/project1/raster_editor/doc')
+bad = {}
+n = 0
+for o in doc.findChildren(type=glslTOP):
+    n += 1
+    o.cook(force=True)
+    e = o.errors(recurse=False)
+    if e: bad[o.name] = e[:160]
+net = comp.ext.RasterEditorExt.network
+print(json.dumps({'n': n, 'bad': dict(list(bad.items())[:6]), 'nbad': len(bad), 'fx_error': getattr(net, 'fx_error', None), 'last_error': str(comp.ext.RasterEditorExt.last_error)}))
+""", 120)
+    ok = res["n"] > len(names) and res["nbad"] == 0 and not res["fx_error"]
+    return ok, f"{len(names)} shader types ({len([n for n in names if n in EF.FILTER_SPECS])} filters), {res['n']} GLSL TOPs cooked, {res['nbad']} with errors {res['bad']}, fx_error={res['fx_error']}"
+
+
+EF_V5 = {
+    "dropShadow": {"dx": 4, "dy": 4, "blur": 4, "color": {"r": 0, "g": 0, "b": 0, "a": 255}, "opacity": 0.6},
+    "outerGlow": {"size": 6, "color": {"r": 255, "g": 200, "b": 0, "a": 255}, "opacity": 0.8},
+    "innerGlow": {"size": 6, "color": {"r": 255, "g": 255, "b": 255, "a": 255}, "opacity": 0.8},
+    "stroke": {"width": 3, "color": {"r": 255, "g": 0, "b": 0, "a": 255}, "position": "outside", "opacity": 1},
+    "bevel": {"depth": 50, "size": 4, "angle": 120, "highlight": {"r": 255, "g": 255, "b": 255, "a": 255}, "shadow": {"r": 0, "g": 0, "b": 0, "a": 255}},
+    "colorOverlay": {"color": {"r": 0, "g": 100, "b": 255, "a": 255}, "opacity": 0.5},
+    "pixelSort": {"direction": "h", "low": 0.2, "high": 0.9, "key": "luma"},
+    "glitch": {"amount": 30, "blockSize": 6, "seed": 3, "rgbShift": 2},
+    "chromaticAberration": {"amount": 2, "angle": 30},
+    "halftone": {"cellSize": 4, "angle": 45, "shape": "dot"},
+}
+
+
 STEPS = [
     (1, "build component, no operator errors, document survives a rebuild", "build", False),
     (2, "web server serves the UI", "server", False),
@@ -2494,7 +3179,15 @@ STEPS = [
     (27, "real UI: Canvas Size anchors, Follow Input reset, input resolution while following / fixed", "uicanvas", True),
     (28, "renderLayer (Flatten source) equals TD's own rendering; errors", "renderlayer", False),
     (29, "Exportpath / Exportdoc round trip; guides + canvas persisted through loadTox", "export", False),
-    (30, "deleting the COMP with clients connected does not freeze TD; undo of the delete restores the pixels (run last)", "delete", False),
+    (31, "multiple inputs: spare connector rule, inputs message, per-input BASE, layers placed, disconnect/reconnect, Follow Input = input 1", "inputs", False),
+    (32, "real UI: connected inputs become input layers; disconnected ones are marked", "uiinputs", True),
+    (33, ".redoc save -> change -> open round trip, reload, PNG export equals out1, pulses, refusals", "files", False),
+    (34, "real UI: affine (rotate / skew + mask) parity TD vs browser preview", "uiaffine", True),
+    (35, "real UI: layer effects parity TD vs browser preview (all ten)", "uieffects", True),
+    (36, "real UI: quick mask, clone, floating commit, crop reflected in TD", "uitools", True),
+    (37, "chooseFile plumbing (test stub): fileChosen, placeImage -> topReady + GET /top, errors", "choose", False),
+    (38, "every effect + filter shader of the built component compiles in TD (includes embedded)", "filters", False),
+    (99, "deleting the COMP with clients connected does not freeze TD; undo of the delete restores the pixels (run last)", "delete", False),
 ]
 FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinput": "s4_no_input", "scene": "s5_scene",
          "masks": "s6_masks", "view": "s7_view_stream", "latency": "s8_latency", "overlay": "s9_panel_overlay",
@@ -2503,7 +3196,9 @@ FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinp
          "help": "s17_param_help", "fonts": "s18_fonts", "topimport": "s19_top_import", "uitop": "s20_ui_top_import",
          "uitextshape": "s21_ui_text_shape", "uiselect": "s22_ui_selection_clip",
          "xform": "s23_transforms_td", "uixform": "s24_ui_transform_parity", "uipaintscaled": "s25_ui_paint_scaled",
-         "canvas": "s26_canvas_td", "uicanvas": "s27_ui_canvas", "renderlayer": "s28_render_layer", "export": "s29_export", "delete": "s30_delete_component"}
+         "canvas": "s26_canvas_td", "uicanvas": "s27_ui_canvas", "renderlayer": "s28_render_layer", "export": "s29_export", "delete": "s30_delete_component",
+         "inputs": "s31_inputs", "uiinputs": "s32_ui_inputs", "files": "s33_files", "uiaffine": "s34_ui_affine_parity",
+         "uieffects": "s35_ui_effects_parity", "uitools": "s36_ui_tools", "choose": "s37_choose_file", "filters": "s38_filters_compile"}
 
 
 def main():
@@ -2528,9 +3223,10 @@ def main():
         try:
             restore = "\n".join(f"comp.par.{k} = {v!r}" for k, v in ORIG.items())
             td(f"""
-comp.inputConnectors[0].disconnect()
+for c in comp.inputConnectors:
+    if c.connections: c.disconnect()
 {restore}
-for p in ('/project1/_validate_in', '/project1/_validate_load', '/project1/_validate_tops'):
+for p in ['/project1/_validate_in' + ('' if n == 1 else str(n)) for n in range(1, 9)] + ['/project1/_validate_load', '/project1/_validate_tops']:
     t = op(p)
     if t: t.destroy()
 comp.par.Active = 1

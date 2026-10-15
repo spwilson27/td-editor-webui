@@ -151,7 +151,7 @@ describe('App layout with the new tools', () => {
   it('mounts with the shape flyout toggle and the hidden place input inside the app root', async () => {
     await mount(<App />, 'width:1600px;height:960px');
     expect(document.querySelector('[data-flyout-toggle]')).toBeTruthy();
-    expect(document.querySelectorAll('[data-tool]').length).toBe(17);
+    expect(document.querySelectorAll('[data-tool]').length).toBe(19);
     expect(q<HTMLInputElement>('[data-place-input]').hidden).toBe(true);
     for (const id of ['lasso', 'wand', 'text', 'shape']) expect(q(`[data-tool=${id}]`).getAttribute('aria-disabled')).toBe('false');
   });

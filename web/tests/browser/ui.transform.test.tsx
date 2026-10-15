@@ -17,7 +17,7 @@ beforeEach(async () => {
   store.aspectLock.value = true;
   store.spaceHeld.value = false;
   px = engine.importImage(new Uint8Array(100 * 50 * 4), 100, 50, 'Px');
-  engine.setTransform(px, { x: 20, y: 10, sx: 1, sy: 1 });
+  engine.setTransform(px, { x: 20, y: 10, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
   engine.calls.length = 0;
   store.setTool('move');
   await mount(<ViewportFrame />, 'display:flex;flex-direction:column;width:640px;height:420px');
@@ -206,12 +206,12 @@ describe('without engine.setLayerBox (older engines)', () => {
     expect(engine.calls.some((c) => c.startsWith(`setShape:${s}:`))).toBe(true);
   });
 
-  it('with it, every move / scale goes through setLayerBox with the target box', async () => {
+  it('v5: pixel layers are moved / scaled by the UI itself: one setTransform per pointermove, no setLayerBox', async () => {
     await dragDoc([120, 60], [50, 25]);
-    const boxes = engine.calls.filter((c) => c.startsWith(`setLayerBox:${px}:`)).map((c) => JSON.parse(c.slice(`setLayerBox:${px}:`.length)));
-    expect(boxes.length).toBeGreaterThanOrEqual(4);
-    const last = boxes.slice(-1)[0];
-    expect([last.x, last.y, last.w, last.h].map((n: number) => Math.round(n * 100) / 100)).toEqual([20, 10, 150, 75]);
+    expect(engine.calls.some((c) => c.startsWith('setLayerBox'))).toBe(false);
+    expect(transforms().length).toBeGreaterThanOrEqual(4);
+    const t = lastT();
+    expect([t.x, t.y, t.sx, t.sy].map((n) => Math.round(n * 100) / 100)).toEqual([20, 10, 1.5, 1.5]);
   });
 });
 
@@ -281,26 +281,26 @@ describe('Move tool context bar', () => {
 
   it('X / Y move the layer', async () => {
     await type('mx', '40');
-    expect(lastT()).toEqual({ x: 40, y: 10, sx: 1, sy: 1 });
+    expect(lastT()).toMatchObject({ x: 40, y: 10, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
     await type('my', '5');
-    expect(lastT()).toEqual({ x: 40, y: 5, sx: 1, sy: 1 });
+    expect(lastT()).toMatchObject({ x: 40, y: 5, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
   });
 
   it('W with the aspect lock scales both axes about the top-left; without it only the width', async () => {
     await type('mw', '200');
-    expect(lastT()).toEqual({ x: 20, y: 10, sx: 2, sy: 2 });
+    expect(lastT()).toMatchObject({ x: 20, y: 10, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 });
     q('[data-aspect-lock]').click();
     await settle();
     expect(q('[data-aspect-lock]').getAttribute('aria-pressed')).toBe('false');
     await type('mw', '300'); // from the current 200x100
-    expect(lastT()).toEqual({ x: 20, y: 10, sx: 3, sy: 2 });
+    expect(lastT()).toMatchObject({ x: 20, y: 10, sx: 3, sy: 2, rot: 0, kx: 0, ky: 0 });
     await type('mh', '50');
     expect(lastT().sy).toBeCloseTo(1);
   });
 
   it('H with the lock scales both; the scale % field sets a uniform scale', async () => {
     await type('mh', '100');
-    expect(lastT()).toEqual({ x: 20, y: 10, sx: 2, sy: 2 });
+    expect(lastT()).toMatchObject({ x: 20, y: 10, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 });
     await type('ms', '50');
     expect(lastT().sx).toBeCloseTo(0.5);
     expect(lastT().sy).toBeCloseTo(0.5);
@@ -311,10 +311,10 @@ describe('Move tool context bar', () => {
     expect(apply.getAttribute('aria-disabled')).toBe('false'); // non-identity (moved)
     reset.click();
     await settle();
-    expect(lastT()).toEqual({ x: 0, y: 0, sx: 1, sy: 1 });
+    expect(lastT()).toEqual({ x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
     expect(q('[data-act=apply-transform]').getAttribute('aria-disabled')).toBe('true');
     expect(q('[data-act=reset-transform]').getAttribute('aria-disabled')).toBe('true');
-    engine.setTransform(px, { x: 0, y: 0, sx: 2, sy: 2 });
+    engine.setTransform(px, { x: 0, y: 0, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 });
     await settle();
     q('[data-act=apply-transform]').click();
     await settle();
@@ -355,7 +355,7 @@ describe('Layer menu transform items', () => {
     expect(item('Apply Transform').getAttribute('aria-disabled')).toBe('false');
     item('Reset Transform').click();
     await settle();
-    expect(lastT()).toEqual({ x: 0, y: 0, sx: 1, sy: 1 });
+    expect(lastT()).toEqual({ x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
     await open();
     expect(item('Apply Transform').getAttribute('aria-disabled')).toBe('true');
     expect(item('Reset Transform').getAttribute('aria-disabled')).toBe('true');

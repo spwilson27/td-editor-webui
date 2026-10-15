@@ -29,8 +29,8 @@ describe('docSpec', () => {
     expect(spec.layers.map((l) => l.id)).toEqual(['base', a, g, b, adj, top]);
     expect(spec.layers.map((l) => l.parentId)).toEqual([null, null, null, g, g, null]);
     expect(spec.layers[0]).toEqual({
-      id: 'base', kind: 'base', parentId: null, name: 'TD Input', visible: true, opacity: 1, blend: 'normal',
-      x: 0, y: 0, sx: 1, sy: 1, slot: null, mask: null, adjustment: null, text: null, shape: null, surfaceW: 30, surfaceH: 20,
+      id: 'base', kind: 'input', input: 1, effects: [], parentId: null, name: 'TD Input', visible: true, opacity: 1, blend: 'normal',
+      x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0, slot: null, mask: null, adjustment: null, text: null, shape: null, surfaceW: 30, surfaceH: 20,
     });
     expect(spec.layers[1]).toMatchObject({ kind: 'pixel', name: 'A', surfaceW: 30, surfaceH: 20, sx: 1, sy: 1, slot: slotOf(e, a), mask: { slot: m, enabled: true }, adjustment: null });
     expect(spec.layers[2]).toMatchObject({ kind: 'group', slot: null, mask: null, adjustment: null });
@@ -348,9 +348,7 @@ describe('loadDocument', () => {
       mut(s);
       expect(() => e.loadDocument(s)).toThrow(RangeError);
     };
-    bad((s) => { s.layers = []; });
     bad((s) => { s.width = 0; });
-    bad((s) => { s.layers.reverse(); });
     bad((s) => { s.layers[1].id = 'base'; });
     bad((s) => { s.layers[1].parentId = 'nope'; });
     bad((s) => { s.layers[1].slot = 0; });
@@ -359,24 +357,23 @@ describe('loadDocument', () => {
     bad((s) => { s.layers.push({ ...s.layers[1], id: 'adj', kind: 'adjustment', slot: null, adjustment: null }); });
     bad((s) => { s.layers.push({ ...s.layers[1], id: 'adj', kind: 'adjustment', slot: null, adjustment: { type: 'nope' } as never }); });
     bad((s) => { s.layers.push({ ...s.layers[1], id: 'zz', kind: 'weird' as never, slot: null }); });
-    bad((s) => { s.layers[0].mask = { slot: 9, enabled: true }; });
     expect(JSON.stringify(e.docSpec())).toBe(before);
   });
 
-  it('sanitises values: opacity, blend, offsets, adjustment params, base id', () => {
+  it('sanitises values: opacity, blend, offsets, adjustment params, input id', () => {
     e = newEngine(10, 10);
     const spec: DocSpec = {
       rev: 5, width: 12, height: 8,
       layers: [
-        { id: 'whatever', kind: 'base', parentId: null, name: 'In', visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, sx: 1, sy: 1, slot: null, mask: null, adjustment: null, text: null, shape: null, surfaceW: 12, surfaceH: 8 },
+        { id: 'whatever', kind: 'input', input: 1, effects: [], rot: 0, kx: 0, ky: 0, parentId: null, name: 'In', visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, sx: 1, sy: 1, slot: null, mask: null, adjustment: null, text: null, shape: null, surfaceW: 12, surfaceH: 8 },
         { id: 'L7', kind: 'pixel', parentId: null, name: 'P', visible: true, opacity: 3, blend: 'bogus' as never, x: 2.4, y: -1, sx: 1.5, sy: 0.5, slot: 40, mask: null, adjustment: null, text: null, shape: null, surfaceW: 7, surfaceH: 5 },
         { id: 'A', kind: 'adjustment', parentId: null, name: 'Adj', visible: true, opacity: 1, blend: 'multiply', x: 0, y: 0, sx: 1, sy: 1, slot: null, mask: { slot: 41, enabled: false }, adjustment: { type: 'threshold', level: 5 }, text: null, shape: null, surfaceW: null, surfaceH: null },
-      ],
+      ] as never, // v4-style entries without the v5 fields are accepted
       guides: { h: [], v: [] }, canvas: { mode: 'input' },
     };
     e.loadDocument(spec);
     const out = e.docSpec();
-    expect(out.layers[0].id).toBe('base');
+    expect(out.layers[0].id).toBe('whatever'); // ids are kept
     expect(out.layers[1]).toMatchObject({ opacity: 1, blend: 'normal', x: 2, y: -1, sx: 1.5, sy: 0.5, surfaceW: 7, surfaceH: 5, slot: 40 });
     expect(out.layers[2]).toMatchObject({ blend: 'normal', mask: { slot: 41, enabled: false }, adjustment: { type: 'threshold', level: 1 } });
     const n = e.addPixelLayer();

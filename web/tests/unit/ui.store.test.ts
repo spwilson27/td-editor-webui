@@ -1,3 +1,4 @@
+import { TOOLS } from '../../src/state/tools';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createStore } from '../../src/state/store';
 import { FakeEngine } from '../browser/fakeEngine';
@@ -18,9 +19,13 @@ describe('store: tools and brush', () => {
     store.setTool('eraser');
     expect(store.tool.value).toBe('eraser');
     expect(engine.tool).toBe('eraser');
-    store.setTool('crop');
-    expect(store.tool.value).toBe('eraser');
-    expect(engine.tool).toBe('eraser');
+    const crop = TOOLS.find((t) => t.id === 'crop')!;
+    crop.enabled = false;
+    try {
+      store.setTool('crop');
+      expect(store.tool.value).toBe('eraser');
+      expect(engine.tool).toBe('eraser');
+    } finally { crop.enabled = true; }
   });
 
   it('pushes colours and brush settings to the engine tool context', () => {
@@ -167,8 +172,8 @@ describe('store: layers', () => {
     store.deleteActive();
     expect(engine.layers().some((l) => l.kind === 'group')).toBe(false);
     engine.setActiveLayer('base');
-    store.deleteActive();
-    expect(engine.layers().some((l) => l.kind === 'base')).toBe(true);
+    store.deleteActive(); // v5: input layers can be deleted
+    expect(engine.layers().some((l) => l.kind === 'input')).toBe(false);
   });
 });
 

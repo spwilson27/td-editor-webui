@@ -1,5 +1,5 @@
 import type { Store } from './store';
-import type { Anchor, AdjustmentSpec, AdjustmentType, CanvasMode, LayerTransform, PaintTarget, SnapOptions, SelectionOptions, ShapeSpec, ShapeType, TextSpec, ToolId, ToolPointer } from '../engine/types';
+import type { CloneOptions, DodgeBurnRange, Effect, Rect, Anchor, AdjustmentSpec, AdjustmentType, CanvasMode, LayerTransform, PaintTarget, SnapOptions, SelectionOptions, ShapeSpec, ShapeType, TextSpec, ToolId, ToolPointer } from '../engine/types';
 import { completeShapeSpec, completeTextSpec } from './specs';
 
 /** `window.__editorTest`, installed only with ?test=1; used by automated TouchDesigner validation. */
@@ -81,6 +81,34 @@ export function installTestHook(store: Store, win: Window = window): void {
     setShapeRenderer: (m: 'sdf' | 'canvas') => { store.setShapeRenderer(m); return store.engine.shapeRenderer(); },
     listTops: () => (store.bridge ? store.bridge.listTops() : Promise.reject(new Error('standalone'))),
     importImageFromTop: (path: string) => (store.bridge ? store.bridge.importTop(path) : Promise.reject(new Error('standalone'))),
+    // v5: retouch tools, crop, floating selection, quick mask, selection ops, effects, inputs, files
+    setEffects: (id: string, effects: Effect[]) => store.engine.setEffects(id, effects),
+    stroke: (tool: ToolId, pts: Array<[number, number]>, mods: Partial<ToolPointer> = {}) => drive(tool, pts, mods),
+    setCloneSource: (x: number, y: number) => drive('clone', [[x, y]], { alt: true }),
+    setCloneOptions: (o: Partial<CloneOptions>) => { store.setCloneOpts(o); return store.cloneOpts.peek(); },
+    setRetouchOptions: (o: Partial<{ strength: number; sharpen: boolean; burn: boolean; range: DodgeBurnRange; exposure: number }>) => { store.setRetouch(o); return store.retouch.peek(); },
+    crop: (r: Rect) => store.engine.cropTo(r),
+    liftSelection: () => store.beginTransformSelection(),
+    floating: () => store.engine.floating(),
+    setFloatingTransform: (t: Partial<LayerTransform>) => {
+      const f = store.engine.floating();
+      if (f) store.engine.setFloatingTransform({ ...f.transform, ...t });
+    },
+    commitFloating: () => store.commitFloating(),
+    cancelFloating: () => store.cancelFloating(),
+    setQuickMask: (on: boolean) => { store.engine.setQuickMask(on); return store.engine.quickMask(); },
+    quickMask: () => store.engine.quickMask(),
+    modifySelection: (op: 'grow' | 'shrink' | 'smooth' | 'feather' | 'border', px: number) => store.engine.modifySelection(op, px),
+    inputs: () => store.inputs.peek(),
+    addInputLayer: (n: number) => store.engine.addInputLayer(n),
+    files: () => store.files.peek(),
+    saveProject: (path?: string) => (store.bridge?.saveProject ? store.bridge.saveProject(path) : Promise.reject(new Error('standalone'))),
+    openProject: (path?: string) => (store.bridge?.openProject ? store.bridge.openProject(path) : Promise.reject(new Error('standalone'))),
+    exportPng: (path?: string) => (store.bridge?.exportPng ? store.bridge.exportPng(path) : Promise.reject(new Error('standalone'))),
+    /** The live engine, for instrumentation in validation scripts. */
+    engine: () => store.engine,
+    placeImageViaTd: () => (store.bridge?.placeImageViaTd ? store.bridge.placeImageViaTd() : Promise.reject(new Error('standalone'))),
+    chooseFile: (purpose: 'saveProject' | 'openProject' | 'exportPng') => (store.bridge?.chooseFile ? store.bridge.chooseFile(purpose) : Promise.reject(new Error('standalone'))),
     readPixel: (x: number, y: number) => Array.from(store.engine.readComposite({ x, y, w: 1, h: 1 })),
     /** Screen (client) coordinates of a document point, for synthesising mouse drags. */
     docToScreen: (x: number, y: number) => {

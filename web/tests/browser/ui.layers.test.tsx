@@ -24,7 +24,7 @@ async function addTwo() {
 describe('LayersPanel rows', () => {
   it('lists layers top first and marks the active one', async () => {
     await addTwo();
-    expect(names()).toEqual(['Layer 2', 'Layer 1', 'TD Input']);
+    expect(names()).toEqual(['Layer 2', 'Layer 1', 'TD Input 1']);
     expect(row('L2').getAttribute('data-selected')).toBe('true');
     expect(row('base').getAttribute('data-selected')).toBe('false');
     expect(q('.row.sel', row('L2').parentElement!)).toBeTruthy();
@@ -51,7 +51,7 @@ describe('LayersPanel rows', () => {
     expect(q('[data-act=lock]', row('base')).classList.contains('on')).toBe(true);
   });
 
-  it('renames on double click: Enter commits, Escape cancels, empty is ignored, base is not renamable', async () => {
+  it('renames on double click: Enter commits, Escape cancels, empty is ignored, input layers rename like any other', async () => {
     await addTwo();
     const dbl = (id: string) => q('[data-act=sel]', row(id)).dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
     dbl('L1');
@@ -83,7 +83,7 @@ describe('LayersPanel rows', () => {
 
     dbl('base');
     await settle();
-    expect(document.querySelector('input[aria-label="Layer name"]')).toBeNull();
+    expect(document.querySelector('input[aria-label="Layer name"]')).toBeTruthy();
   });
 
   it('expands and collapses groups, indenting children', async () => {
@@ -149,16 +149,22 @@ describe('LayersPanel settings and footer', () => {
     await settle();
     expect(engine.layers().some((l) => l.kind === 'group')).toBe(false);
 
-    const fx = q('[aria-label="Layer effects"]');
-    expect(fx.getAttribute('aria-disabled')).toBe('true');
-    expect(fx.title).toContain('Not in this version');
+    // the footer effects button is enabled for the active pixel/input layer, disabled for groups
+    const fx = q('[aria-label="Layer effects"][aria-disabled]');
+    expect(fx.getAttribute('aria-disabled')).toBe('false');
+    store.addGroup();
+    await settle();
+    expect(q('[aria-label="Layer effects"][aria-disabled]').getAttribute('aria-disabled')).toBe('true');
   });
 
-  it('does not delete the base layer', async () => {
-    expect(q('[aria-label="Delete layer"]').getAttribute('aria-disabled')).toBe('true');
+  it('deletes an input layer like any other (no special base case)', async () => {
+    await addTwo();
+    engine.setActiveLayer('base');
+    await settle();
+    expect(q('[aria-label="Delete layer"]').getAttribute('aria-disabled')).toBe('false');
     q('[aria-label="Delete layer"]').click();
     await settle();
-    expect(engine.layers().length).toBe(1);
+    expect(engine.layers().some((l) => l.id === 'base')).toBe(false);
   });
 });
 
@@ -198,15 +204,13 @@ describe('LayersPanel drag reorder', () => {
     expect(last('move:')).toBe(`move:${l}:${g}:0`);
   });
 
-  it('a plain click or tiny wiggle does not reorder; the base layer cannot be dragged', async () => {
+  it('a plain click or tiny wiggle does not reorder', async () => {
     await addTwo();
     const list = q('[data-layer-list]');
     const [x, y] = centre(q('[data-act=sel]', row('L1')));
     q('[data-act=sel]', row('L1')).dispatchEvent(ptr('pointerdown', { clientX: x, clientY: y }));
     list.dispatchEvent(ptr('pointermove', { clientX: x + 1, clientY: y + 1 }));
     list.dispatchEvent(ptr('pointerup', { clientX: x, clientY: y }));
-    const d = dragRow('base', 'L2', 0.2);
-    d.list.dispatchEvent(ptr('pointerup'));
     await settle();
     expect(last('move:')).toBeUndefined();
   });

@@ -48,6 +48,12 @@ export class TileBackup {
     }
   }
 
+  /** Drop the saved tiles without producing patches. */
+  dispose(): void {
+    this.tiles.forEach(releaseSurface);
+    this.tiles.clear();
+  }
+
   /** Put the saved pixels back into `r` (layer space). */
   restore(r: Rect): void {
     this.cover(r);

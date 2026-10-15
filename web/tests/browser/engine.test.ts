@@ -15,7 +15,7 @@ describe('layers', () => {
   it('starts with a locked base layer that is active', () => {
     e = newEngine(10, 10);
     expect(e.layers()).toEqual([
-      { id: 'base', name: 'TD Input', kind: 'base', visible: true, locked: true, opacity: 1, blend: 'normal', depth: 0, parentId: null, slot: null, mask: null, adjustment: null, text: null, shape: null, transform: { x: 0, y: 0, sx: 1, sy: 1 }, surfaceW: 10, surfaceH: 10 },
+      { id: 'base', name: 'TD Input', kind: 'input', input: 1, inputConnected: true, effects: [], visible: true, locked: true, opacity: 1, blend: 'normal', depth: 0, parentId: null, slot: null, mask: null, adjustment: null, text: null, shape: null, transform: { x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 }, surfaceW: 10, surfaceH: 10 },
     ]);
     expect(e.activeLayerId()).toBe('base');
   });
@@ -81,11 +81,11 @@ describe('layers', () => {
     expect(names(e)).toEqual(['c', 'b', 'a', 'TD Input']);
     e.moveLayer(c, null, 2);
     expect(names(e)).toEqual(['b', 'a', 'c', 'TD Input']);
-    e.moveLayer(c, null, 99); // cannot go below the base layer
-    expect(names(e)).toEqual(['b', 'a', 'c', 'TD Input']);
+    e.moveLayer(c, null, 99); // clamps to the bottom of the stack; the input is not special
+    expect(names(e)).toEqual(['b', 'a', 'TD Input', 'c']);
     e.moveLayer(a, null, -5);
-    expect(names(e)).toEqual(['a', 'b', 'c', 'TD Input']);
-    e.moveLayer('base', null, 0); // base is immovable
+    expect(names(e)).toEqual(['a', 'b', 'TD Input', 'c']);
+    e.moveLayer('base', null, 3); // the input layer can be moved anywhere
     expect(names(e)).toEqual(['a', 'b', 'c', 'TD Input']);
     const g = e.addGroup('G');
     e.moveLayer(b, g, 0);
@@ -126,12 +126,12 @@ describe('layers', () => {
     expect(names(e)).toEqual(['TD Input']);
   });
 
-  it('the base layer cannot be deleted', () => {
+  it('the input layer can be deleted', () => {
     e = newEngine(10, 10);
     const ev = collect(e);
     e.deleteLayer('base');
-    expect(names(e)).toEqual(['TD Input']);
-    expect(ev).toEqual([{ type: 'notice', message: 'The base layer cannot be deleted' }]);
+    expect(names(e)).toEqual([]);
+    expect(ev.filter((x) => x.type === 'notice')).toEqual([]);
   });
 
   it('setLayerProps validates, clamps, and ignores no-ops and unknown ids', () => {

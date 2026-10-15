@@ -23,7 +23,7 @@ function transformedLayers(w: number, h: number): Engine {
     const px = new Uint8ClampedArray(iw * 400 * 4);
     for (let k = 0; k < px.length; k += 4) { px[k] = i * 25; px[k + 1] = 255 - i * 20; px[k + 2] = (k >> 4) & 255; px[k + 3] = 200; }
     const id = en.importImage(px, iw, 400, `i${i}`);
-    en.setTransform(id, { x: i * 80, y: i * 40, sx: [0.5, 1.5, 0.8, 2, 1.1, 0.3, 1, 0.9, 1.7][i], sy: [0.5, 1.2, 0.8, 1.5, 1.1, 0.3, 1, 1.3, 1.7][i] });
+    en.setTransform(id, { x: i * 80, y: i * 40, sx: [0.5, 1.5, 0.8, 2, 1.1, 0.3, 1, 0.9, 1.7][i], sy: [0.5, 1.2, 0.8, 1.5, 1.1, 0.3, 1, 1.3, 1.7][i], rot: 0, kx: 0, ky: 0 });
     if (i % 3 === 0) en.addMask(id);
   }
   en.flush();
@@ -43,7 +43,7 @@ d('performance budgets with transformed layers (v4)', () => {
   it('a 64 px stroke on a 2x scaled 1920x1080 layer sustains >= 55 events/s, p99 < 32 ms', () => {
     e = transformedLayers(1920, 1080);
     const id = e.addPixelLayer();
-    e.setTransform(id, { x: 100, y: 50, sx: 2, sy: 2 });
+    e.setTransform(id, { x: 100, y: 50, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 });
     e.setToolContext(brushCtx({ size: 64, hardness: 0.7, opacity: 0.8 }));
     e.setTool('brush');
     e.pointerDown(ptr(300, 500));

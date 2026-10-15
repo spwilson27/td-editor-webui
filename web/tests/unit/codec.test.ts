@@ -1,20 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import {
-  decodeFrame, decodeTdMessage, decodeWebMessage, encodeBands, encodeFrame, encodeMessage, isStale, PROTOCOL_VERSION,
+  decodeFrame, decodeTdMessage, normalizeLayer, decodeWebMessage, encodeBands, encodeFrame, encodeMessage, isStale, PROTOCOL_VERSION,
   FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, FRAME_VIEW, HEADER_BYTES, MAX_BAND_PAYLOAD, type FrameHeader,
 } from '../../src/bridge/codec';
 
 const hdr = (o: Partial<FrameHeader> = {}): FrameHeader => ({
-  type: FRAME_BASE, frameEnd: true, slot: 0, frameId: 7, docW: 100, docH: 50, x: 10, y: 5, w: 4, h: 3, ...o,
+  type: FRAME_BASE, frameEnd: true, slot: 1, frameId: 7, docW: 100, docH: 50, x: 10, y: 5, w: 4, h: 3, ...o,
 });
 const px = (n: number) => Uint8Array.from({ length: n }, (_, i) => i & 255);
 
 describe('frame header', () => {
   it('encodes the exact little-endian layout', () => {
-    const msg = encodeFrame(hdr({ frameId: 0x01020304, slot: 0x0102 }), px(48));
+    const msg = encodeFrame(hdr({ frameId: 0x01020304, slot: 0x0102, type: FRAME_SURFACE }), px(48));
     expect(msg.length).toBe(HEADER_BYTES + 48);
     expect(Array.from(msg.subarray(0, 24))).toEqual([
-      0x52, 0x45, 0x46, 0x31, 1, 1, 0x02, 0x01, 0x04, 0x03, 0x02, 0x01, 100, 0, 50, 0, 10, 0, 5, 0, 4, 0, 3, 0,
+      0x52, 0x45, 0x46, 0x31, 3, 1, 0x02, 0x01, 0x04, 0x03, 0x02, 0x01, 100, 0, 50, 0, 10, 0, 5, 0, 4, 0, 3, 0,
     ]);
     expect(Array.from(msg.subarray(24, 28))).toEqual([0, 1, 2, 3]);
   });
@@ -58,6 +58,8 @@ describe('decode validation', () => {
     ['bad-rect', () => { const m = good(); m[20] = 0; m[21] = 0; return m; }], // w = 0
     ['bad-rect', () => { const m = good(); m[16] = 99; return m; }], // x + w > docW
     ['bad-rect', () => { const m = good(); m[18] = 49; return m; }], // y + h > docH
+    ['bad-slot', () => { const m = good(); m[6] = 0; return m; }], // BASE slot = input index 1..8
+    ['bad-slot', () => { const m = good(); m[6] = 9; return m; }],
     ['bad-length', () => good().subarray(0, 24 + 47)],
     ['bad-length', () => { const m = new Uint8Array(good().length + 1); m.set(good()); return m; }],
   ] as const)('%s', (error, make) => {
@@ -81,6 +83,8 @@ describe('encode validation', () => {
     expect(() => encodeFrame(hdr({ type: 9 as 1 }), px(48))).toThrow(RangeError);
     expect(() => encodeFrame(hdr({ type: 2 as 1 }), px(48))).toThrow(RangeError);
     expect(() => encodeFrame(hdr({ slot: 70000 }), px(48))).toThrow(RangeError);
+    expect(() => encodeFrame(hdr({ slot: 0 }), px(48))).toThrow(RangeError); // BASE needs an input index
+    expect(() => encodeFrame(hdr({ slot: 9 }), px(48))).toThrow(RangeError);
   });
 });
 
@@ -155,12 +159,13 @@ describe('frame types', () => {
 });
 
 describe('protocol v3 messages', () => {
-  it('is protocol version 5', () => { expect(PROTOCOL_VERSION).toBe(5); });
+  it('is protocol version 6', () => { expect(PROTOCOL_VERSION).toBe(6); });
 
   it('decodes a base notice and rejects incomplete ones', () => {
-    const n = { t: 'base', frameId: 4000000000, docW: 1920, docH: 1080, x: 0, y: 0, w: 1920, h: 1080 } as const;
+    const n = { t: 'base', frameId: 4000000000, input: 3, docW: 1920, docH: 1080, x: 0, y: 0, w: 1920, h: 1080 } as const;
     expect(decodeTdMessage(encodeMessage(n))).toEqual(n);
     expect(decodeTdMessage('{"t":"base","frameId":1}')).toBeNull();
+    expect(decodeTdMessage('{"t":"base","frameId":1,"docW":4,"docH":2,"x":0,"y":0,"w":4,"h":2}')).toEqual({ t: 'base', frameId: 1, input: 1, docW: 4, docH: 2, x: 0, y: 0, w: 4, h: 2 }); // input defaults to 1
     expect(decodeTdMessage('{"t":"base","frameId":"1","docW":1,"docH":1,"x":0,"y":0,"w":1,"h":1}')).toBeNull();
   });
 
@@ -172,7 +177,7 @@ describe('protocol v3 messages', () => {
   });
 
   it('docState, view notice and applied', () => {
-    const layers = [{ id: 'base', kind: 'base' }];
+    const layers = [{ id: 'p', kind: 'pixel', rot: 0, kx: 0, ky: 0, input: null, effects: [] }];
     expect(decodeTdMessage(JSON.stringify({ t: 'docState', rev: 3, layers, docW: 8, docH: 4 }))).toEqual({ t: 'docState', rev: 3, layers, docW: 8, docH: 4, guides: { h: [], v: [] }, canvas: { mode: 'input' } });
     expect(decodeTdMessage(JSON.stringify({ t: 'docState', rev: 3, layers, docW: 8, docH: 4, guides: { h: [1, 'x', 2.5], v: 'no' }, canvas: { mode: 'fixed' } })))
       .toEqual({ t: 'docState', rev: 3, layers, docW: 8, docH: 4, guides: { h: [1, 2.5], v: [] }, canvas: { mode: 'fixed' } });
@@ -188,14 +193,18 @@ describe('protocol v3 messages', () => {
 
 describe('json messages', () => {
   it('web messages round trip', () => {
-    const spec = { id: 'a', kind: 'adjustment', parentId: null, name: 'Levels', visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot: null, mask: { slot: 4, enabled: true }, adjustment: { type: 'invert' } };
+    const spec = { id: 'a', kind: 'adjustment', parentId: null, name: 'Levels', visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, rot: 0, kx: 0, ky: 0, input: null, effects: [], slot: null, mask: { slot: 4, enabled: true }, adjustment: { type: 'invert' } };
     const msgs = [
-      { t: 'ready', protocol: 5, client: 'panel', version: '0.1.0', token: 'abc', fresh: true },
+      { t: 'ready', protocol: 6, client: 'panel', version: '0.1.0', token: 'abc', fresh: true },
       { t: 'doc', rev: 5, layers: [spec], guides: { h: [10], v: [] }, canvas: { mode: 'fixed' } },
       { t: 'setCanvas', w: 800, h: 600, mode: 'fixed' },
       { t: 'setCanvas', w: 0, h: 0, mode: 'input' },
       { t: 'renderLayer', requestId: 'r1', layerId: 'L3' },
       { t: 'requestDoc' },
+      { t: 'saveProject', requestId: 'f1' },
+      { t: 'saveProject', requestId: 'f2', path: '/tmp/a.redoc' },
+      { t: 'openProject', requestId: 'f3', path: '/tmp/a.redoc' },
+      { t: 'exportPng', requestId: 'f4' },
       { t: 'view', mode: 'td', zoom: 0.5, panX: 12, panY: -3, rect: { x: 100, y: 80, w: 900, h: 700 } },
       { t: 'takeover' },
       { t: 'requestBase' },
@@ -246,21 +255,73 @@ describe('json messages', () => {
     expect(decodeTdMessage(JSON.stringify({ ...hello, extra: 1 }))).toEqual(hello);
     expect(decodeTdMessage('{"t":"docSize","w":4,"h":5,"hasInput":false}')).toEqual({ t: 'docSize', w: 4, h: 5, hasInput: false, mode: 'input' });
     expect(decodeTdMessage('{"t":"docSize","w":4,"h":5,"hasInput":false,"mode":"fixed"}')).toEqual({ t: 'docSize', w: 4, h: 5, hasInput: false, mode: 'fixed' });
-    expect(decodeTdMessage('{"t":"baseSize","w":1280,"h":720}')).toEqual({ t: 'baseSize', w: 1280, h: 720 });
-    expect(decodeTdMessage('{"t":"baseSize","w":0,"h":0}')).toEqual({ t: 'baseSize', w: 0, h: 0 }); // no input
-    expect(decodeTdMessage('{"t":"baseSize","w":-1,"h":4}')).toBeNull();
     expect(decodeTdMessage('{"t":"hello","protocol":5,"doc":{"w":4,"h":4,"mode":"fixed"},"hasInput":true,"maxSendFps":30,"active":true}'))
       .toMatchObject({ doc: { w: 4, h: 4, mode: 'fixed' } });
     expect(decodeTdMessage('{"t":"active","active":true}')).toEqual({ t: 'active', active: true });
     expect(decodeTdMessage('{"t":"error","msg":"nope"}')).toEqual({ t: 'error', msg: 'nope' });
   });
 
-  it('v5: hello may carry baseSize (0x0 = no input); malformed ones are dropped', () => {
-    const h = { t: 'hello', protocol: 5, doc: { w: 4, h: 4 }, hasInput: true, maxSendFps: 30, active: true };
-    expect(decodeTdMessage(JSON.stringify({ ...h, baseSize: { w: 1280, h: 720 } }))).toMatchObject({ baseSize: { w: 1280, h: 720 } });
-    expect(decodeTdMessage(JSON.stringify({ ...h, baseSize: { w: 0, h: 0 } }))).toMatchObject({ baseSize: { w: 0, h: 0 } });
-    expect('baseSize' in decodeTdMessage(JSON.stringify({ ...h, baseSize: { w: -1, h: 5 } }))!).toBe(false);
-    expect('baseSize' in decodeTdMessage(JSON.stringify(h))!).toBe(false);
+  it('v6: hello may carry inputs (0x0 = unconnected); malformed lists are dropped; baseSize is gone', () => {
+    const h = { t: 'hello', protocol: 6, doc: { w: 4, h: 4 }, hasInput: true, maxSendFps: 30, active: true };
+    const items = [{ input: 1, w: 1280, h: 720, connected: true }, { input: 2, w: 0, h: 0, connected: false }];
+    expect(decodeTdMessage(JSON.stringify({ ...h, inputs: items }))).toMatchObject({ inputs: items });
+    expect(decodeTdMessage(JSON.stringify({ ...h, inputs: [] }))).toMatchObject({ inputs: [] });
+    for (const bad of [[{ input: 0, w: 1, h: 1, connected: true }], [{ input: 9, w: 1, h: 1, connected: true }], [{ input: 1, w: -1, h: 1, connected: true }], [{ input: 1, w: 1, h: 1 }], 'x', [5]]) {
+      expect('inputs' in decodeTdMessage(JSON.stringify({ ...h, inputs: bad }))!).toBe(false);
+    }
+    expect('inputs' in decodeTdMessage(JSON.stringify(h))!).toBe(false);
+    expect('baseSize' in decodeTdMessage(JSON.stringify({ ...h, baseSize: { w: 5, h: 5 } }))!).toBe(false);
+    expect(decodeTdMessage('{"t":"baseSize","w":1280,"h":720}')).toBeNull();
+  });
+
+  it('v6: inputs, fileResult, reload and files', () => {
+    const inputs = { t: 'inputs', items: [{ input: 1, w: 640, h: 360, connected: true }, { input: 4, w: 0, h: 0, connected: false }] } as const;
+    expect(decodeTdMessage(encodeMessage(inputs as never))).toEqual(inputs);
+    expect(decodeTdMessage('{"t":"inputs","items":[]}')).toEqual({ t: 'inputs', items: [] });
+    expect(decodeTdMessage('{"t":"inputs"}')).toBeNull();
+    expect(decodeTdMessage('{"t":"inputs","items":[{"input":1,"w":1}]}')).toBeNull();
+    const fr = { t: 'fileResult', requestId: 'f1', op: 'saveProject', ok: false, path: '/x.redoc', msg: 'disk full' } as const;
+    expect(decodeTdMessage(encodeMessage(fr))).toEqual(fr);
+    expect(decodeTdMessage('{"t":"fileResult","op":"exportPng","ok":true,"path":"/a.png"}')).toEqual({ t: 'fileResult', op: 'exportPng', ok: true, path: '/a.png' });
+    expect(decodeTdMessage('{"t":"fileResult","op":"wipe","ok":true,"path":"/a"}')).toBeNull();
+    expect(decodeTdMessage('{"t":"fileResult","op":"saveProject","ok":"yes","path":"/a"}')).toBeNull();
+    expect(decodeTdMessage('{"t":"fileResult","op":"saveProject","ok":true}')).toBeNull();
+    expect(decodeTdMessage('{"t":"reload","rev":12}')).toEqual({ t: 'reload', rev: 12 });
+    expect(decodeTdMessage('{"t":"reload"}')).toBeNull();
+    expect(decodeTdMessage('{"t":"files","projectFile":"/a.redoc","pngFile":"/a.png"}')).toEqual({ t: 'files', projectFile: '/a.redoc', pngFile: '/a.png' });
+    expect(decodeTdMessage('{"t":"files","projectFile":"/a.redoc"}')).toBeNull();
+    expect(decodeWebMessage('{"t":"saveProject"}')).toBeNull();
+    expect(decodeWebMessage('{"t":"exportPng","requestId":3}')).toBeNull();
+  });
+
+  it('v6: chooseFile / fileChosen', () => {
+    for (const purpose of ['placeImage', 'saveProject', 'openProject', 'exportPng'] as const) {
+      const m = { t: 'chooseFile', requestId: 'c1', purpose } as const;
+      expect(decodeWebMessage(encodeMessage(m))).toEqual(m);
+    }
+    expect(decodeWebMessage('{"t":"chooseFile","requestId":"c1","purpose":"deleteAll"}')).toBeNull();
+    expect(decodeWebMessage('{"t":"chooseFile","requestId":"c1"}')).toBeNull();
+    expect(decodeWebMessage('{"t":"chooseFile","purpose":"placeImage"}')).toBeNull();
+    expect(decodeTdMessage('{"t":"fileChosen","requestId":"c1","path":"/a/b.png"}')).toEqual({ t: 'fileChosen', requestId: 'c1', path: '/a/b.png' });
+    expect(decodeTdMessage('{"t":"fileChosen","requestId":"c1","path":null}')).toEqual({ t: 'fileChosen', requestId: 'c1', path: null });
+    expect(decodeTdMessage('{"t":"fileChosen","requestId":"c1"}')).toBeNull();
+    expect(decodeTdMessage('{"t":"fileChosen","requestId":"c1","path":5}')).toBeNull();
+    expect(decodeTdMessage('{"t":"fileChosen","path":null}')).toBeNull();
+  });
+
+  it('v6: layers are normalised (v5 base -> input 1, missing rot/kx/ky/effects defaulted)', () => {
+    const v5 = { id: 'base', kind: 'base', parentId: null, name: 'Base', visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot: 1, mask: null, adjustment: null, text: null, shape: null, sx: 1, sy: 1, surfaceW: 8, surfaceH: 4 };
+    const st = decodeTdMessage(JSON.stringify({ t: 'docState', rev: 1, layers: [v5, { ...v5, id: 'p', kind: 'pixel', slot: 2 }, { ...v5, id: 'i', kind: 'input', input: 3, rot: 15, kx: 2, ky: -2, effects: [{ enabled: true, type: 'invert' }] }], docW: 8, docH: 4 }));
+    if (st?.t !== 'docState') throw new Error('docState expected');
+    expect(st.layers[0]).toMatchObject({ kind: 'input', input: 1, rot: 0, kx: 0, ky: 0, effects: [] });
+    expect(st.layers[1]).toMatchObject({ kind: 'pixel', input: null, rot: 0, effects: [] });
+    expect(st.layers[2]).toMatchObject({ kind: 'input', input: 3, rot: 15, kx: 2, ky: -2, effects: [{ enabled: true, type: 'invert' }] });
+    const doc = decodeWebMessage(JSON.stringify({ t: 'doc', rev: 2, layers: [v5] }));
+    expect(doc?.t === 'doc' && doc.layers[0]).toMatchObject({ kind: 'input', input: 1 });
+    // idempotent; a pixel layer with a stray input loses it; an input layer with a bad index falls back to 1
+    expect(normalizeLayer(normalizeLayer(v5 as never))).toEqual(normalizeLayer(v5 as never));
+    expect(normalizeLayer({ ...v5, kind: 'pixel', input: 5 } as never).input).toBeNull();
+    expect(normalizeLayer({ ...v5, kind: 'input', input: 99 } as never).input).toBe(1);
   });
 
   it('ignores unknown types and malformed input', () => {

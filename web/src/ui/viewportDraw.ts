@@ -1,6 +1,8 @@
 import type { Rect } from '../engine/types';
 import type { View } from '../state/view';
 import { HANDLES, handlePoint, centreOf } from '../state/transform';
+import { boxCorners, handlePoints, centreOfBox } from '../state/affine';
+import type { LayerTransform } from '../engine/types';
 
 let checker: HTMLCanvasElement | null = null;
 
@@ -102,6 +104,16 @@ export interface OverlayExtra {
   guides?: { h: number[]; v: number[]; skip?: { axis: 'h' | 'v'; index: number } | null; drag?: { axis: 'h' | 'v'; pos: number } | null } | null;
   /** v4: the Move tool's transform box (doc px). */
   box?: Rect | null;
+  /** v5: oriented (rotated / skewed) transform box of a pixel / input layer or a floating selection. */
+  obox?: { t: LayerTransform; w: number; h: number; rotating?: { pointer: Pt; text: string } | null } | null;
+  /** v5: crop box (doc px) with the dimmed outside and a rule-of-thirds grid. */
+  crop?: Rect | null;
+  /** v5: Quick Mask overlay: a doc-sized red canvas. */
+  quickMask?: { src: CanvasImageSource; w: number; h: number } | null;
+  /** v5: clone source marker (doc px). */
+  clone?: Pt | null;
+  /** Canvas size (doc px), needed by the crop dimming. */
+  docW?: number; docH?: number;
   /** v4: snap feedback lines (doc px) while dragging. */
   snap?: { x: number | null; y: number | null } | null;
 }
@@ -162,6 +174,88 @@ function drawBox(ctx: CanvasRenderingContext2D, view: View, r: Rect): void {
   ctx.restore();
 }
 
+function handleSquare(ctx: CanvasRenderingContext2D, cx: number, cy: number, rot: number): void {
+  ctx.save();
+  ctx.translate(Math.round(cx), Math.round(cy));
+  ctx.rotate(rot);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(-HANDLE_SIZE / 2, -HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE);
+  ctx.strokeRect(-HANDLE_SIZE / 2 + 0.5, -HANDLE_SIZE / 2 + 0.5, HANDLE_SIZE - 1, HANDLE_SIZE - 1);
+  ctx.restore();
+}
+
+/** The oriented box: the real (rotated / skewed) parallelogram with its handles, a pivot cross and the rotate read-out. */
+function drawObox(ctx: CanvasRenderingContext2D, view: View, o: NonNullable<OverlayExtra['obox']>): void {
+  const scr = (p: Pt): Pt => ({ x: view.x + p.x * view.zoom, y: view.y + p.y * view.zoom });
+  const c = boxCorners(o.t, o.w, o.h).map(scr);
+  ctx.save();
+  ctx.lineWidth = 1;
+  ctx.setLineDash([]);
+  ctx.strokeStyle = BOX_COLOR;
+  ctx.beginPath();
+  c.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+  ctx.closePath();
+  ctx.stroke();
+  const hp = handlePoints(o.t, o.w, o.h);
+  const rot = (o.t.rot || 0) * Math.PI / 180;
+  for (const hd of HANDLES) { const p = scr(hp[hd]); handleSquare(ctx, p.x, p.y, rot); }
+  const cc = scr(centreOfBox(o.t, o.w, o.h));
+  ctx.beginPath();
+  ctx.moveTo(cc.x - 5, cc.y); ctx.lineTo(cc.x + 5, cc.y); ctx.moveTo(cc.x, cc.y - 5); ctx.lineTo(cc.x, cc.y + 5);
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 3; ctx.stroke();
+  ctx.strokeStyle = BOX_COLOR;
+  ctx.lineWidth = 1; ctx.stroke();
+  if (o.rotating) {
+    const p = scr(o.rotating.pointer);
+    ctx.beginPath(); ctx.moveTo(cc.x, cc.y); ctx.lineTo(p.x, p.y); ctx.stroke();
+    ctx.font = '11px sans-serif';
+    const tw = ctx.measureText(o.rotating.text).width;
+    ctx.fillStyle = 'rgba(20,20,20,0.85)';
+    ctx.fillRect(p.x + 12, p.y + 8, tw + 10, 18);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(o.rotating.text, p.x + 17, p.y + 21);
+  }
+  ctx.restore();
+}
+
+/** Crop: dim everything on the canvas outside the box, thirds guides, then the box and handles. */
+function drawCrop(ctx: CanvasRenderingContext2D, view: View, r: Rect, docW: number, docH: number): void {
+  const z = view.zoom;
+  const X0 = view.x, Y0 = view.y, X1 = view.x + docW * z, Y1 = view.y + docH * z;
+  const x0 = view.x + r.x * z, y0 = view.y + r.y * z, x1 = x0 + r.w * z, y1 = y0 + r.h * z;
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(X0, Y0, X1 - X0, y0 - Y0);
+  ctx.fillRect(X0, y1, X1 - X0, Y1 - y1);
+  ctx.fillRect(X0, y0, x0 - X0, y1 - y0);
+  ctx.fillRect(x1, y0, X1 - x1, y1 - y0);
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+  ctx.beginPath();
+  for (let i = 1; i <= 2; i++) {
+    const gx = Math.round(x0 + ((x1 - x0) * i) / 3) + 0.5, gy = Math.round(y0 + ((y1 - y0) * i) / 3) + 0.5;
+    ctx.moveTo(gx, y0); ctx.lineTo(gx, y1); ctx.moveTo(x0, gy); ctx.lineTo(x1, gy);
+  }
+  ctx.stroke();
+  ctx.restore();
+  drawBox(ctx, view, r);
+}
+
+function drawCloneMarker(ctx: CanvasRenderingContext2D, view: View, p: Pt): void {
+  const x = view.x + p.x * view.zoom, y = view.y + p.y * view.zoom;
+  ctx.save();
+  ctx.setLineDash([]);
+  for (const [color, w] of [['#000000', 3], ['#ffffff', 1]] as const) {
+    ctx.strokeStyle = color; ctx.lineWidth = w;
+    ctx.beginPath();
+    ctx.moveTo(x - 9, y); ctx.lineTo(x + 9, y); ctx.moveTo(x, y - 9); ctx.lineTo(x, y + 9);
+    ctx.stroke();
+    ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.restore();
+}
+
 function drawSnap(ctx: CanvasRenderingContext2D, vw: number, vh: number, view: View, s: { x: number | null; y: number | null }): void {
   ctx.save();
   ctx.lineWidth = 1;
@@ -200,6 +294,13 @@ function antPath(ctx: CanvasRenderingContext2D, view: View, paths: Pt[][], close
 
 export function drawOverlay(ctx: CanvasRenderingContext2D, vw: number, vh: number, view: View, selection: Rect | null, dashOffset: number, cursor: CursorShape | null, extra: OverlayExtra = {}): void {
   ctx.clearRect(0, 0, vw, vh);
+  if (extra.quickMask) {
+    const q = extra.quickMask;
+    ctx.save();
+    ctx.imageSmoothingEnabled = view.zoom < 1;
+    ctx.drawImage(q.src, view.x, view.y, q.w * view.zoom, q.h * view.zoom);
+    ctx.restore();
+  }
   if (extra.paths && extra.paths.length) {
     antPath(ctx, view, extra.paths, true, dashOffset);
   } else if (selection) {
@@ -216,7 +317,10 @@ export function drawOverlay(ctx: CanvasRenderingContext2D, vw: number, vh: numbe
     ctx.setLineDash([]);
   }
   if (extra.guides) drawGuides(ctx, vw, vh, view, extra.guides);
+  if (extra.crop) drawCrop(ctx, view, extra.crop, extra.docW ?? 0, extra.docH ?? 0);
   if (extra.box) drawBox(ctx, view, extra.box);
+  if (extra.obox) drawObox(ctx, view, extra.obox);
+  if (extra.clone) drawCloneMarker(ctx, view, extra.clone);
   if (extra.snap && (extra.snap.x !== null || extra.snap.y !== null)) drawSnap(ctx, vw, vh, view, extra.snap);
   if (extra.preview) antPath(ctx, view, extra.preview.paths, extra.preview.closed, dashOffset);
   if (cursor) {

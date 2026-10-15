@@ -67,7 +67,7 @@ shader early-outs outside each layer's rect.
   <= 9/255 on test images (radii 7..200) and 5.5/255 with thin bright bands ON the document border (v5 Blur TOP: 4..9, and 131 on
   the border bands). Not converged with blurlib's variance-compensated pyramid.
 * **Pre-warmed spares.** Spare GLSL TOPs (3 inputs) and Multi TOPs (16 inputs) are cooked once against a 16x16 constant
-  (`warm_in`) from `tick()` after >= 0.3 s without `apply()`; their first real use no longer compiles the shader.
+  (`warm_in`) from `tick()` after >= 1 s without `apply()`; their first real use no longer compiles the shader.
 * **Cache of the stack below the edit.** TD already cooks only nodes downstream of a change; nothing else recooks the chain
   (checked: parameter sets touch only the edited node; idle cooks 0 nodes). Edit cost is therefore (passes from the edited layer
   up); fewer passes make it cheaper (table in the report). Remaining whole-chain triggers are inherent: a changed input wiring below,

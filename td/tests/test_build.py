@@ -144,15 +144,16 @@ def test_restore_reapplies_values_and_connections_only_when_missing(capsys):
     comp = type("C", (), {})()
     comp.par = type("P", (), {})()
     comp.par.Port = type("Q", (), {"val": 0})()
-    comp.inputConnectors = [Connector()]
+    comp.inputConnectors = [Connector(), Connector(), Connector()]
     comp.outputConnectors = [Connector()]
     target = type("T", (), {})()
     target.inputConnectors = [Connector()]
-    src = object()
-    state = {"pars": {"Port": 9999, "Gone": 1}, "in": src, "out": [(target, 0)]}
+    src, src3 = object(), object()
+    state = {"pars": {"Port": 9999, "Gone": 1}, "ins": {1: src, 3: src3}, "out": [(target, 0)]}
     B.restore(comp, state)
     assert comp.par.Port.val == 9999 and "could not restore Gone" in capsys.readouterr().out
     assert comp.inputConnectors[0].connected == [src] and target.inputConnectors[0].connected == [comp.outputConnectors[0]]
+    assert comp.inputConnectors[1].connected == [] and comp.inputConnectors[2].connected == [src3]   # every wired input comes back
     # in-place rebuild: the connections are still there, so they are not touched
     comp.inputConnectors[0].connections = [Conn(src)]
     comp.inputConnectors[0].connected.clear()
@@ -263,3 +264,39 @@ def test_export_tox_always_destroys_its_scratch_comp(monkeypatch):
 def test_export_tox_dev_mode_builds_nothing(monkeypatch):
     monkeypatch.setattr(B, "build", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no")))
     B.export_tox(True)
+
+
+# --------------------------------------------------------------------------- v6: files, inputs, effect shaders
+
+def test_file_parameters_and_pulses_are_declared_wired_and_documented():
+    pars = B.PARAMS.split()
+    for name in ("Projectfile", "Saveproject", "Openproject", "Pngfile", "Exportpng"):
+        assert name in pars and name in _declared_params() and len(B.HELP[name]) > 80
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build_component.py"), encoding="utf-8").read()
+    for line in ('appendFile("Projectfile"', 'appendPulse("Saveproject"', 'appendPulse("Openproject"', 'appendFile("Pngfile"',
+                 'appendPulse("Exportpng"'):
+        assert line in src
+    assert ".redoc" in B.HELP["Projectfile"] and "PNG" in B.HELP["Exportpng"] and "premultiplied" in B.HELP["Exportpng"].lower()
+
+
+def test_effect_shaders_are_embedded_as_fx_dats(tmp_path):
+    root = tmp_path / "shared" / "effects"
+    root.mkdir(parents=True)
+    for n in ("common.glsl", "dropShadow.glsl", "vectors.json", "notes.txt"):
+        (root / n).write_text("x")
+    assert B.effect_sources(str(tmp_path)) == ["shared/effects/common.glsl", "shared/effects/dropShadow.glsl"]
+    assert [B.effect_dat_name(r) for r in B.effect_sources(str(tmp_path))] == ["fx_common", "fx_dropShadow"]
+    assert B.effect_sources(str(tmp_path / "nowhere")) == []
+    assert "td/raster_editor/effects.py" in B.SOURCES
+
+
+def test_repo_effect_shaders_are_found_for_every_effect_type():
+    import effects
+    names = {B.effect_dat_name(r) for r in B.effect_sources()}
+    assert "fx_common" in names and {"fx_" + t for t in effects.EFFECT_TYPES} <= names
+
+
+def test_build_creates_in1_with_connector_order_and_keeps_wired_inputs():
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build_component.py"), encoding="utf-8").read()
+    assert 'in1.par.connectorder = 1' in src and 't.par.connectorder = n' in src
+    assert B.MAX_INPUTS == 8

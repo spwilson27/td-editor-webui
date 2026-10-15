@@ -4,7 +4,7 @@ import { expect, test, type Page } from '@playwright/test';
 import type { LayerSpec } from '../../src/engine/types';
 import { FakeTd } from './fakeTd';
 
-// v4 (protocol 5): Flatten via renderLayer, canvas size, guides, transforms, rulers layout. The fake TD is the v5 one.
+// v4 (protocol 6): Flatten via renderLayer, canvas size, guides, transforms, rulers layout. The fake TD is the v6 one.
 let td: FakeTd;
 test.afterEach(async () => { await td.close(); });
 
@@ -105,7 +105,7 @@ test.describe('canvas size', () => {
     td.resize(64, 64);
     await page.waitForTimeout(300);
     expect((await state(page)).doc).toEqual({ w: 320, h: 180 });
-    const base = (await hook<any[]>(page, 'layers')).find((l) => l.kind === 'base');
+    const base = (await hook<any[]>(page, 'layers')).find((l) => l.kind === 'input');
     expect([base.surfaceW, base.surfaceH]).toEqual([64, 64]);
     td.sendSolidBase(250, 0, 0);
     await expect.poll(() => hook<number[]>(page, 'readPixel', 30, 30)).toEqual([250, 0, 0, 255]); // the 64x64 input keeps its transform, it is not stretched to the canvas
@@ -126,7 +126,7 @@ test.describe('canvas size', () => {
     await page.locator('[data-anchor=br]').click();
     await page.locator('[data-canvas-ok]').click();
     await td.waitFor(() => td.setCanvasMessages.length === 1);
-    await td.waitFor(() => specs().some((l) => l.kind === 'base' && l.x === 40 && l.y === 10));
+    await td.waitFor(() => specs().some((l) => l.kind === 'input' && l.x === 40 && l.y === 10));
   });
 
   test('undo / redo of a canvas size change tell TD (Docw/Doch revert and return)', async ({ page }) => {
@@ -145,14 +145,15 @@ test.describe('canvas size', () => {
     await td.waitFor(() => td.mode === 'fixed' && td.w === 320 && td.h === 180);
   });
 
-  test('a page reconnecting after the input was removed updates its base from hello.baseSize', async ({ page }) => {
+  test('a page reconnecting after the input was removed updates its input from hello.inputs', async ({ page }) => {
     await open(page);
     td.sendSolidBase(10, 20, 30);
     await expect.poll(() => hook<number[]>(page, 'readPixel', 5, 5)).toEqual([10, 20, 30, 255]);
     td.removeInput();
     td.dropClient();
     await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked', { timeout: 8000 });
-    await expect.poll(async () => { const b = (await hook<any[]>(page, 'layers')).find((l) => l.kind === 'base'); return [b.surfaceW, b.surfaceH]; }).toEqual([1, 1]);
+    await expect.poll(() => hook<any[]>(page, 'inputs')).toEqual([{ input: 1, w: 0, h: 0, connected: false }]);
+    await expect.poll(async () => (await hook<any[]>(page, 'layers')).find((l) => l.kind === 'input')?.inputConnected).toBe(false);
   });
 
   test('a TD-initiated docSize (input resolution while following) updates the page without echoing setCanvas', async ({ page }) => {
@@ -265,7 +266,7 @@ test.describe('transforms', () => {
     await page.locator('[data-layer="base"]').click();
     const frames = td.frames.length;
     await mouseDragDoc(page, [80, 45], [100, 55]);
-    await td.waitFor(() => specs().some((l) => l.kind === 'base' && Math.abs(l.x - 20) < 1.5 && Math.abs(l.y - 10) < 1.5));
+    await td.waitFor(() => specs().some((l) => l.kind === 'input' && Math.abs(l.x - 20) < 1.5 && Math.abs(l.y - 10) < 1.5));
     expect(td.frames).toHaveLength(frames);
   });
 
@@ -291,7 +292,7 @@ for (const [w, h] of [[1600, 960], [1280, 800], [1024, 700]] as const) {
     td = await FakeTd.start({ w: 8, h: 8 });
     await page.setViewportSize({ width: w, height: h });
     await page.goto('/?standalone=1&test=1');
-    await expect(page.locator('[data-tool]')).toHaveCount(17);
+    await expect(page.locator('[data-tool]')).toHaveCount(19);
     for (const tool of ['brush', 'move']) {
       await hook(page, 'setTool', tool);
       const r = await page.locator('[data-context-bar]').evaluate((el) => {

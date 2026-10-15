@@ -38,6 +38,8 @@ export interface Host {
   /** Record a structural edit that was already applied since `before`. */
   commitStructure(label: string, before: StructureSnapshot, coalesceKey?: string, dirty?: Rect | null | false): void;
   sample(x: number, y: number): RGBA | null;
+  /** v5: document-sized canvas holding the current composite; `rect` (document space) is brought up to date first. */
+  compositeCanvas(rect: Rect): CanvasImageSource;
 
   // v3 selection
   selectionOptions(): SelectionOptions;

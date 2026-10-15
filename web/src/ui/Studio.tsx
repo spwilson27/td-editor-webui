@@ -5,6 +5,7 @@ import { HistoryPanel } from './HistoryPanel';
 import { LayersPanel } from './LayersPanel';
 import { SwatchesPanel } from './SwatchesPanel';
 import { AdjustPanel } from './AdjustPanel';
+import { EffectsPanel } from './EffectsPanel';
 import { Tabs } from './Tabs';
 
 export function Studio() {
@@ -21,8 +22,8 @@ export function Studio() {
         {ct === 'color' ? <ColourPanel /> : ct === 'swatches' ? <SwatchesPanel /> : <BrushesPanel />}
       </div>
       <div style="flex:1 1 auto;min-height:0;display:flex;flex-direction:column">
-        <Tabs label="Layer panels" value={lt} onChange={(v) => { store.layerTab.value = v; }} tabs={isAdj ? [['layers', 'Layers'], ['history', 'History'], ['adjust', 'Adjustment']] : [['layers', 'Layers'], ['history', 'History']]} />
-        {lt === 'layers' ? <LayersPanel /> : lt === 'history' ? <HistoryPanel /> : <AdjustPanel layer={active} />}
+        <Tabs label="Layer panels" value={lt} onChange={(v) => { store.layerTab.value = v; }} tabs={isAdj ? [['layers', 'Layers'], ['history', 'History'], ['adjust', 'Adjustment'], ['fx', 'Effects']] : [['layers', 'Layers'], ['history', 'History'], ['fx', 'Effects']]} />
+        {lt === 'layers' ? <LayersPanel /> : lt === 'history' ? <HistoryPanel /> : lt === 'fx' ? <EffectsPanel layer={active} /> : <AdjustPanel layer={active} />}
       </div>
     </div>
   );

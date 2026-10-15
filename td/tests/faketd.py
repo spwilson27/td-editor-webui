@@ -144,6 +144,7 @@ class FakeNetwork:
         self.created = 0
         self.ticks = 0
         self.input_flags = []
+        self.input_calls = []
         self.render_sources = {}  # layer id -> TOP (FakeTop) returned by render_layer_source
         self.render_calls = []
         self.token = 0          # bumped to simulate an apply() / layout refinement
@@ -220,6 +221,11 @@ class FakeNetwork:
     def set_input_connected(self, flag):
         self.input_flags.append(bool(flag))
 
+    def set_inputs(self, items):
+        """v6 API: [{input, w, h, connected}] for every In TOP that exists."""
+        self.input_calls.append([dict(i) for i in items])
+        self.input_flags.append(any(i["input"] == 1 and i["connected"] for i in items))
+
     def stats(self):
         return {}
 
@@ -227,8 +233,13 @@ class FakeNetwork:
 class FakeInput:
     """in1: scripted pixel source with TD's two-step delayed readback."""
 
-    def __init__(self):
-        self.path = "/project1/raster_editor/in1"
+    def __init__(self, n=1, owner=None):
+        self.path = f"/project1/raster_editor/in{n}"
+        self.name = f"in{n}"
+        self.owner = owner
+        self.par = Pars(connectorder=0)
+        self.nodeX = self.nodeY = 0
+        self.destroyed = False
         self.width = 64
         self.height = 32
         self.totalCooks = 0
@@ -238,6 +249,11 @@ class FakeInput:
 
     def cook(self, force=False):
         pass
+
+    def destroy(self):
+        self.destroyed = True
+        if self.owner is not None:
+            self.owner._remove_input(self)
 
     def set_image(self, arr):
         self.array = arr.astype(np.float32)
@@ -347,19 +363,32 @@ class FakeTop:
         return out
 
 
+class FakeInConn:
+    def __init__(self, owner, n):
+        self.owner, self.n = owner, n
+
+    @property
+    def connections(self):
+        return [object()] if self.n in self.owner.connected else []
+
+
 class FakeOwner:
     def __init__(self, **par_overrides):
         pars = dict(Active=1, Port=9980, Docw=64, Doch=32, Premultiplied=1, Maxsendfps=30, Maxinputfps=30,
                     Maxviewfps=30, Viewmode="local", Docsizemode="input", Exportpath="", Devurl="", Panelquery="", Status="", w=1280, h=800,
-                    top="./webrender")
+                    top="./webrender", Projectfile="", Pngfile="")
         pars.update(par_overrides)
         self.par = Pars(**pars)
-        self.inputs = []
+        self.connected = set()  # connected input indices (1-based)
         self.panel = FakePanel()
         self.ext = None
         self.server = FakeServer()
         self.webrender = FakeWebRender()
-        self.in1 = FakeInput()
+        self.in_tops = {}
+        self.in1 = self._add_input(1)
+        self.created = []  # names of In TOPs created by the extension
+        self.out1 = FakeInput(0)
+        self.out1.path, self.out1.name = "/project1/raster_editor/out1", "out1"
         self.switch = FakeSwitch()
         self.ui = FakeText("<html>ui</html>")
         self.path = "/project1/raster_editor"
@@ -367,19 +396,56 @@ class FakeOwner:
         self.doc_state = FakeText("")
         self.saved = []  # (path, frozen, doc_state) per comp.save() call
         self.glsl = FakeText("// glsl")
-        self.net_module = Module(types.SimpleNamespace(DocNetwork=lambda comp, glsl, shape_glsl=None: self.net))
+        self.net_module = Module(types.SimpleNamespace(DocNetwork=self._make_net))
         self._ops = {
             "protocol": Module(protocol), "frames": Module(frames), "webserver": self.server,
-            "webrender": self.webrender, "in1": self.in1, "out_switch": self.switch,
+            "webrender": self.webrender, "out_switch": self.switch, "out1": self.out1,
             "ui_html": self.ui, "network": self.net_module, "blend_glsl": self.glsl, "doc_state": self.doc_state,
             "font_probe": FakeFontProbe(),
         }
         self.tops = {}  # path -> FakeTop (see ext._all_tops / _lookup_top seams in test_ext)
 
+    def _make_net(self, comp, glsl, shape_glsl=None, **kw):
+        self.net_kwargs = kw   # effects / effect_shaders handed to the DocNetwork
+        return self.net
+
+    def _add_input(self, n):
+        t = self.in_tops[n] = FakeInput(n, self)
+        return t
+
+    def _remove_input(self, top):
+        for n, t in list(self.in_tops.items()):
+            if t is top:
+                del self.in_tops[n]
+                self.connected.discard(n)
+
+    @property
+    def inputs(self):
+        return [object() for _ in sorted(self.connected)]
+
+    @inputs.setter
+    def inputs(self, v):  # compat: a truthy list means "input 1 connected"
+        self.connected = {1} if v else set()
+
+    @property
+    def inputConnectors(self):
+        return [FakeInConn(self, n) for n in range(1, max(self.in_tops, default=0) + 1)]
+
+    def create(self, optype, name):
+        assert optype == "inTOP", optype
+        n = int(name[2:])
+        self.created.append(name)
+        return self._add_input(n)
+
     def save(self, path):
         self.saved.append((path, self.net.frozen, self.doc_state.text))
 
     def op(self, name):
+        if name.startswith("in") and name[2:].isdigit():
+            try:
+                return self.in_tops[int(name[2:])]
+            except KeyError:
+                raise KeyError(name) from None
         return self._ops[name]
 
 

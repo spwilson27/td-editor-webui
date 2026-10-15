@@ -9,14 +9,16 @@ export const TOOLS: ToolInfo[] = [
   { id: 'marquee', name: 'Rectangular Marquee', key: 'M', sep: true, enabled: true, hint: 'Drag to select. Ctrl+D deselects.', d: 'M4 4h3M10 4h4M17 4h3v3M20 10v4M20 17v3h-3M14 20h-4M7 20H4v-3M4 14v-4M4 7V4' },
   { id: 'lasso', name: 'Freehand Selection', key: 'L', enabled: true, hint: 'Drag to draw a freehand selection. Release to close. Shift adds, Alt subtracts.', d: 'M12 4c5 0 8 2.5 8 5.5S16.5 15 12 15 4 12.5 4 9.5 7 4 12 4zM7 14c-1 2 0 4 2 4s2 2 1 3' },
   { id: 'wand', name: 'Flood Select', key: 'W', enabled: true, hint: 'Click to select similar colours. Shift adds, Alt subtracts, Shift+Alt intersects.', d: 'M4 20L15 9M14 3v2M20 9h-2M18.5 4.5L17 6M9.5 4.5l1 1M18.5 13.5l-1-1' },
-  { id: 'crop', name: 'Crop Tool', key: 'C', enabled: false, hint: 'Drag handles to crop. Enter to apply.', d: 'M6 2v16h16M2 6h16v16' },
+  { id: 'crop', name: 'Crop Tool', key: 'C', enabled: true, hint: 'Drag a box on the canvas, adjust its handles, Enter crops the canvas, Esc cancels.', d: 'M6 2v16h16M2 6h16v16' },
   { id: 'brush', name: 'Paint Brush', key: 'B', sep: true, enabled: true, hint: 'Drag to paint. Alt picks a colour. [ ] resize.', d: 'M18 3l3 3-9 9-3-3 9-9zM9 12c-3 0-5 2-5 5 0 1.5-1 3-2 3 4 1 9 0 9-5' },
   { id: 'pencil', name: 'Pixel Tool', key: 'N', enabled: true, hint: 'Drag to paint hard-edged pixels.', d: 'M16 3l5 5L8 21H3v-5L16 3zM13 6l5 5' },
   { id: 'eraser', name: 'Erase Brush', key: 'E', enabled: true, hint: 'Drag to erase to transparency.', d: 'M15 4l5 5-10 10H6l-3-3L15 4zM9 10l5 5M10 20h11' },
   { id: 'fill', name: 'Flood Fill', key: 'G', enabled: true, hint: 'Click to fill similar colours with the primary colour.', d: 'M5 11l7-7 8 8-7 7a2 2 0 01-3 0l-5-5a2 2 0 010-3zM5 12h15M20 16c0 1.5 1 2.5 1 3.5a1 1 0 01-2 0c0-1 1-2 1-3.5' },
   { id: 'gradient', name: 'Gradient Tool', key: 'G', enabled: true, hint: 'Drag to draw a gradient from primary to secondary.', d: 'M4 4h16v16H4zM8 16l8-8' },
-  { id: 'clone', name: 'Clone Brush', key: 'S', enabled: false, hint: 'Alt-click to set the source, then drag to paint.', d: 'M9 3h6v5l-1 3h4v4H6v-4h4L9 8zM5 21h14' },
-  { id: 'smudge', name: 'Smudge Brush', key: 'R', enabled: false, hint: 'Drag to push and blend pixels.', d: 'M9 11V5a2 2 0 014 0v6M13 10a2 2 0 014 0v2M17 12a2 2 0 014 0v3a6 6 0 01-6 6h-2a6 6 0 01-5-3l-3-5a2 2 0 013-2l2 2' },
+  { id: 'clone', name: 'Clone Brush', key: 'S', enabled: true, hint: 'Alt-click to set the source, then drag to paint.', d: 'M9 3h6v5l-1 3h4v4H6v-4h4L9 8zM5 21h14' },
+  { id: 'smudge', name: 'Smudge Brush', key: 'R', enabled: true, hint: 'Drag to push and blend pixels.', d: 'M9 11V5a2 2 0 014 0v6M13 10a2 2 0 014 0v2M17 12a2 2 0 014 0v3a6 6 0 01-6 6h-2a6 6 0 01-5-3l-3-5a2 2 0 013-2l2 2' },
+  { id: 'blur', name: 'Blur / Sharpen Brush', key: 'Y', enabled: true, hint: 'Drag to blur; enable Sharpen to sharpen instead.', d: 'M12 3c3 4.5 6 7.5 6 11a6 6 0 01-12 0c0-3.5 3-6.5 6-11zM9 15a3 3 0 003 3' },
+  { id: 'dodge', name: 'Dodge / Burn Brush', key: 'O', enabled: true, hint: 'Drag to lighten; enable Burn to darken.', d: 'M12 3a5 5 0 110 10 5 5 0 010-10zM12 13v8M9 21h6' },
   { id: 'text', name: 'Text Tool', key: 'T', sep: true, enabled: true, hint: 'Click to place text, or click a text layer to edit it. Esc commits.', d: 'M5 5h14M12 5v14M9 19h6' },
   { id: 'shape', name: 'Shape Tool', key: 'U', enabled: true, hint: 'Drag to draw a shape layer. Shift constrains. Click the corner for more shapes.', d: 'M4 4h9v9H4zM11 16a5 5 0 1010 0 5 5 0 10-10 0' },
   { id: 'picker', name: 'Colour Picker', key: 'I', enabled: true, hint: 'Click to sample a colour into the primary swatch.', d: 'M14 4l6 6M17 7L7 17l-3 1 1-3L15 5' },
@@ -25,7 +27,7 @@ export const TOOLS: ToolInfo[] = [
 ];
 
 export const toolInfo = (id: ToolId): ToolInfo => TOOLS.find((t) => t.id === id) || TOOLS[0];
-export const PAINT_TOOLS: ReadonlySet<ToolId> = new Set<ToolId>(['brush', 'pencil', 'eraser', 'clone', 'smudge']);
+export const PAINT_TOOLS: ReadonlySet<ToolId> = new Set<ToolId>(['brush', 'pencil', 'eraser', 'clone', 'smudge', 'blur', 'dodge']);
 
 export const MODES = [
   { id: 'paint', label: 'Paint', enabled: true, d: 'M18 3l3 3-9 9-3-3 9-9zM9 12c-3 0-5 2-5 5 0 1.5-1 3-2 3 4 1 9 0 9-5' },

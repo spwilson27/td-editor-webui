@@ -22,9 +22,9 @@ def px(w, h, seed=0):
 
 def test_header_layout_matches_spec():
     data = P.encode_message(hdr(frame_id=0x01020304, doc_w=0x0506, doc_h=0x0708, x=0x0203, y=0x0304, w=2, h=1,
-                                flags=1, type=1), bytes(8))
+                                flags=1, type=1, slot=3), bytes(8))
     assert data[:4] == b"REF1"
-    assert data[4] == 1 and data[5] == 1 and data[6:8] == b"\0\0"  # slot 0
+    assert data[4] == 1 and data[5] == 1 and data[6:8] == b"\3\0"  # BASE: slot = input index 3
     assert struct.unpack_from("<I", data, 8)[0] == 0x01020304
     assert struct.unpack_from("<HHHHHH", data, 12) == (0x0506, 0x0708, 0x0203, 0x0304, 2, 1)
     assert len(data) == 24 + 8
@@ -32,10 +32,21 @@ def test_header_layout_matches_spec():
 
 def test_slot_field_at_offset_6_roundtrips_for_every_valid_type():
     for typ in P.VALID_TYPES:
-        raw = P.encode_message(hdr(type=typ, slot=0xBEEF, w=1, h=1), bytes(4))
-        assert struct.unpack_from("<H", raw, 6)[0] == 0xBEEF
+        slot = 8 if typ == P.TYPE_BASE else 0xBEEF  # BASE: the input index (1..8)
+        raw = P.encode_message(hdr(type=typ, slot=slot, w=1, h=1), bytes(4))
+        assert struct.unpack_from("<H", raw, 6)[0] == slot
         got, _ = P.decode_frame(raw)
-        assert got.slot == 0xBEEF and got.type == typ
+        assert got.slot == slot and got.type == typ
+
+
+@pytest.mark.parametrize("slot", [0, 9, 300, 0xFFFF])
+def test_base_frame_slot_must_be_an_input_index(slot):
+    with pytest.raises(P.ProtocolError):
+        P.encode_header(hdr(type=P.TYPE_BASE, slot=slot, w=1, h=1))
+    raw = bytearray(P.encode_message(hdr(type=P.TYPE_BASE, slot=1, w=1, h=1), bytes(4)))
+    struct.pack_into("<H", raw, 6, slot)
+    with pytest.raises(P.ProtocolError):
+        P.decode_frame(bytes(raw))
 
 
 def test_type_2_is_invalid_to_encode_and_decode():
@@ -161,7 +172,7 @@ def test_bands_cover_rect_without_overlap_and_respect_limit():
 
 def test_encode_frames_flags_and_content():
     pix = px(8, 10, 3)
-    msgs = list(P.encode_frames(P.TYPE_BASE, 5, 20, 30, (4, 6, 8, 10), pix, max_payload=8 * 4 * 3))
+    msgs = list(P.encode_frames(P.TYPE_BASE, 5, 20, 30, (4, 6, 8, 10), pix, max_payload=8 * 4 * 3, slot=2))
     assert len(msgs) == 4  # 3+3+3+1 rows
     heads = [P.decode_frame(m)[0] for m in msgs]
     assert [h.frame_end for h in heads] == [False, False, False, True]
@@ -177,7 +188,7 @@ def test_encode_frames_single_band_has_frame_end():
 
 def test_encode_frames_full_hd_is_four_bands_under_2mb():
     pix = np.zeros((1080, 1920, 4), np.uint8)
-    msgs = list(P.encode_frames(P.TYPE_BASE, 1, 1920, 1080, (0, 0, 1920, 1080), pix))
+    msgs = list(P.encode_frames(P.TYPE_BASE, 1, 1920, 1080, (0, 0, 1920, 1080), pix, slot=1))
     assert len(msgs) == 4
     assert all(len(m) - P.HEADER_SIZE <= P.MAX_PAYLOAD for m in msgs)
     assert sum(P.decode_frame(m)[0].h for m in msgs) == 1080
@@ -210,13 +221,25 @@ def test_json_decode_rejects(bad):
 
 def test_json_builders():
     assert json.loads(P.hello(10, 20, True, 30, False, "abc")) == {
-        "t": "hello", "protocol": 5, "doc": {"w": 10, "h": 20, "mode": "input"}, "baseSize": {"w": 0, "h": 0},
+        "t": "hello", "protocol": 6, "doc": {"w": 10, "h": 20, "mode": "input"}, "inputs": [],
         "hasInput": True, "maxSendFps": 30, "active": False, "clientId": "abc", "hasDocument": False, "rev": None}
-    h = json.loads(P.hello(10, 20, True, 30, True, "abc", False, None, "fixed", 640, 480))
-    assert h["doc"]["mode"] == "fixed" and h["baseSize"] == {"w": 640, "h": 480}
+    items = [{"input": 2, "w": 5, "h": 6, "connected": True}, {"input": 1, "w": 640, "h": 480, "connected": True},
+             {"input": 3, "w": 9, "h": 9, "connected": False}]
+    h = json.loads(P.hello(10, 20, True, 30, True, "abc", False, None, "fixed", items))
+    assert h["doc"]["mode"] == "fixed" and "baseSize" not in h
+    assert h["inputs"] == [{"input": 1, "w": 640, "h": 480, "connected": True}, {"input": 2, "w": 5, "h": 6, "connected": True},
+                           {"input": 3, "w": 0, "h": 0, "connected": False}]  # sorted; a disconnected input is 0x0
     assert json.loads(P.hello(10, 20, False, 30, True, "abc", True, 12)) ["rev"] == 12
-    assert json.loads(P.base_notice(7, 100, 50)) == {"t": "base", "frameId": 7, "docW": 100, "docH": 50,
-                                                      "x": 0, "y": 0, "w": 100, "h": 50}
+    assert json.loads(P.base_notice(7, 100, 50, 3)) == {"t": "base", "input": 3, "frameId": 7, "docW": 100, "docH": 50,
+                                                         "x": 0, "y": 0, "w": 100, "h": 50}
+    assert json.loads(P.base_notice(7, 100, 50))["input"] == 1
+    assert json.loads(P.inputs_msg(items)) == {"t": "inputs", "items": h["inputs"]}
+    assert json.loads(P.files_msg("/a.redoc", "/b.png")) == {"t": "files", "projectFile": "/a.redoc", "pngFile": "/b.png"}
+    assert json.loads(P.reload_msg(9)) == {"t": "reload", "rev": 9}
+    assert json.loads(P.file_result("r1", "saveProject", True, "/a.redoc")) == {
+        "t": "fileResult", "requestId": "r1", "op": "saveProject", "ok": True, "path": "/a.redoc"}
+    assert json.loads(P.file_result(None, "openProject", False, "/x", "nope")) == {
+        "t": "fileResult", "op": "openProject", "ok": False, "path": "/x", "msg": "nope"}
     assert json.loads(P.view_notice(8, 100, 50, 41)) == {"t": "view", "frameId": 8, "docW": 100, "docH": 50,
                                                           "w": 100, "h": 50, "appliedFrameId": 41}
     assert json.loads(P.applied(5, 900)) == {"t": "applied", "frameId": 5, "tdFrame": 900}
@@ -226,14 +249,13 @@ def test_json_builders():
     assert json.loads(P.doc_state(3, [], 10, 20, {"h": [4], "v": []}, {"mode": "fixed"}))["guides"] == {"h": [4], "v": []}
     assert json.loads(P.doc_size(1, 2, False)) == {"t": "docSize", "w": 1, "h": 2, "hasInput": False, "mode": "input"}
     assert json.loads(P.doc_size(1, 2, True, "fixed"))["mode"] == "fixed"
-    assert json.loads(P.base_size(640, 480)) == {"t": "baseSize", "w": 640, "h": 480}
     assert json.loads(P.active(True)) == {"t": "active", "active": True}
     assert json.loads(P.error("x")) == {"t": "error", "msg": "x"}
 
 
 def test_web_side_builders_roundtrip_through_decode():
     m = P.decode_json(P.ready("panel", "tok", True, "v1"))
-    assert (m["t"], m["protocol"], m["client"], m["token"], m["fresh"]) == ("ready", 5, "panel", "tok", True)
+    assert (m["t"], m["protocol"], m["client"], m["token"], m["fresh"]) == ("ready", 6, "panel", "tok", True)
     assert P.decode_json(P.request_doc()) == {"t": "requestDoc"}
     d = P.decode_json(P.doc(4, [LAYER]))
     assert P.parse_doc(d) == (4, [LAYER])
@@ -366,7 +388,7 @@ def parse(*layers):
 
 
 def test_version_and_new_frame_type():
-    assert P.PROTOCOL_VERSION == 5 and P.TYPE_TOP_IMAGE == 6 and 6 in P.VALID_TYPES
+    assert P.PROTOCOL_VERSION == 6 and P.TYPE_TOP_IMAGE == 6 and 6 in P.VALID_TYPES
 
 
 def test_top_image_frame_uses_the_tops_own_size_as_doc_size():
@@ -383,7 +405,7 @@ def test_parse_doc_accepts_text_and_shape_layers_in_every_form():
               shape_layer(SHAPES["line"], id="s3"), shape_layer(SHAPES["polygon"], id="s4"),
               {**text_layer(), "id": "tm", "mask": {"slot": 5, "enabled": True}}]
     rev, got = parse(*layers)
-    assert rev == 1 and got == layers and P.layer_slots(got) == [5]
+    assert rev == 1 and got == [dict(base, kind="input", input=1)] + layers[1:] and P.layer_slots(got) == [5]
 
 
 def test_parse_doc_keeps_accepting_v3_layers_without_the_new_fields():
@@ -562,3 +584,139 @@ def test_v5_frames_use_surface_and_input_sizes_in_the_header():
     stale = by["stale_docsize"]
     hs, _ = P.decode_frame(open(os.path.join(FIX, stale["file"]), "rb").read())
     assert P.is_stale(hs, stale["currentSurface"]["w"], stale["currentSurface"]["h"])
+
+
+# ---- v6: input layers, free transform, effects, file messages
+
+RGBA = {"r": 10, "g": 20, "b": 30, "a": 255}
+EFFECTS = [
+    {"enabled": True, "type": "dropShadow", "dx": 4, "dy": -3, "blur": 8, "color": RGBA, "opacity": 0.5},
+    {"enabled": False, "type": "outerGlow", "size": 6, "color": RGBA, "opacity": 1},
+    {"enabled": True, "type": "innerGlow", "size": 6, "color": RGBA, "opacity": 0},
+    {"enabled": True, "type": "stroke", "width": 3, "color": RGBA, "position": "outside", "opacity": 1},
+    {"enabled": True, "type": "bevel", "depth": 40, "size": 5, "angle": 120, "highlight": RGBA, "shadow": RGBA},
+    {"enabled": True, "type": "colorOverlay", "color": RGBA, "opacity": 0.3},
+    {"enabled": True, "type": "pixelSort", "direction": "h", "low": 0.2, "high": 0.8, "key": "luma"},
+    {"enabled": True, "type": "glitch", "amount": 0.4, "blockSize": 16, "seed": 7, "rgbShift": 3},
+    {"enabled": True, "type": "chromaticAberration", "amount": 2, "angle": 45},
+    {"enabled": True, "type": "halftone", "cellSize": 8, "angle": 15, "shape": "dot"},
+]
+
+
+def input_layer(n=1, **kw):
+    d = {"id": f"in{n}", "kind": "input", "input": n, "parentId": None, "rot": 15, "kx": 10, "ky": -5, "sx": 2, "sy": 1.5,
+         "x": 3.5, "y": -1, "surfaceW": 64, "surfaceH": 32, "effects": []}
+    d.update(kw)
+    return d
+
+
+def test_parse_doc_accepts_input_layers_transforms_and_every_effect_type():
+    layers = [input_layer(1), input_layer(8, id="i8"), input_layer(2, id="dup", input=1),
+              {"id": "p", "kind": "pixel", "slot": 1, "effects": EFFECTS, "rot": -720, "kx": 85, "ky": -85}]
+    _, got = parse(*layers)
+    assert got == layers
+    for kind, extra in (("text", {"text": text_layer()["text"]}), ("shape", {"shape": SHAPES["rect"]})):
+        parse({"id": "t", "kind": kind, "effects": EFFECTS[:2], **extra})
+
+
+def test_base_layer_is_migrated_to_input_1_everything_else_kept():
+    src = {"id": "bg", "kind": "base", "name": "Background", "x": 5, "sx": 0.5, "surfaceW": 8, "surfaceH": 4}
+    _, (got,) = parse(src)
+    assert got == {**src, "kind": "input", "input": 1} and src["kind"] == "base"  # the message is not mutated
+
+
+@pytest.mark.parametrize("bad", [
+    {"kind": "input"}, {"kind": "input", "input": 0}, {"kind": "input", "input": 9}, {"kind": "input", "input": 1.5},
+    {"kind": "input", "input": True}, {"kind": "input", "input": 1, "slot": 4},
+    {"kind": "pixel", "rot": float("nan")}, {"kind": "pixel", "rot": "5"},     {"kind": "pixel", "kx": float("inf")}, {"kind": "pixel", "sx": 0},
+    {"kind": "pixel", "effects": "x"}, {"kind": "pixel", "effects": [1]},
+    {"kind": "pixel", "effects": [{"type": "colorOverlay", "color": RGBA, "opacity": 0.5}]},  # no enabled
+    {"kind": "pixel", "effects": [{"type": "bad name!", "enabled": True}]},
+    {"kind": "pixel", "effects": [{"type": 5, "enabled": True}]},
+    {"kind": "pixel", "effects": [{"type": "blur", "enabled": 1, "radius": 5}]},
+    {"kind": "pixel", "effects": [{"enabled": True}]},
+    {"kind": "pixel", "effects": [{**EFFECTS[5], "enabled": 1}]},
+    {"kind": "pixel", "effects": [{**EFFECTS[5], "opacity": 1.5}]},
+    {"kind": "pixel", "effects": [{**EFFECTS[5], "color": {"r": 0, "g": 0, "b": 0}}]},
+    {"kind": "pixel", "effects": [{**EFFECTS[5], "color": {**RGBA, "r": 256}}]},
+    {"kind": "pixel", "effects": [{k: v for k, v in EFFECTS[0].items() if k != "blur"}]},
+    {"kind": "pixel", "effects": [{**EFFECTS[0], "blur": -1}]},
+    {"kind": "pixel", "effects": [{**EFFECTS[0], "dx": float("nan")}]},
+    {"kind": "pixel", "effects": [{**EFFECTS[3], "position": "middle"}]},
+    {"kind": "pixel", "effects": [{**EFFECTS[6], "direction": "d"}]},
+    {"kind": "pixel", "effects": [{**EFFECTS[6], "key": "red"}]},
+    {"kind": "pixel", "effects": [{**EFFECTS[7], "blockSize": 0}]},
+    {"kind": "pixel", "effects": [{**EFFECTS[9], "shape": "square"}]},
+    {"kind": "pixel", "effects": [{**EFFECTS[9], "cellSize": 0}]},
+    {"kind": "pixel", "effects": [{**EFFECTS[7], "seed": 1.5}]},
+    {"kind": "pixel", "effects": [{**EFFECTS[7], "amount": 101}]},
+    {"kind": "pixel", "effects": [{**EFFECTS[6], "high": 1.5}]},
+    {"kind": "pixel", "effects": [{**EFFECTS[4], "depth": 101}]},
+    {"kind": "pixel", "effects": [EFFECTS[5]] * 33},
+    {"kind": "group", "effects": [EFFECTS[5]]},
+    {"kind": "adjustment", "effects": [EFFECTS[5]]},
+])
+def test_parse_doc_rejects_bad_v6_fields(bad):
+    with pytest.raises(P.ProtocolError):
+        parse({"id": "x", **bad})
+
+
+def test_groups_and_adjustments_may_carry_an_empty_effects_list():
+    parse({"id": "g", "kind": "group", "effects": []}, {"id": "a", "kind": "adjustment", "effects": None})
+
+
+@pytest.mark.parametrize("msg,expect", [
+    ({"requestId": "r"}, ("r", None)), ({"requestId": 5, "path": " /a/b.redoc "}, (5, "/a/b.redoc")),
+    ({"requestId": "r", "path": None}, ("r", None)),
+])
+def test_parse_file_request(msg, expect):
+    assert P.parse_file_request(msg) == expect
+
+
+@pytest.mark.parametrize("bad", [{}, {"requestId": None}, {"requestId": "r", "path": 5}, {"requestId": "r", "path": "  "},
+                                 {"requestId": "r", "path": "a\0b"}, {"requestId": "r", "path": "x" * 2000}])
+def test_parse_file_request_rejects(bad):
+    with pytest.raises(P.ProtocolError):
+        P.parse_file_request(bad)
+
+
+def test_file_request_builders_roundtrip():
+    for build, t in ((P.save_project, "saveProject"), (P.open_project, "openProject"), (P.export_png, "exportPng")):
+        m = P.decode_json(build("r1", "/x.redoc"))
+        assert m["t"] == t and P.parse_file_request(m) == ("r1", "/x.redoc")
+        assert "path" not in P.decode_json(build("r2"))
+
+
+def test_v6_fixtures_base_frames_carry_the_input_index():
+    by = {e["name"]: e for e in load_fixtures()}
+    assert by["base_small"]["header"]["slot"] == 1 and by["base_input_size"]["header"]["slot"] == 2
+    h8, _ = P.decode_frame(open(os.path.join(FIX, by["base_input8"]["file"]), "rb").read())
+    assert (h8.type, h8.slot, h8.frame_id) == (1, 8, 0xFFFFFFFE)
+    for name in ("invalid_base_input0", "invalid_base_input9"):
+        assert by[name]["valid"] is False
+        with pytest.raises(P.ProtocolError):
+            P.decode_frame(open(os.path.join(FIX, by[name]["file"]), "rb").read())
+
+
+def test_skew_beyond_85_degrees_is_clamped_not_rejected():
+    msg = {"id": "p", "kind": "pixel", "kx": 89.9, "ky": -120, "rot": 5}
+    _, (got,) = parse(msg)
+    assert (got["kx"], got["ky"], got["rot"]) == (85.0, -85.0, 5) and msg["kx"] == 89.9
+
+
+def test_choose_file_messages():
+    assert P.parse_choose_file(P.decode_json(P.choose_file("r", "placeImage"))) == ("r", "placeImage")
+    for purpose in P.CHOOSE_PURPOSES:
+        P.parse_choose_file({"requestId": 1, "purpose": purpose})
+    for bad in ({"purpose": "placeImage"}, {"requestId": "r"}, {"requestId": "r", "purpose": "delete"}):
+        with pytest.raises(P.ProtocolError):
+            P.parse_choose_file(bad)
+    assert json.loads(P.file_chosen("r", "/a.png")) == {"t": "fileChosen", "requestId": "r", "path": "/a.png"}
+    assert json.loads(P.file_chosen("r", None))["path"] is None
+
+
+def test_filter_library_effects_pass_through_with_their_own_parameters():
+    fx = [{"type": "blur", "enabled": True, "radius": 12, "threshold": 0.3}, {"type": "kuwahara", "enabled": False, "radius": "x"},
+          {"type": "someFutureFilter", "enabled": True}]
+    _, (l,) = parse({"id": "p", "kind": "pixel", "effects": fx + EFFECTS[:1]})
+    assert l["effects"][:3] == fx and len(l["effects"]) == 4

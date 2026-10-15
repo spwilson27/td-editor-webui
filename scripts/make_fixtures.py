@@ -66,8 +66,8 @@ def main():
             fh.write(data)
         entries.append(entry(name, file, data, frame, **kw))
 
-    # 1. single-band BASE frame, whole 5x4 document, FRAME_END set
-    for i, m in enumerate(P.encode_frames(P.TYPE_BASE, 1, 5, 4, (0, 0, 5, 4), Pix(0, 0, 5, 4))):
+    # 1. single-band BASE frame of input 1 (v6: header slot = input index 1..8), whole 5x4 input, FRAME_END set
+    for i, m in enumerate(P.encode_frames(P.TYPE_BASE, 1, 5, 4, (0, 0, 5, 4), Pix(0, 0, 5, 4), slot=1)):
         write("base_small", m, "base_small")
 
     # 2. multi-band SURFACE of slot 5: 6x7 doc, rect (1,1,4,6), bands of at most 2 rows (32 bytes)
@@ -93,10 +93,16 @@ def main():
     write("top_image", m, "top_image")
 
     # 5c. v5: a BASE frame has the INPUT's size as docW/docH (here 6x3) which differs from the document (5x4)
-    (m,) = P.encode_frames(P.TYPE_BASE, 31, 6, 3, (0, 0, 6, 3), Pix(0, 0, 6, 3))
+    (m,) = P.encode_frames(P.TYPE_BASE, 31, 6, 3, (0, 0, 6, 3), Pix(0, 0, 6, 3), slot=2)
     write("base_input_size", m, "base_input_size")
     entries[-1]["currentDoc"] = {"w": 5, "h": 4}
-    entries[-1]["note"] = "v5: BASE docW/docH = the input size (6x3), not the document size (5x4); not stale"
+    entries[-1]["note"] = ("v5/v6: BASE docW/docH = the input size (6x3), not the document size (5x4); not stale; "
+                           "v6: slot = the input index (2 here)")
+
+    # 5e. v6: BASE of the last input (8), frame id near the u32 wrap
+    (m,) = P.encode_frames(P.TYPE_BASE, 0xFFFFFFFE, 4, 2, (0, 0, 4, 2), Pix(0, 0, 4, 2), slot=8)
+    write("base_input8", m, "base_input8")
+    entries[-1]["note"] = "v6: BASE for input 8 (the highest); slot = input index"
 
     # 5d. v5: a SURFACE_DUMP of a layer whose surface (9x2) is smaller than the document (5x4 / any); docW/docH = surface size
     (m,) = P.encode_frames(P.TYPE_SURFACE_DUMP, 4, 9, 2, (0, 0, 9, 2), Pix(0, 0, 9, 2), slot=4)
@@ -123,7 +129,7 @@ def main():
     entries[-1]["note"] = "decodes fine; a receiver that does not know the slot must drop it"
 
     # invalid messages: not decodable, receivers drop them
-    good = P.encode_message(P.Header(P.TYPE_BASE, 1, 9, 4, 4, 0, 0, 2, 2), rect_pixels(0, 0, 2, 2))
+    good = P.encode_message(P.Header(P.TYPE_BASE, 1, 9, 4, 4, 0, 0, 2, 2, 1), rect_pixels(0, 0, 2, 2))
     write("invalid_bad_magic", b"XXXX" + good[4:], "invalid", valid=False, error="bad magic")
     write("invalid_rect_outside", bytearray(good[:16]) + struct.pack("<HHHH", 3, 3, 2, 2) + good[24:], "invalid",
           valid=False, error="rect outside document")
@@ -134,6 +140,10 @@ def main():
     write("invalid_zero_size_rect", bytearray(good[:20]) + struct.pack("<HH", 0, 2) , "invalid",
           valid=False, error="zero-width rect")
     write("invalid_too_short", good[:10], "invalid", valid=False, error="message too short")
+    write("invalid_base_input0", good[:6] + struct.pack("<H", 0) + good[8:], "invalid", valid=False,
+          error="v6: a BASE frame's slot is its input index 1..8 (0 is invalid)")
+    write("invalid_base_input9", good[:6] + struct.pack("<H", 9) + good[8:], "invalid", valid=False,
+          error="v6: a BASE frame's slot is its input index 1..8 (9 is invalid)")
 
     with open(os.path.join(OUT, "fixtures.json"), "w") as fh:
         json.dump({"pixel": "r=(x*7+y*3)&255 g=(x*13+y*5+40)&255 b=(x+y*11)&255 a=255-((x+y)&63)",

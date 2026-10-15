@@ -132,7 +132,14 @@ MERGE_MASKS_MAX = 7           # masked layers per merged pass; the node always h
                               # TD recompiles a GLSL TOP whenever its number of wired inputs changes, ~15 ms)
 MPOOL_TARGET = 2              # spare GLSL Multi TOPs kept ready for merged passes
 MPOOL_MAX = 4
-WARM_IDLE_S = 0.3             # spare nodes are pre-cooked (shader compile ~15 ms) only when no apply() happened this recently
+# internal feature switches of optimize=True (bisecting; all on = the v6 network)
+EIGHT_BIT = True               # 8 bit pass outputs where only plain Normal blends follow
+MERGE_RUNS = True              # merged multi-layer passes
+CROP_BOXES = True              # cropped resample / shape passes
+SKIP_RULES = True              # no pass for layers that add nothing
+PREWARM = False                # v6: off by default — an unexplained adjustment-parity failure (validate step 13)
+                               # only ever reproduced with pre-warm on; it saves at most a one-off ~15-20 ms compile
+WARM_IDLE_S = 1.0             # spare nodes are pre-cooked (shader compile ~15 ms) only when no apply() happened this recently
 ADJ_MERGED_CODE = 8           # blend.glsl uAdjust of a merged pass
 BLUR_RADIUS_MAX = 200.0       # web/src sanitizer clamps the blur radius here
 BLUR_NOOP_BELOW = 0.05        # ... and treats a smaller radius as no blur
@@ -281,7 +288,25 @@ def _num(v, default):
 IDENTITY = Affine()
 
 
+_AFFINE_KEYS = ("x", "y", "sx", "sy", "rot", "kx", "ky")
+_AFFINE_MEMO = {}
+
+
 def layer_affine(layer):
+    """:func:`_layer_affine` memoised on the layer's kind and transform fields (an apply() asks for every layer, twice)."""
+    try:
+        key = (layer.get("kind"),) + tuple(layer.get(k) for k in _AFFINE_KEYS)
+        hit = _AFFINE_MEMO.get(key)
+    except TypeError:                    # unhashable junk in a field
+        return _layer_affine(layer)
+    if hit is None:
+        if len(_AFFINE_MEMO) > 2048:
+            _AFFINE_MEMO.clear()
+        hit = _AFFINE_MEMO[key] = _layer_affine(layer)
+    return hit
+
+
+def _layer_affine(layer):
     """LayerSpec -> :class:`Affine`.  Only pixel and input layers (and a legacy ``base``) carry a transform;
     everything else (text, shape, group, adjustment) maps 1:1 at the origin.  Invalid numbers fall back to the identity."""
     if layer.get("kind") not in ("pixel", "input", "base"):
@@ -413,7 +438,24 @@ def clip_box(box, doc_w, doc_h, pad=0):
     return (x0, y0, x1, y1)
 
 
+_BOX_MEMO = {}
+
+
 def layer_box(aff, sw, sh, doc_w, doc_h, hint=None):
+    """:func:`_layer_box` memoised (an apply() asks for every pixel layer; ``aff`` objects are memoised by layer_affine)."""
+    key = (aff, sw, sh, doc_w, doc_h, hint)
+    try:
+        return _BOX_MEMO[key]
+    except KeyError:
+        if len(_BOX_MEMO) > 2048:
+            _BOX_MEMO.clear()
+        out = _BOX_MEMO[key] = _layer_box(aff, sw, sh, doc_w, doc_h, hint)
+        return out
+    except TypeError:                    # unhashable hint
+        return _layer_box(aff, sw, sh, doc_w, doc_h, hint)
+
+
+def _layer_box(aff, sw, sh, doc_w, doc_h, hint=None):
     """Document-space pixel box a pixel / input layer can touch: its surface rect (``sw`` x ``sh``) through ``aff``,
     clipped to the canvas, or None (nothing visible: outside the canvas, a singular matrix, an empty ``hint``).
 
@@ -792,7 +834,7 @@ class DocNetwork:
         doc_w, doc_h = int(doc_w), int(doc_h)
         connected = self._detect_inputs()
         key = (doc_w, doc_h)
-        snap = json.dumps(layers, sort_keys=True, separators=(",", ":"))
+        snap = json.dumps(layers)         # (key order follows the ext's parser: a different order only costs a re-plan)
         if snap == self._prev_layers and key == self._prev_size and connected == self._input_connected:
             self._last = {k: 0 for k in self._counters}
             self._last_ms = (time.perf_counter() - t0) * 1e3
@@ -839,7 +881,7 @@ class DocNetwork:
         if not topped and self._opt and len(self._mpool) < MPOOL_TARGET:
             self._mpool.append(self._make_multi_node())
             topped = True
-        if not topped and self._opt and self._clock() - self._last_apply_t >= WARM_IDLE_S:
+        if PREWARM and not topped and self._opt and self._clock() - self._last_apply_t >= WARM_IDLE_S:
             self._warm_one()
 
     def surface_top(self, slot):
@@ -1508,7 +1550,7 @@ class DocNetwork:
                     xp = blend_pars(0, 0.0, has_mask, ADJ_RESAMPLE, aff.inv, mip, filt="mipmap" if mip else "linear")
                     xp.update({"vec2valuex": float(aff.xf[0]), "vec2valuey": float(aff.xf[1]),
                                "vec2valuez": 0.0, "vec2valuew": 0.0})
-                    if opt and kind == "pixel" and not fx:
+                    if opt and CROP_BOXES and kind == "pixel" and not fx:
                         # v6 bounding box: the resample pass renders only the transformed surface rect (clipped to the
                         # canvas) into a custom-resolution texture; the blend places it at the box origin
                         sw, sh = self._surface_size(l, doc_w, doc_h)
@@ -1530,7 +1572,7 @@ class DocNetwork:
                         cx0, cy0, cx1, cy1 = crop
                         xp.update({"outputresolution": "custom", "resolutionw": cx1 - cx0, "resolutionh": cy1 - cy0,
                                    "vec2valuex": float(aff.xf[0]) - cx0, "vec2valuey": float(aff.xf[1]) - cy0})
-                        xp["format"] = FMT8 if mode == 0 else FMT_BLEND
+                        xp["format"] = FMT8 if (mode == 0 and EIGHT_BIT) else FMT_BLEND
                         info["cropped"] += 1
                         self._boxes[l["id"]] = crop
                         bxf = (float(cx0), float(cy0), 1.0, 1.0)
@@ -1541,7 +1583,7 @@ class DocNetwork:
                     src, mask_name, has_mask, xf, mip = xname, None, False, bxf, False
                 if fx:
                     src = self._plan_effects(add, l, sid, src, fx, doc_w, doc_h, (bx - 100, y))
-                if (opt and kind == "shape" and sbox is not None and not fx and not has_mask and skip_why is None
+                if (opt and CROP_BOXES and kind == "shape" and sbox is not None and not fx and not has_mask and skip_why is None
                         and src == "shape_" + sid):
                     cx0, cy0, cx1, cy1 = sbox
                     # hysteresis: a shape enters the cropped state at <= 50 % of the canvas and leaves it above 65 %
@@ -1566,6 +1608,10 @@ class DocNetwork:
                         self._lazy[l["id"]] = shape_full
                     else:
                         add(shape_full)
+                if skip_why is not None and not SKIP_RULES:
+                    skip_why = None
+                    if not visible or kind == "group" and not kids_items:
+                        opacity = 0.0           # (merged passes have no bypass: a hidden layer is an opacity-0 slot)
                 if skip_why is not None:
                     skip(skip_why)
                     continue
@@ -1625,7 +1671,7 @@ class DocNetwork:
         while i < n:
             it = items[i]
             run = [it]
-            if opt and it["adjust"] == 0:
+            if opt and MERGE_RUNS and it["adjust"] == 0:
                 resolve(i)
                 masks_n = 1 if it["has_mask"] else 0
                 j = i + 1
@@ -1641,7 +1687,7 @@ class DocNetwork:
             else:
                 resolve(i)
             last = i + len(run) - 1
-            fmt = FMT8 if (opt and tail_ok and after[last]) else FMT_BLEND
+            fmt = FMT8 if (opt and EIGHT_BIT and tail_ok and after[last]) else FMT_BLEND
             info["passes"] += 1
             if fmt == FMT8:
                 info["fmt8"] += 1
@@ -2031,6 +2077,10 @@ class DocNetwork:
                 self._note_companions(op)
                 self._cache[name] = {"type": spec.optype, "pars": {}, "inputs": [], "bypass": False, "pos": None}
         if spec.glsl:
+            if existing is not None and op is existing:
+                # an adopted node (loaded file / rebuilt component) carries whatever its previous role left: custom resolution,
+                # mipmap filter, bypass, extra vectors.  Start it from the same neutral state as a pooled spare.
+                self._reset_for_pool(op, self._cache[name], force=True)
             op.tags = [ROLE_PREFIX + name]
             op.comment = name
         self._ops[name] = op
@@ -2039,9 +2089,14 @@ class DocNetwork:
         return op
 
     def _set_pars(self, name, op, pars):
-        self._set_pars_raw(op, self._cache[name], pars)
+        cache = self._cache[name]
+        if cache.get("want") == pars:       # the exact dict applied last time (a repeat apply): one C-level comparison
+            return
+        self._set_pars_raw(op, cache, pars)
+        cache["want"] = pars
 
     def _set_pars_raw(self, op, cache, pars):
+        cache.pop("want", None)          # (any direct write invalidates the "same dict as last time" shortcut of _set_pars)
         cp = cache["pars"]
         for k, v in pars.items():
             if cp.get(k, _MISSING) != v:
@@ -2065,8 +2120,16 @@ class DocNetwork:
         want_all = [(n, self._gen[n]) for n in inputs]
         outs = self._fx_out
         cur = cache["inputs"]
+        if cur is not None and cur == want_all and (op.OPType != "glslmultiTOP" or len(op.inputConnectors) > len(cur)):
+            return
         if cur is None:     # adopted: unknown state, rewire everything
             cur = [object()] * len(op.inputConnectors)
+        elif op.OPType == "glslmultiTOP":
+            # a Multi TOP's connector list is "connected + 1 free" and TD shrinks it when trailing sources are cut (destroyed):
+            # inputs the cache believes connected but that no longer have a connector must be connected again
+            have_n = len(op.inputConnectors) - 1
+            if len(cur) > have_n:
+                cur = list(cur[:max(0, have_n)]) + [None] * (len(cur) - max(0, have_n))
         n = max(len(cur), len(want_all))
         for i in range(n):
             want = want_all[i] if i < len(want_all) else None
@@ -2078,6 +2141,11 @@ class DocNetwork:
                     op.inputConnectors[i].disconnect()
                     self._counters["disconnects"] += 1
             else:
+                while i >= len(op.inputConnectors):          # (defensive) grow the list: connecting the free last one adds one
+                    j = len(op.inputConnectors) - 1
+                    fill = want_all[j][0] if j < len(want_all) else "blank"
+                    op.inputConnectors[j].connect(outs[fill] if fill in outs else self._ops[fill])
+                    self._counters["connects"] += 1
                 op.inputConnectors[i].connect(outs[want[0]] if want[0] in outs else self._ops[want[0]])
                 self._counters["connects"] += 1
         cache["inputs"] = want_all
@@ -2093,6 +2161,22 @@ class DocNetwork:
         if force or pars.get("inputfiltertype", "nearest") != "nearest":
             pars.pop("inputfiltertype", None)
             self._set_pars_raw(op, cache, {"inputfiltertype": "nearest"})
+        if force:
+            # an adopted / loaded node may have served ANY role (effect chain slot: vec names uP0.., shape: uOffset/uC, another
+            # shader DAT): restore exactly what _make_pool_node / _make_multi_node leave.  The blend, resample and adjustment
+            # nodes only write vec0 / vec1 (uParams, uXform) themselves; a stale uA / uB name leaves the translation of a
+            # resample pass and every adjustment parameter unassigned (layers stacked at the origin, wrong adjustments).
+            multi = cache.get("type") == "glslmultiTOP" or op.OPType == "glslmultiTOP"
+            canon = {"pixeldat": "blend_glsl", "format": FMT_BLEND, "vec0name": "uParams", "vec1name": "uXform"}
+            if multi:
+                for k in range(MERGE_MAX):
+                    canon["vec%dname" % (4 + k)] = "uL%d" % k
+                canon.update({"vec2name": "uA", "vec3name": "uB"})
+            else:
+                canon.update({"vec2name": "uA", "vec3name": "uB", "vec4name": ""})
+            for k in canon:
+                pars.pop(k, None)
+            self._set_pars_raw(op, cache, canon)
         if force or cache["bypass"]:
             op.bypass = False
             cache["bypass"] = False

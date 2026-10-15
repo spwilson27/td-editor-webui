@@ -289,3 +289,29 @@ Extension (`ext.py`), all on the main thread, bounded per pump, nothing large on
   already provide (an immediate undo waits for the writer); `Premultiplied` is converted; any mismatch or damage removes the cache, as
   does a restore without a stored document. Ctrl+Z after a delete therefore brings the document back. A delete while a restore is
   pending leaves the locked images alone. Undo only works in the same TD session.
+
+
+## 9. Protocol v6 additions (DESIGN_V5): inputs, files, effects (`ext.py`, `protocol.py`, `frames.py`)
+
+`docs/PROTOCOL.md` §8 / §8.1 is the wire contract; this is the component side.
+
+- **Inputs.** `in1..in8` In TOPs, `Connector Order` = N (verified in TD 2025.32820: the order parameter decides which connector an In TOP
+  takes; node position and creation order do not). `_ensure_input_ops` (each pump) keeps exactly one spare unconnected connector behind the
+  highest connected input (max 8); the spare In TOP is created on demand, a trailing In TOP beyond it is removed 2 s after it became unneeded
+  and a connected one never. The build creates `in1` and, on a rebuild, as many In TOPs as there were wires (+1) and reconnects every wire.
+  Per input a `_Pipe` (`ext.bases[n]`): change detection by `in<N>.totalCooks`, `Maxinputfps`, delayed two-step readback, budgeted conversion
+  (one input converts per pump, round robin; readbacks of all), one immutable BASE message per input served by `GET /base?input=N`, per client and
+  input notice / stall bookkeeping (`_Client.bases`). `network.set_inputs(items)` is called on every change, followed by `apply` in the same pump.
+  A COMP input reporting 0x0 while it restarts keeps its last known size.
+- **Files.** `Projectfile` / `Pngfile` (File parameters), `Saveproject` / `Openproject` / `Exportpng` (pulses), all with help; same code path as
+  the web messages. `.redoc` writer / reader and the PNG codec live in `frames.py` (no PIL / cv2 needed: zlib + zipfile + numpy; the writer uses
+  the Sub filter, the reader handles 8-bit RGB / RGBA, non-interlaced, all five filters -- Average / Paeth are a slow per-pixel loop, our own
+  files never use them). Worker threads (`_run_worker`) only touch plain numpy copies and the filesystem; results come back through
+  `_file_results` and are handled by the pump (`_tick_files`). Limits: a PNG over 8192x8192 px, a project over ~3 GiB declared size or 5000
+  entries, `doc.json` over 64 MB are refused; an inflated size that disagrees with the PNG header is refused.
+- **Effects.** `build_component` embeds `td/raster_editor/effects.py` as DAT `effects` and every `shared/effects/*.glsl` as DAT `fx_<stem>`
+  (`fx_common`, `fx_blurlib`, `fx_filterlib`, `fx_in2lib`, `fx_dropShadow`, ... : every file, libraries included). The extension hands
+  `DocNetwork(..., effects=<module>, effect_shaders=effects.load_shader_texts_from({stem: DAT text}))`, i.e. exactly what `load_shader_texts`
+  builds from the repo (common + each shader's include libraries + the shader; a missing DAT is reported and effects stay off). Filter parameters
+  are not validated by `parse_doc` beyond `type` (name pattern) / `enabled`: TD clamps them with `effects.norm_params` (a COMP without them lets the network look for the repo files; `Status` shows `effects unavailable: ...` when it cannot).
+- **chooseFile.** See PROTOCOL.md §8.1; `ext._choose_dialog` / `ext._make_movie` are the TD-only seams.

@@ -94,7 +94,11 @@ function LayerRow({ layer, layers, selected, maskTarget, editing, onEdit, drag }
   })();
   const dim = !layer.visible || hiddenByParent;
   const indent = group ? 4 + layer.depth * 18 : layer.depth === 0 ? 20 : 22 + (layer.depth - 1) * 18;
-  const meta = group ? 'Group' : layer.opacity < 1 ? `${Math.round(layer.opacity * 100)}%` : '';
+  const pct = layer.opacity < 1 ? `${Math.round(layer.opacity * 100)}%` : '';
+  const meta = group ? 'Group' : layer.kind === 'input' ? [`In ${layer.input ?? '?'}`, pct].filter(Boolean).join(' · ') : pct;
+  const canFx = store.canHaveEffects(layer.kind);
+  const fxCount = layer.effects.length, fxOn = layer.effects.some((x) => x.enabled);
+  const disconnected = layer.kind === 'input' && layer.inputConnected === false;
   const dropHere = drag && drag.target === layer.id;
   const fg = selected ? '#ffffff' : dim ? '#8f8f8f' : '#e3e3e3';
   const mark = dropHere
@@ -116,15 +120,26 @@ function LayerRow({ layer, layers, selected, maskTarget, editing, onEdit, drag }
         </button>
       )}
       <div data-act="sel" role="button" aria-pressed={selected} tabIndex={0} onClick={() => e.setActiveLayer(layer.id)}
-        onDblClick={() => layer.kind !== 'base' && onEdit(layer.id)}
+        onDblClick={() => onEdit(layer.id)}
         style="flex:1 1 auto;min-width:0;height:40px;display:flex;align-items:center;gap:10px;text-align:left;cursor:default">
-        <span data-act="thumb" onClick={() => { if (layer.mask) e.setPaintTarget(layer.id, 'pixels'); }} style="display:flex"><Thumb layer={layer} /></span>
+        <span data-act="thumb" onClick={() => { if (layer.mask) e.setPaintTarget(layer.id, 'pixels'); }} style={`display:flex;opacity:${disconnected ? 0.45 : 1}`}><Thumb layer={layer} /></span>
         {layer.mask && <MaskThumb layer={layer} target={selected && maskTarget} />}
         {editing
           ? <NameField layer={layer} onDone={() => onEdit(null)} />
-          : <span data-name style="flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{layer.name}</span>}
-        <span style={`flex:none;font-size:11px;color:${selected ? '#e6eefa' : '#a8a8a8'}`}>{meta}</span>
+          : <span data-name style={`flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:${disconnected ? 0.55 : 1}`}>{layer.name}</span>}
+        {disconnected && (
+          <span data-disconnected title={`TD input ${layer.input} is not connected - placement is kept`} aria-label={`TD input ${layer.input} is not connected`}
+            style="flex:none;display:flex;color:#d9a441"><Icon d="M12 4l9 16H3zM12 10v4M12 17v1" size={13} sw={1.8} /></span>
+        )}
+        {canFx && fxCount > 0 && <span data-fx-badge title={`${fxCount} effect${fxCount === 1 ? '' : 's'}${fxOn ? '' : ' (all disabled)'}`} style={`flex:none;font-size:10px;font-style:italic;font-weight:600;color:#7fb2f0;opacity:${fxOn ? 1 : 0.4}`}>fx</span>}
+        <span data-meta style={`flex:none;font-size:11px;color:${selected ? '#e6eefa' : '#a8a8a8'}`}>{meta}</span>
       </div>
+      {canFx && (
+        <button class="ib" data-nodrag data-act="fx" aria-label="Layer effects" title="Layer effects" onClick={() => store.openEffects(layer.id)}
+          style={`width:20px;height:26px;flex:none;opacity:${fxCount ? 1 : 0.55}`}>
+          <Icon d="M5 19h4M7 17v4M12 3l2 5 5 2-5 2-2 5-2-5-5-2 5-2z" size={13} sw={1.8} />
+        </button>
+      )}
       {(layer.kind === 'text' || layer.kind === 'shape') && (() => {
         const can = store.canFlatten(layer), busy = store.flattening.value === layer.id;
         return (
@@ -199,7 +214,7 @@ export function LayersPanel() {
     const row = (ev.target as Element).closest('[data-layer]') as HTMLElement | null;
     if (!row || (ev.target as Element).closest('[data-nodrag],input') || ev.button !== 0) return;
     const l = layers.find((x) => x.id === row.dataset.layer);
-    if (!l || l.kind === 'base') return;
+    if (!l) return;
     press.current = { id: l.id, x: ev.clientX, y: ev.clientY, started: false };
   };
   const onMove = (ev: PointerEvent) => {
@@ -222,7 +237,8 @@ export function LayersPanel() {
     if (drop) e.moveLayer(d.id, drop.parentId, drop.index);
   };
 
-  const canDelete = !!active && active.kind !== 'base';
+  const canDelete = !!active;
+  const canFx = !!active && store.canHaveEffects(active.kind);
   return (
     <div style="flex:1 1 auto;min-height:0;display:flex;flex-direction:column">
       <LayerSettings layer={active} />
@@ -233,12 +249,12 @@ export function LayersPanel() {
             onEdit={setEditing} drag={drag} />
         ))}
       </div>
-      <Footer canDelete={canDelete} canMask={store.canAddMask()} />
+      <Footer canDelete={canDelete} canMask={store.canAddMask()} canFx={canFx} />
     </div>
   );
 }
 
-function Footer({ canDelete, canMask }: { canDelete: boolean; canMask: boolean }) {
+function Footer({ canDelete, canMask, canFx }: { canDelete: boolean; canMask: boolean; canFx: boolean }) {
   const [menu, setMenu] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -254,7 +270,7 @@ function Footer({ canDelete, canMask }: { canDelete: boolean; canMask: boolean }
     { label: 'New group', d: FOLDER, run: () => store.addGroup(), enabled: true },
     { label: 'Add mask', d: MASK_ICON, run: () => store.addMask(), enabled: canMask },
     { label: 'New adjustment', d: ADJUST_ICON, run: () => setMenu(!menu), enabled: true, menu: true },
-    { label: 'Layer effects', d: 'M5 19h4M7 17v4M12 3l2 5 5 2-5 2-2 5-2-5-5-2 5-2z', enabled: false },
+    { label: 'Layer effects', d: 'M5 19h4M7 17v4M12 3l2 5 5 2-5 2-2 5-2-5-5-2 5-2z', run: () => store.openEffects(), enabled: canFx },
     { label: 'Delete layer', d: 'M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13', run: () => store.deleteActive(), enabled: canDelete },
   ];
   return (

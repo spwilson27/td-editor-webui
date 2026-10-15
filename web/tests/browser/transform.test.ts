@@ -43,9 +43,9 @@ describe('transforms: compositing', () => {
   it('scales up: interior pixels are exact, edges land on the mapped bounds', () => {
     e = newEngine(100, 100);
     const id = e.importImage(img(10, 10, (x) => (x < 5 ? BLUE : RED)), 10, 10, 'two');
-    expect(info(id).transform).toEqual({ x: 45, y: 45, sx: 1, sy: 1 });
-    e.setTransform(id, { x: 20, y: 10, sx: 4, sy: 4 });
-    expect(info(id).transform).toEqual({ x: 20, y: 10, sx: 4, sy: 4 });
+    expect(info(id).transform).toEqual({ x: 45, y: 45, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
+    e.setTransform(id, { x: 20, y: 10, sx: 4, sy: 4, rot: 0, kx: 0, ky: 0 });
+    expect(info(id).transform).toEqual({ x: 20, y: 10, sx: 4, sy: 4, rot: 0, kx: 0, ky: 0 });
     expect(info(id)).toMatchObject({ surfaceW: 10, surfaceH: 10 });
     expect(px(e, 30, 20)).toEqual(BLUE);
     expect(px(e, 50, 20)).toEqual(RED);
@@ -64,7 +64,7 @@ describe('transforms: compositing', () => {
   it('non-uniform scale maps each axis separately', () => {
     e = newEngine(100, 100);
     const id = e.importImage(img(10, 10, (_x, y) => (y < 5 ? BLUE : RED)), 10, 10, 'rows');
-    e.setTransform(id, { x: 0, y: 0, sx: 2, sy: 6 });
+    e.setTransform(id, { x: 0, y: 0, sx: 2, sy: 6, rot: 0, kx: 0, ky: 0 });
     expect(ink()).toEqual({ x: 0, y: 0, w: 20, h: 60 });
     expect(px(e, 10, 10)).toEqual(BLUE);
     expect(px(e, 10, 50)).toEqual(RED);
@@ -73,7 +73,7 @@ describe('transforms: compositing', () => {
   it('scales down with smoothing (checkerboard averages to grey)', () => {
     e = newEngine(100, 100);
     const id = e.importImage(img(64, 64, (x, y) => (((x + y) & 1) === 0 ? [255, 255, 255, 255] : BLACK)), 64, 64, 'cb');
-    e.setTransform(id, { x: 0, y: 0, sx: 0.25, sy: 0.25 });
+    e.setTransform(id, { x: 0, y: 0, sx: 0.25, sy: 0.25, rot: 0, kx: 0, ky: 0 });
     const v = px(e, 8, 8);
     expect(v[0]).toBeGreaterThan(100);
     expect(v[0]).toBeLessThan(155);
@@ -84,8 +84,8 @@ describe('transforms: compositing', () => {
   it('fractional positions blend the edge pixels', () => {
     e = newEngine(40, 40);
     const id = e.importImage(img(10, 10, () => RED), 10, 10, 'r');
-    e.setTransform(id, { x: 2.5, y: 4.25, sx: 1.5, sy: 1 }); // positions are whole pixels, scale is not
-    expect(info(id).transform).toEqual({ x: 3, y: 4, sx: 1.5, sy: 1 });
+    e.setTransform(id, { x: 2.5, y: 4.25, sx: 1.5, sy: 1, rot: 0, kx: 0, ky: 0 }); // positions are whole pixels, scale is not
+    expect(info(id).transform).toEqual({ x: 3, y: 4, sx: 1.5, sy: 1, rot: 0, kx: 0, ky: 0 });
     expect(px(e, 6, 8)).toEqual(RED);
     expect(px(e, 2, 8)[3]).toBe(0);
     expect(px(e, 3, 8)[3]).toBe(255);
@@ -102,7 +102,7 @@ describe('transforms: compositing', () => {
     for (let y = 0; y < 10; y++) for (let x = 0; x < 20; x++) grey.set([x < 10 ? 0 : 255, 0, 0, 255], (y * 20 + x) * 4);
     e.writeSurface(m, { x: 0, y: 0, w: 20, h: 10 }, grey);
     e.commitSurfaces();
-    e.setTransform(id, { x: 5, y: 5, sx: 3, sy: 3 });
+    e.setTransform(id, { x: 5, y: 5, sx: 3, sy: 3, rot: 0, kx: 0, ky: 0 });
     expect(px(e, 20, 20)[3]).toBe(0); // left half (doc x 5..34)
     expect(px(e, 33, 20)[3]).toBe(0);
     expect(px(e, 38, 20)).toEqual(RED);
@@ -119,12 +119,12 @@ describe('transforms: compositing', () => {
   it('the base (TD Input) has its own surface size and transform, and stays locked', () => {
     e = newEngine(100, 100);
     e.setBaseSize(10, 10);
-    expect(e.docSpec().layers[0]).toMatchObject({ kind: 'base', surfaceW: 10, surfaceH: 10, sx: 1, sy: 1 });
+    expect(e.docSpec().layers[0]).toMatchObject({ kind: 'input', surfaceW: 10, surfaceH: 10, sx: 1, sy: 1 });
     e.writeBase({ x: 0, y: 0, w: 10, h: 10 }, img(10, 10, () => BLUE));
     e.commitBase();
     expect(px(e, 5, 5)).toEqual(BLUE);
     expect(px(e, 15, 5)[3]).toBe(0);
-    e.setTransform('base', { x: 20, y: 20, sx: 3, sy: 3 });
+    e.setTransform('base', { x: 20, y: 20, sx: 3, sy: 3, rot: 0, kx: 0, ky: 0 });
     expect(px(e, 30, 30)).toEqual(BLUE);
     expect(px(e, 10, 10)[3]).toBe(0);
     expect(px(e, 51, 51)[3]).toBe(0);
@@ -139,9 +139,9 @@ describe('transforms: compositing', () => {
     const notices = noticesOf(e);
     e.setToolContext(brushCtx());
     stroke(e, 'brush', [[30, 30]]);
-    expect(notices.some((n) => /locked/i.test(n))).toBe(true);
+    expect(notices.some((n) => /cannot be painted/i.test(n))).toBe(true);
     e.undo();
-    expect(info('base').transform).toEqual({ x: 0, y: 0, sx: 1, sy: 1 });
+    expect(info('base').transform).toEqual({ x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
   });
 
   it('a base resolution change reallocates the base surface; writeBase clips to it', () => {
@@ -163,14 +163,14 @@ describe('transforms: compositing', () => {
   it('the first base size places the input: identity when following, fit + centre when fixed', () => {
     e = newEngine(100, 100);
     e.setBaseSize(50, 50);
-    expect(info('base').transform).toEqual({ x: 0, y: 0, sx: 1, sy: 1 });
+    expect(info('base').transform).toEqual({ x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
     e.dispose();
     e = newEngine(100, 100);
     e.setCanvasSize(100, 50, 'tl');
     e.setBaseSize(400, 100);
-    expect(info('base').transform).toEqual({ x: 0, y: 13, sx: 0.25, sy: 0.25 });
+    expect(info('base').transform).toEqual({ x: 0, y: 13, sx: 0.25, sy: 0.25, rot: 0, kx: 0, ky: 0 });
     e.setBaseSize(200, 100); // only the first connection places it; later resolution changes keep the displayed box (100 x 25)
-    expect(info('base').transform).toEqual({ x: 0, y: 13, sx: 0.5, sy: 0.25 });
+    expect(info('base').transform).toEqual({ x: 0, y: 13, sx: 0.5, sy: 0.25, rot: 0, kx: 0, ky: 0 });
     expect(e.layerBounds('base')).toEqual({ x: 0, y: 13, w: 100, h: 25 });
   });
 
@@ -180,7 +180,7 @@ describe('transforms: compositing', () => {
     const g = e.addGroup();
     const id = e.importImage(img(10, 10, () => BLUE), 10, 10, 'b');
     e.moveLayer(id, g, 0);
-    e.setTransform(id, { x: 10, y: 10, sx: 3, sy: 3 });
+    e.setTransform(id, { x: 10, y: 10, sx: 3, sy: 3, rot: 0, kx: 0, ky: 0 });
     expect(px(e, 20, 20)).toEqual(BLUE);
     e.setLayerProps(id, { opacity: 0.5 });
     expect(near(px(e, 20, 20), [100, 100, 228, 255], 3)).toBe(true);
@@ -200,7 +200,7 @@ describe('transforms: compositing', () => {
   it('thumbnails show the transformed layer inside the document frame', () => {
     e = newEngine(100, 100);
     const id = e.importImage(img(10, 10, () => RED), 10, 10, 'r');
-    e.setTransform(id, { x: 50, y: 50, sx: 5, sy: 5 });
+    e.setTransform(id, { x: 50, y: 50, sx: 5, sy: 5, rot: 0, kx: 0, ky: 0 });
     const cv = document.createElement('canvas');
     cv.width = cv.height = 20;
     e.drawThumbnail(id, cv);
@@ -215,7 +215,7 @@ describe('transforms: setTransform, bounds, history, events', () => {
   it('layerBounds maps the surface; groups union their children; adjustments have none', () => {
     e = newEngine(100, 100);
     const id = e.importImage(img(20, 10, () => RED), 20, 10, 'r');
-    e.setTransform(id, { x: 5.5, y: 6, sx: 2, sy: 0.5 });
+    e.setTransform(id, { x: 5.5, y: 6, sx: 2, sy: 0.5, rot: 0, kx: 0, ky: 0 });
     expect(e.layerBounds(id)).toEqual({ x: 6, y: 6, w: 40, h: 5 });
     const g = e.addGroup();
     e.moveLayer(id, g, 0);
@@ -232,7 +232,7 @@ describe('transforms: setTransform, bounds, history, events', () => {
     const n = e.history().entries.length;
     const ev = collect(e);
     const rev0 = e.docSpec().rev;
-    for (let i = 1; i <= 5; i++) e.setTransform(id, { x: i * 3, y: 0, sx: 1 + i / 10, sy: 1 });
+    for (let i = 1; i <= 5; i++) e.setTransform(id, { x: i * 3, y: 0, sx: 1 + i / 10, sy: 1, rot: 0, kx: 0, ky: 0 });
     expect(e.history().entries).toHaveLength(n + 1);
     expect(e.history().entries.slice(-1)[0].label).toBe('Transform');
     expect(types(ev, 'docspec').length).toBeGreaterThan(0);
@@ -240,18 +240,18 @@ describe('transforms: setTransform, bounds, history, events', () => {
     expect(e.docSpec().layers.find((l) => l.id === id)).toMatchObject({ x: 15, sx: 1.5, surfaceW: 100 });
     expect(ev.some((x) => x.type === 'surface')).toBe(false); // pixels did not change
     e.undo();
-    expect(info(id).transform).toEqual({ x: 0, y: 0, sx: 1, sy: 1 });
+    expect(info(id).transform).toEqual({ x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
     e.redo();
-    expect(info(id).transform).toEqual({ x: 15, y: 0, sx: 1.5, sy: 1 });
+    expect(info(id).transform).toEqual({ x: 15, y: 0, sx: 1.5, sy: 1, rot: 0, kx: 0, ky: 0 });
   });
 
   it('dirty rects cover the old and new mapped bounds only', () => {
     e = newEngine(200, 200);
     const id = e.importImage(img(10, 10, () => RED), 10, 10, 'r');
-    e.setTransform(id, { x: 10, y: 10, sx: 2, sy: 2 });
+    e.setTransform(id, { x: 10, y: 10, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 });
     e.flush();
     const ev = collect(e);
-    e.setTransform(id, { x: 100, y: 100, sx: 4, sy: 4 });
+    e.setTransform(id, { x: 100, y: 100, sx: 4, sy: 4, rot: 0, kx: 0, ky: 0 });
     e.flush();
     const comp = types(ev, 'composite').map((c) => c.rect);
     expect(comp.length).toBeGreaterThan(0);
@@ -271,20 +271,20 @@ describe('transforms: setTransform, bounds, history, events', () => {
     const id = e.addPixelLayer();
     e.setLayerProps(id, { locked: true });
     const notices = noticesOf(e);
-    e.setTransform(id, { x: 5, y: 5, sx: 1, sy: 1 });
+    e.setTransform(id, { x: 5, y: 5, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
     expect(info(id).transform.x).toBe(0);
     expect(notices.some((n) => /locked/i.test(n))).toBe(true);
     e.setLayerProps(id, { locked: false });
     const n = e.history().entries.length;
-    e.setTransform(id, { x: NaN, y: 0, sx: 1, sy: 1 });
-    e.setTransform(id, { x: 0, y: 0, sx: 1, sy: 1 }); // unchanged
-    e.setTransform('nope', { x: 0, y: 0, sx: 2, sy: 2 });
-    e.setTransform(e.addGroup(), { x: 1, y: 1, sx: 2, sy: 2 });
+    e.setTransform(id, { x: NaN, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
+    e.setTransform(id, { x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 }); // unchanged
+    e.setTransform('nope', { x: 0, y: 0, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 });
+    e.setTransform(e.addGroup(), { x: 1, y: 1, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 });
     expect(e.history().entries.length).toBe(n + 1); // only the group add
-    e.setTransform(id, { x: 0, y: 0, sx: -3, sy: 0 }); // scale is clamped to a positive range
+    e.setTransform(id, { x: 0, y: 0, sx: -3, sy: 0, rot: 0, kx: 0, ky: 0 }); // scale is clamped to a positive range
     expect(info(id).transform.sx).toBeGreaterThan(0);
     expect(info(id).transform.sy).toBeGreaterThan(0);
-    e.setTransform('base', { x: 1, y: 2, sx: 1, sy: 1 });
+    e.setTransform('base', { x: 1, y: 2, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
     expect(info('base').transform.x).toBe(1);
   });
 
@@ -292,7 +292,7 @@ describe('transforms: setTransform, bounds, history, events', () => {
     e = newEngine(200, 200);
     const id = e.importImage(img(10, 10, () => RED), 10, 10, 'r');
     e.setLayerBox(id, { x: 5, y: 5, w: 40, h: 20 });
-    expect(info(id).transform).toEqual({ x: 5, y: 5, sx: 4, sy: 2 });
+    expect(info(id).transform).toEqual({ x: 5, y: 5, sx: 4, sy: 2, rot: 0, kx: 0, ky: 0 });
     const t = e.addTextLayer({ text: 'Hi', font: 'sans-serif', size: 20, color: rgba(0, 0, 0), align: 'left', bold: false, italic: false, lineHeight: 1.2, x: 10, y: 10, boxWidth: null });
     const b0 = e.layerBounds(t) as Rect;
     const n = e.history().entries.length;
@@ -321,7 +321,7 @@ describe('transforms: setTransform, bounds, history, events', () => {
 });
 
 describe('transforms: painting lands under the cursor', () => {
-  function scaledLayer(t = { x: 10, y: 20, sx: 2, sy: 2 }): string {
+  function scaledLayer(t = { x: 10, y: 20, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 }): string {
     e = newEngine(100, 100);
     const id = e.addPixelLayer();
     e.setTransform(id, t);
@@ -354,7 +354,7 @@ describe('transforms: painting lands under the cursor', () => {
   });
 
   it('non-uniform scale: the tip is an ellipse in the layer, a circle on screen', () => {
-    scaledLayer({ x: 0, y: 0, sx: 2, sy: 0.5 });
+    scaledLayer({ x: 0, y: 0, sx: 2, sy: 0.5, rot: 0, kx: 0, ky: 0 });
     e.setToolContext(brushCtx({ size: 20, hardness: 1 }));
     stroke(e, 'brush', [[50, 40]]);
     const b = ink() as Rect;
@@ -364,7 +364,7 @@ describe('transforms: painting lands under the cursor', () => {
   });
 
   it('a stroke is continuous on screen with spacing measured in document pixels', () => {
-    scaledLayer({ x: 5, y: 5, sx: 0.5, sy: 0.5 }); // covers document 5..55
+    scaledLayer({ x: 5, y: 5, sx: 0.5, sy: 0.5, rot: 0, kx: 0, ky: 0 }); // covers document 5..55
     e.setToolContext(brushCtx({ size: 8, hardness: 1 }));
     stroke(e, 'brush', [[15, 20], [45, 20], [45, 45]]);
     for (let x = 15; x <= 45; x += 3) expect(px(e, x, 20)[3]).toBeGreaterThan(200);
@@ -377,7 +377,7 @@ describe('transforms: painting lands under the cursor', () => {
     // bled into the dab edges as 1 px rows and columns of the old colour (visible in a scaled, soft-brushed layer).
     e = newEngine(500, 500);
     const id = e.importImage(new Uint8ClampedArray(256 * 256 * 4), 256, 256, 'L');
-    e.setTransform(id, { x: 0, y: 0, sx: 1.953125, sy: 1.953125 });
+    e.setTransform(id, { x: 0, y: 0, sx: 1.953125, sy: 1.953125, rot: 0, kx: 0, ky: 0 });
     e.setToolContext(brushCtx({ size: 60, hardness: 0.4 }, { primary: rgba(230, 100, 50) }));
     stroke(e, 'brush', [[400, 400], [420, 410]]);
     e.setToolContext(brushCtx({ size: 24, hardness: 1 }, { primary: rgba(0, 0, 0) }));
@@ -390,7 +390,7 @@ describe('transforms: painting lands under the cursor', () => {
   });
 
   it('pencil paints whole layer pixels: a 4x4 document block on a 4x layer', () => {
-    const id = scaledLayer({ x: 0, y: 0, sx: 4, sy: 4 });
+    const id = scaledLayer({ x: 0, y: 0, sx: 4, sy: 4, rot: 0, kx: 0, ky: 0 });
     e.setToolContext(brushCtx({ size: 1 }));
     stroke(e, 'pencil', [[10.5, 10.5]]);
     expect(layerPx(e, id, 2, 2)).toEqual(BLACK); // layer pixel 10.5 / 4
@@ -425,7 +425,7 @@ describe('transforms: painting lands under the cursor', () => {
   });
 
   it('flood fill works in layer pixels from the clicked pixel', () => {
-    const id = scaledLayer({ x: 0, y: 0, sx: 2, sy: 2 });
+    const id = scaledLayer({ x: 0, y: 0, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 });
     const s = layer(id).surface.ctx;
     s.fillStyle = 'rgb(255,0,0)';
     s.fillRect(0, 0, 25, 100); // red left quarter of the layer (doc x 0..49)
@@ -445,7 +445,7 @@ describe('transforms: painting lands under the cursor', () => {
   });
 
   it('gradient is defined in document space (iso-lines perpendicular on screen) even for non-uniform scale', () => {
-    scaledLayer({ x: 0, y: 0, sx: 2, sy: 0.5 }); // covers document 0..200 x 0..50
+    scaledLayer({ x: 0, y: 0, sx: 2, sy: 0.5, rot: 0, kx: 0, ky: 0 }); // covers document 0..200 x 0..50
     e.setToolContext(brushCtx({}, { primary: rgba(255, 0, 0), secondary: rgba(0, 0, 255) }));
     e.setTool('gradient');
     e.pointerDown(ptr(20, 25));
@@ -479,7 +479,7 @@ describe('transforms: selection clipping and the wand', () => {
   function scaled(): string {
     e = newEngine(100, 100);
     const id = e.addPixelLayer();
-    e.setTransform(id, { x: 10, y: 10, sx: 2, sy: 2 });
+    e.setTransform(id, { x: 10, y: 10, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 });
     e.setToolContext(brushCtx({ size: 60, hardness: 1 }));
     return id;
   }
@@ -552,7 +552,7 @@ describe('transforms: selection clipping and the wand', () => {
   it('the magic wand samples the layer as it looks in the document', () => {
     e = newEngine(100, 100);
     const id = e.importImage(img(20, 20, (x, y) => (x >= 5 && x < 15 && y >= 5 && y < 15 ? BLUE : RED)), 20, 20, 'w');
-    e.setTransform(id, { x: 10, y: 10, sx: 4, sy: 4 });
+    e.setTransform(id, { x: 10, y: 10, sx: 4, sy: 4, rot: 0, kx: 0, ky: 0 });
     setOpts();
     e.setTool('wand');
     e.pointerDown(ptr(50, 50));
@@ -594,7 +594,7 @@ describe('transforms: applyTransform', () => {
     e = newEngine(100, 100);
     const id = e.importImage(img(10, 10, (x) => (x < 5 ? BLUE : RED)), 10, 10, 'b');
     const slot = info(id).slot!;
-    e.setTransform(id, { x: 5, y: 7, sx: 3, sy: 3 });
+    e.setTransform(id, { x: 5, y: 7, sx: 3, sy: 3, rot: 0, kx: 0, ky: 0 });
     const m = e.addMask(id);
     const grey = new Uint8Array(10 * 10 * 4);
     for (let y = 0; y < 10; y++) for (let x = 0; x < 10; x++) grey.set([y < 5 ? 0 : 255, 0, 0, 255], (y * 10 + x) * 4);
@@ -644,7 +644,7 @@ describe('transforms: applyTransform', () => {
   it('bakes a down-scale and rounds positions to whole pixels; unit scale is a no-op', () => {
     e = newEngine(100, 100);
     const id = e.importImage(img(64, 64, () => RED), 64, 64, 'd');
-    e.setTransform(id, { x: 10.5, y: 3.25, sx: 0.5, sy: 0.25 });
+    e.setTransform(id, { x: 10.5, y: 3.25, sx: 0.5, sy: 0.25, rot: 0, kx: 0, ky: 0 });
     e.applyTransform(id);
     expect(info(id)).toMatchObject({ surfaceW: 32, surfaceH: 16, transform: { x: 11, y: 3, sx: 1, sy: 1 } });
     expect(layerPx(e, id, 16, 8)).toEqual(RED);
@@ -658,7 +658,7 @@ describe('transforms: applyTransform', () => {
     const notices = noticesOf(e);
     const s = e.addShapeLayer({ type: 'ellipse', x: 0, y: 0, w: 10, h: 10, fill: { enabled: true, color: rgba(1, 2, 3) }, stroke: { enabled: false, color: rgba(0, 0, 0), width: 1 }, rotation: 0 });
     const id = e.addPixelLayer();
-    e.setTransform(id, { x: 0, y: 0, sx: 2, sy: 2 });
+    e.setTransform(id, { x: 0, y: 0, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 });
     e.setLayerProps(id, { locked: true });
     const n = e.history().entries.length;
     e.applyTransform('base');
@@ -684,7 +684,7 @@ describe('importImage: native resolution and fit transform', () => {
     expect(px(e, 10, 25)).toEqual(BLUE);
     expect(px(e, 90, 25)).toEqual(RED);
     const tall = e.importImage(img(100, 200, () => [0, 255, 0, 255]), 100, 200, 'tall');
-    expect(info(tall).transform).toEqual({ x: 38, y: 0, sx: 0.25, sy: 0.25 });
+    expect(info(tall).transform).toEqual({ x: 38, y: 0, sx: 0.25, sy: 0.25, rot: 0, kx: 0, ky: 0 });
     expect(px(e, 50, 25)).toEqual([0, 255, 0, 255]);
     expect(px(e, 36, 25)[1]).not.toBe(255);
   });
@@ -693,7 +693,7 @@ describe('importImage: native resolution and fit transform', () => {
     e = newEngine(100, 80);
     const notices = noticesOf(e);
     const id = e.importImage(img(21, 10, () => RED), 21, 10, 'small');
-    expect(info(id).transform).toEqual({ x: 40, y: 35, sx: 1, sy: 1 });
+    expect(info(id).transform).toEqual({ x: 40, y: 35, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
     expect(notices).toHaveLength(0);
     expect(px(e, 40, 35)).toEqual(RED);
     expect(px(e, 60, 44)).toEqual(RED);
@@ -714,7 +714,7 @@ describe('move tool with transforms', () => {
   it('moves the position only, keeping the scale; one history entry; docspec announced while dragging', () => {
     e = newEngine(100, 100);
     const id = e.importImage(img(10, 10, () => RED), 10, 10, 'r');
-    e.setTransform(id, { x: 10, y: 10, sx: 2, sy: 3 });
+    e.setTransform(id, { x: 10, y: 10, sx: 2, sy: 3, rot: 0, kx: 0, ky: 0 });
     e.setTool('move');
     const ev = collect(e);
     const n = e.history().entries.length;
@@ -722,13 +722,13 @@ describe('move tool with transforms', () => {
     e.pointerMove(ptr(30, 25));
     expect(types(ev, 'docspec').length).toBeGreaterThan(0);
     e.pointerUp(ptr(32, 27));
-    expect(info(id).transform).toEqual({ x: 22, y: 17, sx: 2, sy: 3 });
+    expect(info(id).transform).toEqual({ x: 22, y: 17, sx: 2, sy: 3, rot: 0, kx: 0, ky: 0 });
     expect(e.history().entries).toHaveLength(n + 1);
     expect(e.history().entries.slice(-1)[0].label).toBe('Move');
     expect(px(e, 30, 30)).toEqual(RED);
     expect(px(e, 15, 20)[3]).toBe(0);
     e.undo();
-    expect(info(id).transform).toEqual({ x: 10, y: 10, sx: 2, sy: 3 });
+    expect(info(id).transform).toEqual({ x: 10, y: 10, sx: 2, sy: 3, rot: 0, kx: 0, ky: 0 });
   });
 
   it('moves the TD Input although it is locked', () => {
@@ -737,7 +737,7 @@ describe('move tool with transforms', () => {
     e.setTool('move');
     e.pointerDown(ptr(5, 5));
     e.pointerUp(ptr(15, 25));
-    expect(info('base').transform).toEqual({ x: 10, y: 20, sx: 1, sy: 1 });
+    expect(info('base').transform).toEqual({ x: 10, y: 20, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
     expect(px(e, 5, 5)[3]).toBe(0);
     expect(px(e, 20, 30)).toEqual(BLUE);
     expect(info('base').locked).toBe(true);
@@ -746,7 +746,7 @@ describe('move tool with transforms', () => {
   it('snaps the dragged bounds to guides and canvas edges within threshold / zoom', () => {
     e = newEngine(100, 100);
     const id = e.importImage(img(20, 20, () => RED), 20, 20, 'r');
-    e.setTransform(id, { x: 0, y: 0, sx: 1, sy: 1 });
+    e.setTransform(id, { x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
     e.addGuide('v', 60);
     e.setSnap({ enabled: true, guides: true, canvas: true, layers: false, threshold: 6 });
     e.setTool('move');
@@ -774,7 +774,7 @@ describe('move tool with transforms', () => {
     e.pointerDown(ptr(15, 15));
     e.pointerUp(ptr(35, 25));
     expect(info(s).shape).toMatchObject({ x: 30, y: 20 });
-    expect(info(s).transform).toEqual({ x: 0, y: 0, sx: 1, sy: 1 });
+    expect(info(s).transform).toEqual({ x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
     expect(px(e, 40, 30)).toEqual(RED);
   });
 });
@@ -783,15 +783,15 @@ describe('docSpec / loadDocument with transforms', () => {
   it('round-trips transforms, per-surface sizes, masks, guides and canvas mode', () => {
     e = newEngine(120, 90);
     const a = e.importImage(img(30, 20, () => RED), 30, 20, 'a');
-    e.setTransform(a, { x: 7.5, y: -3, sx: 2.5, sy: 0.5 });
+    e.setTransform(a, { x: 7.5, y: -3, sx: 2.5, sy: 0.5, rot: 0, kx: 0, ky: 0 });
     const am = e.addMask(a);
     const b = e.addPixelLayer();
-    e.setTransform(b, { x: 1, y: 2, sx: 1, sy: 1 });
+    e.setTransform(b, { x: 1, y: 2, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
     e.addGuide('h', 33);
     e.addGuide('v', 44.5);
     e.setCanvasSize(120, 90, 'tl');
     e.setBaseSize(40, 30);
-    e.setTransform('base', { x: 5, y: 6, sx: 3, sy: 3 });
+    e.setTransform('base', { x: 5, y: 6, sx: 3, sy: 3, rot: 0, kx: 0, ky: 0 });
     const spec = JSON.parse(JSON.stringify(e.docSpec()));
     expect(spec.layers.find((l: { id: string }) => l.id === a)).toMatchObject({ x: 8, y: -3, sx: 2.5, sy: 0.5, surfaceW: 30, surfaceH: 20 });
     expect(spec.layers[0]).toMatchObject({ surfaceW: 40, surfaceH: 30, x: 5, sx: 3 });
@@ -823,7 +823,7 @@ describe('docSpec / loadDocument with transforms', () => {
     e.setCanvasSize(50, 50, 'tl');
     e.loadDocument({ ...spec, width: 50, height: 50 });
     e.setBaseSize(300, 300); // base placement comes from the document after a load
-    expect(info('base').transform).toEqual({ x: 0, y: 0, sx: 1, sy: 1 });
+    expect(info('base').transform).toEqual({ x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 });
   });
 
   it('validates scales, surface sizes, guides and the canvas mode', () => {
@@ -861,7 +861,7 @@ describe('docSpec / loadDocument with transforms', () => {
     e = newEngine(100, 100);
     const id = e.importImage(img(8, 4, () => RED), 8, 4, 'r');
     const slot = info(id).slot!;
-    e.setTransform(id, { x: 10, y: 10, sx: 5, sy: 5 });
+    e.setTransform(id, { x: 10, y: 10, sx: 5, sy: 5, rot: 0, kx: 0, ky: 0 });
     expect(e.readSurface(slot, { x: 0, y: 0, w: 8, h: 4 }).length).toBe(8 * 4 * 4);
     expect(e.readSurface(slot, { x: 6, y: 3, w: 4, h: 4 }).slice(0, 4)).toEqual(new Uint8ClampedArray([255, 0, 0, 255]));
     expect(e.readSurface(slot, { x: 8, y: 0, w: 1, h: 1 })[3]).toBe(0); // outside the surface
@@ -881,11 +881,11 @@ describe('docSpec / loadDocument with transforms', () => {
 describe('review regressions', () => {
   it('history never restores a stale base surface (the TD Input resolution is not history)', () => {
     e = newEngine(100, 100);
-    e.setTransform('base', { x: 5, y: 5, sx: 2, sy: 2 });
+    e.setTransform('base', { x: 5, y: 5, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 });
     e.setBaseSize(50, 40);
     e.writeBase({ x: 0, y: 0, w: 50, h: 40 }, img(50, 40, () => BLUE));
     e.commitBase();
-    e.setTransform('base', { x: 6, y: 6, sx: 2, sy: 2 });
+    e.setTransform('base', { x: 6, y: 6, sx: 2, sy: 2, rot: 0, kx: 0, ky: 0 });
     e.undo();
     e.undo();
     expect(e.docSpec().layers[0]).toMatchObject({ surfaceW: 50, surfaceH: 40, x: 0, sx: 1 });
@@ -903,12 +903,12 @@ describe('review regressions', () => {
   it('setLayerBox on a pure move keeps sx / sy exactly; load rejects oversized surfaces', () => {
     e = newEngine(100, 100);
     const id = e.importImage(img(30, 30, () => RED), 30, 30, 'r');
-    e.setTransform(id, { x: 0, y: 0, sx: 1 / 3, sy: 0.7 });
+    e.setTransform(id, { x: 0, y: 0, sx: 1 / 3, sy: 0.7, rot: 0, kx: 0, ky: 0 });
     for (let i = 1; i < 6; i++) {
       const b = e.layerBounds(id) as Rect;
       e.setLayerBox(id, { x: b.x + 1, y: b.y, w: b.w, h: b.h });
     }
-    expect(info(id).transform).toEqual({ x: 5, y: 0, sx: 1 / 3, sy: 0.7 });
+    expect(info(id).transform).toEqual({ x: 5, y: 0, sx: 1 / 3, sy: 0.7, rot: 0, kx: 0, ky: 0 });
     const spec = JSON.parse(JSON.stringify(e.docSpec()));
     spec.layers[1].surfaceW = 16000;
     spec.layers[1].surfaceH = 16000;

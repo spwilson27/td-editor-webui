@@ -4,6 +4,9 @@ import type { RGBA, SelectionMode } from '../engine/types';
 import { toHex } from '../state/colour';
 import { PAINT_TOOLS, BRUSHES, SHAPE_KINDS, toolInfo } from '../state/tools';
 import { editBounds, type BoundsField } from '../state/transform';
+import { MAX_SKEW, boxAabb, keepCentre, normDeg } from '../state/affine';
+import { orientedTarget, type OTarget } from '../state/xtarget';
+import type { DodgeBurnRange, ToolId } from '../engine/types';
 import { Icon, NOT_IN_VERSION } from './Icon';
 
 const BOX = 'padding:3px 6px;color:#e3e3e3;background:#1f1f1f;border:1px solid #474747;border-radius:4px;text-align:right';
@@ -196,16 +199,98 @@ function FillOptions() {
 const round = (n: number) => Math.round(n * 100) / 100;
 
 /** A numeric field that commits on change / Enter and re-reads the engine value afterwards. */
-function NumField({ id, label, value, unit, disabled, onCommit, min }: { id: string; label: string; value: number | null; unit?: string; disabled?: boolean; onCommit: (v: number) => void; min?: number }) {
+function NumField({ id, label, value, unit, disabled, onCommit, min, wide, low }: { id: string; label: string; value: number | null; unit?: string; disabled?: boolean; onCommit: (v: number) => void; min?: number; wide?: number; low?: boolean }) {
   const shown = value === null ? '' : String(round(value));
   return (
-    <div style="display:flex;align-items:center;gap:5px">
+    <div class={low ? 'lowprio' : undefined} style="display:flex;align-items:center;gap:5px">
       <label for={id} style="color:#a8a8a8">{label}</label>
       <input id={id} data-field={id} type="number" step="any" min={min} value={shown} disabled={disabled || value === null} aria-label={`${label}${unit ? ` (${unit})` : ''}`}
         onChange={(e) => { const input = e.target as HTMLInputElement; const n = parseFloat(input.value); if (Number.isFinite(n)) onCommit(n); else input.value = shown; }}
         onKeyDown={(e) => { e.stopPropagation(); if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
-        style={`width:62px;${BOX};color:#e3e3e3`} />
+        style={`width:${wide ?? 62}px;${BOX};color:#e3e3e3`} />
       {unit && <span style="color:#8f8f8f">{unit}</span>}
+    </div>
+  );
+}
+
+const RANGES: { id: DodgeBurnRange; label: string }[] = [{ id: 'shadows', label: 'Shadows' }, { id: 'midtones', label: 'Midtones' }, { id: 'highlights', label: 'Highlights' }];
+const ghostBtn = (on = true) => `height:24px;padding:0 10px;border:1px solid #474747;border-radius:4px;background:#262626;opacity:${on ? 1 : 0.45}`;
+
+/** Clone / Smudge / Blur-Sharpen / Dodge-Burn: size + hardness and the tool's own options. */
+function RetouchOptions({ tool }: { tool: ToolId }) {
+  const b = store.brush.value, c = store.cloneOpts.value, r = store.retouch.value;
+  return (
+    <div class="opts" data-retouch-options={tool}>
+      <RangeRow label="Width" id="bw" min={1} max={300} value={b.size} unit=" px" w={110} span={46} onInput={(v) => store.setBrush({ size: v })} />
+      <RangeRow label="Hardness" id="bh" min={0} max={100} value={Math.round(b.hardness * 100)} unit="%" w={80} span={36} onInput={(v) => store.setBrush({ hardness: v / 100 })} />
+      {tool === 'clone' && <>
+        <Check id="cla" label="Aligned" checked={c.aligned} onChange={(v) => store.setCloneOpts({ aligned: v })} />
+        <Check id="clsa" label="Sample all layers" checked={c.sampleAll} onChange={(v) => store.setCloneOpts({ sampleAll: v })} />
+        <span class="lowprio" style="color:#8f8f8f">Alt-click sets the source</span>
+      </>}
+      {(tool === 'smudge' || tool === 'blur') && <RangeRow label="Strength" id="rs" min={0} max={100} value={Math.round(r.strength * 100)} unit="%" w={80} span={36} onInput={(v) => store.setRetouch({ strength: v / 100 })} />}
+      {tool === 'blur' && <div role="group" aria-label="Mode" style={SEG}><Toggle label="Sharpen" data="sharpen" on={r.sharpen} onClick={() => store.setRetouch({ sharpen: !r.sharpen })} /></div>}
+      {tool === 'dodge' && <>
+        <div role="group" aria-label="Range" style={SEG}>
+          {RANGES.map((g) => <button key={g.id} data-range={g.id} aria-pressed={r.range === g.id} onClick={() => store.setRetouch({ range: g.id })} style={segBtn(r.range === g.id)}>{g.label}</button>)}
+        </div>
+        <RangeRow label="Exposure" id="re" min={0} max={100} value={Math.round(r.exposure * 100)} unit="%" w={80} span={36} onInput={(v) => store.setRetouch({ exposure: v / 100 })} />
+        <div role="group" aria-label="Mode" style={SEG}><Toggle label="Burn" data="burn" on={r.burn} onClick={() => store.setRetouch({ burn: !r.burn })} /></div>
+      </>}
+    </div>
+  );
+}
+
+/** Crop: the box (X Y W H, doc px) and Apply / Cancel. */
+function CropOptions() {
+  const box = store.cropBox.value;
+  const edit = (f: BoundsField, v: number) => { if (box) store.setCropBox({ ...box, [f]: f === 'w' || f === 'h' ? Math.max(1, v) : v }); };
+  return (
+    <div class="opts" data-crop-options>
+      <NumField id="crx" label="X" unit="px" wide={54} value={box ? box.x : null} onCommit={(v) => edit('x', v)} />
+      <NumField id="cry" label="Y" unit="px" wide={54} value={box ? box.y : null} onCommit={(v) => edit('y', v)} />
+      <NumField id="crw" label="W" unit="px" wide={54} min={1} value={box ? box.w : null} onCommit={(v) => edit('w', v)} />
+      <NumField id="crh" label="H" unit="px" wide={54} min={1} value={box ? box.h : null} onCommit={(v) => edit('h', v)} />
+      <button data-act="crop-apply" aria-disabled={!box} title="Crop the canvas to the box (Enter)" onClick={() => store.applyCrop()} style={ghostBtn(!!box)}>Crop</button>
+      <button data-act="crop-cancel" aria-disabled={!box} title="Drop the box (Esc)" onClick={() => store.cancelCrop()} style={ghostBtn(!!box)}>Cancel</button>
+      <span class="lowprio" style="color:#8f8f8f">{box ? 'Enter crops · Esc cancels' : 'Drag on the canvas to draw a crop box'}</span>
+    </div>
+  );
+}
+
+/** Move tool on a pixel / input layer or a floating selection: bounds, scale, rotation and skew. */
+function OrientedOptions({ tg }: { tg: OTarget }) {
+  const { t, w, h } = tg, lock = store.aspectLock.value;
+  const ab = boxAabb(t, w, h);
+  const set = (n: Partial<typeof t>) => tg.set({ ...t, ...n });
+  const setW = (v: number) => { const sx = Math.max(0.0001, v) / w; set({ sx, sy: lock ? t.sy * (sx / t.sx) : t.sy }); };
+  const setH = (v: number) => { const sy = Math.max(0.0001, v) / h; set({ sy, sx: lock ? t.sx * (sy / t.sy) : t.sx }); };
+  const setScale = (pct: number) => { if (!(pct > 0)) return; const sx = pct / 100; set({ sx, sy: lock ? t.sy * (sx / t.sx) : t.sy }); };
+  const skew = (k: 'kx' | 'ky', v: number) => tg.set(keepCentre(t, w, h, { [k]: Math.max(-MAX_SKEW, Math.min(MAX_SKEW, v)) }));
+  const l = tg.layer ?? undefined;
+  return (
+    <div class="opts" data-move-options data-oriented={tg.floating ? 'floating' : 'layer'}>
+      {tg.floating && <span data-float-pill style="padding:2px 8px;border-radius:10px;background:#3d6fb4;color:#fff;font-weight:600">Transform Selection</span>}
+      <NumField id="mx" label="X" unit="px" wide={54} value={ab.x} onCommit={(v) => set({ x: t.x + v - ab.x })} />
+      <NumField id="my" label="Y" unit="px" wide={54} value={ab.y} onCommit={(v) => set({ y: t.y + v - ab.y })} />
+      <NumField id="mw" label="W" unit="px" wide={54} min={1} value={w * t.sx} onCommit={setW} />
+      <button aria-label="Keep aspect ratio" data-aspect-lock title="Keep aspect ratio" aria-pressed={lock} onClick={() => { store.aspectLock.value = !lock; }}
+        style={`${segBtn(lock)};display:inline-flex;align-items:center;justify-content:center;width:26px;padding:0;border:1px solid #474747`}><Icon d={LINK} size={14} sw={1.8} /></button>
+      <NumField id="mh" label="H" unit="px" wide={54} min={1} value={h * t.sy} onCommit={setH} />
+      <NumField id="ms" label="Scale" unit="%" wide={54} min={0.01} low value={t.sx * 100} onCommit={setScale} />
+      <NumField id="mr" label="Rotate" unit="°" wide={50} value={t.rot} onCommit={(v) => tg.set(keepCentre(t, w, h, { rot: normDeg(v) }))} />
+      <NumField id="mkx" label="Skew X" unit="°" wide={46} value={t.kx} onCommit={(v) => skew('kx', v)} />
+      <NumField id="mky" label="Skew Y" unit="°" wide={46} value={t.ky} onCommit={(v) => skew('ky', v)} />
+      {tg.floating ? <>
+        <button data-act="commit-float" title="Commit the transformed selection (Enter)" onClick={() => store.commitFloating()}
+          style="height:24px;padding:0 12px;border-radius:4px;background:#3d6fb4;color:#fff;font-weight:600">Commit</button>
+        <button data-act="cancel-float" title="Discard the transform (Esc)" onClick={() => store.cancelFloating()} style={ghostBtn()}>Cancel</button>
+      </> : <>
+        <button data-act="apply-transform" aria-disabled={!store.canApplyTransform(l)} title="Bake the transform into the layer's pixels" onClick={() => store.applyTransform()} style={ghostBtn(store.canApplyTransform(l))}>Apply Transform</button>
+        <button data-act="reset-transform" aria-disabled={!store.canResetTransform(l)} title="Back to position 0, 0 at 100%, no rotation or skew" onClick={() => store.resetTransform()} style={ghostBtn(store.canResetTransform(l))}>Reset Transform</button>
+      </>}
+      <SnapCheck />
+      <span class="lowprio" style="color:#8f8f8f">Drag outside a corner to rotate · Ctrl-drag an edge to skew</span>
     </div>
   );
 }
@@ -214,13 +299,15 @@ const LINK = 'M10 14a4 4 0 005.7 0l3-3a4 4 0 00-5.7-5.7l-1 1M14 10a4 4 0 00-5.7 
 
 /** Move tool: the active layer's bounds (X Y W H), scale %, aspect lock, Apply / Reset Transform. */
 function MoveOptions() {
-  store.docVersion.value; store.docspecVersion.value;
+  store.docVersion.value; store.docspecVersion.value; store.floatVersion.value; store.selectionVersion.value;
+  const tg = store.hasEngine() ? orientedTarget(store) : null;
+  if (tg) return <OrientedOptions tg={tg} />;
   const l = store.hasEngine() ? store.activeLayer() : undefined;
   const e = store.hasEngine() ? store.engine : null;
   const b = l && e ? e.layerBounds(l.id) : null;
   const ok = !!l && !!b && store.canEditTransform(l);
   const lock = store.aspectLock.value;
-  const pixel = !!l && (l.kind === 'pixel' || l.kind === 'base');
+  const pixel = !!l && (l.kind === 'pixel' || l.kind === 'input');
   const edit = (field: BoundsField, v: number) => { if (l && b) store.setLayerBounds(l, b, editBounds(b, field, v, lock)); };
   const setScale = (pct: number) => {
     if (!l || !b || !pixel || !(pct > 0)) return;
@@ -267,14 +354,21 @@ function Readout() {
 export function ContextBar() {
   const id = store.tool.value;
   const info = toolInfo(id);
+  store.floatVersion.value; store.selectionVersion.value;
+  const qm = store.quickMaskOn();
   return (
     <div class="ctx" data-context-bar>
       <div class="ctx-tool">
         <Icon d={info.d} size={18} sw={1.7} stroke="#7fb2f0" />
         <span data-context="name" class="ctx-name">{info.name}</span>
       </div>
+      {qm && <span data-quick-mask-pill title="Quick Mask: paint white to add to the selection, black to remove (Q to leave)"
+        style="padding:2px 8px;border-radius:10px;background:#b4472c;color:#fff;font-weight:600;white-space:nowrap">Quick Mask</span>}
+      {qm && <span class="lowprio" data-quick-mask-hint style="color:#a8a8a8;white-space:nowrap">white adds · black removes</span>}
       <div style="width:1px;height:22px;background:#474747" />
-      {PAINT_TOOLS.has(id) ? <BrushOptions />
+      {id === 'clone' || id === 'smudge' || id === 'blur' || id === 'dodge' ? <RetouchOptions tool={id} />
+        : id === 'crop' ? <CropOptions />
+        : PAINT_TOOLS.has(id) ? <BrushOptions />
         : id === 'marquee' || id === 'lasso' ? <SelectOptions />
         : id === 'wand' ? <SelectOptions wand />
         : id === 'text' ? <TextOptions />

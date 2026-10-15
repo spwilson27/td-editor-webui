@@ -4,7 +4,7 @@ import { cropData, floodFill } from '../floodFill';
 import { isVector, layerBox, type EditTarget, type PixelLayer, type StructureSnapshot, type VectorLayer } from '../model';
 import { translateShape, translateText } from '../textShape';
 import { luminance } from '../adjustments';
-import { innerLayerRect, layerRectToDoc, outerRect } from '../xform';
+import { applyMat, innerLayerRect, invMat, isAxis, layerRectToDoc, matOf, outerRect, toLayer } from '../xform';
 import type { Surface } from '../surface';
 import { commitPatches, drawCoverage, editableRegion, restoreAndDraw } from './paint';
 import { cancelRaf, raf } from '../compositor';
@@ -119,8 +119,9 @@ export class FillTool implements Tool {
     if (!(dxp >= 0 && dyp >= 0 && dxp < docW && dyp < docH)) return;
     const cov = this.host.selectionAlpha();
     if (cov && cov[dyp * docW + dxp] === 0) return; // clicked on an unselected pixel
-    const cu = Math.floor((p.x - tf.x) / tf.sx);
-    const cv = Math.floor((p.y - tf.y) / tf.sy);
+    const lp = toLayer(tf, p.x, p.y);
+    const cu = Math.floor(lp.x);
+    const cv = Math.floor(lp.y);
     const lay = intersect(
       { x: 0, y: 0, w: layer.surface.width, h: layer.surface.height },
       innerLayerRect(tf, this.host.doc.selection ?? { x: 0, y: 0, w: docW, h: docH }),
@@ -135,11 +136,16 @@ export class FillTool implements Tool {
     const before = cropData(img.data, lay.w, res.rect);
     const after = before.slice();
     // selection coverage at crop pixel (x, y) of res.rect: sampled at the layer pixel's centre in document space
-    const covAt = cov
+    const m = matOf(tf);
+    const sel = this.host.doc.selection;
+    const covAt = cov || !isAxis(tf) // rotated / skewed: the layer pixels in the bounding box can lie outside the canvas / selection
       ? (x: number, y: number): number => {
-        const dx = Math.floor(tf.x + tf.sx * (lay.x + res.rect.x + x + 0.5));
-        const dy = Math.floor(tf.y + tf.sy * (lay.y + res.rect.y + y + 0.5));
-        return dx >= 0 && dy >= 0 && dx < docW && dy < docH ? cov[dy * docW + dx] : 0;
+        const q = applyMat(m, lay.x + res.rect.x + x + 0.5, lay.y + res.rect.y + y + 0.5);
+        const dx = Math.floor(q.x);
+        const dy = Math.floor(q.y);
+        if (!(dx >= 0 && dy >= 0 && dx < docW && dy < docH)) return 0;
+        if (sel && !(dx >= sel.x && dy >= sel.y && dx < sel.x + sel.w && dy < sel.y + sel.h)) return 0;
+        return cov ? cov[dy * docW + dx] : 255;
       }
       : null;
     if (layer.isMask) paintMaskValue(after, lay.w, res.rect, res.mask, luminance(ctx.primary.r, ctx.primary.g, ctx.primary.b), ctx.primary.a / 255, covAt);
@@ -269,8 +275,12 @@ export class GradientTool implements Tool {
       }
       if (layer.isMask) c.clearRect(area.x, area.y, area.w, area.h); // the gradient replaces the old mask
       const d = layerRectToDoc(tf, area);
+      const inv = invMat(matOf(tf)); // document -> layer
       c.save();
-      c.setTransform(1 / tf.sx, 0, 0, 1 / tf.sy, -tf.x / tf.sx, -tf.y / tf.sy);
+      c.beginPath();
+      c.rect(area.x, area.y, area.w, area.h); // rotated / skewed: the gradient's bounding box is larger than the area
+      c.clip();
+      c.transform(inv.a, inv.b, inv.c, inv.d, inv.e, inv.f);
       const g = c.createLinearGradient(this.sx, this.sy, p.x, p.y);
       this.stops(g, layer.isMask, a, b);
       c.fillStyle = g;
@@ -302,7 +312,8 @@ export class GradientTool implements Tool {
     tc.clearRect(0, 0, area.w, area.h);
     drawCoverage(this.host, tc, sel, area, tf, 0, 0);
     tc.globalCompositeOperation = 'source-in';
-    tc.setTransform(1 / tf.sx, 0, 0, 1 / tf.sy, -tf.x / tf.sx - area.x, -tf.y / tf.sy - area.y); // document -> window
+    const inv = invMat(matOf(tf));
+    tc.setTransform(inv.a, inv.b, inv.c, inv.d, inv.e - area.x, inv.f - area.y); // document -> window
     const g = tc.createLinearGradient(this.sx, this.sy, p.x, p.y);
     this.stops(g, layer.isMask, a, b);
     tc.fillStyle = g;

@@ -23,10 +23,10 @@ afterEach(unmount);
 
 describe('Adjustment panel', () => {
   it('has no Adjustment tab until an adjustment layer is active; it is then selected automatically', async () => {
-    expect(tabs()).toEqual(['Layers:true', 'History:false']);
+    expect(tabs()).toEqual(['Layers:true', 'History:false', 'Effects:false']);
     store.addAdjustment('levels');
     await settle();
-    expect(tabs()).toEqual(['Layers:false', 'History:false', 'Adjustment:true']);
+    expect(tabs()).toEqual(['Layers:false', 'History:false', 'Adjustment:true', 'Effects:false']);
     expect(document.querySelector('[data-adjust-panel][data-adjust-type=levels]')).toBeTruthy();
   });
 
@@ -35,7 +35,7 @@ describe('Adjustment panel', () => {
     await settle();
     engine.setActiveLayer('base');
     await settle();
-    expect(tabs()).toEqual(['Layers:true', 'History:false']);
+    expect(tabs()).toEqual(['Layers:true', 'History:false', 'Effects:false']);
     expect(document.querySelector('[data-adjust-panel]')).toBeNull();
   });
 

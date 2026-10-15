@@ -3,7 +3,7 @@ import type { EditTarget } from '../model';
 import { createSurface, releaseSurface, type Ctx2D, type Surface } from '../surface';
 import { luminance } from '../adjustments';
 import { clipToSize, intersect, union } from '../rect';
-import { innerLayerRect, layerRectToDoc, type Xf } from '../xform';
+import { clipDocRect, innerLayerRect as innerRect, invMat, isAxis, layerRectToDoc, matOf, toLayer, type Xf } from '../xform';
 import type { Host, Tool } from './host';
 import { TileBackup } from '../tiles';
 
@@ -16,17 +16,34 @@ export type PaintMode = 'brush' | 'pencil' | 'eraser';
  */
 export function drawCoverage(host: Host, c: Ctx2D, sel: Surface, r: Rect, tf: Xf, ox: number, oy: number): void {
   const d = layerRectToDoc(tf, r);
-  const x0 = Math.max(0, d.x);
-  const y0 = Math.max(0, d.y);
-  const x1 = Math.min(host.doc.width, d.x + d.w);
-  const y1 = Math.min(host.doc.height, d.y + d.h);
+  const x0 = Math.max(0, Math.floor(d.x));
+  const y0 = Math.max(0, Math.floor(d.y));
+  const x1 = Math.min(host.doc.width, Math.ceil(d.x + d.w));
+  const y1 = Math.min(host.doc.height, Math.ceil(d.y + d.h));
   if (x1 <= x0 || y1 <= y0) return;
-  const kx = r.w / d.w;
-  const ky = r.h / d.h;
   c.save();
   c.imageSmoothingEnabled = true;
   c.imageSmoothingQuality = 'low';
-  c.drawImage(sel.canvas as CanvasImageSource, x0, y0, x1 - x0, y1 - y0, (x0 - d.x) * kx + ox, (y0 - d.y) * ky + oy, (x1 - x0) * kx, (y1 - y0) * ky);
+  if (!isAxis(tf)) {
+    // rotated / skewed: draw the selection canvas under the inverse affine (document -> layer), shifted so r.x,r.y -> ox,oy
+    const m = invMat(matOf(tf));
+    c.transform(m.a, m.b, m.c, m.d, m.e + ox - r.x, m.f + oy - r.y);
+    c.drawImage(sel.canvas as CanvasImageSource, x0, y0, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0);
+    c.restore();
+    return;
+  }
+  const dd = layerRectToDoc(tf, r);
+  const ax0 = Math.max(0, dd.x);
+  const ay0 = Math.max(0, dd.y);
+  const ax1 = Math.min(host.doc.width, dd.x + dd.w);
+  const ay1 = Math.min(host.doc.height, dd.y + dd.h);
+  if (ax1 <= ax0 || ay1 <= ay0) {
+    c.restore();
+    return;
+  }
+  const kx = r.w / dd.w;
+  const ky = r.h / dd.h;
+  c.drawImage(sel.canvas as CanvasImageSource, ax0, ay0, ax1 - ax0, ay1 - ay0, (ax0 - dd.x) * kx + ox, (ay0 - dd.y) * ky + oy, (ax1 - ax0) * kx, (ay1 - ay0) * ky);
   c.restore();
 }
 
@@ -49,18 +66,19 @@ export function coveredSource(host: Host, canvas: CanvasImageSource, r: Rect, tf
   return { img: t.canvas as CanvasImageSource, x: 0, y: 0 };
 }
 
+/** Clip the layer context to what an edit may touch: (rotated / skewed layers) the canvas, and the selection rect. Call between save() / restore(). */
+export function clipEditable(host: Host, layer: EditTarget, c: Ctx2D): void {
+  if (!isAxis(layer.tf)) clipDocRect(c as CanvasRenderingContext2D, layer.tf, { x: 0, y: 0, w: host.doc.width, h: host.doc.height }); // rotated: pixels outside the canvas stay
+  const s = host.doc.selection;
+  if (s) clipDocRect(c as CanvasRenderingContext2D, layer.tf, s);
+}
+
 /** Restore the pre-edit pixels in `r` (layer space), then run `draw` clipped to the selection (mapped into layer pixels). */
 export function restoreAndDraw(host: Host, layer: EditTarget, tb: TileBackup, r: Rect, draw: () => void): void {
   tb.restore(r);
   const c = layer.surface.ctx;
   c.save();
-  const s = host.doc.selection;
-  if (s) {
-    const q = innerLayerRect(layer.tf, s);
-    c.beginPath();
-    c.rect(q.x, q.y, q.w, q.h);
-    c.clip();
-  }
+  clipEditable(host, layer, c);
   draw();
   c.restore();
 }
@@ -70,16 +88,61 @@ export function restoreAndDraw(host: Host, layer: EditTarget, tb: TileBackup, r:
  * document ∩ the selection. Returns layer space.
  */
 export function editableRegion(host: Host, layer: EditTarget, r: Rect): Rect | null {
-  const vis = innerLayerRect(layer.tf, { x: 0, y: 0, w: host.doc.width, h: host.doc.height });
+  const vis = innerRect(layer.tf, { x: 0, y: 0, w: host.doc.width, h: host.doc.height });
   let out = intersect(r, { x: 0, y: 0, w: layer.surface.width, h: layer.surface.height });
   if (out) out = intersect(out, vis);
-  if (out && host.doc.selection) out = intersect(out, innerLayerRect(layer.tf, host.doc.selection));
+  if (out && host.doc.selection) out = intersect(out, innerRect(layer.tf, host.doc.selection));
   return out;
 }
 
 export function commitPatches(host: Host, layer: EditTarget, tb: TileBackup, label: string): void {
   const patches = tb.patches();
   if (patches.length) host.pushPatch(label, layer, patches);
+}
+
+export interface Tip { drawW: number; drawH: number; stampW: number; stampH: number }
+
+/**
+ * Render the brush tip into the scratch stamp canvas: a document-space circle of `size` px, seen from the layer's pixel grid.
+ * Under the layer affine A (layer -> document) the circle is the ellipse Q = (size / 2) * A^-1 (unit circle -> layer
+ * pixels): exact for any scale, rotation and skew (the v4 axis-aligned case is the ellipse (size / sx) x (size / sy)).
+ * `drawW x drawH` is the layer-pixel box of the tip (centre = dab position); the stamp canvas may hold it smaller (huge tips).
+ */
+export function renderTip(s: Surface, t: Xf, size: number, hardness: number, col: string): Tip {
+  const d = Math.min(1000, Math.max(1, size));
+  const inv = invMat(matOf(t));
+  const rho = d / 2;
+  const ex = rho * Math.hypot(inv.a, inv.c); // half extents of the ellipse along the layer axes
+  const ey = rho * Math.hypot(inv.b, inv.d);
+  const cap = s.width;
+  const drawW = Math.min(4096, Math.ceil(2 * ex) + 2);
+  const drawH = Math.min(4096, Math.ceil(2 * ey) + 2);
+  const sw = Math.min(cap, drawW); // canvas pixels (a huge tip is drawn smaller and enlarged)
+  const sh = Math.min(cap, drawH);
+  // Clear the whole scratch canvas, not just sw x sh: the stamp is drawn at fractional positions with bilinear sampling, which
+  // reads the texels just outside its source rect; leftovers of a previous (larger / differently coloured) tip there showed up
+  // as 1 px lines of the old colour along the dab edges (rows and columns) on scaled layers.
+  s.ctx.clearRect(0, 0, s.canvas.width, s.canvas.height);
+  s.ctx.save();
+  s.ctx.translate(sw / 2, sh / 2);
+  s.ctx.scale(sw / drawW, sh / drawH);
+  s.ctx.transform(rho * inv.a, rho * inv.b, rho * inv.c, rho * inv.d, 0, 0);
+  if (hardness >= 1) {
+    s.ctx.fillStyle = col;
+    s.ctx.beginPath();
+    s.ctx.arc(0, 0, 1, 0, Math.PI * 2);
+    s.ctx.fill();
+  } else {
+    const g = s.ctx.createRadialGradient(0, 0, 0, 0, 0, 1);
+    const base = col.slice(4, -1);
+    g.addColorStop(0, `rgba(${base},1)`);
+    g.addColorStop(Math.max(0, hardness), `rgba(${base},1)`);
+    g.addColorStop(1, `rgba(${base},0)`);
+    s.ctx.fillStyle = g;
+    s.ctx.fillRect(-1.5, -1.5, 3, 3);
+  }
+  s.ctx.restore();
+  return { drawW, drawH, stampW: sw, stampH: sh };
 }
 
 /**
@@ -109,8 +172,8 @@ export class StrokeTool implements Tool {
   constructor(private host: Host, private mode: PaintMode) {}
 
   private map(x: number, y: number): { u: number; v: number } {
-    const t = (this.layer as EditTarget).tf;
-    return { u: (x - t.x) / t.sx, v: (y - t.y) / t.sy };
+    const p = toLayer((this.layer as EditTarget).tf, x, y);
+    return { u: p.x, v: p.y };
   }
 
   down(p: ToolPointer): void {
@@ -178,41 +241,11 @@ export class StrokeTool implements Tool {
 
   private prepareStamp(): void {
     const { size, hardness } = this.host.context().brush;
-    const t = (this.layer as EditTarget).tf;
-    const d = Math.min(1000, Math.max(1, size));
-    const dx = d / t.sx; // tip diameter in layer pixels
-    const dy = d / t.sy;
-    const cap = this.host.scratch.stamp.width;
-    this.drawW = Math.ceil(dx) + 2;
-    this.drawH = Math.ceil(dy) + 2;
-    const sw = Math.min(cap, this.drawW); // canvas pixels (a huge tip is drawn smaller and enlarged)
-    const sh = Math.min(cap, this.drawH);
-    this.stampW = sw;
-    this.stampH = sh;
-    const s = this.host.scratch.stamp;
-    // Clear the whole scratch canvas, not just sw x sh: the stamp is drawn at fractional positions with bilinear sampling, which
-    // reads the texels just outside its source rect; leftovers of a previous (larger / differently coloured) tip there showed up
-    // as 1 px lines of the old colour along the dab edges (rows and columns) on scaled layers.
-    s.ctx.clearRect(0, 0, s.canvas.width, s.canvas.height);
-    s.ctx.save();
-    s.ctx.translate(sw / 2, sh / 2);
-    s.ctx.scale((dx / 2) * (sw / this.drawW), (dy / 2) * (sh / this.drawH));
-    const col = this.color();
-    if (hardness >= 1) {
-      s.ctx.fillStyle = col;
-      s.ctx.beginPath();
-      s.ctx.arc(0, 0, 1, 0, Math.PI * 2);
-      s.ctx.fill();
-    } else {
-      const g = s.ctx.createRadialGradient(0, 0, 0, 0, 0, 1);
-      const base = col.slice(4, -1);
-      g.addColorStop(0, `rgba(${base},1)`);
-      g.addColorStop(Math.max(0, hardness), `rgba(${base},1)`);
-      g.addColorStop(1, `rgba(${base},0)`);
-      s.ctx.fillStyle = g;
-      s.ctx.fillRect(-1.5, -1.5, 3, 3);
-    }
-    s.ctx.restore();
+    const tip = renderTip(this.host.scratch.stamp, (this.layer as EditTarget).tf, size, hardness, this.color());
+    this.drawW = tip.drawW;
+    this.drawH = tip.drawH;
+    this.stampW = tip.stampW;
+    this.stampH = tip.stampH;
   }
 
   /** Make the stroke buffer cover `r` (layer space, inside the surface); grows geometrically so a long stroke reallocates rarely. */
@@ -242,8 +275,9 @@ export class StrokeTool implements Tool {
     let pw = 0;
     let ph = 0;
     if (this.mode === 'pencil') {
-      pw = Math.max(1, Math.round(brush.size / t.sx));
-      ph = Math.max(1, Math.round(brush.size / t.sy));
+      const m = matOf(t); // pencil: a box of layer pixels, as wide as `size` document pixels along each layer axis
+      pw = Math.max(1, Math.round(brush.size / Math.hypot(m.a, m.b)));
+      ph = Math.max(1, Math.round(brush.size / Math.hypot(m.c, m.d)));
       r = { x: Math.floor(u) - Math.floor(pw / 2), y: Math.floor(v) - Math.floor(ph / 2), w: pw, h: ph };
     } else {
       r = { x: Math.floor(u - this.drawW / 2) - 1, y: Math.floor(v - this.drawH / 2) - 1, w: this.drawW + 3, h: this.drawH + 3 };

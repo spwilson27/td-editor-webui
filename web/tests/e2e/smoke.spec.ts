@@ -17,7 +17,7 @@ const hook = <T,>(page: Page, fn: string, ...args: unknown[]) =>
 const docPoint = async (page: Page, x: number, y: number) => hook<{ x: number; y: number }>(page, 'docToScreen', x, y);
 
 test('renders the editor in standalone mode', async ({ page }) => {
-  await expect(page.locator('[data-tool]')).toHaveCount(17);
+  await expect(page.locator('[data-tool]')).toHaveCount(19);
   await expect(page.locator('[data-status=connection]')).toContainText('Standalone');
   await expect(page.getByText('landscape.png')).toBeVisible();
   await expect(page.locator('[data-status=layer]')).toHaveText('Layer 1');
@@ -49,11 +49,12 @@ test('switches tools by click and keyboard; disabled tools stay off', async ({ p
   await expect(page.locator('[data-context=name]')).toHaveText('Flood Fill');
   await page.keyboard.press('g');
   await expect(page.locator('[data-context=name]')).toHaveText('Gradient Tool');
-  await page.locator('[data-tool=crop]').click({ force: true });
-  await expect(page.locator('[data-context=name]')).toHaveText('Gradient Tool');
-  await expect(page.locator('[data-tool=crop]')).toHaveAttribute('title', /Not in this version/);
-  await page.keyboard.press('c');
-  await expect(page.locator('[data-status=notice]')).toContainText('not available');
+  await page.locator('[data-tool=crop]').click();
+  await expect(page.locator('[data-context=name]')).toHaveText('Crop Tool');
+  await page.keyboard.press('s');
+  await expect(page.locator('[data-context=name]')).toHaveText('Clone Brush');
+  await page.keyboard.press('r');
+  await expect(page.locator('[data-context=name]')).toHaveText('Smudge Brush');
 });
 
 test('colour panel: ring, square, sliders, hex and recent swatches', async ({ page }) => {
@@ -248,7 +249,7 @@ for (const [w, h] of [[1280, 800], [1024, 700]] as const) {
   test(`layout fits at ${w}x${h}: single-row context bar, unscrolled rail with every tool visible`, async ({ page }) => {
     await page.setViewportSize({ width: w, height: h });
     await page.goto(URL);
-    await expect(page.locator('[data-tool]')).toHaveCount(17);
+    await expect(page.locator('[data-tool]')).toHaveCount(19);
     const bar = page.locator('[data-context-bar]');
     const rows = await bar.evaluate((el) => {
       const tops = new Set([...el.querySelectorAll<HTMLElement>('.ctx-tool, .opts > *')].filter((c) => c.offsetParent !== null).map((c) => Math.round(c.getBoundingClientRect().top + c.getBoundingClientRect().height / 2)));
