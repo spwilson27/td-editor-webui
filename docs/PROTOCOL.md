@@ -205,3 +205,26 @@ Further v5 details (TD implementation):
   operator was replaced or a newer `doc` was applied before the readback finished (the client may simply retry).
 - A surface without `surfaceW/H` in the spec (adjustment / group masks, v4 documents) keeps the size of its existing buffer, else the
   document size; the engine should send `surfaceW/H` for pixel layers (masks follow their layer) to be exact.
+
+## 8. Version 6 additions (DESIGN_V5)
+
+`ready.protocol` / `hello.protocol` = **6**. Changes to §1–7:
+
+- **LayerSpec:** `kind: 'base'` → **`'input'`** with `input: number` (1..8); a doc may contain several
+  input layers, anywhere in the stack, or none. Pixel and input layers carry `rot`, `kx`, `ky` (degrees)
+  next to `x, y, sx, sy`: `doc = T(x,y)·R(rot)·K(kx,ky)·S(sx,sy)·layer` (rotation clockwise on screen,
+  K = [[1, tan kx],[tan ky, 1]]), about the surface's top-left. New field `effects: Effect[]` (shape in
+  `web/src/engine/types.ts`). A v5 `base` layer is read as `input: 1`.
+- **BASE frames:** header `slot` = input index (1..8). `base` notices carry `input`; fetch
+  `GET /base?…&input=N`. Each input has its own newest frame and notice bookkeeping.
+- **`baseSize` replaced by `inputs`:** TD → web `{t:"inputs", items:[{input, w, h, connected}]}` after
+  `hello` and on any input change (connect/disconnect/resolution). `hello` carries the same `inputs` list.
+
+| Direction | `t` | Fields | Meaning |
+| --- | --- | --- | --- |
+| web → TD | `saveProject` | `requestId`, `path?` | write the current document as `.redoc` (path omitted = `Projectfile` parameter; a given path is written to the parameter first) |
+| web → TD | `openProject` | `requestId`, `path?` | read a `.redoc`, replace TD's document, then broadcast `reload` |
+| web → TD | `exportPng` | `requestId`, `path?` | save TD's flattened output to PNG (`Pngfile`) |
+| TD → web | `fileResult` | `requestId`, `op`, `ok`, `path`, `msg?` | outcome of the above (also sent, without `requestId`, when the pulses are used in TD) |
+| TD → web | `reload` | `rev` | the stored document was replaced (Open Project): every client drops its document and reloads via `requestDoc` |
+| TD → web | `files` | `projectFile`, `pngFile` | current parameter values (after `hello` and on change) for the UI's dialogs |

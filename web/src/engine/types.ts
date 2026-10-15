@@ -9,7 +9,24 @@ export type BlendMode =
 
 export interface Rect { x: number; y: number; w: number; h: number }
 
-export type LayerKind = 'pixel' | 'group' | 'base' | 'adjustment' | 'text' | 'shape';
+export type LayerKind = 'pixel' | 'group' | 'input' | 'adjustment' | 'text' | 'shape'; // v5: 'base' → 'input' (migrated on load)
+
+/** v5: per-layer effects (docs/DESIGN_V5.md §1). Colours straight RGBA 0..255; lengths in doc px. */
+export type Effect = { enabled: boolean } & (
+  | { type: 'dropShadow'; dx: number; dy: number; blur: number; color: RGBA; opacity: number }
+  | { type: 'outerGlow'; size: number; color: RGBA; opacity: number }
+  | { type: 'innerGlow'; size: number; color: RGBA; opacity: number }
+  | { type: 'stroke'; width: number; color: RGBA; position: 'inside' | 'center' | 'outside'; opacity: number }
+  | { type: 'bevel'; depth: number; size: number; angle: number; highlight: RGBA; shadow: RGBA }
+  | { type: 'colorOverlay'; color: RGBA; opacity: number }
+  | { type: 'pixelSort'; direction: 'h' | 'v'; low: number; high: number; key: 'luma' | 'hue' }
+  | { type: 'glitch'; amount: number; blockSize: number; seed: number; rgbShift: number }
+  | { type: 'chromaticAberration'; amount: number; angle: number }
+  | { type: 'halftone'; cellSize: number; angle: number; shape: 'dot' | 'line' }
+);
+export type EffectType = Effect['type'];
+export type CloneOptions = { aligned: boolean; sampleAll: boolean };
+export type DodgeBurnRange = 'shadows' | 'midtones' | 'highlights';
 
 /** v3: editable text and shape layers (docs/DESIGN_V3.md §2.2). Colours are straight RGBA 0..255. */
 export interface TextSpec {
@@ -59,8 +76,13 @@ export interface LayerSpec {
   adjustment: AdjustmentSpec | null;
   text: TextSpec | null;
   shape: ShapeSpec | null;
-  sx: number; // v4: scale (> 0), doc = (x,y) + (sx,sy)·layer
+  sx: number; // v4: scale (> 0)
   sy: number;
+  rot: number; // v5: degrees, clockwise on screen; doc = T(x,y)·R(rot)·K(kx,ky)·S(sx,sy)·layer
+  kx: number; // v5: skew degrees
+  ky: number;
+  input: number | null; // v5: input layers: 1..8
+  effects: Effect[]; // v5
   surfaceW: number | null; // v4: pixel/base surface size; null for other kinds
   surfaceH: number | null;
 }
@@ -70,7 +92,7 @@ export interface DocSpec {
   rev: number; width: number; height: number; layers: LayerSpec[];
   guides: Guides; canvas: { mode: CanvasMode };
 }
-export interface LayerTransform { x: number; y: number; sx: number; sy: number }
+export interface LayerTransform { x: number; y: number; sx: number; sy: number; rot: number; kx: number; ky: number }
 export type Anchor = 'tl' | 't' | 'tr' | 'l' | 'c' | 'r' | 'bl' | 'b' | 'br';
 export interface SnapOptions { enabled: boolean; guides: boolean; canvas: boolean; layers: boolean; threshold: number /*screen px*/ }
 
@@ -91,7 +113,10 @@ export interface LayerInfo {
   adjustment: AdjustmentSpec | null; // adjustment layers
   text: TextSpec | null; // text layers
   shape: ShapeSpec | null; // shape layers
-  transform: LayerTransform; // v4: pixel/base layers (identity for others)
+  transform: LayerTransform; // v4/v5: pixel/input layers (identity for others)
+  input: number | null; // v5: input layers
+  inputConnected: boolean | null; // v5: input layers: is that TD input connected
+  effects: Effect[]; // v5
   surfaceW: number | null; // v4: pixel/base surface size
   surfaceH: number | null;
 }
