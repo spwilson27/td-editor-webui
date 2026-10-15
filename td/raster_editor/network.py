@@ -54,7 +54,19 @@ blur              uAdjust 1   one extra node ``adj_L_<id>`` = Blur TOP (gaussian
 adjustment.  Same maths, folded into the shader to cut GPU passes and cooks.)
 
 Blend uniforms (GLSL TOP Vectors page): ``uParams`` vec4 = (BlendMode index, opacity, hasMask,
-uAdjust 0..6) and ``uOffset`` vec2 = (x, y).  See blend.glsl.
+uAdjust 0..7) and ``uXform`` vec4 = (x, y, sx, sy), the layer -> document mapping ``doc = (x, y) + (sx, sy) * layer``
+(v4 transforms; x/y fractional, identity for every layer that is not a pixel / base layer).  The layer's own surface
+is the Script TOP ``s<slot>`` at ``surfaceW x surfaceH`` (the base layer's is ``in1`` at its own resolution).
+
+Resampling is a separate pass: a pixel / base layer whose transform is NOT an integer offset at scale 1 gets a node
+``xf_L_<id>`` (uAdjust 7, custom resolution = document size; inputs: surface, mask or the surface again) that renders
+surface x coverage x mask into document space; the blend node then reads that through ``texelFetch`` with an identity
+mapping and no mask.  Only the ``xf_L`` node has ``inputfiltertype`` = ``mipmap`` (while lod =
+``max(0, -log2(sqrt(sx*sy)) - 0.5)`` > 0, i.e. sx*sy < 0.5; trilinear, which is what Canvas 2D drawImage 'medium'
+does) or ``linear``; its inputs are surfaces (or ``base_src``), never an accumulator.  Every other glsl node is
+``nearest`` / texelFetch only (TD builds mip chains for ALL inputs of a mipmap-filtered node, and keeps them).
+Integer offsets at scale 1 have no resample node: the blend pass places the surface itself (exact).  Text / shape
+layers are always TD rendered at document size (they never have a surface slot); see ``render_layer_source``.
 
 Persistence (verified): a LOCKED Script TOP keeps its pixels in COMP.save()/loadTox (and so in a saved .toe).
 Locking resets the locked image, so ``freeze()`` does ``top.lock = True`` and then calls ``comp.OnSurfaceCook(top)``
@@ -80,6 +92,7 @@ BLEND_INDEX = {name: i for i, name in enumerate(BLEND_MODES)}
 GRACE_S = 2.0
 WIDTH_CACHE_MAX = 100000   # measured widths kept (LRU); far above one max-size (20000 char) text
 MEASURE_BUDGET = 16      # Text TOP measurement cooks per apply() / per tick()
+FLATTEN_BUDGET = 200     # Text TOP measurement cooks per render_layer_status() call
 POOL_TARGET = 6          # spare glsl TOPs kept ready (creating a GLSL TOP costs ~4.7 ms)
 POOL_MAX = 10
 GARBAGE_MAX = 12
@@ -169,6 +182,28 @@ def blur_preshrink(radius):
     large radii run on a 2x/4x/8x smaller image (sigma >= ~3.5 shrunk px; measured error vs a true gaussian
     stays ~4/255 incl. 1 px lines)."""
     return 1 if radius < 6 else 2 if radius < 14 else 4 if radius < 32 else 8
+
+
+def xform_uniforms(layer):
+    """LayerSpec -> blend ``uXform`` (x, y, sx, sy) and whether the sampler must be mipmapped (mip lod > 0, i.e. sx*sy < 0.5).  Only pixel and
+    base layers carry a transform; everything else (text, shape, group, adjustment) maps 1:1 at the origin."""
+    if layer.get("kind") not in ("pixel", "base"):
+        return (0.0, 0.0, 1.0, 1.0), False
+    x, y = float(layer.get("x", 0) or 0), float(layer.get("y", 0) or 0)
+    sx, sy = float(layer.get("sx", 1.0) or 1.0), float(layer.get("sy", 1.0) or 1.0)
+    if not (sx > 0 and math.isfinite(sx)):
+        sx = 1.0
+    if not (sy > 0 and math.isfinite(sy)):
+        sy = 1.0
+    if not (math.isfinite(x) and math.isfinite(y)):
+        x = y = 0.0
+    return (x, y, sx, sy), (sx * sy < 0.5)
+
+
+def xform_is_exact(xf):
+    """True when the mapping is an integer offset at scale 1: the blend pass places the surface with texelFetch and
+    no resample pass is needed.  Same tolerance as blend.glsl."""
+    return (xf[2] == 1.0 and xf[3] == 1.0 and abs(xf[0] - round(xf[0])) < 1e-4 and abs(xf[1] - round(xf[1])) < 1e-4)
 
 
 # --------------------------------------------------------------------------- text / shape specs
@@ -338,7 +373,7 @@ class Plan:
 
 
 # blend.glsl uAdjust codes
-ADJ_BLEND, ADJ_PREMULT, ADJ_LEVELS, ADJ_BC, ADJ_INVERT, ADJ_THRESHOLD, ADJ_HSV = range(7)
+ADJ_BLEND, ADJ_PREMULT, ADJ_LEVELS, ADJ_BC, ADJ_INVERT, ADJ_THRESHOLD, ADJ_HSV, ADJ_RESAMPLE = range(8)
 
 
 def _ab(a=0.0, b=0.0, c=0.0, d=0.0, e=0.0):
@@ -415,6 +450,7 @@ class DocNetwork:
         self._budget = MEASURE_BUDGET
         self._text_nodes = {}  # text node name -> (spec, doc_w, doc_h)
         self._text_todo = set()     # text nodes laid out with the fallback metrics, finished by tick()
+        self._text_rev = {}         # text node name -> bumped whenever tick()/status refines its layout
         self._text_retry = {}       # text node name -> (consecutive failures, retry not before)
         self._fontset = None
         self._fonts_at = -1e9
@@ -423,7 +459,13 @@ class DocNetwork:
         self._used_names = set()
         self._desired = {}
         self._slots = {}      # slot -> node name (live surfaces)
+        self._new_sizes = {}
+        self._slot_sizes = {}  # slot -> (w, h) of the surface (document size when the spec has none)
+        self._source_keys = {}  # text / shape layer id -> its own spec + document size (Flatten token)
+        self._sources = {}     # text / shape layer id -> source node name
+        self._slot_nodes = {}
         self._prev_layers = None
+        self._prev_stack = None
         self._prev_size = None
         self._input_connected = None
         self._scanned = False
@@ -454,6 +496,7 @@ class DocNetwork:
         desired = self._plan(layers, doc_w, doc_h, connected)
         self._reconcile(desired)
         self._prev_layers = snap
+        self._prev_stack = [{"id": l.get("id"), "kind": l.get("kind")} for l in layers]
         self._prev_size = key
         self._counters["applies"] += 1
         self._last_ms = (time.perf_counter() - t0) * 1e3
@@ -490,6 +533,79 @@ class DocNetwork:
     def slots(self):
         return sorted(self._slots)
 
+    def surface_size(self, slot):
+        """(w, h) the Script TOP of ``slot`` is allocated at (the layer's surfaceW x surfaceH; masks: the size of their
+        layer's surface; document size when the spec has no size), or None for an unknown slot."""
+        slot = int(slot)
+        if slot in self._slot_sizes:
+            return self._slot_sizes[slot]
+        top = self.surface_top(slot)
+        return (int(top.width), int(top.height)) if top is not None else None
+
+    # ---- Flatten (text / shape layer rendered alone) -------------------------------------------
+    # The ext re-resolves these EVERY FRAME while a renderLayer request is in flight (they are cheap dictionary
+    # lookups): the operator behind a layer can be recycled / destroyed by an apply() between two frames.
+
+    def render_layer_source(self, layer_id):
+        """The TOP that renders a text / shape layer alone: its source node (Text TOP / shape GLSL TOP) at document
+        resolution, transparent background, premultiplied RGBA, NOT affected by the layer's opacity, mask, blend
+        mode, visibility (a hidden layer still renders) or the layers below.  Pure lookup, no cooking, no
+        measurement.  ``None`` when ``layer_id`` is not a text / shape layer of the last applied stack (never
+        applied, deleted, kind changed) or its operator is gone; the transparent ``blank`` TOP for a layer without a
+        spec.  Check :meth:`render_layer_ready` before reading pixels and :meth:`render_layer_token` before and after
+        the readback."""
+        name = self._sources.get(layer_id)
+        if name is None:
+            for l in self._prev_stack or ():
+                if l.get("id") == layer_id and l.get("kind") in ("text", "shape"):
+                    op = self._ops.get("blank")
+                    return op if op is not None and op.valid else None
+            return None
+        op = self._ops.get(name)
+        return op if op is not None and op.valid else None
+
+    def render_layer_token(self, layer_id):
+        """Opaque value identifying the pixels ``render_layer_source`` would produce right now.  PER LAYER: it changes
+        only when this layer's own spec / kind / the document size changes, the node behind it is replaced, or its text
+        layout is refined (measurements finished).  Edits to other layers do not touch it, so a readback survives
+        continuous editing elsewhere.  ``None`` = the layer is gone.  The ext compares it before cooking and after
+        reading back and drops the result when it differs."""
+        if self.render_layer_source(layer_id) is None:
+            return None
+        name = self._sources.get(layer_id, "blank")
+        return (self._gen.get(name), self._source_keys.get(layer_id), self._text_rev.get(name, 0))
+
+    def render_layer_status(self, layer_id):
+        """``'ready'`` | ``'pending'`` (text measurements still being finished over later ticks, the layout shown is
+        the 0.5 em fallback) | ``'failed'`` (the Text TOP could not be measured: retried with back-off, the fallback
+        layout is what renders) | ``None`` (layer gone).  Does a bounded amount of measurement work itself
+        (``FLATTEN_BUDGET`` cooks per call), so polling it each frame converges."""
+        if self.render_layer_source(layer_id) is None:
+            return None
+        name = self._sources.get(layer_id)
+        if name is None or name not in self._text_todo:
+            return "ready"
+        node, op = self._text_nodes.get(name), self._ops.get(name)
+        if node is not None and op is not None and self._clock() >= self._text_retry.get(name, (0, 0.0))[1]:
+            old = self._budget
+            self._budget = FLATTEN_BUDGET
+            try:
+                metrics, complete = self._text_metrics(node[0], name)
+                pars0 = self._counters["par_sets"]
+                self._set_pars(name, op, text_pars(node[0], node[1], node[2], metrics))
+                if self._counters["par_sets"] != pars0:           # a poll that changes nothing keeps the token
+                    self._text_rev[name] = self._text_rev.get(name, 0) + 1
+                if complete:
+                    self._text_todo.discard(name)
+            finally:
+                self._budget = old
+        if name not in self._text_todo:
+            return "ready"
+        return "failed" if self._text_retry.get(name, (0, 0.0))[0] > 0 else "pending"
+
+    def render_layer_ready(self, layer_id):
+        return self.render_layer_status(layer_id) == "ready"
+
     def output(self):
         return self._ops.get("out")
 
@@ -499,6 +615,7 @@ class DocNetwork:
         if flag != self._input_connected and self._prev_layers is not None:
             self._input_connected = flag
             self._set_base_source(flag)
+            self._prev_layers = None        # the base transform only applies to a connected input: re-plan on apply()
 
     def freeze(self):
         """Lock every surface TOP so its pixels are stored with the file.
@@ -769,7 +886,10 @@ class DocNetwork:
             if self._clock() < self._text_retry.get(name, (0, 0.0))[1]:
                 continue                                  # this layer is backing off; the others go on
             metrics, complete = self._text_metrics(spec, name)
+            pars0 = self._counters["par_sets"]
             self._set_pars(name, op, text_pars(spec, w, h, metrics))
+            if self._counters["par_sets"] != pars0:
+                self._text_rev[name] = self._text_rev.get(name, 0) + 1
             if complete:
                 self._text_todo.discard(name)
             if self._budget <= 0:
@@ -784,6 +904,9 @@ class DocNetwork:
         for gone in [n for n in self._text_retry if not n.startswith("text_")]:
             del self._text_retry[gone]
         self._slot_nodes = {}
+        self._new_sizes = {}
+        self._sources = {}
+        self._source_keys = {}
         def add(node):
             d[node.name] = node
             return node
@@ -803,18 +926,25 @@ class DocNetwork:
 
         row = [0]
 
-        def surface(slot, x, y):
+        def surface(slot, x, y, w=None, h=None):
+            """Script TOP of a surface, allocated at its own size (default: the document size)."""
             name = "s%d" % slot
             self._slot_nodes[slot] = name
+            w = doc_w if not w else int(w)
+            h = doc_h if not h else int(h)
+            self._new_sizes[slot] = (w, h)
             if name not in d:
-                add(_Node(name, "scriptTOP", dict(res, callbacks="surface_callbacks"), pos=(x, y)))
+                add(_Node(name, "scriptTOP", {"outputresolution": "custom", "resolutionw": w, "resolutionh": h,
+                                              "callbacks": "surface_callbacks"}, pos=(x, y)))
             return name
 
-        def blend_pars(mode, opacity, has_mask, adjust, ox, oy, fmt=FMT_BLEND):
+        def blend_pars(mode, opacity, has_mask, adjust, xf, mip, fmt=FMT_BLEND, filt="nearest"):
             return {
                 "vec0name": "uParams", "vec0valuex": float(mode), "vec0valuey": float(opacity),
                 "vec0valuez": 1.0 if has_mask else 0.0, "vec0valuew": float(adjust),
-                "vec1name": "uOffset", "vec1valuex": float(ox), "vec1valuey": float(oy),
+                "vec1name": "uXform", "vec1valuex": xf[0], "vec1valuey": xf[1], "vec1valuez": xf[2],
+                "vec1valuew": xf[3],
+                "inputfiltertype": filt, "inputextenduv": "hold",
                 "pixeldat": "blend_glsl", "format": fmt,
             }
 
@@ -829,18 +959,25 @@ class DocNetwork:
                 mask = l.get("mask")
                 mask_name = None
                 if mask and kind in ("pixel", "adjustment", "group", "base", "text", "shape") and mask.get("slot") is not None:
-                    mask_name = surface(int(mask["slot"]), bx - 700, y - 60)
+                    # a mask lives in layer space: same size as the layer's surface (document size for the rest)
+                    own = kind in ("pixel", "base")
+                    mask_name = surface(int(mask["slot"]), bx - 700, y - 60,
+                                        l.get("surfaceW") if own else None, l.get("surfaceH") if own else None)
                     if not mask.get("enabled", True):
                         mask_name = None   # surface exists, but is not cooked / wired
                 visible = bool(l.get("visible", True))
                 opacity = l.get("opacity", 1.0)
                 mode = BLEND_INDEX.get(l.get("blend", "normal"), 0)
                 bname = "blend_base" if kind == "base" else "blend_L_" + sid
-                raster = kind in ("text", "shape") and bool(l.get("rasterize"))
-                ox, oy = (l.get("x", 0), l.get("y", 0)) if kind == "pixel" or raster else (0, 0)
+                xf, mip = xform_uniforms(l)
+                if kind in ("text", "shape"):
+                    self._source_keys[l["id"]] = json.dumps([kind, l.get(kind), doc_w, doc_h], sort_keys=True,
+                                                            separators=(",", ":"))
                 if kind == "base":
                     src, adjust, mode = "base_src", 0, 0
-                elif kind in ("text", "shape") and not raster:
+                    if not connected:
+                        xf, mip = (0.0, 0.0, 1.0, 1.0), False       # nothing to transform: blank is document sized
+                elif kind in ("text", "shape"):        # always TD rendered (v4: no rasterize, never a surface)
                     adjust = 0
                     spec = l.get(kind)
                     if not spec:
@@ -852,6 +989,7 @@ class DocNetwork:
                         if not complete:
                             self._text_todo.add(src)
                         add(_Node(src, "textTOP", text_pars(spec, doc_w, doc_h, metrics), (), pos=(bx - 350, y)))
+                        self._sources[l["id"]] = src
                     else:
                         src = "shape_" + sid
                         pars = {"outputresolution": "custom", "resolutionw": doc_w, "resolutionh": doc_h,
@@ -860,9 +998,11 @@ class DocNetwork:
                                 "vec4name": "uC"}
                         pars.update(shape_uniforms(spec, doc_h))
                         add(_Node(src, "glslTOP", pars, (), pos=(bx - 350, y)))
-                elif kind in ("pixel", "text", "shape"):
+                        self._sources[l["id"]] = src
+                elif kind == "pixel":
                     slot = l.get("slot")
-                    src = surface(int(slot), bx - 350, y) if slot is not None else "blank"
+                    src = surface(int(slot), bx - 350, y, l.get("surfaceW"), l.get("surfaceH")) \
+                        if slot is not None else "blank"
                     adjust = 0
                 elif kind == "group":
                     kids2 = children.get(l["id"], [])
@@ -888,8 +1028,17 @@ class DocNetwork:
                 else:
                     continue
                 # sTD2DInputs[] is sized by the number of wired inputs: always wire all three
+                has_mask = mask_name is not None
+                if kind in ("pixel", "base") and src != "blank" and not xform_is_exact(xf):
+                    # non-integer position or scale: a resample pass renders the layer (and its mask) into document
+                    # space; it is the only node that reads through a mipmap filter, the blend below only fetches
+                    xname = "xf_L_" + sid
+                    xp = blend_pars(0, 0.0, has_mask, ADJ_RESAMPLE, xf, mip, filt="mipmap" if mip else "linear")
+                    xp.update({"outputresolution": "custom", "resolutionw": doc_w, "resolutionh": doc_h})
+                    add(_Node(xname, "glslTOP", xp, [src, mask_name or src, src], pos=(bx - 175, y)))      # 3 inputs: sTD2DInputs[] is sized by the wired ones
+                    src, mask_name, has_mask, xf, mip = xname, None, False, (0.0, 0.0, 1.0, 1.0), False
                 inputs = [acc, src, mask_name or "blank"]
-                bp = blend_pars(mode, opacity, mask_name is not None, adjust, ox, oy)
+                bp = blend_pars(mode, opacity, has_mask, adjust, xf, mip)
                 bp.update(extra)
                 add(_Node(bname, "glslTOP", bp, inputs, bypass=not visible, pos=(bx, y)))
                 acc = bname
@@ -907,6 +1056,9 @@ class DocNetwork:
         old_names = set(self._desired)
         self._desired = desired
         slots_new = dict(self._slot_nodes)
+        # slots leaving the stack keep their size while their Script TOP is in the grace period (dropped in _drop)
+        self._slot_sizes = {sl: v for sl, v in self._slot_sizes.items() if sl not in slots_new}
+        self._slot_sizes.update(self._new_sizes)
         first = not self._scanned
         if first:
             self._build_adopt_map()
@@ -1028,7 +1180,7 @@ class DocNetwork:
         self._note_companions(op)
         cache = {"type": "glslTOP", "pars": {}, "inputs": [], "bypass": False, "pos": None}
         self._set_pars_raw(op, cache, {
-            "pixeldat": "blend_glsl", "format": FMT_BLEND, "vec0name": "uParams", "vec1name": "uOffset",
+            "pixeldat": "blend_glsl", "format": FMT_BLEND, "vec0name": "uParams", "vec1name": "uXform",
             "vec2name": "uA", "vec3name": "uB"})
         return (op, cache)
 
@@ -1126,6 +1278,8 @@ class DocNetwork:
         op = self._ops.pop(name)
         cache = self._cache.pop(name)
         self._pending.pop(name, None)
+        if _SURFACE_NAME.match(name):
+            self._slot_sizes.pop(int(name[1:]), None)
         # disconnect so nothing downstream keeps a reference
         for i in range(len(cache["inputs"] or [])):
             op.inputConnectors[i].disconnect()
@@ -1135,6 +1289,8 @@ class DocNetwork:
             if cache["pars"].get("outputresolution", "useinput") != "useinput":
                 # shape nodes have a custom resolution; blend nodes inherit input 0's
                 self._set_pars_raw(op, cache, {"outputresolution": "useinput"})
+            if cache["pars"].get("inputfiltertype", "nearest") != "nearest":
+                self._set_pars_raw(op, cache, {"inputfiltertype": "nearest"})      # never recycle a mipmap flag
             if cache["bypass"]:
                 op.bypass = False
                 cache["bypass"] = False
@@ -1182,6 +1338,7 @@ class DocNetwork:
 
 _MISSING = object()
 _SPARE_NAME = re.compile(r"^g\d+$")
+_SURFACE_NAME = re.compile(r"^s\d+$")
 
 
 def _read_sibling(name):

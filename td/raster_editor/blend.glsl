@@ -4,7 +4,20 @@
 // Uniforms (GLSL TOP "Vectors" page):
 //   uParams  vec4  x = uMode (BlendMode index, web/src/engine/types.ts: normal=0 ... luminosity=15)
 //                  y = uOpacity (0..1)   z = uHasMask (0/1)   w = uAdjust (0..6)
-//   uOffset  vec2  layer x,y in document pixels, top-left origin (applied to inputs 1 and 2)
+//   uXform   vec4  layer -> document mapping  doc = (x, y) + (sx, sy) * layer  (document pixels, top-left
+//                  origin, x/y fractional, sx/sy > 0).  Layer pixel (0,0) is the top-left texel of the source
+//                  (its size = textureSize of the source input).
+// uAdjust = 7: RESAMPLE pass (only exists for layers whose transform is not an integer offset at scale 1).
+//   Inputs: 0 = layer surface, 1 = mask surface (or the surface again when uHasMask = 0).  Output (document
+//   sized, custom resolution) = source * coverage * mask, premultiplied, in document space.  The mask covers the
+//   same layer rect (normalised coordinates).  Sampling: linear; trilinear mip level
+//   lod = max(0, -log2(sqrt(sx*sy)) - 0.5) (what Canvas 2D drawImage imageSmoothingQuality 'medium' does); the
+//   network sets this node's "Input Smoothness" to mipmap while lod > 0 and linear otherwise, input extend = hold.
+//   The pixel footprint is clipped to the source rect (coverage 0 outside -> transparent, fractional on the edge).
+//   Only this pass ever reads through a mipmap filter; the blend passes below use texelFetch only.
+// uAdjust 0..6 (blend / adjust passes): inputs 0 = below, 1 = source, 2 = mask.  The source is at document
+//   size (a resample result, group result, adjustment source) or a surface placed by an INTEGER offset:
+//   source texel = document pixel - round(uXform.xy)  (outside the source, or outside the mask = transparent / 0).
 // uAdjust = 0: W3C Compositing and Blending L1 "source-over with blend mode" (== Canvas 2D
 //   globalCompositeOperation + globalAlpha), premultiplied in / out.
 // uAdjust = 1: out = mix(below, adjusted, opacity * mask)   (adjusted = premultiplied RGBA, input 1).
@@ -14,10 +27,9 @@
 //   3 bright/contr uA = (brightness, contrast)         4 invert
 //   5 threshold   uA.x = level (Rec.709 luma >= level -> white else black)
 //   6 hue/sat/val uA = (hue deg, saturation, value)   true HSV edit
-// All inputs are fetched with texelFetch, so there is no filtering and no resampling.
 
 uniform vec4 uParams;
-uniform vec2 uOffset;
+uniform vec4 uXform;
 uniform vec4 uA;      // adjustment parameters (uAdjust 2..6)
 uniform vec4 uB;
 
@@ -130,16 +142,53 @@ vec3 adjustFn(int k, vec3 c) {
     return hsv2rgb(vec3(h.x + uA.x, min(1.0, h.y * uA.y), h.z * uA.z));
 }
 
+// document pixel centre (top-left origin, continuous) -> layer pixels; samples source (input 0) and mask (input 1)
+void resample() {
+    vec2 outSize = uTDOutputInfo.res.zw;
+    vec2 srcSz = vec2(textureSize(sTD2DInputs[0], 0));
+    vec2 sc = max(uXform.zw, vec2(1e-6));
+    vec2 c = vec2(gl_FragCoord.x, outSize.y - gl_FragCoord.y);
+    vec2 l = (c - uXform.xy) / sc;
+    vec2 h = 0.5 / sc;                                   // half pixel footprint in layer pixels
+    vec2 cov2 = clamp((min(l + h, srcSz) - max(l - h, vec2(0.0))) / (2.0 * h), 0.0, 1.0);
+    float cov = cov2.x * cov2.y;
+    vec4 src = vec4(0.0);
+    if (cov > 0.0) {
+        bool exact = abs(sc.x - 1.0) < 1e-6 && abs(sc.y - 1.0) < 1e-6
+            && abs(uXform.x - floor(uXform.x + 0.5)) < 1e-4 && abs(uXform.y - floor(uXform.y + 0.5)) < 1e-4;
+        vec2 uv = vec2(l.x / srcSz.x, 1.0 - l.y / srcSz.y);
+        float lod = max(0.0, -0.5 * log2(sc.x * sc.y) - 0.5);
+        ivec2 ip = ivec2(floor(l));
+        float m = 1.0;
+        if (exact) {
+            src = texelFetch(sTD2DInputs[0], clamp(ivec2(ip.x, int(srcSz.y) - 1 - ip.y), ivec2(0), ivec2(srcSz) - 1), 0);
+        } else {
+            src = textureLod(sTD2DInputs[0], uv, lod);
+        }
+        if (uParams.z > 0.5) {
+            ivec2 mSize = textureSize(sTD2DInputs[1], 0);
+            if (exact && mSize == ivec2(srcSz)) {
+                m = texelFetch(sTD2DInputs[1], clamp(ivec2(ip.x, mSize.y - 1 - ip.y), ivec2(0), mSize - 1), 0).r;
+            } else {
+                m = textureLod(sTD2DInputs[1], uv, lod).r;
+            }
+        }
+        src *= cov * m;
+    }
+    fragColor = TDOutputSwizzle(src);
+}
+
 void main() {
+    if (uParams.w > 6.5) { resample(); return; }
     ivec2 p = ivec2(gl_FragCoord.xy);
     vec4 below = texelFetch(sTD2DInputs[0], p, 0);
     int mode = int(uParams.x + 0.5);
     float opacity = clamp(uParams.y, 0.0, 1.0);
 
-    // document (top-left) pixel -> source texel (bottom-left)
+    // document (top-left) pixel -> source texel (bottom-left), integer offset only
     ivec2 outSize = textureSize(sTD2DInputs[0], 0);
     ivec2 srcSize = textureSize(sTD2DInputs[1], 0);
-    ivec2 d = ivec2(p.x, outSize.y - 1 - p.y) - ivec2(floor(uOffset + 0.5));
+    ivec2 d = ivec2(p.x, outSize.y - 1 - p.y) - ivec2(floor(uXform.xy + 0.5));
     vec4 src = vec4(0.0);
     float m = 1.0;
     if (d.x >= 0 && d.y >= 0 && d.x < srcSize.x && d.y < srcSize.y) {

@@ -42,10 +42,40 @@ Builds on `DESIGN_V3.md` (tag `v0.3.0`). Protocol: `PROTOCOL.md` §7 (version 5)
 
 ## 4. TouchDesigner
 
-- Blend shader: `uOffset` becomes a full mapping (`uXform = (x, y, sx, sy)`, `uSrcSize`); sampling uses
-  normalised texture coordinates with linear filtering (mipmaps when `sx < 1` or `sy < 1`); outside the
-  source = transparent; the mask uses the same mapping. The base layer's blend node gets the TD Input's
-  transform. Surfaces Script TOPs are allocated at their own size.
+- **Resample pass + blend pass** (`blend.glsl`): `uOffset` became `uXform = (x, y, sx, sy)`
+  (`doc = (x, y) + (sx, sy) · layer`). A pixel/base layer whose transform is **not** an integer offset at scale 1
+  gets an extra GLSL TOP `xf_L_<id>` (`uAdjust = 7`, document-size output, inputs: surface, mask or the surface
+  again, surface) that renders surface × coverage × mask into document space; the blend node then reads it with
+  `texelFetch` (identity mapping, no mask). Integer offsets at scale 1 have no extra node: the blend pass places the
+  surface itself (bit exact). TD builds mip chains for *all* inputs of a mipmap-filtered GLSL TOP (and keeps doing
+  so), so only `xf_L_*` nodes ever use `inputfiltertype = mipmap`, and their inputs are surfaces or `base_src`
+  (never the doc-size accumulator); every blend/shape node is `nearest`. The pass is created/removed (pool node,
+  3 connects) when a transform enters/leaves the integer-offset case; a transform edit otherwise is 4 uniform sets
+  (+ one `inputfiltertype` set when crossing the mip threshold).
+- Sampling in the resample pass: linear; trilinear mip level `lod = max(0, -log2(sqrt(sx·sy)) - 0.5)`, i.e. the
+  **geometric mean** of the two scales (anisotropic scales are not mipped by the larger factor), minus half a
+  level. This was fitted against Chromium/Skia `drawImage` with `imageSmoothingQuality = 'medium'` (best lod vs
+  scale for isotropic and anisotropic cases): `sx=2, sy=0.5` is lod 0, `sx=0.5, sy=0.25` is lod 1. The filter is
+  `mipmap` only while `lod > 0` (`sx·sy < 0.5`). Input extend = hold; outside the source rect = transparent; edge
+  pixels get fractional coverage (the browser canvas snaps the rect to whole pixels: 1 px fringe difference at
+  fractional positions). Preview parity: use `imageSmoothingQuality = 'medium'` (`'low'` aliases when
+  minifying, `'high'` is bicubic when magnifying and differs by up to ~30/255). The base layer's resample/blend
+  node gets the TD Input's transform (only while an input is connected; the input keeps its own resolution;
+  `blank`/the output stay canvas sized). Surface Script TOPs `s<slot>` are allocated at `surfaceW × surfaceH`
+  (mask: its layer's surface size; masks of adjustment/group/text/shape layers: document size; missing sizes:
+  document size).
+- Text/shape layers are always TD rendered at document size (`rasterize` and any slot on them are ignored).
+- `DocNetwork` interface additions (see DESIGN_V2 §8): `surface_size(slot) -> (w, h) | None` (also for slots in
+  their grace period), Flatten API (called by the ext **every frame** while a request is in flight, all cheap
+  lookups): `render_layer_source(layer_id) -> TOP | None` (the text/shape source node at document resolution,
+  transparent background, premultiplied, independent of opacity/mask/blend/visibility; `None` = layer gone / not a
+  text-shape layer; the transparent `blank` TOP for a layer without a spec), `render_layer_status(layer_id) ->
+  'ready' | 'pending' | 'failed' | None` (does at most `FLATTEN_BUDGET` = 200 Text TOP measurement cooks per call,
+  so polling converges; `'failed'` = the layout fell back to the 0.5 em estimate and is retried with back-off),
+  `render_layer_ready(layer_id) -> bool`, `render_layer_token(layer_id)` (changes on every real `apply()`, when the
+  node behind the layer is replaced or its layout is refined; `None` = gone; compare before cooking and after the
+  readback, drop the result if it differs). `set_input_connected()` also re-plans the base transform on the next
+  `apply()`. A surface size change is 2 parameter sets on the existing Script TOP (the ext must re-upload).
 - Flatten: `renderLayer {requestId, layerId}` → TD renders the text/shape source node alone at doc
   resolution (premultiplied → straight), served like a TOP import (`topReady` + `GET /top`).
 - Canvas: `setCanvas {w, h, mode}` from the active client updates `Docsizemode`/`Docw`/`Doch`; in

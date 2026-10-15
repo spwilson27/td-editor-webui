@@ -13,11 +13,12 @@ Checks (each prints PASS/FAIL with numbers):
   misc    masks, offsets, hidden layers, opacity, group isolation, base input
   view    TD-view overlay placement + checkerboard
   persist freeze / read_locked / thaw, .tox round trip
+  xform   v4 transforms: scale/offset/mask/base vs numpy and Chromium canvas, Flatten source; xperf: timings
   perf    apply() timings and GPU cook time of a 20-layer 1080p document
   shapes  v3 shape layers (shape.glsl) vs a supersampled numpy reference, every shape type
   shapes-gl  same, offline: shape.glsl in headless Chromium WebGL2 (no TouchDesigner)
   text    v3 text layers vs Chromium Canvas 2D (textShape.ts conventions): bbox +-2 px, coverage IoU
-  v3perf  apply() timings for text/shape edits and rasterize toggles, GPU cost per layer @1080p
+  v3perf  apply() timings for text/shape edits, GPU cost per layer @1080p
 """
 
 from __future__ import annotations
@@ -193,7 +194,7 @@ _emit("ok")
 
 def layer(id_, kind="pixel", **kw) -> dict:
     d = dict(id=id_, kind=kind, parentId=None, name=id_, visible=True, opacity=1.0, blend="normal",
-             x=0, y=0, slot=None, mask=None, adjustment=None)
+             x=0, y=0, sx=1.0, sy=1.0, surfaceW=None, surfaceH=None, slot=None, mask=None, adjustment=None)
     d.update(kw)
     return d
 
@@ -1019,6 +1020,393 @@ _emit({"g": g, "cpu": cpu, "by": by})
     check("perf: DocNetwork.apply structural change (add/delete/reorder) < 10 ms", max(adds) < 10.0, f"worst {max(adds):.2f} ms")
 
 
+# --------------------------------------------------------------------------- checks: transforms (v4)
+
+XFORM_JS = r"""
+const { chromium } = require('playwright');
+const fs = require('fs');
+(async () => {
+  const inp = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+  const browser = await chromium.launch();
+  const page = await browser.newPage();
+  const out = await page.evaluate(({ cases, W, H }) => {
+    const mk = (data, w, h, maskAlpha) => {
+      const c = document.createElement('canvas'); c.width = w; c.height = h;
+      const px = new Uint8ClampedArray(data);
+      if (maskAlpha) for (let i = 0; i < w * h; i++) { px[i * 4 + 3] = px[i * 4]; px[i * 4] = px[i * 4 + 1] = px[i * 4 + 2] = 255; }
+      c.getContext('2d').putImageData(new ImageData(px, w, h), 0, 0); return c;
+    };
+    const res = [];
+    for (const cs of cases) {
+      const row = {};
+      for (const q of ['low', 'medium', 'high']) {
+        const src = mk(cs.src, cs.sw, cs.sh, false);
+        const layer = document.createElement('canvas'); layer.width = W; layer.height = H;
+        const lx = layer.getContext('2d');
+        lx.imageSmoothingEnabled = true; lx.imageSmoothingQuality = q;
+        lx.drawImage(src, cs.x, cs.y, cs.sw * cs.sx, cs.sh * cs.sy);
+        if (cs.mask) {
+          const m = mk(cs.mask, cs.sw, cs.sh, true);
+          lx.globalCompositeOperation = 'destination-in';
+          lx.drawImage(m, cs.x, cs.y, cs.sw * cs.sx, cs.sh * cs.sy);
+          lx.globalCompositeOperation = 'source-over';
+        }
+        const o = document.createElement('canvas'); o.width = W; o.height = H;
+        const ox = o.getContext('2d'); ox.globalAlpha = cs.opacity; ox.drawImage(layer, 0, 0);
+        row[q] = Array.from(ox.getImageData(0, 0, W, H).data);
+      }
+      res.push(row);
+    }
+    return res;
+  }, inp);
+  fs.writeFileSync(process.argv[3], JSON.stringify(out));
+  await browser.close();
+})();
+"""
+
+
+def chromium_xform(cases, W, H):
+    """Canvas 2D drawImage(smoothing) reference for each case -> list of {quality: premultiplied float (H, W, 4) 0..255}."""
+    web = os.path.join(ROOT, "web")
+    if not os.path.isdir(os.path.join(web, "node_modules", "playwright")):
+        return None
+    with tempfile.TemporaryDirectory() as d:
+        js = os.path.join(d, "ref.cjs")
+        open(js, "w").write(XFORM_JS)
+        inp, outp = os.path.join(d, "in.json"), os.path.join(d, "out.json")
+        json.dump({"W": W, "H": H, "cases": [
+            {"src": c["src"].ravel().tolist(), "sw": c["src"].shape[1], "sh": c["src"].shape[0],
+             "mask": None if c.get("mask") is None else c["mask"].ravel().tolist(),
+             "x": c["x"], "y": c["y"], "sx": c["sx"], "sy": c["sy"], "opacity": c.get("opacity", 1.0)} for c in cases]},
+            open(inp, "w"))
+        env = dict(os.environ, NODE_PATH=os.path.join(web, "node_modules"))
+        r = subprocess.run(["node", js, inp, outp], cwd=web, capture_output=True, text=True, timeout=300, env=env)
+        if r.returncode != 0 or not os.path.exists(outp):
+            print("chromium xform reference failed:", r.stderr[-500:])
+            return None
+        o = json.load(open(outp))
+    return [{q: premul255(np.array(v, np.uint8).reshape(H, W, 4)) for q, v in row.items()} for row in o]
+
+
+def xform_sources():
+    rng = np.random.default_rng(11)
+    noise = rng.integers(0, 256, (30, 40, 4), dtype=np.uint8)
+    noise[..., 3] = 255
+    yy, xx = np.mgrid[0:120, 0:160]
+    smooth = np.zeros((120, 160, 4), np.uint8)       # photo-like: low frequencies + a soft (3 px) circular edge
+    disc = 0.5 + 0.5 * np.tanh((30.0 - np.hypot(xx - 80.0, yy - 60.0)) / 1.5)
+    smooth[..., 0] = 127 + 100 * np.sin(xx / 17.0) * np.cos(yy / 23.0) + 60 * disc
+    smooth[..., 1] = 127 + 100 * np.cos(yy / 13.0) - 70 * disc
+    smooth[..., 2] = 127 + 90 * np.sin((xx + yy) / 11.0)
+    smooth[..., 3] = 255
+    checker = np.zeros((120, 160, 4), np.uint8)      # hard-edged stress image (10 px checker)
+    checker[..., 0] = 127 + 120 * np.sin(xx / 17.0)
+    checker[..., 1] = 127 + 120 * np.cos(yy / 13.0)
+    checker[..., 2] = np.where(((xx // 10) + (yy // 10)) % 2 == 0, 230, 40)
+    checker[..., 3] = 255
+    mask_a = rng.integers(0, 256, (30, 40, 4), dtype=np.uint8)
+    mask_a[..., 1] = mask_a[..., 2] = mask_a[..., 0]
+    mask_a[..., 3] = 255
+    mask_b = np.zeros((120, 160, 4), np.uint8)
+    mask_b[..., 0] = 128 + 127 * np.sin(xx / 9.0) * np.cos(yy / 11.0)
+    mask_b[..., 1] = mask_b[..., 2] = mask_b[..., 0]
+    mask_b[..., 3] = 255
+    return noise, smooth, mask_a, mask_b, checker
+
+
+def xform_cases():
+    A, B, MA, MB, K = xform_sources()
+    c = lambda name, src, x, y, sx, sy, kind, **kw: dict(name=name, src=src, x=x, y=y, sx=sx, sy=sy, kind=kind, **kw)
+    return [
+        c("int offset (7,-5) x1", A, 7, -5, 1.0, 1.0, "exact"),
+        c("int offset (-3,40) x1", B[:60, :80].copy(), -3, 40, 1.0, 1.0, "exact"),
+        c("frac offset (3.5,2.25) x1", A, 3.5, 2.25, 1.0, 1.0, "frac"),
+        c("frac offset (0.3,-0.7) x1", A, 0.3, -0.7, 1.0, 1.0, "frac"),
+        c("x2 at (5,4)", A, 5, 4, 2.0, 2.0, "up"),
+        c("x3.7 at (-6.3,4.4)", A, -6.3, 4.4, 3.7, 3.7, "up"),
+        c("sx2 sy0.5 at (10.5,20.25)", A, 10.5, 20.25, 2.0, 0.5, "mixed"),
+        c("x0.5 at (3,3)", B, 3, 3, 0.5, 0.5, "down"),
+        c("x0.25 at (10,10)", B, 10, 10, 0.25, 0.25, "down"),
+        c("x0.5 at (3.5,3.25)", B, 3.5, 3.25, 0.5, 0.5, "down"),
+        c("x0.3 at (-4.7,6.1)", B, -4.7, 6.1, 0.3, 0.3, "down"),
+        c("sx0.5 sy1.5 at (8,-10)", B, 8, -10, 0.5, 1.5, "mixed"),
+        c("sx0.5 sy0.25 at (2.5,3.5)", B, 2.5, 3.5, 0.5, 0.25, "down"),
+        c("x0.1 at (1.5,2.5)", B, 1.5, 2.5, 0.1, 0.1, "down"),
+        c("x0.72 at (1.3,2.7)", B, 1.3, 2.7, 0.72, 0.72, "down"),
+        c("sx2 sy0.1 at (2.5,3.5)", B, 2.5, 3.5, 2.0, 0.1, "down"),
+        c("[stress] noise x0.5 at (3.5,3.25)", np.tile(A, (2, 2, 1)), 3.5, 3.25, 0.5, 0.5, "stress"),
+        c("[stress, hard edges] checker x0.5 at (3.5,3.25)", K, 3.5, 3.25, 0.5, 0.5, "stress"),
+        c("[stress, hard edges] checker x0.3 at (-4.7,6.1)", K, -4.7, 6.1, 0.3, 0.3, "stress"),
+        c("[stress, hard edges] checker x0.5 at (3,3)", K, 3, 3, 0.5, 0.5, "stress"),
+        c("mask x2.5 at (4.5,3.25) op .8", A, 4.5, 3.25, 2.5, 2.5, "up", mask=MA, opacity=0.8),
+        c("mask exact (6,5) x1", A, 6, 5, 1.0, 1.0, "exact", mask=MA),
+        c("mask x0.5 at (4,4)", B, 4, 4, 0.5, 0.5, "down", mask=MB),
+    ]
+
+
+def test_xform():
+    DW, DH = 96, 80
+    setup(DW, DH)
+    cases = xform_cases()
+    chrome = chromium_xform(cases, DW, DH)
+    if chrome is None:
+        print("  (Chromium/Playwright unavailable: only the numpy comparison runs)")
+    sys.path.insert(0, os.path.join(ROOT, "td", "tests"))
+    import fakenet
+    worst = {"exact": [0, 0], "frac": [0, 0], "up": [0, 0], "down": [0, 0], "mixed": [0, 0], "stress": [0, 0]}
+    for i, cs in enumerate(cases):
+        src = cs["src"]
+        sh, sw = src.shape[:2]
+        upload(1, src)
+        lay = layer("a", slot=1, x=cs["x"], y=cs["y"], sx=cs["sx"], sy=cs["sy"], surfaceW=sw, surfaceH=sh,
+                    opacity=cs.get("opacity", 1.0))
+        if cs.get("mask") is not None:
+            upload(2, cs["mask"])
+            lay["mask"] = {"slot": 2, "enabled": True}
+        apply([base_layer(), lay], DW, DH)
+        out = read_out(True) * 255.0
+        P = premul_f(src)
+        ref = fakenet.sample_reference(P, DW, DH, cs["x"], cs["y"], cs["sx"], cs["sy"])
+        if cs.get("mask") is not None:
+            m = fakenet.sample_reference(cs["mask"][..., :1] / 255.0, DW, DH, cs["x"], cs["y"], cs["sx"], cs["sy"],
+                                         coverage=False)
+            ref = ref * m
+        ref = ref * cs.get("opacity", 1.0) * 255.0
+        # interior = every pixel whose footprint lies fully inside the source rect (coverage 1)
+        jj, ii = np.mgrid[0:DH, 0:DW]
+        lx, ly = (ii + 0.5 - cs["x"]) / cs["sx"], (jj + 0.5 - cs["y"]) / cs["sy"]
+        hx, hy = 0.5 / cs["sx"], 0.5 / cs["sy"]
+        inner = (lx - hx >= 0) & (lx + hx <= sw) & (ly - hy >= 0) & (ly + hy <= sh)
+        edge = ~inner & (np.abs(out).sum(-1) + np.abs(ref).sum(-1) > 0)
+        dn = np.abs(out - ref)
+        line = f"  [{cs['name']}] ({inner.sum()} interior, {edge.sum()} edge px)\n      TD vs numpy: interior max {dn[inner].max():.2f}"
+        if edge.any():
+            line += f", edge max {dn[edge].max():.2f}"
+        if chrome is not None:
+            parts = []
+            for q in ("low", "medium", "high"):
+                dc = np.abs(out - chrome[i][q]).max(-1)
+                parts.append(f"{q}: int max {dc[inner].max():.1f} mean {dc[inner].mean():.2f}"
+                             + (f" / edge max {dc[edge].max():.1f}" if edge.any() else ""))
+            line += "\n      TD vs Chromium canvas  " + " | ".join(parts)
+            k = cs["kind"]
+            best = min(np.abs(out - chrome[i][q]).max(-1)[inner].max() for q in ("low", "medium"))
+            worst[k][0] = max(worst[k][0], best)
+        worst[cs["kind"]][1] = max(worst[cs["kind"]][1], dn[inner].max())
+        print(line)
+        lim = 0.6 if cs["kind"] == "exact" else 2.5 if cs["kind"] in ("frac", "up", "mixed") else 6.0
+        check(f"xform: TD vs numpy reference, {cs['name']}", dn[inner].max() < lim, f"interior max {dn[inner].max():.2f} (limit {lim})")
+    if chrome is not None:
+        check("xform: integer position at scale 1 vs Chromium canvas <= 3/255", worst["exact"][0] <= 3.0, f"{worst['exact'][0]:.1f}")
+        for k in ("frac", "up", "mixed", "down"):
+            check(f"xform: {k} interiors vs Chromium canvas (best of low/medium; 'high' is bicubic) <= 8/255", worst[k][0] <= 8.0,
+                  f"{worst[k][0]:.1f}")
+        check("xform: stress (hard-edged checker, noise) interiors vs Chromium canvas medium <= 8/255", worst["stress"][0] <= 8.0,
+              f"{worst['stress'][0]:.1f}")
+
+
+def test_xform_base_and_flatten():
+    """Base layer transform on a TD Input of its own resolution; render_layer_source() for Flatten."""
+    sys.path.insert(0, os.path.join(ROOT, "td", "tests"))
+    import fakenet
+    DW, DH = 96, 80
+    setup(DW, DH)
+    A, B, MA, MB, K = xform_sources()
+    src = B[:90, :120].copy()                       # the "TD Input": 120 x 90, not the document size
+    sh, sw = src.shape[:2]
+    path = os.path.join(WORK, "input_img.npy")
+    np.save(path, np.ascontiguousarray(premul_f(src)[::-1].astype(np.float32)))
+    td(PRELUDE + f"""
+p = op("/project1")
+for n in ("_netdev_src2", "_netdev_src2_cb"):
+    if p.op(n): p.op(n).destroy()
+s = p.create(scriptTOP, "_netdev_src2")
+s.par.outputresolution = "custom"; s.par.resolutionw = {sw}; s.par.resolutionh = {sh}
+cb = p.create(textDAT, "_netdev_src2_cb")
+cb.text = "import numpy as np\\ndef onCook(scriptOp):\\n    scriptOp.copyNumpyArray(np.load({path!r}))\\n"
+s.par.callbacks = cb
+st = _st(); c = st.comp
+c.create(inTOP, "in1")
+c.inputConnectors[0].connect(s)
+s.cook(force=True)
+_emit([s.width, s.height])
+""")
+    cases = [dict(name="base identity", x=0, y=0, sx=1.0, sy=1.0, exact=True),
+             dict(name="base moved (7,-5)", x=7, y=-5, sx=1.0, sy=1.0, exact=True),
+             dict(name="base x0.6 at (5.5,-3.25)", x=5.5, y=-3.25, sx=0.6, sy=0.6, exact=False),
+             dict(name="base x1.4 at (-10,6.5)", x=-10, y=6.5, sx=1.4, sy=1.4, exact=False),
+             dict(name="base sx0.5 sy0.3 at (0,0)", x=0, y=0, sx=0.5, sy=0.3, exact=False)]
+    chrome = chromium_xform([dict(src=src, x=c["x"], y=c["y"], sx=c["sx"], sy=c["sy"]) for c in cases], DW, DH)
+    P = premul_f(src)
+    for i, cs in enumerate(cases):
+        lay = layer("base", "base", x=cs["x"], y=cs["y"], sx=cs["sx"], sy=cs["sy"], surfaceW=sw, surfaceH=sh)
+        apply([lay], DW, DH)
+        out = read_out(True) * 255.0
+        ref = fakenet.sample_reference(P, DW, DH, cs["x"], cs["y"], cs["sx"], cs["sy"]) * 255.0
+        jj, ii = np.mgrid[0:DH, 0:DW]
+        lx, ly = (ii + 0.5 - cs["x"]) / cs["sx"], (jj + 0.5 - cs["y"]) / cs["sy"]
+        inner = (lx - 0.5 / cs["sx"] >= 0) & (lx + 0.5 / cs["sx"] <= sw) & (ly - 0.5 / cs["sy"] >= 0) & (ly + 0.5 / cs["sy"] <= sh)
+        dn = np.abs(out - ref).max(-1)
+        msg = f"vs numpy interior max {dn[inner].max():.2f}"
+        ok = dn[inner].max() < (0.6 if cs["exact"] else 2.5)
+        if chrome is not None:
+            dc = np.abs(out - chrome[i]["medium"]).max(-1)
+            msg += f", vs Chromium(medium) interior max {dc[inner].max():.1f}"
+            ok = ok and dc[inner].max() <= (3.0 if cs["exact"] else 8.0)
+        check(f"xform: {cs['name']} (input {sw}x{sh} in a {DW}x{DH} document)", ok, msg)
+    r = td(PRELUDE + "o = _st().net.output(); _emit([o.width, o.height])")
+    check("xform: output is document sized, independent of the input", r == [DW, DH], str(r))
+    td(PRELUDE + "st = _st(); st.comp.inputConnectors[0].disconnect(); _emit(1)")
+    apply([layer("base", "base", x=3, y=3, sx=0.5, sy=0.5)], DW, DH)
+    out = read_out(True)
+    check("xform: base without input is transparent", out.max() == 0, f"max {out.max()}")
+    td(PRELUDE + """
+p = op("/project1")
+for n in ("_netdev_src2", "_netdev_src2_cb"):
+    if p.op(n): p.op(n).destroy()
+_emit(1)
+""")
+
+    # ---- flatten: render_layer_source == the layer alone, unaffected by opacity / mask / blend / visibility
+    setup(DW, DH)
+    rng = np.random.default_rng(2)
+    upload(1, rng.integers(0, 256, (DH, DW, 4), dtype=np.uint8))
+    upload(9, np.concatenate([np.repeat(rng.integers(0, 256, (DH, DW, 1), dtype=np.uint8), 3, -1), np.full((DH, DW, 1), 255, np.uint8)], -1))
+    rect = {"type": "rect", "x": 10.0, "y": 8.0, "w": 50.0, "h": 40.0, "radius": 6, "fill": fill_(), "stroke": stroke_(w=4), "rotation": 12}
+    ts = text_spec(size=24.0, text="Flatten me", x=6.0, y=30.0)
+    noisy = dict(opacity=0.3, blend="multiply", visible=False, mask={"slot": 9, "enabled": True})
+    full = [base_layer(), layer("p", slot=1, surfaceW=DW, surfaceH=DH),
+            shape_layer("sh", dict(rect), **noisy), text_layer("tx", dict(ts), **noisy)]
+    plain = [base_layer(), shape_layer("sh", dict(rect)), text_layer("tx", dict(ts))]
+    flat_path = os.path.join(WORK, "flat.npy")
+    for lid, kind in (("sh", "shape"), ("tx", "text")):
+        apply(full, DW, DH)
+        settle()
+        t = td(PRELUDE + f"""
+net = _st().net
+for _ in range(3):
+    if net.render_layer_ready({lid!r}): break
+tok = net.render_layer_token({lid!r})
+op_ = net.render_layer_source({lid!r})
+op_.cook(force=True)
+np.save({flat_path!r}, op_.numpyArray().astype(np.float32))
+_emit({{"w": op_.width, "h": op_.height, "name": op_.name, "same": tok == net.render_layer_token({lid!r})}})
+""")
+        flat = np.load(flat_path)[::-1]
+        only = [base_layer()] + [l for l in plain if l["id"] == lid]
+        apply(only, DW, DH)
+        ref = read_out(True)
+        d = np.abs(flat - ref).max() * 255
+        ink = int((ref[..., 3] > 0).sum())
+        check(f"flatten: render_layer_source({kind}) = the layer alone at document size, premultiplied (hidden, opacity .3, multiply, masked)",
+              t["w"] == DW and t["h"] == DH and ink > 50 and d < 1.5 and t['same'], f"{t['w']}x{t['h']} node {t['name']}, {ink} inked px, max diff {d:.2f}/255")
+
+
+def test_xform_perf():
+    W, H = 1920, 1080
+    setup(W, H)
+    n = 16
+    td(PRELUDE + f"""
+st = _st(); rng = np.random.default_rng(1)
+a = rng.integers(0, 256, (64, 64, 4), dtype=np.uint8)
+big = np.ascontiguousarray(np.tile(a, ({H} // 64 + 1, {W} // 64 + 1, 1))[:{H}, :{W}])
+for s in list(range(1, {n} + 1)) + [100, 101, 102]:
+    st.buffers[s] = big
+_emit(1)
+""", timeout=300)
+
+    def doc(mode):
+        ls = [base_layer()]
+        for i in range(n):
+            kw = dict(slot=i + 1, surfaceW=W, surfaceH=H, blend=("normal", "multiply", "screen")[i % 3], opacity=0.9)
+            if mode == "int-offset":
+                kw.update(x=(i * 3) % 40, y=(i * 5) % 30)
+            elif mode == "bilinear":
+                kw.update(x=(i * 3) % 40 + 0.5, y=(i * 5) % 30 + 0.25, sx=1.0 + 0.02 * i, sy=1.0 + 0.02 * i)
+            elif mode == "mip":
+                kw.update(x=(i * 3) % 40 + 0.5, y=(i * 5) % 30 + 0.25, sx=0.45, sy=0.45)
+            if i % 4 == 1:
+                kw["mask"] = {"slot": 100 + i // 4 % 3, "enabled": True}
+            ls.append(layer(f"p{i}", **kw))
+        return ls
+
+    def gpu_cook():
+        code = PRELUDE + """
+st = _st(); net = st.net
+tops = [c for c in net.doc.children if c.isTOP]
+g = sum(c.gpuCookTime for c in tops if c.OPType == "glslTOP")
+net.surface_top(1).cook(force=True)
+net.output().cook(force=True)
+_emit({"g": g})
+"""
+        rows = [td(code, timeout=120)["g"] for _ in range(30)][8:]
+        return float(np.median(rows)), float(max(rows))
+
+    res = {}
+    for mode in ("identity", "int-offset", "bilinear", "mip"):
+        apply(doc(mode), W, H)
+        settle()
+        res[mode] = gpu_cook()
+        print(f"  GPU cook, {n} full-size pixel layers (4 masked) @1080p, {mode:10s}: median {res[mode][0]:.2f} ms  max {res[mode][1]:.2f} ms")
+    over = (res["bilinear"][0] - res["int-offset"][0]) / n
+    check("xform perf: a resample pass (bilinear, full-size layer @1080p) adds < 0.2 ms over the exact path",
+          over < 0.2, f"{over:.3f} ms per layer ({res['bilinear'][0]:.2f} vs {res['int-offset'][0]:.2f} ms for 16 layers)")
+    setup(W, H)
+    td(PRELUDE + f"""
+st = _st(); rng = np.random.default_rng(1)
+a = rng.integers(0, 256, (64, 64, 4), dtype=np.uint8)
+big = np.ascontiguousarray(np.tile(a, ({H} // 64 + 1, {W} // 64 + 1, 1))[:{H}, :{W}])
+for s in list(range(1, {n} + 1)) + [100, 101, 102]:
+    st.buffers[s] = big
+_emit(1)
+""", timeout=300)
+    # GPU timings on this machine jump between ~3.9 and ~5.8 ms for the SAME network (also without any minify), so
+    # every state is measured in 4 interleaved cycles and compared by its best (minimum) median.
+    def minified(k):
+        ls = doc("bilinear")
+        for i in range(k):
+            ls[1 + (i * n) // k]["sx"] = ls[1 + (i * n) // k]["sy"] = 0.45
+        return ls
+    base_s, min4_s, min16_s, after_s = [], [], [], []
+    for cyc in range(4):
+        for k, bucket in ((0, base_s), (4, min4_s), (16, min16_s), (0, after_s)):
+            apply(minified(k), W, H)
+            settle()
+            bucket.append(gpu_cook()[0])
+        print(f"  cycle {cyc}: baseline {base_s[-1]:.2f}  4 minified {min4_s[-1]:.2f}  16 minified {min16_s[-1]:.2f}  after un-minify {after_s[-1]:.2f} ms")
+    cost = (min(min16_s) - min(base_s)) / 16.0
+    check("xform perf: GPU cost of a minified (mipmapped) full-size layer @1080p < 0.25 ms (best of 4)", cost < 0.25,
+          f"{cost:.3f} ms per layer (16 minified {min(min16_s):.2f} vs {min(base_s):.2f} ms)")
+    check("xform perf: after un-minifying, GPU cost is within the machine's 1.5 ms bimodal timing noise of the baseline (best of 4)",
+          min(after_s) - min(base_s) < 1.5,
+          f"baseline {min(base_s):.2f} -> after {min(after_s):.2f} ms")
+    apply(doc("identity"), W, H)
+    settle()
+    ident = gpu_cook()[0]
+    print(f"  GPU cook, identity transforms after all that (resample passes removed): {ident:.2f} ms")
+
+    apply(doc("bilinear"), W, H)
+    settle()
+
+    def med(a):
+        return float(np.median(a))
+
+    def edit(mutate, k=20):
+        cur = json.loads(json.dumps(doc("bilinear")))
+        out = []
+        for i in range(k):
+            mutate(cur, i)
+            out.append(apply(cur, W, H)["ms"])
+        return out
+    t_move = edit(lambda c, i: c[5].__setitem__("x", 10.0 + 0.25 * i))
+    t_scale = edit(lambda c, i: (c[6].__setitem__("sx", 1.0 + 0.01 * i), c[6].__setitem__("sy", 1.0 + 0.01 * i)))
+    t_drag = edit(lambda c, i: (c[7].__setitem__("sx", 0.9 - 0.02 * i), c[7].__setitem__("sy", 0.9 - 0.02 * i), c[7].__setitem__("x", i)))
+    print(f"  apply() transform edit (17 layers @1080p): move {med(t_move):.2f}/{max(t_move):.2f} ms, scale {med(t_scale):.2f}/{max(t_scale):.2f} ms, "
+          f"scale across the mip threshold {med(t_drag):.2f}/{max(t_drag):.2f} ms")
+    worst = max(med(t_move), med(t_scale), med(t_drag))
+    check("xform perf: apply() for a transform edit < 1 ms (median)", worst < 1.0, f"{worst:.2f} ms")
+
+
 # --------------------------------------------------------------------------- checks: shapes (v3)
 
 RED = {"r": 230, "g": 40, "b": 30, "a": 255}
@@ -1035,12 +1423,10 @@ def stroke_(c=BLUE, w=6.0, on=True):
 
 
 def shape_layer(id_, spec, **kw):
-    kw.setdefault("rasterize", False)
     return layer(id_, "shape", shape=spec, text=None, **kw)
 
 
 def text_layer(id_, spec, **kw):
-    kw.setdefault("rasterize", False)
     return layer(id_, "text", text=spec, shape=None, **kw)
 
 
@@ -1684,7 +2070,7 @@ def test_text():
 
 
 def test_v3perf():
-    """apply() timings for spec edits / rasterize toggles and GPU cost per text / shape layer @1080p."""
+    """apply() timings for spec edits and GPU cost per text / shape layer @1080p."""
     W, H = 1920, 1080
     setup(W, H)
     star = {"type": "polygon", "cx": 900.0, "cy": 500.0, "radius": 300.0, "sides": 7, "innerRatio": 0.5,
@@ -1695,12 +2081,12 @@ def test_v3perf():
     shapes = [star, rect, arrow, ell]
     ts = text_spec(size=96.0, text="Hamburgefonstiv\nsecond line", x=100.0, y=100.0)
 
-    def doc(n_shape=0, n_text=0, raster=False):
+    def doc(n_shape=0, n_text=0):
         ls = [base_layer()]
         for i in range(n_shape):
-            ls.append(shape_layer(f"s{i}", dict(shapes[i % 4]), rasterize=raster, slot=(50 + i) if raster else None))
+            ls.append(shape_layer(f"s{i}", dict(shapes[i % 4])))
         for i in range(n_text):
-            ls.append(text_layer(f"t{i}", dict(ts, y=100.0 + 20 * i, boxWidth=900.0 if i % 2 else None), rasterize=raster, slot=(80 + i) if raster else None))
+            ls.append(text_layer(f"t{i}", dict(ts, y=100.0 + 20 * i, boxWidth=900.0 if i % 2 else None)))
         return ls
 
     def gpu(label, ls, kinds):
@@ -1758,18 +2144,6 @@ _emit({"g": g, "cpu": cpu, "n": len(mine)})
     worst = max(med(a) for a in (t_move, t_rot, t_col, t_tmove, t_tcol, t_tbox, t_tsize))
     check("v3 perf: apply() for a text / shape spec edit < 2 ms (median)", worst < 2.0, f"worst median {worst:.2f} ms")
 
-    # rasterize toggles
-    cur = json.loads(json.dumps(base_doc))
-    for lid, slot in (("s2", 70), ("t2", 71)):
-        l = find(cur, lid)
-        settle()
-        l["rasterize"], l["slot"] = True, slot
-        r1 = apply(cur, W, H)
-        settle()
-        l["rasterize"], l["slot"] = False, None
-        r2 = apply(cur, W, H)
-        print(f"  apply() rasterize {lid}: on {r1['ms']:.2f} ms ({json.dumps(r1['stats']['last'])}), off {r2['ms']:.2f} ms ({json.dumps(r2['stats']['last'])})")
-        check(f"v3 perf: rasterize toggle {lid} on/off < 10 ms", max(r1["ms"], r2["ms"]) < 10.0, f"{r1['ms']:.2f} / {r2['ms']:.2f} ms")
     # adding new layers
     settle()
     r = apply(doc(4, 4) + [shape_layer("new1", dict(rect))], W, H)
@@ -1798,6 +2172,12 @@ def main() -> int:
             test_adjust()
         if which in ("all", "misc"):
             test_misc()
+        if which in ("all", "xform"):
+            test_xform()
+        if which in ("all", "xform"):
+            test_xform_base_and_flatten()
+        if which in ("all", "xperf"):
+            test_xform_perf()
         if which in ("all", "view"):
             test_view()
         if which in ("all", "persist"):

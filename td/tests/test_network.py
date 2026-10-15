@@ -4,6 +4,7 @@ import json
 import os
 import re
 
+import numpy as np
 import pytest
 
 import fakenet
@@ -119,14 +120,15 @@ def test_blend_L_parameters(env):
     net, comp, log, _ = env
     net.apply(stack_of_three(), W, H)
     b = net._ops["blend_L_b"].par.value
-    assert b("vec0name") == "uParams" and b("vec1name") == "uOffset"
+    assert b("vec0name") == "uParams" and b("vec1name") == "uXform"
     assert b("vec0valuex") == 1.0        # multiply
     assert b("vec0valuey") == 0.5        # opacity
     assert b("vec0valuez") == 0.0        # no mask
     assert b("vec0valuew") == 0.0        # blend, not adjust
     assert b("pixeldat") == "blend_glsl"
     c = net._ops["blend_L_c"].par.value
-    assert (c("vec1valuex"), c("vec1valuey")) == (5.0, -3.0)
+    assert tuple(c("vec1value" + k) for k in "xyzw") == (5.0, -3.0, 1.0, 1.0)
+    assert c("inputfiltertype") == "nearest" and c("inputextenduv") == "hold"
     assert net._ops["blend_L_c"].tags == ["role:blend_L_c"]
 
 
@@ -142,7 +144,7 @@ def test_every_mode_has_a_shader_case():
 
 
 def test_shader_contract():
-    for needle in ("uniform vec4 uParams", "uniform vec2 uOffset", "texelFetch(sTD2DInputs[0]",
+    for needle in ("uniform vec4 uParams", "uniform vec4 uXform", "texelFetch(sTD2DInputs[0]", "textureLod(sTD2DInputs[1]",
                    "TDOutputSwizzle", "sTD2DInputs[2]"):
         assert needle in GLSL
 
@@ -536,7 +538,7 @@ def test_pool_nodes_are_fully_configured(env):
     net.tick()
     node, cache = net._pool[0]
     pv = node.par.value
-    assert pv("pixeldat") == "blend_glsl" and pv("vec0name") == "uParams" and pv("vec1name") == "uOffset"
+    assert pv("pixeldat") == "blend_glsl" and pv("vec0name") == "uParams" and pv("vec1name") == "uXform"
     assert pv("format") == network.FMT_BLEND
 
 
@@ -1020,12 +1022,12 @@ TEXT = {"text": "Hi", "font": "Arial", "size": 20, "color": RED, "align": "left"
         "lineHeight": 1.2, "x": 7, "y": 9, "boxWidth": None}
 
 
-def shp(id_, spec=RECT, raster=False, slot=None, **kw):
-    return L(id_, "shape", shape=spec, text=None, rasterize=raster, slot=slot, **kw)
+def shp(id_, spec=RECT, **kw):
+    return L(id_, "shape", shape=spec, text=None, **kw)
 
 
-def txt(id_, spec=TEXT, raster=False, slot=None, **kw):
-    return L(id_, "text", text=spec, shape=None, rasterize=raster, slot=slot, **kw)
+def txt(id_, spec=TEXT, **kw):
+    return L(id_, "text", text=spec, shape=None, **kw)
 
 
 def pvals(net, role, prefix):
@@ -1174,53 +1176,15 @@ def test_text_spec_edit_is_par_sets_only(env):
     assert {k for n, k, v in d["par_sets"]} == {P["text"], P["size"], "fontsizey", P["posx"], P["posy"], P["spacing"]}
 
 
-def test_shape_rasterize_toggle_swaps_source_with_minimal_rewiring(env):
+def test_text_shape_never_have_surfaces_and_ignore_legacy_fields(env):
     net, comp, log, _ = env
-    net.apply([base(), shp("s")], W, H)
-    settle(net)
-    shape_op = net._ops["shape_s"]
-    m = log.mark()
-    net.apply([base(), shp("s", raster=True, slot=4)], W, H)
-    d = log.since(m)
-    assert "shape_s" not in net._ops and net.slots() == [4]
-    assert source_of(net, "blend_L_s", 1) == "s4"
-    assert [c for c in d["creates"] if c[0] != "textDAT"] == [("scriptTOP", "s4")]        # only the new surface
-    assert not d["destroys"]
-    assert d["connects"] == [(net._ops["blend_L_s"].name, 1, "s4")]
-    # the shape node is in the spare pool, reset to inherit its resolution, ready to serve a blend node
-    assert shape_op.valid and shape_op.tags == [] and shape_op.par.value("outputresolution") == "useinput"
-    assert not shape_op.inputConnectors[0].connections
-    # and back
-    m = log.mark()
-    net.apply([base(), shp("s")], W, H)
-    d = log.since(m)
-    assert source_of(net, "blend_L_s", 1) == "shape_s"
-    assert not [c for c in d["creates"] if c[0] == "glslTOP"]                # a spare pool node is reused
-    assert net.slots() == []
-    assert len(d["connects"]) == 1
-
-
-def test_text_rasterize_toggle_destroys_text_top_in_tick_only(env):
-    net, comp, log, _ = env
-    net.apply([base(), txt("t")], W, H)
-    settle(net)
-    top = net._ops["text_t"]
-    m = log.mark()
-    net.apply([base(), txt("t", raster=True, slot=2, x=3, y=4)], W, H)
-    assert not log.since(m)["destroys"] and top.valid
-    assert source_of(net, "blend_L_t", 1) == "s2"
-    assert pvals(net, "blend_L_t", "vec1")[:2] == (3.0, 4.0)       # rasterized layers behave like pixel layers
-    settle(net)
-    assert not top.valid
-    net.apply([base(), txt("t")], W, H)
-    assert net._ops["text_t"].OPType == "textTOP" and source_of(net, "blend_L_t", 1) == "text_t"
-
-
-def test_rasterized_shape_without_slot_is_blank_and_non_raster_has_no_offset(env):
-    net, comp, log, _ = env
-    net.apply([base(), shp("s", raster=True, slot=None), shp("u", x=9, y=9)], W, H)
-    assert source_of(net, "blend_L_s", 1) == "blank"
-    assert pvals(net, "blend_L_u", "vec1")[:2] == (0.0, 0.0)
+    # v5: `rasterize` is gone; a stale slot / rasterize / transform on a text or shape layer is ignored
+    net.apply([base(), shp("s", rasterize=True, slot=4, x=9, y=9, sx=2.0, sy=2.0), txt("t", rasterize=True, slot=2)],
+              W, H)
+    assert net.slots() == [] and net.surface_top(4) is None
+    assert source_of(net, "blend_L_s", 1) == "shape_s" and source_of(net, "blend_L_t", 1) == "text_t"
+    assert pvals(net, "blend_L_s", "vec1") == (0.0, 0.0, 1.0, 1.0)         # identity: geometry lives in the spec
+    assert net._ops["blend_L_s"].par.value("inputfiltertype") == "nearest"
 
 
 def test_text_shape_with_mask_opacity_blend_hidden_and_group(env):
@@ -1262,7 +1226,7 @@ def test_pooled_shape_node_serves_blend_with_inherited_resolution(env):
 
 def test_missing_spec_is_blank(env):
     net, comp, log, _ = env
-    net.apply([base(), L("t", "text", text=None, rasterize=False), L("s", "shape", shape=None, rasterize=False)], W, H)
+    net.apply([base(), L("t", "text", text=None), L("s", "shape", shape=None)], W, H)
     assert source_of(net, "blend_L_t", 1) == "blank" and source_of(net, "blend_L_s", 1) == "blank"
 
 
@@ -1606,3 +1570,509 @@ def test_polygon_sdf_numpy_port_vs_brute_force():
         for p, v in zip(pts, sd):
             dmin = min(float(nd._seg_dist(p[None], a, b)[0]) for a, b in seg)
             assert abs(abs(v) - dmin) < 1e-9
+
+
+# --------------------------------------------------------------------------- v5 transforms / surface sizes
+
+
+def test_xform_uniforms_mapping():
+    f = network.xform_uniforms
+    assert f(L("a", x=2.5, y=-1.25, sx=0.5, sy=0.7)) == ((2.5, -1.25, 0.5, 0.7), True)
+    assert f(L("a", sx=0.5, sy=3.7)) == ((0.0, 0.0, 0.5, 3.7), False)         # mixed: lod = 0 (sx*sy >= 0.5)
+    assert f(L("a", sx=2.0, sy=1.0)) == ((0.0, 0.0, 2.0, 1.0), False)
+    assert f(L("a", sx=0.7, sy=0.7))[1] is True and f(L("a", sx=0.72, sy=0.72))[1] is False    # lod > 0 below sx*sy = 0.5
+    assert f(L("a")) == ((0.0, 0.0, 1.0, 1.0), False)                       # v4 spec without sx/sy: identity
+    assert f(L("b", "base", x=3, y=4, sx=2, sy=2)) == ((3.0, 4.0, 2.0, 2.0), False)
+    for kind in ("text", "shape", "group", "adjustment"):
+        assert f(L("a", kind, x=9, y=9, sx=0.2, sy=0.2)) == ((0.0, 0.0, 1.0, 1.0), False)
+    assert f(L("a", sx=0.0, sy=-2.0))[0][2:] == (1.0, 1.0)                  # invalid scale -> identity
+    assert f(L("a", x=float("nan"), y=1))[0][:2] == (0.0, 0.0)
+
+
+def test_transform_reaches_resample_pass_unflipped(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1, x=2.5, y=-1.25, sx=0.25, sy=0.5, surfaceW=16, surfaceH=8)], W, H)
+    assert pvals(net, "xf_L_a", "vec1") == (2.5, -1.25, 0.25, 0.5)            # document top-left px; the shader flips
+    xf = net._ops["xf_L_a"].par.value
+    assert xf("vec0valuew") == network.ADJ_RESAMPLE and xf("inputfiltertype") == "mipmap"
+    assert (xf("outputresolution"), xf("resolutionw"), xf("resolutionh")) == ("custom", W, H)
+    assert source_of(net, "xf_L_a", 0) == "s1" and source_of(net, "xf_L_a", 1) == "s1"     # no mask: the surface again
+    assert source_of(net, "xf_L_a", 2) == "s1"             # sTD2DInputs[] is sized by the wired inputs: always 3
+    # the blend only fetches: identity mapping, source = the resample result, nearest filter, no mask
+    assert source_of(net, "blend_L_a", 1) == "xf_L_a"
+    assert pvals(net, "blend_L_a", "vec1") == (0.0, 0.0, 1.0, 1.0)
+    assert net._ops["blend_L_a"].par.value("inputfiltertype") == "nearest"
+
+
+def test_integer_offset_has_no_resample_pass(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1, x=7, y=-5, surfaceW=16, surfaceH=8)], W, H)
+    assert "xf_L_a" not in net._ops and source_of(net, "blend_L_a", 1) == "s1"
+    assert pvals(net, "blend_L_a", "vec1") == (7.0, -5.0, 1.0, 1.0)
+
+
+def test_transform_edit_is_uniform_sets_only(env):
+    net, comp, log, _ = env
+    L1 = lambda **kw: [base(), px("a", 1, surfaceW=16, surfaceH=8, **kw)]
+    net.apply(L1(x=0.5, y=0.25, sx=1.5, sy=1.5), W, H)
+    settle(net)
+    gname = net._ops["xf_L_a"].name
+    m = log.mark()
+    net.apply(L1(x=3.5, y=1.25, sx=1.7, sy=1.6), W, H)
+    d = log.since(m)
+    assert not d["creates"] and not d["destroys"] and not d["connects"] and not d["disconnects"]
+    assert {(n, k) for n, k, v in d["par_sets"]} == {(gname, "vec1value" + c) for c in "xyzw"}
+    m = log.mark()
+    net.apply(L1(x=3.5, y=1.25, sx=0.5, sy=0.5), W, H)                  # starts minifying: filter flag on the resample node
+    d = log.since(m)
+    assert {(n, k) for n, k, v in d["par_sets"]} == {(gname, "vec1valuez"), (gname, "vec1valuew"), (gname, "inputfiltertype")}
+    assert [v for n, k, v in d["par_sets"] if k == "inputfiltertype"] == ["mipmap"]
+    assert not d["creates"] and not d["connects"]
+
+
+def test_unminify_resets_the_filter_and_exact_drops_the_pass(env):
+    net, comp, log, _ = env
+    L1 = lambda **kw: [base(), px("a", 1, surfaceW=16, surfaceH=8, **kw)]
+    net.apply(L1(x=0.5, sx=0.3, sy=0.3), W, H)
+    node = net._ops["xf_L_a"]
+    assert node.par.value("inputfiltertype") == "mipmap"
+    net.apply(L1(x=0.5, sx=0.9, sy=0.9), W, H)
+    assert net._ops["xf_L_a"].par.value("inputfiltertype") == "linear"
+    net.apply(L1(x=3, sx=1.0, sy=1.0), W, H)                            # back to an integer offset: pass removed
+    assert "xf_L_a" not in net._ops and node in [n for n, c in net._pool] + [g for g, c in net._garbage]
+    settle(net)
+    if node.valid and node in [n for n, c in net._pool]:
+        assert node.par.value("inputfiltertype") == "nearest" and node.par.value("outputresolution") == "useinput"
+    assert source_of(net, "blend_L_a", 1) == "s1"
+
+
+def _mip_inputs_are_surfaces(net):
+    """The accumulator (blend / group / blank / adjustment results) is never read through a mipmap-filtered node."""
+    for name, op in net._ops.items():
+        if op.OPType != "glslTOP" or op.par.value("inputfiltertype") != "mipmap":
+            continue
+        for con in op.inputConnectors:
+            if con.source is None:
+                continue
+            src = next(n for n, o in net._ops.items() if o is con.source)
+            assert re.fullmatch(r"s\d+|base_src", src), (name, "reads", src)
+    # and every other glsl node is texelFetch-only
+    for name, op in net._ops.items():
+        if op.OPType == "glslTOP" and name.startswith(("blend_", "shape_")):
+            assert op.par.value("inputfiltertype") in (None, "nearest"), name
+
+
+def test_accumulator_is_never_read_through_a_mipmap_filter(env):
+    net, comp, log, _ = env
+    layers = [base(), px("a", 1, sx=0.3, sy=0.3, x=0.5, surfaceW=20, surfaceH=20),
+              px("b", 2, sx=0.2, sy=0.4, surfaceW=20, surfaceH=20, mask={"slot": 5, "enabled": True}),
+              L("g", "group"), px("c", 3, parentId="g", sx=0.45, sy=0.45, y=0.5, surfaceW=20, surfaceH=20),
+              L("adj", "adjustment", adjustment={"type": "blur", "radius": 4}), shp("s")]
+    net.apply(layers, W, H)
+    _mip_inputs_are_surfaces(net)
+    assert sum(1 for o in net._ops.values() if o.OPType == "glslTOP" and o.par.value("inputfiltertype") == "mipmap") == 3
+    comp.inputConnectors[0].connect(comp.in1)
+    layers[0] = L("base", "base", sx=0.3, sy=0.3, x=1.5)
+    net.apply(layers, W, H)
+    _mip_inputs_are_surfaces(net)
+    assert source_of(net, "xf_L_base", 0) == "base_src"
+    # churn through pool recycling: nothing keeps a stale mipmap flag
+    for i in range(4):
+        layers[1]["sx"] = layers[1]["sy"] = 0.3 if i % 2 else 1.0
+        layers[2]["x"] = 3 + i
+        net.apply(layers, W, H)
+        settle(net)
+        _mip_inputs_are_surfaces(net)
+    for node, cache in net._pool:
+        assert node.par.value("inputfiltertype") in (None, "nearest")
+
+
+def test_surfaces_use_their_own_size_and_masks_follow_the_layer(env):
+    net, comp, log, _ = env
+    layers = [base(), px("a", 1, surfaceW=200, surfaceH=100, mask={"slot": 5, "enabled": True}),
+              px("b", 2, surfaceW=7, surfaceH=9),
+              L("adj", "adjustment", adjustment={"type": "invert"}, mask={"slot": 6, "enabled": True}),
+              shp("s", mask={"slot": 8, "enabled": True}), px("legacy", 3)]
+    net.apply(layers, W, H)
+    size = lambda n: (net._ops[n].par.value("resolutionw"), net._ops[n].par.value("resolutionh"))
+    assert size("s1") == (200, 100) and size("s2") == (7, 9)
+    assert size("s5") == (200, 100)                         # mask: size of its layer's surface
+    assert size("s6") == (W, H) and size("s8") == (W, H)    # adjustment / shape masks cover the document
+    assert size("s3") == (W, H)                             # no surfaceW/H in the spec: document size
+    assert net.surface_size(1) == (200, 100) and net.surface_size(5) == (200, 100) and net.surface_size(99) is None
+    assert net._ops["blank"].par.value("resolutionw") == W
+
+
+def test_surface_size_change_and_doc_resize_do_not_touch_each_other(env):
+    net, comp, log, _ = env
+    st = lambda w, h: [base(), px("a", 1, surfaceW=w, surfaceH=h)]
+    net.apply(st(100, 50), W, H)
+    settle(net)
+    m = log.mark()
+    net.apply(st(100, 50), 128, 96)                        # canvas resize: surfaces keep their size
+    d = log.since(m)
+    assert {n for n, k, v in d["par_sets"]} == {"blank"} and not d["creates"]
+    assert net.surface_size(1) == (100, 50)
+    m = log.mark()
+    net.apply(st(30, 40), 128, 96)                         # replaced pixels (apply transform): same slot, new size
+    d = log.since(m)
+    assert {(n, k, v) for n, k, v in d["par_sets"]} == {("s1", "resolutionw", 30), ("s1", "resolutionh", 40)}
+    assert not d["creates"] and not d["destroys"] and net.surface_size(1) == (30, 40)
+
+
+def test_base_transform_applies_only_with_a_connected_input(env):
+    net, comp, log, _ = env
+    b = L("base", "base", x=10.5, y=-4, sx=0.5, sy=0.5)
+    net.apply([b], W, H)
+    assert "xf_L_base" not in net._ops
+    assert pvals(net, "blend_base", "vec1") == (0.0, 0.0, 1.0, 1.0)        # no input: transparent blank, nothing to move
+    assert source_of(net, "blend_base", 1) == "base_src" and source_of(net, "blend_base", 0) == "blank"
+    comp.inputConnectors[0].connect(comp.in1)
+    net.apply([b], W, H)
+    assert pvals(net, "xf_L_base", "vec1") == (10.5, -4.0, 0.5, 0.5)
+    assert net._ops["xf_L_base"].par.value("inputfiltertype") == "mipmap" and source_of(net, "xf_L_base", 0) == "base_src"
+    assert source_of(net, "blend_base", 1) == "xf_L_base"
+    assert net._ops["base_src"].par.value("top") == "../in1"
+    comp.inputConnectors[0].disconnect()
+    net.set_input_connected(False)
+    net.apply([b], W, H)
+    assert "xf_L_base" not in net._ops and pvals(net, "blend_base", "vec1") == (0.0, 0.0, 1.0, 1.0)
+
+
+def test_set_input_connected_true_replans_the_base_transform(env):
+    net, comp, log, _ = env
+    b = L("base", "base", x=2.5, y=0, sx=0.5, sy=0.5)
+    net.apply([b], W, H)
+    assert "xf_L_base" not in net._ops
+    comp.inputConnectors[0].connect(comp.in1)      # the ext flips the flag, then applies the (unchanged) stack
+    net.set_input_connected(True)
+    net.apply([b], W, H)
+    assert "xf_L_base" in net._ops and net._ops["base_src"].par.value("top") == "../in1"
+
+
+def test_render_layer_source_returns_the_unblended_source_node(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("p", 1), shp("s", opacity=0.3, blend="multiply", visible=False,
+                                       mask={"slot": 7, "enabled": True}), txt("t", opacity=0.5),
+               L("empty", "text", text=None)], W, H)
+    s, t = net.render_layer_source("s"), net.render_layer_source("t")
+    assert s is net._ops["shape_s"] and t is net._ops["text_t"]               # not the blend node (opacity / mask / mode)
+    assert s.par.value("resolutionw") == W and t.par.value("resolutionh") == H
+    assert net.render_layer_source("empty") is net._ops["blank"]               # no spec: transparent
+    assert net.render_layer_source("p") is None and net.render_layer_source("nope") is None
+
+
+def test_render_layer_status_finishes_pending_text_with_a_bounded_budget(env, monkeypatch):
+    net, comp, log, _ = env
+    monkeypatch.setattr(network, "MEASURE_BUDGET", 0)
+    spec = dict(TEXT, boxWidth=40.0, text="aaa bbb ccc ddd eee fff")
+    net.apply([base(), txt("t", spec)], W, H)
+    assert "text_t" in net._text_todo
+    before = net._ops["text_t"].par.value(network.TEXT_PAR["text"]), net._ops["text_t"].par.value(network.TEXT_PAR["spacing"])
+    tok = net.render_layer_token("t")
+    assert net.render_layer_ready("t") is True                           # bounded work inside the call converges
+    assert "text_t" not in net._text_todo and net._budget == 0           # the budget is restored (try/finally)
+    after = net._ops["text_t"].par.value(network.TEXT_PAR["text"]), net._ops["text_t"].par.value(network.TEXT_PAR["spacing"])
+    assert after != before                                               # real (measured) layout, not the fallback
+    assert net.render_layer_token("t") != tok                            # the readback in flight must be dropped
+    assert net.render_layer_source("t") is net._ops["text_t"]
+
+
+def test_render_layer_status_signals_failure_and_never_blocks(env, monkeypatch):
+    net, comp, log, clock = env
+    net.apply([base(), txt("t")], W, H)
+    net._ops["text_measure"].cook = lambda force=False: (_ for _ in ()).throw(RuntimeError("cook failed"))
+    net._text_todo.add("text_t")
+    net._metrics.clear()
+    net._widths.clear()
+    b0 = net._budget
+    assert net.render_layer_status("t") == "failed"
+    assert net._budget == b0                                              # restored even though the measurement raised
+
+
+def test_render_layer_source_after_delete_and_kind_change(env):
+    net, comp, log, _ = env
+    net.apply([base(), shp("s"), txt("t")], W, H)
+    tok = net.render_layer_token("s")
+    assert tok is not None and net.render_layer_status("s") == "ready"
+    net.apply([base(), txt("t")], W, H)
+    assert net.render_layer_source("s") is None and net.render_layer_token("s") is None
+    assert net.render_layer_status("s") is None and net.render_layer_ready("s") is False
+    net.apply([base(), px("s", 3), txt("t")], W, H)                       # same id, now a pixel layer
+    assert net.render_layer_source("s") is None
+    net.apply([base(), shp("s"), txt("t")], W, H)
+    assert net.render_layer_source("s") is not None and net.render_layer_token("s") != tok    # new node: token differs
+    net.apply([base(), shp("s", x=0, opacity=0.5), txt("t")], W, H)       # any apply invalidates an in-flight readback
+    assert net.render_layer_source("s") is not None
+
+
+def test_render_layer_token_changes_with_every_real_apply(env):
+    net, comp, log, _ = env
+    st = [base(), shp("s")]
+    net.apply(st, W, H)
+    t0 = net.render_layer_token("s")
+    net.apply(st, W, H)
+    assert net.render_layer_token("s") == t0                               # no-op apply: same pixels
+    st2 = [base(), shp("s", dict(RECT, x=11))]
+    net.apply(st2, W, H)
+    assert net.render_layer_token("s") != t0
+
+
+def test_surface_size_is_consistent_for_slots_in_grace_and_after_destroy(env):
+    net, comp, log, clock = env
+    net.apply([base(), px("a", 1, surfaceW=30, surfaceH=20)], W, H)
+    net.apply([base()], W, H)                                              # slot 1 now in its grace period
+    assert net.surface_top(1) is not None and net.surface_size(1) == (30, 20)
+    clock.t += 3.0
+    settle(net)
+    assert net.surface_top(1) is None and net.surface_size(1) is None
+
+
+def test_mask_follows_a_resized_surface(env):
+    net, comp, log, _ = env
+    st = lambda w, h: [base(), px("a", 1, surfaceW=w, surfaceH=h, mask={"slot": 5, "enabled": True}, sx=1.5, sy=1.5, x=0.5)]
+    net.apply(st(40, 30), W, H)
+    assert net.surface_size(5) == (40, 30)
+    net.apply(st(25, 12), W, H)
+    assert net.surface_size(1) == net.surface_size(5) == (25, 12)
+    assert net._ops["s5"].par.value("resolutionw") == 25 and net._ops["s5"].par.value("resolutionh") == 12
+    assert source_of(net, "xf_L_a", 1) == "s5" and net._ops["xf_L_a"].par.value("vec0valuez") == 1.0
+    assert net._ops["blend_L_a"].par.value("vec0valuez") == 0.0            # the mask is consumed by the resample pass
+
+
+def _ramp(h, w, seed=3):
+    rng = np.random.default_rng(seed)
+    return rng.random((h, w, 4))
+
+
+def test_reference_integer_position_scale_one_is_an_exact_copy():
+    src = _ramp(9, 11)
+    out = fakenet.sample_reference(src, 20, 15, 4, -2, 1.0, 1.0)
+    exp = np.zeros((15, 20, 4))
+    for j in range(15):
+        for i in range(20):
+            sy_, sx_ = j + 2, i - 4
+            if 0 <= sy_ < 9 and 0 <= sx_ < 11:
+                exp[j, i] = src[sy_, sx_]
+    assert np.array_equal(out, exp)
+
+
+def test_reference_half_pixel_shift_blends_neighbours_and_clips_edges():
+    src = np.zeros((2, 4, 4))
+    src[..., 3] = 1.0
+    src[:, :, 0] = [[0, 1, 2, 3]] * 2
+    out = fakenet.sample_reference(src, 8, 2, 0.5, 0.0, 1.0, 1.0)
+    # doc pixel 1 (centre 1.5) -> layer x = 1.0: halfway between texels 0 and 1
+    assert out[0, 1, 0] == pytest.approx(0.5)
+    assert out[0, 2, 0] == pytest.approx(1.5)
+    # first column is half covered (layer starts at 0.5): colour clamps to the edge texel, alpha = coverage
+    assert out[0, 0, 3] == pytest.approx(0.5) and out[0, 0, 0] == pytest.approx(0.0)
+    # last covered column: layer x range [3.5, 4.5] vs source [0, 4] -> half covered
+    assert out[0, 4, 3] == pytest.approx(0.5) and out[0, 5, 3] == 0.0
+
+
+def test_reference_y_axis_is_top_down_for_fractional_positions():
+    src = np.zeros((4, 1, 4))
+    src[..., 3] = 1.0
+    src[:, 0, 0] = [0, 1, 2, 3]                       # row index grows downwards
+    out = fakenet.sample_reference(src, 1, 8, 0.0, 1.5, 1.0, 1.0)
+    # doc row 3 has centre 3.5 -> layer y = 2.0: halfway between source rows 1 and 2
+    assert out[3, 0, 0] == pytest.approx(1.5)
+    assert out[0, 0, 3] == 0.0 and out[0, 0, 0] == 0.0                       # row 0 is above the layer (starts at y = 1.5)
+    assert out[1, 0, 3] == pytest.approx(0.5) and out[1, 0, 0] == pytest.approx(0.0)     # half covered, edge texel
+    assert out[2, 0, 3] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("x,y,sx,sy", [(0.3, -1.7, 1.0, 1.0), (2.25, 1.5, 2.0, 3.7), (-3.5, 0.0, 1.3, 0.9)])
+def test_shader_port_matches_reference(x, y, sx, sy):
+    """The GL conventions (bottom-up rows, v = 1 - ly/H, gl_FragCoord) reproduce the top-down reference."""
+    src = _ramp(7, 9)
+    # interior only: edge coverage is a separate (analytic) factor
+    ref = fakenet.sample_reference(src, 40, 30, x, y, sx, sy, mip=False)
+    port = fakenet.shader_port(src[::-1], 40, 30, x, y, sx, sy)
+    jj, ii = np.mgrid[0:30, 0:40]
+    lx, ly = (ii + 0.5 - x) / sx, (jj + 0.5 - y) / sy
+    interior = (lx - 0.5 / sx >= 0) & (lx + 0.5 / sx <= 9) & (ly - 0.5 / sy >= 0) & (ly + 0.5 / sy <= 7)
+    assert interior.sum() > 20
+    assert np.abs(ref[interior] - port[interior]).max() < 1e-9
+
+
+def test_reference_minification_uses_a_mip_level():
+    src = np.zeros((32, 32, 4))
+    src[::2, :, :] = 1.0                                # horizontal 1 px stripes
+    plain = fakenet.sample_reference(src, 10, 10, 0, 0, 0.3, 0.3, mip=False)[2:8, 2:8]
+    mipped = fakenet.sample_reference(src, 10, 10, 0, 0, 0.3, 0.3, mip=True)[2:8, 2:8]
+    assert plain[..., 0].std() > 0.15                                # aliased without mips
+    assert mipped[..., 0].std() < 0.5 * plain[..., 0].std() and abs(mipped[..., 0].mean() - 0.5) < 0.1
+
+
+# --------------------------------------------------------------------------- shader ports (resample + blend fetch)
+
+
+def _tex(h, w, seed, alpha=True):
+    t = _ramp(h, w, seed)
+    if not alpha:
+        t[..., 1:] = t[..., :1]
+    return t
+
+
+@pytest.mark.parametrize("x,y,sx,sy", [
+    (0.3, -1.7, 1.0, 1.0), (2.25, 1.5, 2.0, 3.7), (-3.5, 0.0, 1.3, 0.9), (4.0, 3.0, 1.0, 1.0),   # exact branch
+    (1.5, 2.5, 0.5, 0.5), (-2.2, 3.3, 0.3, 0.45), (2.0, 1.0, 0.25, 0.25), (3.5, 2.0, 2.0, 0.4)])
+@pytest.mark.parametrize("masked", [False, True])
+def test_resample_port_matches_sample_reference(x, y, sx, sy, masked):
+    """The uAdjust = 7 pass (GL conventions, coverage, exact branch, trilinear lod, mask) == the top-down reference,
+    edges included."""
+    src = _tex(16, 20, 5)
+    mask = _tex(16, 20, 6)
+    port = fakenet.resample_port(src[::-1], mask[::-1], 48, 40, x, y, sx, sy, has_mask=masked)
+    ref = fakenet.sample_reference(src, 48, 40, x, y, sx, sy)
+    if masked:
+        ref = ref * fakenet.sample_reference(mask[..., :1], 48, 40, x, y, sx, sy, coverage=False)
+    assert np.abs(port - ref).max() < 1e-9
+
+
+def test_resample_port_mask_of_another_size_follows_the_layer_rect():
+    src, mask = _tex(16, 20, 5), _tex(8, 10, 6)
+    port = fakenet.resample_port(src[::-1], mask[::-1], 48, 40, 3.5, 2.5, 1.5, 1.5, has_mask=True)
+    ref = fakenet.sample_reference(src, 48, 40, 3.5, 2.5, 1.5, 1.5) * \
+        fakenet.sample_reference(mask[..., :1], 48, 40, 3.5, 2.5, 3.0, 3.0, mip=False, coverage=False)   # 2x smaller mask
+    # the mask is addressed with normalised coordinates: the same rect as the layer
+    assert np.abs(port - ref).max() < 1e-9
+
+
+@pytest.mark.parametrize("x,y", [(7, -5), (2.6, 3.4), (-3.5, 2.5), (0.49, 0.5), (-0.5, -0.51)])
+def test_blend_fetch_port_integer_offset_and_mask_guard(x, y):
+    src, mask = _tex(12, 14, 7), _tex(6, 8, 8)               # the mask is smaller than the layer: 0 outside it
+    s, m = fakenet.blend_source_port(src[::-1], mask[::-1], 40, 36, x, y, has_mask=True)
+    ox, oy = int(np.floor(x + 0.5)), int(np.floor(y + 0.5))
+    ref = fakenet.sample_reference(src, 40, 36, ox, oy, 1.0, 1.0)
+    assert np.array_equal(s, ref)
+    # outside the mask (but inside the layer) the mask is 0; outside the layer it is irrelevant (source is 0)
+    jj, ii = np.mgrid[0:36, 0:40]
+    in_layer = (ii - ox >= 0) & (ii - ox < 14) & (jj - oy >= 0) & (jj - oy < 12)
+    in_mask = in_layer & (ii - ox < 8) & (jj - oy < 6)
+    assert np.all(m[in_layer & ~in_mask] == 0.0)
+    assert np.array_equal(m[in_mask], mask[(jj - oy)[in_mask], (ii - ox)[in_mask], 0])
+
+
+def test_round_half_up_offset_in_the_blend_path():
+    src = _tex(4, 4, 9)
+    a, _ = fakenet.blend_source_port(src[::-1], None, 10, 10, 2.5, 2.5)        # floor(2.5 + 0.5) = 3
+    b, _ = fakenet.blend_source_port(src[::-1], None, 10, 10, 3, 3)
+    c, _ = fakenet.blend_source_port(src[::-1], None, 10, 10, 2.49, 2.49)      # -> 2
+    d, _ = fakenet.blend_source_port(src[::-1], None, 10, 10, 2, 2)
+    assert np.array_equal(a, b) and np.array_equal(c, d) and not np.array_equal(a, c)
+
+
+# The ports above are Python; these pin the GLSL text to them (a mutated shader must fail the contract).
+
+GLSL_PINS = {
+    "round-half-up integer offset": "ivec2(floor(uXform.xy + 0.5))",
+    "mask out-of-bounds guard": "m = (d.x < mSize.x && d.y < mSize.y) ? texelFetch(sTD2DInputs[2], mp, 0).r : 0.0;",
+    "blend source flip": "ivec2 sp = ivec2(d.x, srcSize.y - 1 - d.y);",
+    "blend mask flip": "ivec2 mp = ivec2(d.x, mSize.y - 1 - d.y);",
+    "doc y flip": "vec2 c = vec2(gl_FragCoord.x, outSize.y - gl_FragCoord.y);",
+    "layer coords": "vec2 l = (c - uXform.xy) / sc;",
+    "coverage": "vec2 cov2 = clamp((min(l + h, srcSz) - max(l - h, vec2(0.0))) / (2.0 * h), 0.0, 1.0);",
+    "coverage applied": "src *= cov * m;",
+    "uv flip": "vec2 uv = vec2(l.x / srcSz.x, 1.0 - l.y / srcSz.y);",
+    "lod": "float lod = max(0.0, -0.5 * log2(sc.x * sc.y) - 0.5);",
+    "exact flip": "ivec2(ip.x, int(srcSz.y) - 1 - ip.y)",
+    "exact tolerance": "abs(uXform.x - floor(uXform.x + 0.5)) < 1e-4 && abs(uXform.y - floor(uXform.y + 0.5)) < 1e-4",
+    "resample dispatch": "if (uParams.w > 6.5) { resample(); return; }",
+    "sampling by lod": "textureLod(sTD2DInputs[0], uv, lod)",
+    "mask sampling by lod": "textureLod(sTD2DInputs[1], uv, lod).r",
+}
+
+
+def glsl_contract_failures(src):
+    return [k for k, v in GLSL_PINS.items() if v not in src]
+
+
+def test_glsl_matches_the_pinned_port_formulas():
+    assert glsl_contract_failures(GLSL) == []
+
+
+@pytest.mark.parametrize("pin,old,new", [
+    ("round-half-up integer offset", "ivec2(floor(uXform.xy + 0.5))", "ivec2(floor(uXform.xy))"),
+    ("mask out-of-bounds guard", "(d.x < mSize.x && d.y < mSize.y) ? texelFetch(sTD2DInputs[2], mp, 0).r : 0.0", "texelFetch(sTD2DInputs[2], mp, 0).r"),
+    ("coverage applied", "src *= cov * m;", "src *= m;"),
+    ("doc y flip", "outSize.y - gl_FragCoord.y", "gl_FragCoord.y"),
+    ("uv flip", "1.0 - l.y / srcSz.y", "l.y / srcSz.y"),
+    ("lod", "- 0.5);", "+ 0.5);"),
+    ("lod", "log2(sc.x * sc.y)", "log2(max(sc.x, sc.y))"),
+    ("coverage", "(2.0 * h)", "(1.0 * h)"),
+    ("blend source flip", "srcSize.y - 1 - d.y", "d.y"),
+    ("exact flip", "int(srcSz.y) - 1 - ip.y", "ip.y"),
+    ("exact tolerance", "< 1e-4 && abs(uXform.y", "< 1e-2 && abs(uXform.y"),
+])
+def test_shader_mutations_are_caught(pin, old, new):
+    assert old in GLSL
+    mutated = GLSL.replace(old, new, 1)
+    assert mutated != GLSL and pin in glsl_contract_failures(mutated)
+
+
+# --------------------------------------------------------------------------- xform_is_exact tolerance / mask wiring
+
+
+@pytest.mark.parametrize("x,y,exact", [(3.0, 2.0, True), (3.00005, 2.0, True), (3.0, 2.00009, True), (3.0005, 2.0, False),
+                                       (3.0, 2.0005, False), (-4.99995, 0.0, True), (0.5, 0.0, False)])
+def test_xform_is_exact_tolerance(x, y, exact):
+    assert network.xform_is_exact((x, y, 1.0, 1.0)) is exact
+    assert network.xform_is_exact((x, y, 1.0001, 1.0)) is False
+
+
+def test_exactness_decides_the_resample_pass(env):
+    net, comp, log, _ = env
+    mk = lambda x: [base(), px("a", 1, x=x, y=2.0, surfaceW=16, surfaceH=8)]
+    net.apply(mk(3.00005), W, H)
+    assert "xf_L_a" not in net._ops and source_of(net, "blend_L_a", 1) == "s1"
+    assert pvals(net, "blend_L_a", "vec1") == (3.00005, 2.0, 1.0, 1.0)          # the shader rounds it
+    net.apply(mk(3.0005), W, H)
+    assert "xf_L_a" in net._ops and source_of(net, "blend_L_a", 1) == "xf_L_a"
+
+
+def test_mask_is_not_wired_on_the_blend_after_resampling(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1, x=0.5, sx=1.5, sy=1.5, surfaceW=16, surfaceH=8, mask={"slot": 5, "enabled": True})], W, H)
+    assert source_of(net, "xf_L_a", 1) == "s5"
+    assert net._ops["blend_L_a"].par.value("vec0valuez") == 0.0
+    assert source_of(net, "blend_L_a", 2) == "blank"
+    # exact placement keeps the mask on the blend
+    net.apply([base(), px("a", 1, x=2, surfaceW=16, surfaceH=8, mask={"slot": 5, "enabled": True})], W, H)
+    assert net._ops["blend_L_a"].par.value("vec0valuez") == 1.0 and source_of(net, "blend_L_a", 2) == "s5"
+    assert "xf_L_a" not in net._ops
+
+
+# --------------------------------------------------------------------------- per-layer Flatten token
+
+
+def test_render_layer_token_is_per_layer(env):
+    net, comp, log, _ = env
+    st = lambda **kw: [base(), px("p", 1, **kw), shp("s"), txt("t")]
+    net.apply(st(), W, H)
+    ts, tt = net.render_layer_token("s"), net.render_layer_token("t")
+    net.apply(st(x=5, opacity=0.5, visible=False), W, H)               # unrelated pixel layer edits
+    assert net.render_layer_token("s") == ts and net.render_layer_token("t") == tt
+    net.apply([base(), px("p", 1), shp("s", dict(RECT, x=40)), txt("t")], W, H)       # the shape's own edit
+    assert net.render_layer_token("s") != ts and net.render_layer_token("t") == tt
+    net.apply([base(), px("p", 1), shp("s", dict(RECT, x=40), opacity=0.2, blend="multiply"), txt("t")], W, H)
+    assert net.render_layer_token("s") == net.render_layer_token("s")      # opacity / blend never matter
+    t2 = net.render_layer_token("s")
+    net.apply([base(), px("p", 1), shp("s", dict(RECT, x=40), opacity=0.9), txt("t")], W, H)
+    assert net.render_layer_token("s") == t2
+    net.apply([base(), px("p", 1), shp("s", dict(RECT, x=40)), txt("t")], 100, 80)    # document size does
+    assert net.render_layer_token("s") != t2 and net.render_layer_token("t") != tt
+
+
+def test_status_polls_with_no_change_keep_the_token(env):
+    net, comp, log, _ = env
+    net.apply([base(), txt("t")], W, H)
+    assert net.render_layer_ready("t") is True
+    tok = net.render_layer_token("t")
+    for _ in range(3):
+        assert net.render_layer_status("t") == "ready"
+    net._text_todo.add("text_t")                      # forced re-poll: the measurements are cached, the pars identical
+    assert net.render_layer_status("t") == "ready"
+    assert net.render_layer_token("t") == tok
