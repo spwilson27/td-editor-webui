@@ -59,6 +59,7 @@ export function installTestHook(store: Store, win: Window = window): void {
     setRasterize: (id: string, on: boolean) => store.engine.setRasterize(id, on),
     flatten: (id: string) => store.engine.flattenLayer(id),
     fonts: () => store.fonts.peek(),
+    setShapeRenderer: (m: 'sdf' | 'canvas') => { store.setShapeRenderer(m); return store.engine.shapeRenderer(); },
     listTops: () => (store.bridge ? store.bridge.listTops() : Promise.reject(new Error('standalone'))),
     importImageFromTop: (path: string) => (store.bridge ? store.bridge.importTop(path) : Promise.reject(new Error('standalone'))),
     readPixel: (x: number, y: number) => Array.from(store.engine.readComposite({ x, y, w: 1, h: 1 })),

@@ -28,7 +28,9 @@ const MENUS: MenuDef[] = [
   { label: 'View', items: [{ label: 'Zoom in', hint: '+', run: (s) => s.zoomStep(1) }, { label: 'Zoom out', hint: '-', run: (s) => s.zoomStep(-1) },
     { label: 'Fit', hint: '0', run: (s) => s.fit() }, { label: '100%', hint: '1', run: (s) => s.zoomTo(1) }, 'sep',
     { label: 'Local view', run: (s) => s.setViewMode('local'), checked: (s) => s.viewMode.value === 'local' },
-    { label: 'TouchDesigner view', run: (s) => s.setViewMode('td'), checked: (s) => s.viewMode.value === 'td', enabled: (s) => s.tdAvailable.value }] },
+    { label: 'TouchDesigner view', run: (s) => s.setViewMode('td'), checked: (s) => s.viewMode.value === 'td', enabled: (s) => s.tdAvailable.value }, 'sep',
+    { label: 'Shape antialiasing: Exact (matches TouchDesigner)', run: (s) => s.setShapeRenderer('sdf'), checked: (s) => s.shapeRenderer.value === 'sdf' },
+    { label: 'Shape antialiasing: Browser canvas', run: (s) => s.setShapeRenderer('canvas'), checked: (s) => s.shapeRenderer.value === 'canvas' }] },
   { label: 'Window', items: [off('Reset layout'), off('Show rulers')] },
 ];
 

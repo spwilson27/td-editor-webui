@@ -14,8 +14,9 @@ import {
   invert as invertSel, materialize, NO_SEL, rectSel, resizeSel, selectAllState, tracePath, type SelState,
 } from './selection';
 import {
-  drawShape, drawText, sameSpec, sanitizeShape, sanitizeText, shapeBounds, textBox, textBounds,
+  drawText, sameSpec, sanitizeShape, sanitizeText, shapeBounds, textBox, textBounds,
 } from './textShape';
+import { clearShapeCache, drawShapeWith, setShapeCacheBudget } from './shapeSdf';
 import type { Patch } from './tiles';
 import { clipToSize, equal, intersect, isEmpty, translate, union } from './rect';
 import { createSurface, releaseSurface, resizedCopy, type Surface } from './surface';
@@ -96,6 +97,7 @@ export class Engine implements EditorEngine, Host {
   private selPathCache: Array<Array<{ x: number; y: number }>> | null = null;
   private tmp: Surface | null = null;
   private shapeType: ShapeType = 'rect';
+  private rasterMode = new WeakMap<Surface, 'sdf' | 'canvas'>(); // renderer that drew each shape surface
   private textCount = 0;
   private shapeCount = 0;
 
@@ -216,6 +218,11 @@ export class Engine implements EditorEngine, Host {
     const apply = (s: StructureSnapshot) => () => {
       const prev = this.doc.snapshot();
       const changed = this.doc.restore(s);
+      for (const l of this.doc.all()) { // surfaces restored from a time the other renderer was active
+        if (l.kind === 'shape' && l.surface && this.rasterMode.get(l.surface) !== this.doc.shapeRenderer && !changed.some((c) => c.layer === l)) {
+          changed.push({ layer: l, prevSpec: l.spec, prevRasterize: false });
+        }
+      }
       const surfaceEvents = this.rerender(changed);
       this.structureChanged(null, !specSame(prev, this.doc.snapshot()));
       surfaceEvents.forEach((e) => this.emit(e));
@@ -479,7 +486,7 @@ export class Engine implements EditorEngine, Host {
       c.rect(0, 0, this.doc.width, this.doc.height);
       c.clip();
       if (l.kind === 'text') drawText(c, l.spec);
-      else drawShape(c, l.spec);
+      else this.drawShapeSpec(c, l.spec);
       c.restore();
       return;
     }
@@ -915,7 +922,7 @@ export class Engine implements EditorEngine, Host {
       const t = this.tempWindow(W, H);
       t.ctx.clearRect(0, 0, W, H);
       if (l.kind === 'text') drawText(t.ctx, l.spec);
-      else drawShape(t.ctx, l.spec);
+      else this.drawShapeSpec(t.ctx, l.spec);
       return t.ctx.getImageData(0, 0, W, H).data;
     }
     const sl = l as SurfaceLayer;
@@ -1065,7 +1072,7 @@ export class Engine implements EditorEngine, Host {
     const surface = createSurface(this.doc.width, this.doc.height, !l.surface);
     if (l.surface) surface.ctx.drawImage(l.surface.canvas as CanvasImageSource, 0, 0);
     else if (l.kind === 'text') drawText(surface.ctx, l.spec);
-    else drawShape(surface.ctx, l.spec);
+    else this.drawShapeSpec(surface.ctx, l.spec);
     const px: PixelLayer = {
       id: l.id, kind: 'pixel', name: l.name, visible: l.visible, locked: l.locked, opacity: l.opacity, blend: l.blend,
       surface, x: 0, y: 0, slot: l.surface && l.slot !== null ? l.slot : this.doc.newSlot(), mask: l.mask,
@@ -1074,6 +1081,32 @@ export class Engine implements EditorEngine, Host {
   }
 
   /** Stored only: the UI creates shape layers itself (addShapeLayer); the engine's 'shape' / 'text' tools are no-ops. */
+  private drawShapeSpec(ctx: Parameters<typeof drawText>[0], spec: ShapeSpec): void {
+    drawShapeWith(this.doc.shapeRenderer, ctx, spec, this.doc.width, this.doc.height);
+  }
+
+  /** 'sdf' (default): the same maths as TD's shape.glsl; 'canvas': Canvas 2D paths. Not part of the document. */
+  setShapeRenderer(mode: 'sdf' | 'canvas'): void {
+    const m = mode === 'canvas' ? 'canvas' : 'sdf';
+    if (m === this.doc.shapeRenderer) return;
+    this.finishStroke();
+    this.doc.shapeRenderer = m;
+    for (const l of this.doc.all()) {
+      if (l.kind !== 'shape') continue;
+      if (l.surface) {
+        this.renderRaster(l, null);
+        this.emitSurface(l, null);
+      }
+    }
+    this.version++;
+    this.thumbs.clear();
+    this.compositor.invalidate(null);
+    this.emit({ type: 'pixels', rect: this.docRect() });
+    this.emit({ type: 'structure' });
+  }
+
+  shapeRenderer(): 'sdf' | 'canvas' { return this.doc.shapeRenderer; }
+
   setShapeTool(type: ShapeType): void { this.shapeType = type; }
   shapeTool(): ShapeType { return this.shapeType; }
   /** Topmost visible text layer whose layout box contains the point (document px). */
@@ -1099,6 +1132,7 @@ export class Engine implements EditorEngine, Host {
     const area = union(specBounds(l), l.kind === 'text' ? textBounds(spec as TextSpec) : shapeBounds(spec as ShapeSpec)) as Rect;
     (l as { spec: unknown }).spec = spec;
     if (l.surface) this.renderRaster(l, area);
+    if (l.kind === 'shape') this.updateShapeBudget();
     this.changed(area);
     this.emitSurface(l, area);
   }
@@ -1107,6 +1141,10 @@ export class Engine implements EditorEngine, Host {
   private renderRaster(l: VectorLayer, area: Rect | null): void {
     const s = l.surface;
     if (!s) return;
+    if (l.kind === 'shape') {
+      if (this.rasterMode.get(s) !== this.doc.shapeRenderer) area = null; // drawn by the other renderer: redo it all
+      this.rasterMode.set(s, this.doc.shapeRenderer);
+    }
     const r = area ? clipToSize(area, s.width, s.height) : { x: 0, y: 0, w: s.width, h: s.height };
     if (!r) return;
     const c = s.ctx;
@@ -1116,7 +1154,7 @@ export class Engine implements EditorEngine, Host {
     c.rect(r.x, r.y, r.w, r.h);
     c.clip();
     if (l.kind === 'text') drawText(c, l.spec);
-    else drawShape(c, l.spec);
+    else this.drawShapeSpec(c, l.spec);
     c.restore();
   }
 
@@ -1252,6 +1290,7 @@ export class Engine implements EditorEngine, Host {
     Object.values(this.scratch).forEach(releaseSurface);
     this.doc.pixelLayers().forEach((l) => releaseSurface(l.surface));
     this.doc.masks().forEach((m) => releaseSurface(m.surface));
+    clearShapeCache();
     if (this.selCanvas) releaseSurface(this.selCanvas);
     if (this.tmp) releaseSurface(this.tmp);
     this.listeners.clear();
@@ -1289,7 +1328,19 @@ export class Engine implements EditorEngine, Host {
    * Emit 'docspec' (rev++) when what docSpec() returns changed, then a full-surface 'surface' event for every slot
    * that newly exists (undo of a delete, redo of an add mask, ...): TouchDesigner may have dropped it.
    */
+  /** Tell the shape raster cache how much the shape layers need (so its cap never cycles a fitting working set). */
+  private updateShapeBudget(): void {
+    let bytes = 0;
+    for (const l of this.doc.all()) {
+      if (l.kind !== 'shape') continue;
+      const b = clipToSize(shapeBounds(l.spec), this.doc.width, this.doc.height);
+      if (b) bytes += b.w * b.h * 4;
+    }
+    setShapeCacheBudget(bytes);
+  }
+
   private syncSpec(specChanged: boolean): void {
+    this.updateShapeBudget();
     const slots = this.doc.slots();
     const added: number[] = [];
     for (const s of slots) {

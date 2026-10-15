@@ -1,7 +1,8 @@
 import type { AdjustmentSpec, BlendMode, Rect } from './types';
 import { createSurface, releaseSurface, type Ctx2D, type Surface } from './surface';
 import { isVector, specBounds, type Document, type GroupLayer, type Mask, type SurfaceLayer, type VectorLayer } from './model';
-import { drawShape, drawText } from './textShape';
+import { drawText } from './textShape';
+import { drawShapeWith } from './shapeSdf';
 import { clipToSize, intersect, union } from './rect';
 import { adjustmentReach, isIdentity, pixRect, renderAdjusted } from './adjustments';
 
@@ -247,7 +248,7 @@ export class Compositor {
     s.ctx.rect(vis.x, vis.y, vis.w, vis.h);
     s.ctx.clip();
     if (l.kind === 'text') drawText(s.ctx, l.spec);
-    else drawShape(s.ctx, l.spec);
+    else drawShapeWith(this.doc.shapeRenderer, s.ctx, l.spec, this.doc.width, this.doc.height);
     s.ctx.restore();
     if (l.mask && l.mask.enabled) this.maskIn(s.ctx, l.mask, vis, vis);
     this.blit(tgt.ctx, s.canvas, pixRect(s, vis), vis, l.opacity, l.blend);

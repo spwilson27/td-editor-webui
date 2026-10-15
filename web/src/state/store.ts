@@ -7,6 +7,13 @@ import { hsvToRgb, parseHex, rgbToHsl, rgbToHsv, toHex, type Hsv, type Rgb } fro
 import { BRUSHES, FALLBACK_FONTS, RECENT_DEFAULT, toolInfo } from './tools';
 import { fitView, screenToDoc, zoomAbout, clampZoom, type View } from './view';
 
+export const SHAPE_RENDERER_KEY = 'raster-editor.shapeRenderer';
+export type ShapeRenderer = 'sdf' | 'canvas';
+
+function loadShapeRenderer(): ShapeRenderer {
+  try { return localStorage.getItem(SHAPE_RENDERER_KEY) === 'canvas' ? 'canvas' : 'sdf'; } catch { return 'sdf'; }
+}
+
 export type Connection = 'linked' | 'standalone' | 'reconnecting';
 
 const DEFAULT_PRIMARY: Hsv = rgbToHsv(parseHex('#e2683c')!);
@@ -35,6 +42,7 @@ export function createStore() {
   const textOpts = signal<TextOptions>(DEFAULT_TEXT_OPTIONS);
   const shapeOpts = signal<ShapeOptions>(DEFAULT_SHAPE_OPTIONS);
   const fonts = signal<string[]>(FALLBACK_FONTS);
+  const shapeRenderer = signal<ShapeRenderer>(loadShapeRenderer());
   const textEdit = signal<{ id: string; isNew: boolean; baseIndex?: number } | null>(null);
   const topDialog = signal(false);
   let bridgeApi: Pick<Bridge, 'listTops' | 'importTop'> | null = null;
@@ -89,7 +97,13 @@ export function createStore() {
 
   const store = {
     tool, hsv, primary, secondary, alpha, recent, customSwatches, brush, brushPreset, fillTolerance,
-    selOpts, textOpts, shapeOpts, fonts, textEdit, topDialog,
+    selOpts, textOpts, shapeOpts, fonts, textEdit, topDialog, shapeRenderer,
+    /** Shape antialiasing: 'sdf' = same maths as TouchDesigner, 'canvas' = browser Canvas 2D. Persisted per viewer. */
+    setShapeRenderer(mode: ShapeRenderer) {
+      shapeRenderer.value = mode;
+      engine?.setShapeRenderer(mode);
+      try { localStorage.setItem(SHAPE_RENDERER_KEY, mode); } catch { /* storage may be blocked */ }
+    },
     /** The bridge's TOP import API (null in standalone mode). */
     get bridge() { return bridgeApi; },
     set bridge(b: Pick<Bridge, 'listTops' | 'importTop'> | null) { bridgeApi = b; },
@@ -151,6 +165,7 @@ export function createStore() {
       });
       e.setTool(tool.value);
       e.setShapeTool(shapeOpts.peek().type);
+      e.setShapeRenderer(shapeRenderer.peek());
       e.setPreviewEnabled(viewMode.peek() === 'local');
       lastActiveId = e.activeLayerId();
       stopContextSync = effect(() => {

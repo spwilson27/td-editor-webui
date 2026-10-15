@@ -207,6 +207,11 @@ export interface EditorEngine {
   setShapeTool(type: ShapeType): void; // shape drawn by the 'shape' tool
   textLayerAt(x: number, y: number): string | null; // hit test for the text tool (doc px)
   importImage(rgba: Uint8Array | Uint8ClampedArray, w: number, h: number, name: string): string;
+  /** v3.1: how text-free shape layers are rasterised in the browser (preview AND rasterized surfaces).
+   *  'sdf' (default) = same antialiased SDF maths as td/raster_editor/shape.glsl, so Local preview and TD
+   *  match; 'canvas' = Canvas 2D paths (Chromium's own antialiasing). Not part of the document. */
+  setShapeRenderer(mode: 'sdf' | 'canvas'): void;
+  shapeRenderer(): 'sdf' | 'canvas';
 
   dispose(): void;
 }

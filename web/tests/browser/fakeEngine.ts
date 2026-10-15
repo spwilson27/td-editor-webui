@@ -306,6 +306,9 @@ export class FakeEngine implements EditorEngine {
     this.push('Flatten layer');
     this.changed();
   }
+  renderer: 'sdf' | 'canvas' = 'sdf';
+  setShapeRenderer(mode: 'sdf' | 'canvas') { this.renderer = mode; this.calls.push(`shapeRenderer:${mode}`); }
+  shapeRenderer() { return this.renderer; }
   setShapeTool(type: ShapeType) { this.shapeTool = type; this.calls.push(`shapeTool:${type}`); }
   /** Rough hit test: the text box is `size * 0.6` px per character wide and `size * lineHeight` per line tall. */
   textLayerAt(x: number, y: number) {

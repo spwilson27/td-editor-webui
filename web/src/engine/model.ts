@@ -125,6 +125,7 @@ export class Document {
   readonly root: GroupLayer;
   activeId: string | null = null;
   selection: Rect | null = null;
+  shapeRenderer: 'sdf' | 'canvas' = 'sdf'; // how shape layers are drawn (not part of the document)
   private seq = 0;
   private slotSeq = 0;
 

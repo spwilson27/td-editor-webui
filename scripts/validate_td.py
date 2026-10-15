@@ -1602,6 +1602,8 @@ def s21_ui_text_shape(args):
         return _text_shape_body()
     finally:
         try:
+            if not hook_missing("setShapeRenderer"):
+                hook_call("setShapeRenderer('sdf')")
             hook_call("setLayerVisible('base', true)")
             hook_call("deselect()")
         except Exception:  # noqa: BLE001
@@ -1612,6 +1614,9 @@ def _text_shape_body():
     notes, ok_all = [f"(text IoU criterion deliberately relaxed to >= {TEXT_MIN_IOU}: TD glyphs are thinner than Chromium's; "
                       f"bbox +-2 px and exact colour are the real text criteria)"], True
     hook_call("setLayerVisible('base', false)")  # both sides then composite only the layers under test
+    has_renderer = not hook_missing("setShapeRenderer")
+    if has_renderer:
+        hook_call("setShapeRenderer('sdf')")  # the default: the browser draws shapes with the TS port of shape.glsl
     fonts = hook_call("fonts()") or []
     text = dict(SPEC_TEXT, font=pick_font(fonts))
     tid = hook_call(f"addTextLayer({json.dumps(text)})")
@@ -1642,6 +1647,20 @@ def _text_shape_body():
     ok_all &= judge("text", text_parity, TEXT_BOX)
     for name, box in SHAPE_BOXES.items():
         ok_all &= judge(name, shape_parity, box)
+    if has_renderer:  # report only: the 'canvas' renderer (Canvas 2D) is a different rasteriser than TD's SDF
+        hook_call("setShapeRenderer('canvas')")
+        time.sleep(0.5)
+        nums = []
+        for name, box in SHAPE_BOXES.items():
+            td_img, pg = pair(box)
+            if pg is not None:
+                ok, d = shape_parity(td_img, pg)
+                nums.append(f"{name}: {d}")
+        notes.append("REPORT ONLY, page shapeRenderer='canvas': " + "; ".join(nums))
+        hook_call("setShapeRenderer('sdf')")
+        time.sleep(0.5)
+    else:
+        notes.append("(hook setShapeRenderer missing: canvas-mode numbers not measured)")
     # rasterize on: the browser renders the pixels, TD shows them exactly (a surface slot appears)
     for lid, box, label in ((tid, TEXT_BOX, "text"), (sids["rect"], SHAPE_BOXES["rect"], "rect")):
         hook_call(f"setRasterize({lid!r}, true)")
