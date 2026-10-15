@@ -95,3 +95,35 @@ adjustment effects.
 - **Undo across saves:** persist the **last 50 steps, ≤ 256 MB** (oldest dropped beyond either limit).
 - **Auto TD view for large documents:** **never automatic** — show a one-time notice suggesting TD view above
   ~8 MP instead.
+
+## 5. Phase B specification
+
+- **Filters in the document.** A filter is an `Effect` whose `type` is a filter-library type (`shared/effects/filters*.d.ts`);
+  the effects module renders it (`applyEffects` already knows every type; unknown-to-the-engine params are kept verbatim).
+  As a per-layer effect it sits in `effects[]` like any effect. As an **adjustment layer** it is
+  `adjustment: { type: 'filter', effect: Effect }` (applied to the accumulated result below within the parent, mixed by
+  opacity × mask, exactly like other adjustments; TD runs an `EffectChain` on the accumulated input).
+- **tdPreview layers.** For a layer whose effects/filters include a planner-flagged `tdPreview` type, the browser's Local
+  preview shows **TD's render of that layer's content after its effects** (doc space, straight alpha) instead of computing
+  it: TD → `layerPreview {layerId, frameId}` notice (one outstanding per client+layer) → `GET /layer?…&layerId=` (frame type 7
+  LAYER_PREVIEW, doc-sized). The browser composites that image with the layer's opacity/blend/mask as usual.
+- **Effects on groups** (applied to the group's isolated composite before it blends) and **on adjustment layers** (applied
+  to the adjusted result before the opacity×mask mix). Browser and TD.
+- **Selection-limited adjustments.** Adding an adjustment (incl. filter adjustments) while a selection exists creates the
+  layer with a mask from the selection (feathered coverage); the selection stays.
+- **Brushes.** Tip shapes: round (existing) plus built-in textured tips (chalk, bristle, spatter, noise, square, star) and
+  **custom tip from selection** (the selected pixels' luminance × alpha of the active layer, ≤ 512²); per-dab **scatter**
+  (distance, count), **angle jitter**, **size jitter**, **colour jitter** (hue/sat/value), seeded. **Presets**: name + full
+  brush settings + tip; built-in presets + user presets saved per viewer (localStorage) and **in the document**
+  (`DocSpec.brushPresets`, custom tips embedded as PNG data in the doc spec, ≤ 512² each, ≤ 16 presets with custom tips).
+- **Undo across saves.** The browser serialises its history (last 50 steps, ≤ 256 MB: pixel patches + structural entries)
+  into a binary blob and uploads it, debounced (≈2 s after the last history change and before any Save Project), with
+  `POST /history?token&client&rev` (body = blob; TD stores it in COMP storage → saved with the `.toe`, and in `.redoc` as
+  `history.bin`). On document load the page fetches `GET /history?…` and restores the history if its `rev` matches the
+  loaded document rev; otherwise it starts empty. Blob format versioned; unknown versions ignored.
+- **Fonts.** Bold/italic for font-collection families (TTC: Helvetica, Menlo, …) in TD's Text TOP (pick the face file /
+  typeface name correctly).
+- **Performance follow-ups.** Browser: cache of the composite below the active layer during strokes (recomposite only the
+  active layer + above over the cached below). Ext: call `network.set_active_layer` (active client's active layer, sent in a
+  new `activeLayer {id}` message) and `set_content_bounds` (from per-slot painted bounds it tracks from SURFACE tiles).
+  UI: one-time notice suggesting TD view above ~8 MP.

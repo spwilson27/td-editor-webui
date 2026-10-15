@@ -271,3 +271,16 @@ Further v5 details (TD implementation):
   `topReady {requestId, w, h}` + `GET /top?...&requestId=` (frame type 6), or `topError {requestId, msg}`.
   Test-only: with `Panelquery` containing `test=1` the message may carry `testPath` (string, or null = cancel) which replaces the dialog.
 - `Status` shows file results for 10 s and `effects unavailable: ...` when the network could not load the layer effects.
+
+## 9. Version 7 additions (DESIGN_V6 §5)
+
+`ready.protocol` / `hello.protocol` = **7**.
+- LayerSpec: `effects[]` may contain filter-library types (any `^[A-Za-z][A-Za-z0-9]{0,47}$` type; params per
+  `shared/effects/filters*.d.ts`); adjustment layers may be `adjustment: {type:"filter", effect: Effect}`; group and
+  adjustment layers may carry non-empty `effects[]`. `DocSpec.brushPresets: BrushPreset[]` (see `types.ts`).
+- Frame type `7` LAYER_PREVIEW (TD → web, `GET /layer?token&client&layerId=`): one band, doc-sized, straight RGBA8,
+  `slot` 0. Notice `{t:"layerPreview", layerId, frameId}` (one outstanding per client+layer; same stall/404 rules as `view`),
+  sent only for layers TD's planner flags `tdPreview`.
+- `{t:"activeLayer", id}` web → TD (active client; drives `set_active_layer`).
+- History: `POST /history?token&client&rev` (body: history blob, ≤ 256 MB) → `204`; `GET /history?token&client` → `200`
+  blob with header `X-Doc-Rev`, or `404`. Stored in COMP storage and in `.redoc` (`history.bin`).

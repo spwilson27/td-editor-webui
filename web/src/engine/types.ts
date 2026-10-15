@@ -55,7 +55,8 @@ export type AdjustmentSpec =
   | { type: 'hueSaturation'; hue: number; saturation: number; value: number }
   | { type: 'blur'; radius: number }
   | { type: 'invert' }
-  | { type: 'threshold'; level: number };
+  | { type: 'threshold'; level: number }
+  | { type: 'filter'; effect: Effect }; // v6: filter-library filter as an adjustment layer
 export type AdjustmentType = AdjustmentSpec['type'];
 
 export type PaintTarget = 'pixels' | 'mask';
@@ -91,6 +92,20 @@ export type CanvasMode = 'input' | 'fixed';
 export interface DocSpec {
   rev: number; width: number; height: number; layers: LayerSpec[];
   guides: Guides; canvas: { mode: CanvasMode };
+  brushPresets?: BrushPreset[]; // v6
+}
+/** v6 brushes (docs/DESIGN_V6.md §5). */
+export type TipShape = 'round' | 'chalk' | 'bristle' | 'spatter' | 'noise' | 'square' | 'star' | 'custom';
+export interface BrushDynamics {
+  scatter: number; scatterCount: number; // scatter distance as a fraction of size (0..4), dabs per step (1..16)
+  sizeJitter: number; angleJitter: number; // 0..1 (fraction of size), degrees 0..360
+  hueJitter: number; satJitter: number; valJitter: number; // 0..1
+  angle: number; roundness: number; // tip angle (deg), 0.05..1
+  seed: number;
+}
+export interface BrushPreset {
+  id: string; name: string; settings: BrushSettings; tip: TipShape; dynamics: BrushDynamics;
+  customTip?: { w: number; h: number; png: string /* data URL, ≤ 512² */ };
 }
 export interface LayerTransform { x: number; y: number; sx: number; sy: number; rot: number; kx: number; ky: number }
 export type Anchor = 'tl' | 't' | 'tr' | 'l' | 'c' | 'r' | 'bl' | 'b' | 'br';
@@ -282,6 +297,16 @@ export interface EditorEngine {
   setEffects(id: string, effects: Effect[]): void; // coalesced history like opacity
   setInputs(items: Array<{ input: number; w: number; h: number; connected: boolean }>): void; // from TD; auto-creates layers
   addInputLayer(input: number): string;
+
+  // v6: brushes, history persistence, below-cache, tdPreview layers (docs/DESIGN_V6.md §5)
+  setBrushTip(tip: TipShape, dynamics: BrushDynamics, customTip?: { w: number; h: number; alpha: Uint8Array }): void;
+  tipFromSelection(): { w: number; h: number; alpha: Uint8Array } | null; // active layer luminance × alpha in the selection
+  brushPresets(): BrushPreset[];
+  setBrushPresets(presets: BrushPreset[]): void; // document presets (docspec event)
+  serializeHistory(maxSteps: number, maxBytes: number): Uint8Array; // versioned blob
+  restoreHistory(blob: Uint8Array, rev: number): boolean; // true if restored (rev must equal the loaded doc rev)
+  tdPreviewLayers(): string[]; // layers whose effects need TD's render in the Local preview
+  setLayerPreview(layerId: string, rgba: Uint8Array | Uint8ClampedArray | null): void; // doc-sized straight RGBA from TD (null = clear)
   writeInput(input: number, rect: Rect, rgba: Uint8Array | Uint8ClampedArray): void; // replaces writeBase (no history)
   commitInput(input: number): void; // replaces commitBase
   // v4 engine additions (optional so fakes keep compiling; the real engine implements all of them)
