@@ -151,6 +151,7 @@ def L(id, kind="pixel", slot=None, mask=None, **kw):
 
 
 DOC = [L("base", "base"), L("p1", slot=1), L("p2", slot=2, mask={"slot": 3, "enabled": True})]
+DOC_SIZED = [dict(l, surfaceW=64, surfaceH=32) if l["kind"] in ("base", "pixel") else l for l in DOC]  # as TD hands it to a client
 
 
 # ----------------------------------------------------------------------------- HTTP
@@ -194,8 +195,8 @@ def test_first_client_becomes_active_and_gets_hello(env):
     env.pump()
     a = env.connect("external")
     (hello,) = env.s.messages(a, "hello")
-    assert hello["protocol"] == 4 and hello["active"] is True and hello["hasInput"] is False
-    assert hello["doc"] == {"w": 64, "h": 32} and hello["maxSendFps"] == 30
+    assert hello["protocol"] == 5 and hello["active"] is True and hello["hasInput"] is False
+    assert hello["doc"] == {"w": 64, "h": 32, "mode": "input"} and hello["baseSize"] == {"w": 0, "h": 0} and hello["maxSendFps"] == 30
     assert hello["hasDocument"] is False and hello["rev"] is None
 
 
@@ -607,7 +608,7 @@ def test_doc_is_applied_to_the_network_and_stored_in_doc_state(env):
     assert env.o.doc_state.text == ""  # written once per pump, not per message
     env.pump()
     stored = json.loads(env.o.doc_state.text)
-    assert stored == {"rev": 5, "layers": DOC}
+    assert stored == {"rev": 5, "layers": DOC, "guides": {"h": [], "v": []}, "canvas": {"mode": "input"}}
 
 
 def test_doc_state_written_once_per_pump_with_the_newest_doc(env):
@@ -752,7 +753,8 @@ def test_fresh_load_flow_request_doc_then_surface_per_slot(env):
     assert env.s.messages(b, "hello")[0]["hasDocument"] is True
     env.send(b, {"t": "requestDoc"})
     (st,) = env.s.messages(b, "docState")
-    assert st == {"t": "docState", "rev": 3, "layers": DOC, "docW": 64, "docH": 32}
+    assert st == {"t": "docState", "rev": 3, "layers": DOC_SIZED, "docW": 64, "docH": 32, "guides": {"h": [], "v": []},
+                  "canvas": {"mode": "input"}}
     for s, im in imgs.items():
         h, got = env.dump(b, s)
         assert (h.type, h.slot, h.frame_end, (h.x, h.y, h.w, h.h)) == (P.TYPE_SURFACE_DUMP, s, True, (0, 0, 64, 32))
@@ -943,7 +945,7 @@ def test_request_base_without_input_is_noop(env):
 
 
 
-def test_input_resize_sends_docsize_then_new_base_and_reallocates_surfaces_top_left(env):
+def test_input_resize_sends_docsize_and_basesize_new_base_and_keeps_surfaces(env):
     env.set_input(64, 32)
     env.pump()
     a = env.connect("panel")
@@ -951,32 +953,113 @@ def test_input_resize_sends_docsize_then_new_base_and_reallocates_surfaces_top_l
     env.run_until_bases(a)
     img = wire_img(64, 32, 3, 255)
     env.surface(a, 1, (0, 0, 64, 32), img)
+    env.pump()
+    uploads = len(env.top(1).uploads)
     env.set_input(80, 40, 2)
     env.pump()
     (ds,) = env.s.messages(a, "docSize")
-    assert ds == {"t": "docSize", "w": 80, "h": 40, "hasInput": True}
-    assert all(b.shape == (40, 80, 4) for b in env.x.surfaces.values())
-    # anchored top-left: wire pixel (x, y) is unchanged, the new area is transparent
-    new = env.dump(a, 1)[1]
-    assert (new[:32, :64] == img).all() and not new[32:].any() and not new[:, 64:].any()
+    assert ds == {"t": "docSize", "w": 80, "h": 40, "hasInput": True, "mode": "input"}
+    assert env.s.messages(a, "baseSize")[-1] == {"t": "baseSize", "w": 80, "h": 40}
+    # v5: surfaces keep their own size and pixels; nothing is reallocated or re-uploaded by a document resize
+    assert all(b.shape == (32, 64, 4) for b in env.x.surfaces.values())
+    assert (env.dump(a, 1)[1] == img).all() and len(env.top(1).uploads) == uploads
     assert env.o.net.applies[-1][1:] == (80, 40)  # network told the new size
-    env.surface(a, 1, (0, 0, 64, 32), wire_img(64, 32), dw=64, dh=32)  # in-flight stale tile
-    assert (env.dump(a, 1)[1] == new).all()
+    env.surface(a, 1, (0, 0, 8, 8), wire_img(8, 8, 9, 255), dw=64, dh=32)  # a tile for the (unchanged) surface still lands
+    assert not (env.dump(a, 1)[1][:8, :8] == img[:8, :8]).all()
     env.pump(30)
     last = list(env.bases(a).values())[-1]
-    assert (last[0][0].doc_w, last[0][0].doc_h) == (80, 40)
-    assert env.top(1).uploaded.shape == (40, 80, 4)  # re-uploaded at the new size
+    assert (last[0][0].doc_w, last[0][0].doc_h) == (80, 40)  # BASE frames carry the input size
 
 
-def test_shrinking_the_document_crops_surfaces_top_left(env):
+def test_base_frame_is_the_input_size_not_the_document_size_in_fixed_mode(env):
+    env.o.par.Docsizemode.val = "fixed"
+    env.o.par.Docw.val, env.o.par.Doch.val = 100, 60
+    env.set_input(80, 40, 2)
+    env.pump()
+    a = env.connect("panel")
+    env.run_until_bases(a)
+    assert (env.x.doc_w, env.x.doc_h, env.x.in_w, env.x.in_h) == (100, 60, 80, 40)
+    n = env.notices(a)[-1]
+    assert (n["docW"], n["docH"], n["w"], n["h"]) == (80, 40, 80, 40)
+    h, payload = list(env.bases(a).values())[-1][0]
+    assert (h.doc_w, h.doc_h, h.w, h.h, len(payload)) == (80, 40, 80, 40, 80 * 40 * 4)
+    env.set_input(60, 30, 3)  # input resolution change while Fixed: baseSize, no docSize, doc unchanged
+    env.pump(20)
+    assert env.s.messages(a, "baseSize")[-1] == {"t": "baseSize", "w": 60, "h": 30}
+    assert not env.s.messages(a, "docSize") and (env.x.doc_w, env.x.doc_h) == (100, 60)
+    assert (env.notices(a)[-1]["docW"], env.notices(a)[-1]["docH"]) == (60, 30)
+
+
+def test_doc_size_change_does_not_touch_surfaces(env):
     env.pump()
     a = env.connect("panel")
     env.doc(a, DOC)
     img = wire_img(64, 32, 3, 255)
     env.surface(a, 1, (0, 0, 64, 32), img)
+    env.pump()
+    uploads = len(env.top(1).uploads)
     env.o.par.Docw.val, env.o.par.Doch.val = 40, 20
     env.pump()
-    assert (env.dump(a, 1)[1] == img[:20, :40]).all()
+    assert (env.x.doc_w, env.x.doc_h) == (40, 20)
+    assert env.s.messages(a, "docSize")[-1] == {"t": "docSize", "w": 40, "h": 20, "hasInput": False, "mode": "input"}
+    assert (env.dump(a, 1)[1] == img).all() and len(env.top(1).uploads) == uploads
+
+
+def test_surfaces_are_allocated_at_their_own_sizes_and_masks_follow_their_layer(env):
+    env.pump()
+    a = env.connect("panel")
+    layers = [L("base", "base"), L("p1", slot=1, surfaceW=20, surfaceH=10, sx=2.0, sy=0.5, x=3.5, y=-2.25),
+              L("p2", slot=2, mask={"slot": 3, "enabled": True}, surfaceW=7, surfaceH=9)]
+    env.doc(a, layers)
+    assert {s: b.shape for s, b in env.x.surfaces.items()} == {1: (10, 20, 4), 2: (9, 7, 4), 3: (9, 7, 4)}
+    assert (env.x.surfaces[3] == 255).all()  # a mask starts white
+    h, got = env.dump(a, 2)
+    assert (h.doc_w, h.doc_h, h.x, h.y, h.w, h.h) == (7, 9, 0, 0, 7, 9) and got.shape == (9, 7, 4)
+    # frames are checked against the slot's surface size, not the document's
+    px = wire_img(20, 10, 4, 255)
+    env.surface(a, 1, (0, 0, 20, 10), px, dw=20, dh=10)
+    assert (env.dump(a, 1)[1] == px).all()
+    env.surface(a, 1, (0, 0, 20, 10), wire_img(20, 10, 5, 255), dw=64, dh=32)   # the document's size: stale for this slot
+    assert (env.dump(a, 1)[1] == px).all()
+    env.surface(a, 3, (0, 0, 7, 9), wire_img(7, 9, 6, 255), dw=7, dh=9)
+    assert env.dump(a, 3)[1][:, :, 0].any()
+
+
+def test_spec_size_change_reallocates_that_slot_only_and_drops_old_size_frames(env):
+    env.pump()
+    a = env.connect("panel")
+    layers = lambda w, h: [L("base", "base"), L("p1", slot=1, surfaceW=w, surfaceH=h), L("p2", slot=2, surfaceW=8, surfaceH=8)]
+    env.doc(a, layers(16, 8), rev=1)
+    px = wire_img(16, 8, 1, 255)
+    env.surface(a, 1, (0, 0, 16, 8), px, dw=16, dh=8)
+    env.surface(a, 2, (0, 0, 8, 8), wire_img(8, 8, 2, 255), dw=8, dh=8)
+    p2 = env.x.surfaces[2].copy()
+    env.pump()
+    n = len(env.top(1).uploads)
+    env.doc(a, layers(32, 24), rev=2)
+    assert env.x.surfaces[1].shape == (24, 32, 4) and (env.x.surfaces[2] == p2).all()
+    got = env.dump(a, 1)[1]
+    assert (got[:8, :16] == px).all() and not got[8:].any()  # kept top-left until the engine's resend
+    env.surface(a, 1, (0, 0, 16, 8), wire_img(16, 8, 7, 255), dw=16, dh=8)  # in flight, old size: dropped
+    assert (env.dump(a, 1)[1] == got).all()
+    full = wire_img(32, 24, 8, 255)
+    env.surface(a, 1, (0, 0, 32, 24), full, dw=32, dh=24)
+    assert (env.dump(a, 1)[1] == full).all()
+    env.pump()
+    assert env.top(1).uploaded.shape == (24, 32, 4) and len(env.top(1).uploads) > n
+    env.doc(a, layers(32, 24), rev=3)  # unchanged spec: nothing reallocated
+    assert (env.dump(a, 1)[1] == full).all()
+
+
+def test_v4_layer_without_surface_size_keeps_the_buffer_through_a_canvas_resize(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, DOC)
+    assert env.x.surfaces[1].shape == (32, 64, 4)
+    env.o.par.Docw.val = 100
+    env.pump()
+    env.doc(a, DOC, rev=2)  # still no surfaceW/H in the spec: the buffer keeps its size (never realloc on canvas resize)
+    assert env.x.surfaces[1].shape == (32, 64, 4) and env.x.doc_w == 100
 
 
 def test_doc_size_change_with_no_surfaces_and_no_document_is_fine(env):
@@ -994,7 +1077,8 @@ def test_input_disconnect_returns_to_doc_par_size(env):
     env.o.inputs = []
     env.pump()
     assert (env.x.doc_w, env.x.doc_h, env.x.has_input) == (64, 32, False)
-    assert env.s.messages(a, "docSize")[-1] == {"t": "docSize", "w": 64, "h": 32, "hasInput": False}
+    assert env.s.messages(a, "docSize")[-1] == {"t": "docSize", "w": 64, "h": 32, "hasInput": False, "mode": "input"}
+    assert env.s.messages(a, "baseSize")[-1] == {"t": "baseSize", "w": 0, "h": 0}
     assert env.o.net.applies[-1][1:] == (64, 32)
     assert env.o.switch.par.index.eval() == 1
 
@@ -1005,7 +1089,7 @@ def test_doc_par_change_without_input_resizes(env):
     env.o.par.Docw.val = 100
     env.o.par.Doch.val = 50
     env.pump()
-    assert env.s.messages(a, "docSize")[-1] == {"t": "docSize", "w": 100, "h": 50, "hasInput": False}
+    assert env.s.messages(a, "docSize")[-1] == {"t": "docSize", "w": 100, "h": 50, "hasInput": False, "mode": "input"}
     env.o.par.Docw.val = 101  # change when an input is connected must be ignored
     env.o.inputs = [object()]
     env.set_input(10, 10)
@@ -1435,18 +1519,17 @@ def test_premultiplied_toggle_mid_conversion_restarts_it():
 
 
 
-def test_failed_buffer_allocation_does_not_commit_doc_size(env, monkeypatch):
+def test_failed_buffer_allocation_does_not_commit_the_doc(env, monkeypatch):
     env.pump()
     a = env.connect("panel")
     env.doc(a, DOC)
-    env.o.par.Docw.val = 200
-    monkeypatch.setattr(env.x.frames, "resize_buffer", lambda old, w, h: (_ for _ in ()).throw(MemoryError("no")))
-    env.pump()
-    assert (env.x.doc_w, env.x.doc_h) == (64, 32) and env.x.surfaces[1].shape == (32, 64, 4)
-    assert not env.s.messages(a, "docSize")
+    more = DOC + [L("p9", slot=9, surfaceW=30, surfaceH=30)]
+    monkeypatch.setattr(env.x.frames, "alloc_buffer", lambda w, h, white=False: (_ for _ in ()).throw(MemoryError("no")))
+    env.doc(a, more, rev=2)  # guarded: reported, nothing committed
+    assert env.x.doc_layers == DOC and 9 not in env.x.surfaces and env.x.surfaces[1].shape == (32, 64, 4)
     monkeypatch.undo()
-    env.pump()
-    assert env.x.doc_w == 200 and env.s.messages(a, "docSize")
+    env.doc(a, more, rev=3)
+    assert env.x.surfaces[9].shape == (30, 30, 4)
 
 
 def test_one_failing_pump_step_does_not_skip_the_rest(env):
@@ -1684,7 +1767,7 @@ def test_resize_mid_conversion_voids_notices_and_serves_only_the_new_size():
     assert env.x.base.conv is not None
     env.o.in1.set_image(np.random.RandomState(2).rand(40, 80, 4).astype(np.float32))
     env.pump()
-    assert env.s.messages(a, "docSize")[-1] == {"t": "docSize", "w": 80, "h": 40, "hasInput": True}
+    assert env.s.messages(a, "docSize")[-1] == {"t": "docSize", "w": 80, "h": 40, "hasInput": True, "mode": "input"}
     assert env.x.base.conv is None and env.x.clients[a].base.outstanding is None
     assert env.fetch(a)["statusCode"] == 404  # the old frame is gone, the new one is not ready yet
     env.pump(30)
@@ -2325,7 +2408,7 @@ def test_restore_rebuilds_network_and_buffers_from_doc_state_and_locked_tops():
     h = b.s.messages(c, "hello")[0]
     assert h["hasDocument"] is True and h["rev"] == 6
     b.send(c, {"t": "requestDoc"})
-    assert b.s.messages(c, "docState")[0]["layers"] == DOC
+    assert b.s.messages(c, "docState")[0]["layers"] == DOC_SIZED
     assert (b.dump(c, 1)[1] == a.imgs[1]).all()  # opaque layers come back bit-exact
     assert np.abs(b.dump(c, 2)[1].astype(int) - a.imgs[2]).max() <= 2  # premultiplied round trip
     assert b.top(1).uploaded is not None and (b.top(1).uploaded == a.x.surfaces[1]).all()
@@ -2391,10 +2474,13 @@ def test_savetox_thaws_even_when_the_save_fails():
     assert not e.o.net.frozen and not e.x.frozen
 
 
-def test_savetox_pulse_uses_the_default_path(env):
+def test_exportdoc_pulse_saves_to_the_export_path(env, tmp_path):
     env.pump()
-    env.x.OnParChange(env.o.par.Savetox)
-    assert env.o.saved and env.o.saved[0][0].endswith(".tox")
+    target = tmp_path / "out.tox"
+    env.o.par.Exportpath.val = str(target)
+    env.x.OnParChange(env.o.par.Exportdoc)
+    assert env.o.saved[0][0] == str(tmp_path / "out.part.tox") and env.renamed == [(str(tmp_path / "out.part.tox"), str(target))]
+    assert "exported with document to " + str(target) in env.x.GetStatus() or env.x._flash[0].endswith(str(target))
 
 
 def test_freeze_thaw_round_trip_keeps_state_and_output_identical():
@@ -2895,17 +2981,17 @@ def rgba(r=0, g=0, b=0, a=255):
     return {"r": r, "g": g, "b": b, "a": a}
 
 
-def TEXT(id, rasterize=False, slot=None, **kw):
+def TEXT(id, **kw):
     spec = {"text": "Hi", "font": "Arial", "size": 32, "color": rgba(255, 0, 0), "align": "left", "bold": False,
             "italic": False, "lineHeight": 1.2, "x": 10, "y": 20, "boxWidth": None}
     spec.update(kw)
-    return L(id, "text", slot=slot, text=spec, shape=None, rasterize=rasterize)
+    return L(id, "text", text=spec, shape=None)
 
 
-def SHAPE(id, rasterize=False, slot=None):
+def SHAPE(id):
     spec = {"type": "rect", "x": 1, "y": 2, "w": 30, "h": 20, "radius": 4, "rotation": 0,
             "fill": {"enabled": True, "color": rgba(0, 0, 255)}, "stroke": {"enabled": False, "color": rgba(), "width": 2}}
-    return L(id, "shape", slot=slot, text=None, shape=spec, rasterize=rasterize)
+    return L(id, "shape", text=None, shape=spec)
 
 
 def install_tops(env, *tops):
@@ -3334,17 +3420,17 @@ def test_import_does_not_touch_documents_or_other_streams(env):
 def test_text_and_shape_layers_are_accepted_and_applied(env):
     env.pump()
     a = env.connect("panel")
-    layers = [L("base", "base"), TEXT("t1"), SHAPE("s1"), TEXT("t2", True, slot=4), SHAPE("s2", True, slot=5)]
+    layers = [L("base", "base"), TEXT("t1"), SHAPE("s1"), TEXT("t2", sx=2.0, sy=2.0), SHAPE("s2")]
     env.doc(a, layers)
     assert env.x.doc_layers == layers and not env.s.messages(a, "error")
-    assert set(env.x.surfaces) == {4, 5} and env.o.net.applies[-1][0] == layers
+    assert not env.x.surfaces and env.o.net.applies[-1][0] == layers   # text / shape layers never own a surface
 
 
-def test_text_layer_without_matching_rasterize_slot_is_rejected(env):
+def test_text_or_shape_layer_with_a_slot_is_rejected(env):
     env.pump()
     a = env.connect("panel")
-    env.doc(a, [L("base", "base"), TEXT("t1", True, slot=None)])
-    env.doc(a, [L("base", "base"), TEXT("t1", False, slot=3)])
+    env.doc(a, [L("base", "base"), L("t1", "text", slot=3, text=TEXT("x")["text"], shape=None)])
+    env.doc(a, [L("base", "base"), L("s1", "shape", slot=4, text=None, shape=SHAPE("x")["shape"])])
     assert len(env.s.messages(a, "error")) == 2 and env.x.doc_layers is None
 
 
@@ -3477,3 +3563,644 @@ def test_orphaned_import_temporaries_are_swept_on_start_and_drop(env):
     env.o.children = again
     env.x._drop_all_tops()
     assert [k.gone for k in again] == [True, False]
+
+
+# ----------------------------------------------------------------------------- v5: canvas (DESIGN_V4 section 1)
+
+def test_set_canvas_fixed_updates_the_parameters_and_tells_the_others(env):
+    env.pump()
+    a, b = env.connect("panel"), env.connect("external")
+    env.send(a, {"t": "setCanvas", "w": 300, "h": 200, "mode": "fixed"})
+    assert (env.o.par.Docw.val, env.o.par.Doch.val, env.o.par.Docsizemode.val) == (300, 200, "fixed")
+    assert (env.x.doc_w, env.x.doc_h) == (300, 200)
+    assert env.s.messages(b, "docSize")[-1] == {"t": "docSize", "w": 300, "h": 200, "hasInput": False, "mode": "fixed"}
+    assert not env.s.messages(a, "docSize")  # exactly what the sender asked for: no echo
+    assert env.o.net.applies[-1][1:] == (300, 200)
+    env.pump()
+    assert json.loads(env.o.doc_state.text if env.o.doc_state.text else "{}") == {}  # no document yet: nothing stored
+
+
+def test_set_canvas_does_not_resample_or_reallocate_surfaces(env):
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, [L("base", "base"), L("p1", slot=1, surfaceW=40, surfaceH=20)])
+    img = wire_img(40, 20, 3, 255)
+    env.surface(a, 1, (0, 0, 40, 20), img, dw=40, dh=20)
+    env.pump()
+    uploads = len(env.top(1).uploads)
+    env.send(a, {"t": "setCanvas", "w": 500, "h": 400, "mode": "fixed"})
+    env.pump()
+    assert env.x.surfaces[1].shape == (20, 40, 4) and (env.dump(a, 1)[1] == img).all()
+    assert len(env.top(1).uploads) == uploads
+
+
+def test_set_canvas_input_mode_follows_the_input_and_tells_the_sender_the_size(env):
+    env.set_input(80, 40)
+    env.o.par.Docsizemode.val = "fixed"
+    env.o.par.Docw.val, env.o.par.Doch.val = 300, 200
+    env.pump()
+    a = env.connect("panel")
+    assert (env.x.doc_w, env.x.doc_h) == (300, 200)
+    env.send(a, {"t": "setCanvas", "w": 1, "h": 1, "mode": "input"})
+    assert env.o.par.Docsizemode.val == "input" and (env.x.doc_w, env.x.doc_h) == (80, 40)
+    assert env.s.messages(a, "docSize")[-1] == {"t": "docSize", "w": 80, "h": 40, "hasInput": True, "mode": "input"}
+    env.send(a, {"t": "setCanvas", "w": 90, "h": 70, "mode": "fixed"})
+    assert (env.x.doc_w, env.x.doc_h, env.x._mode()) == (90, 70, "fixed")
+    # the input keeps its own resolution while Fixed
+    assert (env.x.in_w, env.x.in_h) == (80, 40)
+
+
+def test_set_canvas_only_from_the_active_client_and_validated(env):
+    env.pump()
+    a, b = env.connect("panel"), env.connect("external")
+    env.send(b, {"t": "setCanvas", "w": 300, "h": 200, "mode": "fixed"})
+    assert env.x.doc_w == 64 and env.o.par.Docsizemode.val == "input"
+    for bad in ({"w": 0, "h": 5, "mode": "fixed"}, {"w": 5, "h": 20000, "mode": "fixed"}, {"mode": "nope"}, {"w": "x", "h": 1, "mode": "fixed"}):
+        env.send(a, {"t": "setCanvas", **bad})
+    assert len(env.s.messages(a, "error")) == 4 and env.x.doc_w == 64
+
+
+def test_set_canvas_clamped_by_the_host_is_sent_back_to_the_sender(env):
+    env.pump()
+    a, b = env.connect("panel"), env.connect("external")
+    real_sync = env.x._sync_doc_size
+
+    def clamped():  # a host whose Docw parameter clamps to 16: the actual size differs from the request
+        env.o.par.Docw.val = min(int(env.o.par.Docw.val), 16)
+        real_sync()
+    env.x._sync_doc_size = clamped
+    env.send(a, {"t": "setCanvas", "w": 100, "h": 50, "mode": "fixed"})
+    assert env.s.messages(a, "docSize")[-1] == {"t": "docSize", "w": 16, "h": 50, "hasInput": False, "mode": "fixed"}
+    assert env.s.messages(b, "docSize")[-1]["w"] == 16
+
+
+def test_follow_input_doc_size_tracks_the_input_and_disconnect_uses_the_parameters(env):
+    env.set_input(80, 40)
+    env.pump()
+    a = env.connect("panel")
+    assert (env.x.doc_w, env.x.doc_h) == (80, 40) and env.s.messages(a, "hello")[0]["baseSize"] == {"w": 80, "h": 40}
+    env.set_input(33, 22)
+    env.pump()
+    assert (env.x.doc_w, env.x.doc_h) == (33, 22) and env.s.messages(a, "docSize")[-1]["mode"] == "input"
+    env.o.inputs = []
+    env.pump()
+    assert (env.x.doc_w, env.x.doc_h, env.x.in_w) == (64, 32, 0)
+
+
+def test_fixed_mode_ignores_the_input_size_and_uses_docw_doch(env):
+    env.o.par.Docsizemode.val = "fixed"
+    env.o.par.Docw.val, env.o.par.Doch.val = 120, 50
+    env.set_input(80, 40)
+    env.pump()
+    assert (env.x.doc_w, env.x.doc_h, env.x.in_w, env.x.in_h) == (120, 50, 80, 40)
+    a = env.connect("panel")
+    h = env.s.messages(a, "hello")[0]
+    assert h["doc"] == {"w": 120, "h": 50, "mode": "fixed"} and h["baseSize"] == {"w": 80, "h": 40} and h["hasInput"] is True
+    env.o.inputs = []
+    env.pump()
+    assert (env.x.doc_w, env.x.doc_h) == (120, 50)
+    assert env.s.messages(a, "baseSize")[-1] == {"t": "baseSize", "w": 0, "h": 0}
+    assert env.s.messages(a, "docSize")[-1]["hasInput"] is False
+
+
+def test_parameter_flip_to_fixed_keeps_the_current_size(env):
+    env.set_input(80, 40)
+    env.pump()
+    a = env.connect("panel")
+    env.o.par.Docsizemode.val = "fixed"
+    env.x.OnParChange(env.o.par.Docsizemode)
+    assert (env.x.doc_w, env.x.doc_h) == (80, 40) and (env.o.par.Docw.val, env.o.par.Doch.val) == (80, 40)
+    assert env.s.messages(a, "docSize")[-1] == {"t": "docSize", "w": 80, "h": 40, "hasInput": True, "mode": "fixed"}
+    env.o.par.Docw.val = 200  # the user edits the size: pushed as docSize with the mode
+    env.x.OnParChange(env.o.par.Docw)
+    assert env.s.messages(a, "docSize")[-1] == {"t": "docSize", "w": 200, "h": 40, "hasInput": True, "mode": "fixed"}
+    env.o.par.Docsizemode.val = "input"
+    env.x.OnParChange(env.o.par.Docsizemode)
+    assert (env.x.doc_w, env.x.doc_h) == (80, 40) and env.s.messages(a, "docSize")[-1]["mode"] == "input"
+
+
+def test_default_base_layer_is_fitted_in_fixed_mode_and_identity_when_following(env):
+    env.set_input(80, 40)
+    env.pump()
+    (base,) = env.o.net.applies[-1][0]
+    assert (base["sx"], base["sy"], base["x"], base["y"], base["surfaceW"], base["surfaceH"]) == (1, 1, 0, 0, 80, 40)
+    assert "rasterize" not in base
+    env.o.par.Docsizemode.val = "fixed"
+    env.o.par.Docw.val, env.o.par.Doch.val = 160, 160
+    env.pump()
+    (base,) = env.o.net.applies[-1][0]
+    assert (base["sx"], base["sy"], base["x"], base["y"]) == (2, 2, 0, 40)  # contain + centred
+
+
+def test_guides_and_canvas_mode_are_stored_and_restored(env):
+    env.pump()
+    a = env.connect("panel")
+    env.send(a, {"t": "setCanvas", "w": 300, "h": 200, "mode": "fixed"})
+    env.send(a, {"t": "doc", "rev": 4, "layers": DOC, "guides": {"h": [10, 20.5], "v": [5]}, "canvas": {"mode": "fixed"}})
+    env.pump()
+    stored = json.loads(env.o.doc_state.text)
+    assert stored["guides"] == {"h": [10.0, 20.5], "v": [5.0]} and stored["canvas"] == {"mode": "fixed"}
+    b = env.connect("external", fresh=True)
+    env.send(b, {"t": "requestDoc"})
+    st = env.s.messages(b, "docState")[-1]
+    assert st["guides"] == {"h": [10.0, 20.5], "v": [5.0]} and st["canvas"] == {"mode": "fixed"} and (st["docW"], st["docH"]) == (300, 200)
+    # a restart: the stored guides come back, and the stored mode wins over a stale parameter
+    e2 = Env(like=env)
+    e2.o.par.Docsizemode.val = "input"
+    e2.pump(3)
+    assert e2.x.guides == {"h": [10.0, 20.5], "v": [5.0]} and e2.x._mode() == "fixed"
+    assert e2.o.par.Docsizemode.val == "fixed"
+
+
+def test_canvas_in_a_doc_message_does_not_override_the_parameter(env):
+    env.pump()
+    a = env.connect("panel")
+    env.send(a, {"t": "doc", "rev": 1, "layers": DOC, "canvas": {"mode": "fixed"}})
+    env.pump()
+    assert json.loads(env.o.doc_state.text)["canvas"] == {"mode": "input"}  # setCanvas / the parameter are authoritative
+
+
+def test_a_v4_stored_document_is_migrated(env):
+    old = {"rev": 2, "layers": [L("base", "base"), dict(L("t", "text", slot=3, text=TEXT("x")["text"], shape=None), rasterize=True)]}
+    env.o.doc_state.text = json.dumps(old)
+    env.x.Start()
+    env.pump(2)
+    assert env.x.doc_layers[1]["slot"] is None and "rasterize" not in env.x.doc_layers[1]
+    assert env.x.guides == {"h": [], "v": []}
+
+
+def test_bad_guides_in_a_doc_are_rejected(env):
+    env.pump()
+    a = env.connect("panel")
+    env.send(a, {"t": "doc", "rev": 1, "layers": DOC, "guides": {"h": ["x"]}})
+    assert env.s.messages(a, "error") and env.x.doc_layers is None
+
+
+# ----------------------------------------------------------------------------- v5: export (DESIGN_V4 section 1)
+
+def test_exportdoc_writes_to_exportpath_via_temp_and_rename_and_reports(tmp_path):
+    e = settled_env()
+    e.x._open_url = e.opened.append
+    target = tmp_path / "doc.tox"
+    e.o.par.Exportpath.val = str(target)
+    e.x.OnParChange(e.o.par.Exportdoc)
+    ((path, frozen, state),) = e.o.saved
+    assert path == str(tmp_path / "doc.part.tox") and frozen is True and json.loads(state)["rev"] == 6
+    assert e.renamed == [(path, str(target))]
+    assert not e.o.net.frozen and not e.x.frozen
+    e.pump()
+    assert f"exported with document to {target}" in e.x.GetStatus() and "ERROR" not in e.x.GetStatus()
+
+
+def test_exportdoc_appends_tox_and_defaults_an_empty_path(env, tmp_path):
+    env.pump()
+    env.o.par.Exportpath.val = str(tmp_path / "noext")
+    assert env.x.ExportDoc() == str(tmp_path / "noext.tox")
+    env.o.par.Exportpath.val = ""
+    assert env.x.ExportDoc() == "raster_editor_export.tox"
+    env.pump()
+    assert "Export Path was empty" in env.x.GetStatus()
+
+
+def test_exportdoc_reports_a_missing_folder_and_save_failures_and_still_thaws(tmp_path):
+    e = settled_env()
+    e.o.par.Exportpath.val = str(tmp_path / "nope" / "x.tox")
+    assert e.x.ExportDoc() is None and not e.o.saved
+    e.pump()
+    assert "export failed" in e.x.GetStatus() and "does not exist" in e.x.GetStatus()
+    e.o.par.Exportpath.val = str(tmp_path / "ok.tox")
+    e.o.save = lambda p: (_ for _ in ()).throw(OSError("disk full"))
+    assert e.x.ExportDoc() is None
+    assert not e.o.net.frozen and not e.x.frozen and not e.renamed
+    e.pump()
+    assert "disk full" in e.x.GetStatus()
+    e.o.save = lambda p: e.o.saved.append((p, e.o.net.frozen, ""))
+    assert e.x.ExportDoc() == str(tmp_path / "ok.tox")
+    e.pump()
+    assert "ERROR" not in e.x.GetStatus() and "exported" in e.x.GetStatus()  # the old error is cleared
+
+
+def test_exportdoc_status_message_expires(tmp_path):
+    e = settled_env()
+    e.o.par.Exportpath.val = str(tmp_path / "x.tox")
+    e.x.ExportDoc()
+    e.pump()
+    assert "exported" in e.x.GetStatus()
+    e.pump(2, dt=E.EXPORT_FLASH_S)
+    assert "exported" not in e.x.GetStatus()
+
+
+def test_exportdoc_refused_while_a_restore_is_pending(tmp_path):
+    a = settled_env()
+    a.pump(3)
+    b = Env(like=a)
+    b.o.net.raise_on_apply = True
+    b.x.Start()
+    assert b.x._restore_pending
+    b.o.par.Exportpath.val = str(tmp_path / "x.tox")
+    assert b.x.ExportDoc() is None and not b.o.saved
+    b.pump()
+    assert "still being restored" in b.x.GetStatus()
+
+
+def test_savetox_parameter_is_gone():
+    import inspect
+    assert "Savetox" not in inspect.getsource(E)
+
+
+# ----------------------------------------------------------------------------- v5: Flatten (renderLayer)
+
+def flatten_env(**kw):
+    e = Env(**kw)
+    e.pump()
+    a = e.connect("panel")
+    e.doc(a, [L("base", "base"), TEXT("t1"), SHAPE("s1"), L("p1", slot=1)])
+    return e, a
+
+
+def render_ready(e, a, layer="t1", rid="f1", frames=10):
+    e.send(a, {"t": "renderLayer", "requestId": rid, "layerId": layer})
+    e.pump(frames)
+
+
+def test_render_layer_serves_the_layer_at_document_size_as_a_top_image():
+    e, a = flatten_env()
+    arr = tops_img(64, 32, 5)
+    arr[..., :3] *= arr[..., 3:4]
+    e.o.net.render_sources["t1"] = FakeTop("/project1/raster_editor/doc/t1_render", 64, 32, array=arr)
+    install_tops(e)
+    render_ready(e, a)
+    assert set(e.o.net.render_calls) == {"t1"} and len(e.o.net.render_calls) >= 2  # re-resolved every pump
+    (ready,) = e.s.messages(a, "topReady")
+    assert ready == {"t": "topReady", "requestId": "f1", "w": 64, "h": 32} and not e.s.messages(a, "topError")
+    r = get_top(e, a, "f1")
+    h, payload = P.decode_frame(r["data"])
+    assert (h.type, h.doc_w, h.doc_h, h.w, h.h, h.frame_end) == (6, 64, 32, 64, 32, True)
+    got = np.frombuffer(payload, np.uint8).reshape(32, 64, 4)
+    assert (got == frames.WireConverter().to_wire(arr, True)).all()  # premultiplied -> straight, top row first
+
+
+def test_render_layer_errors():
+    e, a = flatten_env()
+    e.o.net.render_sources["s1"] = FakeTop("/project1/raster_editor/doc/s1_render", 64, 32, array=tops_img(64, 32))
+    install_tops(e)
+    cases = [("p1", "not a text or shape"), ("nope", "not a text or shape"), ("t1", "cannot render")]  # t1: network has no source
+    for i, (layer, text) in enumerate(cases):
+        render_ready(e, a, layer, f"e{i}", frames=6)
+        errs = [m for m in e.s.messages(a, "topError") if m["requestId"] == f"e{i}"]
+        assert len(errs) == 1 and text in errs[0]["msg"], (layer, errs)
+    e.send(a, {"t": "renderLayer", "requestId": "bad"})
+    assert e.s.messages(a, "error")
+    b = e.connect("external")
+    e.send(b, {"t": "renderLayer", "requestId": "sb", "layerId": "s1"})
+    assert "active editor" in e.s.messages(b, "topError")[0]["msg"]
+
+
+def test_render_layer_refused_for_a_huge_document_and_while_restoring():
+    e, a = flatten_env()
+    e.x.doc_w, e.x.doc_h = 8000, 8000
+    e.send(a, {"t": "renderLayer", "requestId": "big", "layerId": "t1"})
+    assert "too large" in e.s.messages(a, "topError")[-1]["msg"]
+    e.x.doc_w, e.x.doc_h = 64, 32
+    e.x._restore_pending = True
+    e.send(a, {"t": "renderLayer", "requestId": "rs", "layerId": "t1"})
+    assert "restoring" in e.s.messages(a, "topError")[-1]["msg"]
+
+
+def test_render_layer_with_a_different_sized_source_is_scaled_to_the_document():
+    e, a = flatten_env()
+    src = FakeTop("/project1/raster_editor/doc/t1_render", 32, 16, array=tops_img(32, 16))
+    e.o.net.render_sources["t1"] = src
+    made = []
+    scaled = FakeTop("/project1/raster_editor/_imp_res0", 64, 32, array=tops_img(64, 32, 8))
+    e.x._make_scaler = lambda top, tw, th, tag: (made.append((top, tw, th)) or (scaled, []))
+    render_ready(e, a, frames=12)
+    assert made == [(src, 64, 32)] and e.s.messages(a, "topReady")[0]["w"] == 64
+    h, _ = P.decode_frame(get_top(e, a, "f1")["data"])
+    assert (h.doc_w, h.doc_h) == (64, 32)
+
+
+def test_render_layer_fails_if_the_document_is_resized_meanwhile():
+    e, a = flatten_env()
+    e.o.net.render_sources["t1"] = FakeTop("/project1/raster_editor/doc/t1_render", 64, 32, array=tops_img(64, 32))
+    e.send(a, {"t": "renderLayer", "requestId": "rz", "layerId": "t1"})
+    e.o.par.Docw.val = 70
+    e.pump(6)
+    assert "resized" in e.s.messages(a, "topError")[-1]["msg"] and not e.s.messages(a, "topReady")
+
+
+def test_newer_render_layer_supersedes_a_running_import_of_the_same_client():
+    e, a = flatten_env()
+    install_tops(e, FakeTop("/project1/img", 6, 4, array=tops_img(6, 4)))
+    e.o.net.render_sources["t1"] = FakeTop("/project1/raster_editor/doc/t1_render", 64, 32, array=tops_img(64, 32))
+    e.send(a, {"t": "importTop", "requestId": "i1", "path": "/project1/img"})
+    e.send(a, {"t": "renderLayer", "requestId": "f1", "layerId": "t1"})
+    e.pump(12)
+    assert [m["requestId"] for m in e.s.messages(a, "topError")] == ["i1"]
+    assert [m["requestId"] for m in e.s.messages(a, "topReady")] == ["f1"]
+
+
+# ----------------------------------------------------------------------------- v5: freeze / restore with variable surface sizes
+
+def sized_env():
+    e = Env()
+    e.pump()
+    a = e.connect("panel")
+    layers = [L("base", "base"), L("p1", slot=1, surfaceW=20, surfaceH=10, sx=2.0, sy=2.0, x=3.5, y=1.25),
+              L("p2", slot=2, mask={"slot": 3, "enabled": True}, surfaceW=7, surfaceH=9)]
+    e.doc(a, layers, rev=8)
+    e.imgs = {1: wire_img(20, 10, 21, 255), 2: wire_img(7, 9, 22, 200), 3: wire_img(7, 9, 23, 255)}
+    e.imgs[3][..., :3] = e.imgs[3][..., :1]
+    for s, im in e.imgs.items():
+        e.surface(a, s, (0, 0, im.shape[1], im.shape[0]), im, dw=im.shape[1], dh=im.shape[0], frame_id=s)
+    e.pump()
+    e.a, e.layers = a, layers
+    return e
+
+
+def test_freeze_checks_every_slot_against_its_own_size_and_thaw_round_trips():
+    e = sized_env()
+    e.x.Freeze()
+    assert e.o.net.frozen and {s: (t.uploaded.shape[1], t.uploaded.shape[0]) for s, t in e.o.net.tops.items()} == {
+        1: (20, 10), 2: (7, 9), 3: (7, 9)}
+    e.x.Thaw()
+    assert not e.o.net.frozen
+
+
+def test_freeze_fails_and_releases_locks_when_a_surface_holds_the_wrong_size():
+    e = sized_env()
+    e.top(3).skip_copy = True  # its callback writes nothing: the locked 128x128 image is not 7x9
+    with pytest.raises(RuntimeError, match="7x9"):
+        e.x.Freeze()
+    assert not e.o.net.frozen and not e.x.frozen
+
+
+def test_restart_restores_every_surface_at_its_own_size_from_the_locked_tops():
+    a = sized_env()
+    a.x.Freeze()
+    b = Env(like=a)
+    b.x.Start()
+    b.pump(3)
+    assert {s: buf.shape for s, buf in b.x.surfaces.items()} == {1: (10, 20, 4), 2: (9, 7, 4), 3: (9, 7, 4)}
+    cid = b.connect("panel", fresh=True)
+    for s, im in a.imgs.items():
+        h, got = b.dump(cid, s)
+        assert (h.doc_w, h.doc_h) == (im.shape[1], im.shape[0])
+        assert np.abs(got.astype(int) - im.astype(int)).max() <= 2  # (alpha 200 surfaces round trip through premultiplication)
+    assert not b.x._restore_pending and b.x.doc_rev == 8 and not b.o.net.frozen
+
+
+def test_restore_with_a_late_network_keeps_variable_sizes_and_holds_stale_tiles():
+    a = sized_env()
+    a.x.Freeze()
+    b = Env(like=a)
+    b.o.net.raise_on_apply = True
+    b.x.Start()
+    assert b.x._restore_pending
+    assert {s: buf.shape for s, buf in b.x.surfaces.items()} == {1: (10, 20, 4), 2: (9, 7, 4), 3: (9, 7, 4)}
+    c = b.connect("panel")
+    b.surface(c, 1, (0, 0, 20, 10), wire_img(20, 10, 99, 255), dw=20, dh=10)  # held, replayed after the restore
+    assert b.x._held
+    b.o.net.raise_on_apply = False
+    b.pump(5)
+    assert not b.x._restore_pending and not b.x._held
+    assert (b.dump(c, 1)[1] == wire_img(20, 10, 99, 255)).all()
+    assert b.dump(c, 2)[1].shape == (9, 7, 4)
+
+
+def test_premultiplied_toggle_re_encodes_surfaces_of_every_size():
+    e = sized_env()
+    e.o.par.Premultiplied.val = 0
+    e.x.OnParChange(e.o.par.Premultiplied)
+    e.pump(5)
+    assert not e.x._stale_enc
+    h, got = e.dump(e.a, 2)
+    assert (h.doc_w, h.doc_h) == (7, 9)
+    assert np.abs(got.astype(int) - e.imgs[2].astype(int)).max() <= 2  # (round trip through premultiplication)
+
+
+def test_a_restored_v4_document_without_surface_sizes_uses_the_document_size():
+    a = settled_env()
+    a.x.Freeze()
+    b = Env(like=a)
+    b.x.Start()
+    b.pump(3)
+    assert all(buf.shape == (32, 64, 4) for buf in b.x.surfaces.values()) and b.x.doc_rev == 6
+
+
+def test_adjustment_mask_without_a_size_keeps_its_buffer_across_canvas_resize(env):
+    env.pump()
+    a = env.connect("panel")
+    layers = [L("base", "base"), L("adj", "adjustment", mask={"slot": 4, "enabled": True}, adjustment={"type": "invert"})]
+    env.doc(a, layers)
+    assert env.x.surfaces[4].shape == (32, 64, 4)
+    env.send(a, {"t": "setCanvas", "w": 128, "h": 64, "mode": "fixed"})
+    env.doc(a, layers, rev=2)
+    assert env.x.surfaces[4].shape == (32, 64, 4)
+    assert env.dump(a, 4)[0].doc_w == 64
+
+
+def test_render_layer_aborts_when_the_source_operator_is_replaced_mid_readback():
+    e, a = flatten_env()
+    first = FakeTop("/project1/raster_editor/doc/t1_render", 64, 32, array=tops_img(64, 32))
+    e.o.net.render_sources["t1"] = first
+    e.send(a, {"t": "renderLayer", "requestId": "f1", "layerId": "t1"})
+    e.pump(1)   # readback in progress
+    e.o.net.render_sources["t1"] = FakeTop("/project1/raster_editor/doc/other", 64, 32, array=tops_img(64, 32, 9))
+    e.pump(8)
+    assert e.s.messages(a, "topError")[-1]["msg"] == "layer changed" and not e.s.messages(a, "topReady")
+
+
+def test_render_layer_aborts_when_the_layer_vanishes_or_its_token_changes():
+    for how in ("gone", "token"):
+        e, a = flatten_env()
+        e.o.net.render_sources["t1"] = FakeTop("/p/t1", 64, 32, array=tops_img(64, 32))
+        e.send(a, {"t": "renderLayer", "requestId": "f1", "layerId": "t1"})
+        e.pump(1)
+        if how == "gone":
+            del e.o.net.render_sources["t1"]
+        else:
+            e.o.net.token += 1   # a newer doc was applied
+        e.pump(8)
+        assert e.s.messages(a, "topError")[-1]["msg"] == "layer changed", how
+
+
+def test_render_layer_waits_until_the_layer_is_ready_then_succeeds_or_times_out():
+    e, a = flatten_env()
+    src = FakeTop("/p/t1", 64, 32, array=tops_img(64, 32))
+    e.o.net.render_sources["t1"] = src
+    e.o.net.not_ready.add("t1")
+    e.send(a, {"t": "renderLayer", "requestId": "f1", "layerId": "t1"})
+    e.pump(6)
+    assert src.calls == 0 and not e.s.messages(a, "topReady") and not e.s.messages(a, "topError")  # nothing read yet
+    e.o.net.not_ready.clear()
+    e.o.net.token += 1   # (measuring refined the layout while waiting: not an abort)
+    e.pump(10)
+    assert e.s.messages(a, "topReady")
+    e2, a2 = flatten_env()
+    e2.o.net.render_sources["t1"] = FakeTop("/p/t1", 64, 32, array=tops_img(64, 32))
+    e2.o.net.not_ready.add("t1")
+    e2.send(a2, {"t": "renderLayer", "requestId": "f2", "layerId": "t1"})
+    e2.pump(2)
+    e2.pump(1, dt=E.TOP_READ_TIMEOUT_S + 1)
+    assert "never became ready" in e2.s.messages(a2, "topError")[-1]["msg"]
+
+
+def test_doc_state_fills_in_missing_surface_sizes_for_the_client(env):
+    env.set_input(80, 40)
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, [L("base", "base"), L("p1", slot=1), L("p2", slot=2, surfaceW=7, surfaceH=9)])
+    b = env.connect("external", fresh=True)
+    env.send(b, {"t": "requestDoc"})
+    got = {l["id"]: (l["surfaceW"], l["surfaceH"]) for l in env.s.messages(b, "docState")[0]["layers"]}
+    assert got == {"base": (80, 40), "p1": (80, 40), "p2": (7, 9)}
+    assert "surfaceW" not in env.x.doc_layers[1]  # the stored stack is untouched
+
+
+# ----------------------------------------------------------------------------- review follow-ups (base layer in TD, baseSize, export)
+
+def base_of(env):
+    return next(l for l in env.x.doc_layers if l["kind"] == "base")
+
+
+def fixed_env_with_input(w=80, h=40):
+    e = Env()
+    e.set_input(w, h)
+    e.pump()
+    a = e.connect("panel")
+    e.doc(a, [L("base", "base", surfaceW=w, surfaceH=h, x=30, y=10, sx=2.0, sy=2.0)], rev=3)
+    e.send(a, {"t": "setCanvas", "w": 300, "h": 200, "mode": "fixed"})
+    e.pump()
+    return e, a
+
+
+def test_switching_to_follow_input_resets_the_stored_base_transform_in_td():
+    for via in ("setCanvas", "par"):
+        e, a = fixed_env_with_input()
+        assert (base_of(e)["x"], base_of(e)["sx"]) == (30, 2.0)
+        if via == "setCanvas":
+            e.send(a, {"t": "setCanvas", "w": 0, "h": 0, "mode": "input"})
+        else:
+            e.o.par.Docsizemode.val = "input"
+            e.x.OnParChange(e.o.par.Docsizemode)
+        b = base_of(e)
+        assert (b["x"], b["y"], b["sx"], b["sy"]) == (0, 0, 1, 1), via
+        assert e.o.net.applies[-1][0][0]["sx"] == 1 and e.x._doc_state_dirty
+        e.pump()
+        assert json.loads(e.o.doc_state.text)["layers"][0]["sx"] == 1
+
+
+def test_fixed_mode_input_resolution_change_keeps_the_displayed_box_in_td():
+    e, a = fixed_env_with_input(80, 40)
+    e.set_input(160, 20)
+    e.pump()
+    b = base_of(e)
+    assert (b["surfaceW"], b["surfaceH"]) == (160, 20)
+    assert abs(b["sx"] * 160 - 2.0 * 80) < 1e-9 and abs(b["sy"] * 20 - 2.0 * 40) < 1e-9   # same 160x80 box
+    assert (b["x"], b["y"]) == (30, 10) and e.o.net.applies[-1][0][0]["surfaceW"] == 160
+    # Follow Input: only the surface size follows (the transform is the identity)
+    e.send(a, {"t": "setCanvas", "w": 0, "h": 0, "mode": "input"})
+    e.set_input(50, 60)
+    e.pump()
+    b = base_of(e)
+    assert (b["surfaceW"], b["surfaceH"], b["sx"], b["sy"]) == (50, 60, 1, 1)
+
+
+def test_fixed_mode_reconnect_of_an_input_does_not_rescale_from_a_stale_size():
+    e, a = fixed_env_with_input(80, 40)
+    e.o.inputs = []
+    e.pump()
+    e.set_input(100, 100)
+    e.pump()
+    b = base_of(e)
+    assert (b["surfaceW"], b["surfaceH"], b["sx"]) == (100, 100, 2.0)   # no input before: just the new size
+
+
+def test_explicit_base_size_message_follows_hello():
+    e = Env()
+    e.set_input(80, 40)
+    e.pump()
+    a = e.connect("panel")
+    kinds = [m["t"] for c, m in e.s.texts if c == a]
+    assert kinds.index("hello") < kinds.index("baseSize")
+    assert e.s.messages(a, "baseSize")[0] == {"t": "baseSize", "w": 80, "h": 40}
+    b = e.connect("external")
+    assert e.s.messages(b, "baseSize")[0]["w"] == 80
+
+
+def test_zero_sized_input_is_ignored_only_in_follow_input_mode():
+    e = Env()
+    e.set_input(80, 40)
+    e.pump()
+    e.o.in1.width = e.o.in1.height = 0
+    e.pump()
+    assert (e.x.doc_w, e.x.doc_h, e.x.in_w) == (80, 40, 80)   # Follow Input keeps the document while the input restarts
+    e.o.in1.width, e.o.in1.height = 80, 40
+    e.o.par.Docsizemode.val = "fixed"
+    e.o.par.Docw.val, e.o.par.Doch.val = 200, 100
+    e.pump()
+    e.o.in1.width = e.o.in1.height = 0
+    e.pump()
+    assert (e.x.doc_w, e.x.doc_h) == (200, 100) and e.x.in_w == 0   # Fixed: the document never depended on it
+
+
+def test_render_layer_first_read_after_readiness_is_discarded():
+    e, a = flatten_env()
+    src = FakeTop("/p/t1", 64, 32, array=tops_img(64, 32))
+    e.o.net.render_sources["t1"] = src
+    e.o.net.not_ready.add("t1")
+    e.send(a, {"t": "renderLayer", "requestId": "f1", "layerId": "t1"})
+    e.pump(3)
+    src.array = tops_img(64, 32, 9)   # the final layout renders something else
+    e.o.net.not_ready.clear()
+    e.pump(1)   # ready flips: this pump may issue the first delayed read, never use it
+    assert not e.s.messages(a, "topReady")
+    e.pump(8)
+    h, payload = P.decode_frame(get_top(e, a, "f1")["data"])
+    want = frames.WireConverter().to_wire(tops_img(64, 32, 9), True)
+    assert (np.frombuffer(payload, np.uint8).reshape(32, 64, 4) == want).all()
+
+
+def test_exportdoc_failure_removes_the_part_file_and_keeps_unrelated_errors(tmp_path):
+    e = settled_env()
+    removed = []
+    real_remove = E.os.remove
+    E.os.remove = lambda p: removed.append(p)
+    try:
+        e.o.par.Exportpath.val = str(tmp_path / "x.tox")
+        e.x._replace = lambda a, b: (_ for _ in ()).throw(OSError("rename failed"))
+        assert e.x.ExportDoc() is None
+    finally:
+        E.os.remove = real_remove
+    assert removed == [str(tmp_path / "x.part.tox")]
+    e.x._replace = lambda a, b: None
+    e.x.last_error = ("network: boom", e.x._now())
+    assert e.x.ExportDoc() == str(tmp_path / "x.tox")
+    assert e.x.last_error and e.x.last_error[0] == "network: boom"   # not an export error: stays
+
+
+def test_exportpath_expands_the_home_directory():
+    e = Env()
+    e.o.par.Exportpath.val = "~/exports/a"
+    path, _ = e.x._export_path()
+    assert path == E.os.path.expanduser("~/exports/a") + ".tox" and "~" not in path
+
+
+def test_exportdoc_in_follow_input_mode_mirrors_the_current_size_into_docw_doch(tmp_path):
+    e = Env()
+    e.set_input(80, 40)
+    e.pump()
+    e.o.par.Exportpath.val = str(tmp_path / "m.tox")
+    e.x.ExportDoc()
+    assert (e.o.par.Docw.val, e.o.par.Doch.val) == (80, 40)
+
+
+def test_default_fit_uses_whole_pixels():
+    e = Env()
+    e.set_input(7, 3)
+    e.o.par.Docsizemode.val = "fixed"
+    e.o.par.Docw.val, e.o.par.Doch.val = 20, 20
+    e.pump()
+    (b,) = e.o.net.applies[-1][0]
+    assert b["x"] == int(b["x"]) and b["y"] == int(b["y"])

@@ -1,4 +1,4 @@
-"""TD <-> web wire protocol (docs/PROTOCOL.md, version 4). Pure python, no TD or numpy needed.
+"""TD <-> web wire protocol (docs/PROTOCOL.md, version 5). Pure python, no TD or numpy needed.
 
 Binary frames: 24-byte little-endian header + RGBA8 straight-alpha payload (top row first).
 JSON messages: text frames with a string field ``t``.
@@ -8,7 +8,7 @@ import json
 import struct
 from typing import Iterator, NamedTuple, Optional, Tuple
 
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 MAGIC = b"REF1"
 HEADER_SIZE = 24
 TYPE_BASE = 1  # TD -> web, GET /base
@@ -16,7 +16,7 @@ TYPE_BASE = 1  # TD -> web, GET /base
 TYPE_SURFACE = 3  # web -> TD, WebSocket, one slot per frame
 TYPE_SURFACE_DUMP = 4  # TD -> web, GET /surface
 TYPE_VIEW = 5  # TD -> web, GET /view
-TYPE_TOP_IMAGE = 6  # TD -> web, GET /top (docW/docH = the TOP's own size)
+TYPE_TOP_IMAGE = 6  # TD -> web, GET /top (docW/docH = the TOP's own size; the document size for renderLayer)
 VALID_TYPES = (TYPE_BASE, TYPE_SURFACE, TYPE_SURFACE_DUMP, TYPE_VIEW, TYPE_TOP_IMAGE)
 MAX_TOPS = 2000  # `tops` list length
 MAX_TOP_DIM = 8192  # importTop: width and height limit
@@ -27,6 +27,11 @@ SHAPE_TYPES = ("rect", "ellipse", "line", "polygon")
 FLAG_FRAME_END = 1
 MAX_PAYLOAD = 2 * 1024 * 1024  # bytes of pixel data per message
 MAX_DIM = 0xFFFF
+MAX_CANVAS_DIM = 16384  # document size limit (the Docw / Doch parameters)
+MAX_SURFACE_DIM = 16384  # one pixel surface: width and height ...
+MAX_SURFACE_PIXELS = 8192 * 8192  # ... and total pixels (imports are limited to 8192x8192)
+MAX_GUIDES = 1000  # per direction
+CANVAS_MODES = ("input", "fixed")
 
 _HEADER = struct.Struct("<4sBBHIHHHHHH")
 assert _HEADER.size == HEADER_SIZE
@@ -61,7 +66,8 @@ class Header(NamedTuple):
 
 
 def validate_header(h: Header) -> None:
-    """Raise ProtocolError unless the header describes a legal rect inside the document."""
+    """Raise ProtocolError unless the header describes a legal rect inside its ``doc_w`` x ``doc_h`` (v5: for SURFACE /
+    SURFACE_DUMP that is the surface size, for BASE the input size, for VIEW the document size)."""
     if h.type not in VALID_TYPES:
         raise ProtocolError(f"unknown frame type {h.type}")
     if not 0 <= h.slot <= 0xFFFF:
@@ -122,7 +128,8 @@ def decode_frame(data) -> Tuple[Header, memoryview]:
 
 
 def is_stale(h: Header, doc_w: int, doc_h: int) -> bool:
-    """True if the frame was produced for a different document size (drop silently)."""
+    """True if the frame was produced for a different size than the receiver's (drop silently). v5: the size to
+    compare with is the slot's surface size for SURFACE frames, not the document size."""
     return h.doc_w != doc_w or h.doc_h != doc_h
 
 
@@ -172,8 +179,11 @@ def decode_json(text) -> dict:
 
 
 def hello(doc_w: int, doc_h: int, has_input: bool, max_send_fps: float, active: bool, client_id: str = "",
-          has_document: bool = False, rev=None) -> str:
-    return encode_json({"t": "hello", "protocol": PROTOCOL_VERSION, "doc": {"w": doc_w, "h": doc_h},
+          has_document: bool = False, rev=None, mode: str = "input", base_w: int = 0, base_h: int = 0) -> str:
+    """``doc`` also carries the canvas ``mode`` and ``baseSize`` the input's resolution (0x0 = no input); both are v5
+    additions the web side may use instead of waiting for the first base notice."""
+    return encode_json({"t": "hello", "protocol": PROTOCOL_VERSION, "doc": {"w": doc_w, "h": doc_h, "mode": mode},
+                        "baseSize": {"w": int(base_w), "h": int(base_h)},
                         "hasInput": bool(has_input), "maxSendFps": max_send_fps, "active": bool(active),
                         "clientId": client_id, "hasDocument": bool(has_document),
                         "rev": rev if has_document else None})
@@ -214,12 +224,20 @@ def applied(frame_id: int, td_frame: int) -> str:
     return encode_json({"t": "applied", "frameId": frame_id, "tdFrame": td_frame})
 
 
-def doc_state(rev, layers: list, doc_w: int, doc_h: int) -> str:
-    return encode_json({"t": "docState", "rev": rev, "layers": layers, "docW": doc_w, "docH": doc_h})
+def doc_state(rev, layers: list, doc_w: int, doc_h: int, guides=None, canvas=None) -> str:
+    return encode_json({"t": "docState", "rev": rev, "layers": layers, "docW": doc_w, "docH": doc_h,
+                        "guides": guides if guides is not None else {"h": [], "v": []},
+                        "canvas": canvas if canvas is not None else {"mode": "input"}})
 
 
-def doc_size(w: int, h: int, has_input: bool) -> str:
-    return encode_json({"t": "docSize", "w": w, "h": h, "hasInput": bool(has_input)})
+def doc_size(w: int, h: int, has_input: bool, mode: str = "input") -> str:
+    """The document / canvas size (v5: surfaces are NOT reallocated by it) and the size mode."""
+    return encode_json({"t": "docSize", "w": w, "h": h, "hasInput": bool(has_input), "mode": mode})
+
+
+def base_size(w: int, h: int) -> str:
+    """The TD Input resolution changed, or the input was (dis)connected (0x0 = no input)."""
+    return encode_json({"t": "baseSize", "w": int(w), "h": int(h)})
 
 
 def active(is_active: bool) -> str:
@@ -237,8 +255,21 @@ def ready(client: str, token: str, fresh: bool = False, version: str = "", proto
                         "token": token, "fresh": bool(fresh)})
 
 
-def doc(rev, layers: list) -> str:
-    return encode_json({"t": "doc", "rev": rev, "layers": layers})
+def doc(rev, layers: list, guides=None, canvas=None) -> str:
+    msg = {"t": "doc", "rev": rev, "layers": layers}
+    if guides is not None:
+        msg["guides"] = guides
+    if canvas is not None:
+        msg["canvas"] = canvas
+    return encode_json(msg)
+
+
+def set_canvas(w: int, h: int, mode: str) -> str:
+    return encode_json({"t": "setCanvas", "w": w, "h": h, "mode": mode})
+
+
+def render_layer(request_id, layer_id: str) -> str:
+    return encode_json({"t": "renderLayer", "requestId": request_id, "layerId": layer_id})
 
 
 def list_tops(request_id) -> str:
@@ -334,10 +365,29 @@ def check_shape_spec(s) -> None:
     _check_stroke(s.get("stroke"), typ)
 
 
+def _check_surface_size(l):
+    """surfaceW / surfaceH of a pixel / base layer: both absent / null, or both ints in range."""
+    sw, sh = l.get("surfaceW"), l.get("surfaceH")
+    if sw is None and sh is None:
+        return
+    for v in (sw, sh):
+        _check(isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= MAX_SURFACE_DIM, f"layer {l['id']!r} surface size")
+    _check(sw * sh <= MAX_SURFACE_PIXELS, f"layer {l['id']!r} surface size (too many pixels)")
+
+
+def _check_guides(g):
+    _check(isinstance(g, dict), "guides")
+    for k in ("h", "v"):
+        v = g.get(k, [])
+        _check(isinstance(v, list) and len(v) <= MAX_GUIDES and all(_num(x) for x in v), f"guides.{k}")
+
+
 def parse_doc(msg: dict):
     """Validate a ``doc`` message. Returns (rev, layers) or raises ProtocolError. Checks what the TD side
-    relies on: a list of objects with string id / known kind, slot / mask slots as u16 ints, and for v4
-    text / shape layers their spec and ``rasterize`` (a slot exactly when rasterized)."""
+    relies on: a list of objects with string id / known kind, slot / mask slots as u16 ints, finite transform
+    numbers (x, y, sx, sy > 0), surface sizes (v5), text / shape specs, and that text / shape layers have no slot
+    (TD always renders them). The optional ``guides`` / ``canvas`` are validated too; read them with
+    ``doc_extras``."""
     layers = msg.get("layers")
     if not isinstance(layers, list) or not _num(msg.get("rev")):
         raise ProtocolError("doc needs a numeric rev and a layers list")
@@ -347,11 +397,15 @@ def parse_doc(msg: dict):
             raise ProtocolError("bad layer spec")
         kind = l["kind"]
         if kind in ("text", "shape"):
-            if not (l.get("rasterize") is None or isinstance(l["rasterize"], bool)):
-                raise ProtocolError("bad rasterize")
             (check_text_spec if kind == "text" else check_shape_spec)(l.get(kind))
-            if bool(l.get("rasterize")) != (l.get("slot") is not None):
-                raise ProtocolError(f"{kind} layer {l['id']!r}: a slot is required exactly when rasterize is true")
+            if l.get("slot") is not None:
+                raise ProtocolError(f"{kind} layer {l['id']!r}: text / shape layers have no surface slot")
+        for k in ("x", "y"):
+            _check_opt(l, k, _num, f"layer {l['id']!r}")
+        for k in ("sx", "sy"):
+            _check_opt(l, k, lambda v: _num(v) and 0 < v <= 1e6, f"layer {l['id']!r}")
+        if kind in ("pixel", "base"):
+            _check_surface_size(l)
         for s in (l.get("slot"), (l.get("mask") or {}).get("slot") if isinstance(l.get("mask"), dict) else None):
             if s is None:
                 continue
@@ -360,7 +414,61 @@ def parse_doc(msg: dict):
             if s in seen:
                 raise ProtocolError(f"duplicate surface slot {s}")
             seen.add(s)
+    if msg.get("guides") is not None:
+        _check_guides(msg["guides"])
+    if msg.get("canvas") is not None:
+        c = msg["canvas"]
+        _check(isinstance(c, dict) and c.get("mode") in CANVAS_MODES, "canvas")
     return msg["rev"], layers
+
+
+def doc_extras(msg: dict):
+    """(guides, canvas) of a validated ``doc`` / stored document, normalised: guides ``{"h": [...], "v": [...]}``
+    (document pixels, floats), canvas ``{"mode": "input" | "fixed"}``; missing -> no guides / follow input."""
+    g = msg.get("guides") or {}
+    guides = {"h": [float(x) for x in g.get("h", [])], "v": [float(x) for x in g.get("v", [])]}
+    c = msg.get("canvas") or {}
+    return guides, {"mode": c.get("mode", "input")}
+
+
+def parse_set_canvas(msg: dict):
+    """Validate ``setCanvas``; returns (w, h, mode). With ``mode: "input"`` w / h are ignored (returned as 0)."""
+    mode = msg.get("mode")
+    if mode not in CANVAS_MODES:
+        raise ProtocolError("bad canvas mode")
+    if mode == "input":
+        return 0, 0, mode
+    w, h = msg.get("w"), msg.get("h")
+    for v in (w, h):
+        if not _num(v) or v != int(v) or not 1 <= v <= MAX_CANVAS_DIM:
+            raise ProtocolError(f"bad canvas size {w!r}x{h!r} (1..{MAX_CANVAS_DIM})")
+    return int(w), int(h), mode
+
+
+def parse_render_layer(msg: dict):
+    """Validate ``renderLayer``; returns (requestId, layerId)."""
+    rid = _request_id(msg)
+    lid = msg.get("layerId")
+    if not isinstance(lid, str) or not 0 < len(lid) <= 256:
+        raise ProtocolError("bad layerId")
+    return rid, lid
+
+
+def slot_sizes(layers: list, doc_w: int, doc_h: int, current=None) -> dict:
+    """{slot: (w, h)} of every surface slot (pixel layer surfaces and masks, v5). A pixel layer's surface is its
+    ``surfaceW x surfaceH``; its mask has the same size. A layer without a surface size (adjustment / group
+    masks, or a v4 document) keeps the size of its existing buffer (``current``: {slot: (w, h)}), else the
+    document size: a canvas resize never reallocates a surface."""
+    cur = current or {}
+    out = {}
+    for l in layers:
+        sw, sh = l.get("surfaceW"), l.get("surfaceH")
+        known = (int(sw), int(sh)) if sw is not None and sh is not None else None
+        m = l.get("mask")
+        for s in (l.get("slot"), m.get("slot") if isinstance(m, dict) else None):
+            if s is not None:
+                out[s] = known or cur.get(s) or (doc_w, doc_h)
+    return out
 
 
 def import_target_size(w: int, h: int, doc_w: int, doc_h: int):

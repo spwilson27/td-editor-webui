@@ -170,6 +170,63 @@
       "payloadSha256": "f2f47624973f09fa8e65f43f69b9cb4239f05fee6afbb257b7575b5bdb901933"
     },
     {
+      "name": "base_input_size",
+      "file": "base_input_size.bin",
+      "frame": "base_input_size",
+      "valid": true,
+      "size": 96,
+      "header": {
+        "type": 1,
+        "slot": 0,
+        "flags": 1,
+        "frameEnd": true,
+        "frameId": 31,
+        "docW": 6,
+        "docH": 3,
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 3
+      },
+      "payloadSha256": "c95d1c8a84c6c830e09f174aa09c4c3001506e8bab78db87885f8e3301aaf8f5",
+      "currentDoc": {
+        "w": 5,
+        "h": 4
+      },
+      "note": "v5: BASE docW/docH = the input size (6x3), not the document size (5x4); not stale"
+    },
+    {
+      "name": "surface_dump_layer",
+      "file": "surface_dump_layer.bin",
+      "frame": "surface_dump_layer",
+      "valid": true,
+      "size": 96,
+      "header": {
+        "type": 4,
+        "slot": 4,
+        "flags": 1,
+        "frameEnd": true,
+        "frameId": 4,
+        "docW": 9,
+        "docH": 2,
+        "x": 0,
+        "y": 0,
+        "w": 9,
+        "h": 2
+      },
+      "payloadSha256": "e7658227091a1aef2ff5be5cf4f8c93d4582e45b2b65edfc5b04f1076086883f",
+      "currentDoc": {
+        "w": 5,
+        "h": 4
+      },
+      "currentSurface": {
+        "slot": 4,
+        "w": 9,
+        "h": 2
+      },
+      "note": "v5: docW/docH = the slot's surface size (9x2); the document may be any size"
+    },
+    {
       "name": "stale_docsize",
       "file": "stale_docsize.bin",
       "frame": "stale_docsize",
@@ -193,7 +250,12 @@
         "w": 6,
         "h": 7
       },
-      "note": "decodes fine; a receiver whose document is currentDoc must drop it"
+      "currentSurface": {
+        "slot": 5,
+        "w": 6,
+        "h": 7
+      },
+      "note": "decodes fine; v5: docW/docH are compared with the slot's surface size (currentSurface), a receiver whose slot is that size must drop it"
     },
     {
       "name": "wrong_slot",
@@ -216,6 +278,11 @@
       },
       "payloadSha256": "d8277da61fa6efe246f000edbdcf54fca9874e52d3701daa1700ed8cfca69601",
       "currentDoc": {
+        "w": 6,
+        "h": 7
+      },
+      "currentSurface": {
+        "slot": 5,
         "w": 6,
         "h": 7
       },

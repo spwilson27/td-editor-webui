@@ -11,7 +11,8 @@ or hand it to TD directly:
 Idempotent: rebuilds the COMP's contents in place, keeping its position, size, connections and the
 document (the `doc` network with its locked surface TOPs + the `doc_state` DAT), which survive every
 rebuild. The clean dist/raster_editor.tox is exported from a throw-away build (no document in it).
-Only touches /project1/raster_editor (and a temporary /project1/_re_tox_build, destroyed again).
+Only touches /project1/raster_editor (and a temporary /project1/_re_tox_build, always destroyed again,
+also when its build fails).
 """
 
 import os
@@ -154,16 +155,24 @@ HELP = {
     "Port": "TCP port of the editor's web server on 127.0.0.1 (1024-65535, default 9980). The editor panel and "
             "Open in Browser connect to it. Change it only if another program already uses 9980, or to run two "
             "editors in one project; changing it restarts the server and reloads the panel.",
-    "Docw": "Document width in pixels (1-16384, default 1920) when the input is not connected. Ignored while an "
-            "input is connected: then the document takes the input's size. Changing it resizes all layers, "
-            "anchored at the top-left, and clears the editor's undo history.",
-    "Doch": "Document height in pixels (1-16384, default 1080) when the input is not connected. Ignored while an "
-            "input is connected: then the document takes the input's size. Changing it resizes all layers, "
-            "anchored at the top-left, and clears the editor's undo history.",
+    "Docsizemode": "How the document (canvas) size is chosen. Follow Input (default): the document is the size of the "
+                   "connected input image; with no input it is Doc Width x Doc Height. Fixed: always Doc Width x "
+                   "Doc Height; an input keeps its own resolution and is placed as a movable layer. The editor's "
+                   "Document > Canvas Size dialog sets this and Doc Width / Doc Height for you. Switching to Fixed "
+                   "keeps the current size. Layers are never resampled by a size change.",
+    "Docw": "Document width in pixels (1-16384, default 1920). Used when Document Size Mode is Fixed, or when it is "
+            "Follow Input and no input is connected; ignored while an input is followed. Changing it changes the "
+            "canvas only: layers keep their pixels and positions (the editor's Canvas Size dialog can also shift "
+            "them by an anchor).",
+    "Doch": "Document height in pixels (1-16384, default 1080). Used when Document Size Mode is Fixed, or when it is "
+            "Follow Input and no input is connected; ignored while an input is followed. Changing it changes the "
+            "canvas only: layers keep their pixels and positions (the editor's Canvas Size dialog can also shift "
+            "them by an anchor).",
     "Premultiplied": "Whether TouchDesigner's image data is premultiplied by alpha (on, default, which is TD's "
-                     "convention). On: the input is un-premultiplied before the editor sees it and the output is "
-                     "premultiplied again. Turn off only if your input is straight (non-premultiplied) alpha "
-                     "and the output should be straight too. Has no visible effect on fully opaque images.",
+                     "convention). On: the input is un-premultiplied before the editor sees it, the output is "
+                     "premultiplied again, and layers are stored premultiplied. Also applies to Flatten and TOP "
+                     "imports. Turn off only if your input is straight (non-premultiplied) alpha and the output "
+                     "should be straight too. Has no visible effect on fully opaque images.",
     "Maxsendfps": "Upper limit, in frames per second (1-120, default 30), that the web editor uses when it sends "
                   "painted pixels to TouchDesigner. Lower it to reduce load on slow machines; raise it for the "
                   "smoothest live strokes. Sent to the editor when it connects.",
@@ -184,8 +193,14 @@ HELP = {
                    "browser window takes over.",
     "Reloadui": "Pulse: reloads the editor page in the panel. Use it if the panel looks stuck or after updating "
                 "the editor; the document is kept in TouchDesigner and reloaded.",
-    "Savetox": "Pulse: exports this component, including the current document and all its pixels, to "
-               "raster_editor_export.tox next to the project file. Does not save the project itself.",
+    "Exportpath": "File the Export with Document pulse writes: a .tox (default empty = raster_editor_export.tox next "
+                  "to the project file). A relative path is relative to the project folder, a missing .tox ending is "
+                  "added, and the folder must already exist.",
+    "Exportdoc": "Pulse (Export with Document): saves this component as a .tox at Export Path including the current "
+                 "document, all layers' pixels, guides and the canvas size mode, so loading the .tox restores the "
+                 "editor as you left it. An existing file at Export Path is overwritten. It is written to a temporary file and renamed, so a failed export never "
+                 "damages an earlier one. Refused while the document is still being restored. Does not save the "
+                 "project itself; the result is shown in Status.",
     "Status": "Informational, read-only: a one-line summary of the editor (which window is active, document size, "
               "tiles per second received, connected windows, errors). Nothing to set here.",
 }
@@ -193,7 +208,7 @@ COMMENT = ("Raster Editor: a layer-based raster editor with a web UI. Wire a TOP
            "document size on the Raster Editor page; Open in Browser opens a second window. Hover a parameter "
            "for help.")
 
-PARAMS = "Active Port Docw Doch Premultiplied Maxsendfps Maxinputfps Maxviewfps Devurl Panelquery Openbrowser Reloadui Savetox"
+PARAMS = "Active Port Docw Doch Premultiplied Maxsendfps Maxinputfps Maxviewfps Devurl Panelquery Openbrowser Reloadui Exportdoc Docsizemode"
 
 
 # --------------------------------------------------------------------------- build (inside TD)
@@ -304,6 +319,10 @@ def build(dev=False, name=NAME, in_place=True):
     page = comp.appendCustomPage("Raster Editor")
     page.appendToggle("Active", label="Active")[0].default = True
     page.appendInt("Port", label="Port")[0].default = 9980
+    dm = page.appendMenu("Docsizemode", label="Document Size Mode")[0]
+    dm.menuNames = ["input", "fixed"]
+    dm.menuLabels = ["Follow Input", "Fixed"]
+    dm.default = "input"
     page.appendInt("Docw", label="Doc Width")[0].default = 1920
     page.appendInt("Doch", label="Doc Height")[0].default = 1080
     page.appendToggle("Premultiplied", label="Premultiplied")[0].default = True
@@ -319,14 +338,17 @@ def build(dev=False, name=NAME, in_place=True):
     page.appendStr("Panelquery", label="Panel Query")
     page.appendPulse("Openbrowser", label="Open in Browser")
     page.appendPulse("Reloadui", label="Reload UI")
-    page.appendPulse("Savetox", label="Save TOX")
+    page.appendFile("Exportpath", label="Export Path")
+    page.appendPulse("Exportdoc", label="Export with Document")
     page.appendStr("Status", label="Status")[0].readOnly = True
     for pname, lo, hi in (("Port", 1024, 65535), ("Docw", 1, 16384), ("Doch", 1, 16384),
                           ("Maxsendfps", 1, 120), ("Maxinputfps", 1, 120), ("Maxviewfps", 1, 120)):
         p = getattr(comp.par, pname)
         p.min, p.max, p.clampMin, p.clampMax = lo, hi, True, True
+    # (TD 2025.32820 has no file-type filter for a custom File parameter: ExportDoc appends ".tox" itself)
     for pname in ("Active", "Port", "Docw", "Doch", "Premultiplied", "Maxsendfps", "Maxinputfps", "Maxviewfps"):
         getattr(comp.par, pname).val = getattr(comp.par, pname).default
+    comp.par.Docsizemode = "input"
     comp.par.Viewmode = "local"
     for pname, text in HELP.items():
         getattr(comp.par, pname).help = text
@@ -456,18 +478,29 @@ def restore(comp, state):
             target.inputConnectors[index].connect(comp.outputConnectors[0])
 
 
+def destroy_scratch():
+    """Destroy the temporary clean-build COMP (/project1/_re_tox_build) if it exists."""
+    stale = op(PARENT).op(TOX_NAME)
+    if stale is not None:
+        try:
+            stale.destroy()
+        except Exception as e:  # noqa: BLE001
+            print("could not destroy", TOX_NAME, e)
+
+
 def export_tox(dev):
     """dist/raster_editor.tox from a throw-away clean build (no document, defaults, no runtime state)."""
     if dev:
         return
-    scratch, _ = build(False, TOX_NAME, in_place=False)
+    destroy_scratch()  # a leftover of an earlier failed run
     try:
+        scratch, _ = build(False, TOX_NAME, in_place=False)
         out = os.path.join(REPO, "dist", "raster_editor.tox")
         os.makedirs(os.path.dirname(out), exist_ok=True)
         scratch.save(out)
         print("saved", out)
     finally:
-        scratch.destroy()  # same script, no frame ran in between: its extension never started
+        destroy_scratch()  # always, also when build() or save() failed half way (no frame ran: its extension never started)
 
 
 def main(dev):

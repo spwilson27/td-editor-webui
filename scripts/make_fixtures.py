@@ -92,17 +92,33 @@ def main():
     (m,) = P.encode_frames(P.TYPE_TOP_IMAGE, 21, 7, 3, (0, 0, 7, 3), Pix(0, 0, 7, 3))
     write("top_image", m, "top_image")
 
-    # 6. valid on the wire but stale: produced for a 7x7 document while the receiver's is 6x7;
+    # 5c. v5: a BASE frame has the INPUT's size as docW/docH (here 6x3) which differs from the document (5x4)
+    (m,) = P.encode_frames(P.TYPE_BASE, 31, 6, 3, (0, 0, 6, 3), Pix(0, 0, 6, 3))
+    write("base_input_size", m, "base_input_size")
+    entries[-1]["currentDoc"] = {"w": 5, "h": 4}
+    entries[-1]["note"] = "v5: BASE docW/docH = the input size (6x3), not the document size (5x4); not stale"
+
+    # 5d. v5: a SURFACE_DUMP of a layer whose surface (9x2) is smaller than the document (5x4 / any); docW/docH = surface size
+    (m,) = P.encode_frames(P.TYPE_SURFACE_DUMP, 4, 9, 2, (0, 0, 9, 2), Pix(0, 0, 9, 2), slot=4)
+    write("surface_dump_layer", m, "surface_dump_layer")
+    entries[-1]["currentDoc"] = {"w": 5, "h": 4}
+    entries[-1]["currentSurface"] = {"slot": 4, "w": 9, "h": 2}
+    entries[-1]["note"] = "v5: docW/docH = the slot's surface size (9x2); the document may be any size"
+
+    # 6. valid on the wire but stale: produced for a 7x7 surface while the receiver's is 6x7;
     #    decode_frame accepts it, receivers must drop it silently (PROTOCOL.md rules)
     stale = P.Header(P.TYPE_SURFACE, 1, 11, 7, 7, 0, 0, 2, 2, 5)
     write("stale_docsize", P.encode_message(stale, rect_pixels(0, 0, 2, 2)), "stale_docsize")
     entries[-1]["currentDoc"] = {"w": 6, "h": 7}
-    entries[-1]["note"] = "decodes fine; a receiver whose document is currentDoc must drop it"
+    entries[-1]["currentSurface"] = {"slot": 5, "w": 6, "h": 7}
+    entries[-1]["note"] = ("decodes fine; v5: docW/docH are compared with the slot's surface size (currentSurface), "
+                           "a receiver whose slot is that size must drop it")
 
     # 7. valid on the wire but for a slot TD does not know (not in its last `doc`): dropped
     unk = P.Header(P.TYPE_SURFACE, 1, 13, 6, 7, 0, 0, 2, 2, 999)
     write("wrong_slot", P.encode_message(unk, rect_pixels(0, 0, 2, 2)), "wrong_slot")
     entries[-1]["currentDoc"] = {"w": 6, "h": 7}
+    entries[-1]["currentSurface"] = {"slot": 5, "w": 6, "h": 7}
     entries[-1]["knownSlots"] = [5, 9]
     entries[-1]["note"] = "decodes fine; a receiver that does not know the slot must drop it"
 

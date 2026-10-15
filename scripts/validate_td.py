@@ -1,4 +1,4 @@
-"""Live validation of the raster_editor COMP (protocol v4) against a running TouchDesigner
+"""Live validation of the raster_editor COMP (protocol v5) against a running TouchDesigner
 (docs/TESTING.md section 3, docs/DESIGN_V2.md section 7).
 
     .venv/bin/python scripts/validate_td.py                  # every step (the real UI drives the UI steps)
@@ -6,12 +6,12 @@
     .venv/bin/python scripts/validate_td.py --fake-client    # same, but keeps the UI steps that tolerate it
     .venv/bin/python scripts/validate_td.py --only 5,7,9     # run chosen steps (numbers below)
 
-The fake client speaks protocol v3 over a stdlib WebSocket: it sends `doc` + SURFACE tiles like the web
+The fake client speaks protocol v5 over a stdlib WebSocket: it sends `doc` + SURFACE tiles like the web
 app, pulls BASE / VIEW / SURFACE over HTTP and measures `applied` latency.
 
 Flags: --no-build (reuse the COMP that exists), --port N, --only. Only operators inside
-/project1/raster_editor and the temporary /project1/_validate_in, /project1/_validate_load are touched
-(destroyed again at the end); the user's .toe is never saved: persistence uses SaveTox to dist/validate.
+/project1/raster_editor and the temporary /project1/_validate_in, /project1/_validate_load, _validate_tops are
+touched (destroyed again at the end); the user's .toe is never saved: persistence uses the Exportdoc pulse to dist/validate.
 """
 
 import argparse
@@ -227,15 +227,17 @@ def get_base(port, tok, client_id, frame_id=0):
     return body if st == 200 else None
 
 
-def L(id, kind="pixel", slot=None, mask=None, **kw):
+def L(id, kind="pixel", slot=None, mask=None, size=None, **kw):
+    """A v5 LayerSpec. ``size`` = (surfaceW, surfaceH) of a pixel / base layer's surface (default: none = document size)."""
     d = {"id": id, "kind": kind, "parentId": None, "name": id, "visible": True, "opacity": 1, "blend": "normal",
-         "x": 0, "y": 0, "slot": slot, "mask": mask, "adjustment": None}
+         "x": 0, "y": 0, "sx": 1, "sy": 1, "surfaceW": size[0] if size else None, "surfaceH": size[1] if size else None,
+         "slot": slot, "mask": mask, "adjustment": None}
     d.update(kw)
     return d
 
 
 class Editor:
-    """A fake web client speaking protocol v3: doc + SURFACE tiles out, notices + HTTP pulls in."""
+    """A fake web client speaking protocol v5: doc + SURFACE tiles out, notices + HTTP pulls in."""
 
     def __init__(self, port, kind="external", fresh=False, autofetch=True):
         self.port, self.kind, self.autofetch = port, kind, autofetch
@@ -250,6 +252,8 @@ class Editor:
         self.sent, self.applied = {}, {}     # frameId -> send time / `applied` receive time
         self.doc_state = None
         self.doc_w = self.doc_h = None
+        self.mode = None            # canvas mode from hello / docSize
+        self.base_size = None       # (w, h) of the TD Input from hello / baseSize; (0, 0) = none
         self.fid = 1000 if kind == "external" else 5000
         self.ws.send(P.ready(kind, self.token, fresh, "validate"))
 
@@ -270,10 +274,15 @@ class Editor:
             if t == "hello":
                 self.hello, self.client_id, self.active = msg, msg["clientId"], msg["active"]
                 self.doc_w, self.doc_h = msg["doc"]["w"], msg["doc"]["h"]
+                self.mode = msg["doc"].get("mode")
+                self.base_size = (msg["baseSize"]["w"], msg["baseSize"]["h"]) if "baseSize" in msg else None
+            elif t == "baseSize":
+                self.base_size = (msg["w"], msg["h"])
             elif t == "active":
                 self.active = msg["active"]
             elif t == "docSize":
                 self.doc_w, self.doc_h = msg["w"], msg["h"]
+                self.mode = msg.get("mode")
             elif t == "docState":
                 self.doc_state = msg
             elif t == "applied":
@@ -312,16 +321,21 @@ class Editor:
         self.send(json.dumps({"t": "takeover"}))
         return self.wait(lambda: self.active is True, 3)
 
-    def send_doc(self, layers, rev):
-        self.send(P.doc(rev, layers))
+    def send_doc(self, layers, rev, guides=None, canvas=None):
+        self.send(P.doc(rev, layers, guides, canvas))
 
-    def send_surface(self, slot, rect, pixels):
-        """One SURFACE frame (bands under 2 MB); returns its frameId."""
+    def send_surface(self, slot, rect, pixels, size=None):
+        """One SURFACE frame (bands under 2 MB); returns its frameId. v5: the header size is the SLOT's surface size
+        (``size`` = (w, h); default the document size)."""
         self.fid += 1
         self.sent[self.fid] = time.time()
-        for m in P.encode_frames(P.TYPE_SURFACE, self.fid, self.doc_w, self.doc_h, rect, pixels, slot=slot):
+        sw, sh = size or (self.doc_w, self.doc_h)
+        for m in P.encode_frames(P.TYPE_SURFACE, self.fid, sw, sh, rect, pixels, slot=slot):
             self.ws.send(m)
         return self.fid
+
+    def send_canvas(self, w, h, mode):
+        self.send(P.set_canvas(w, h, mode))
 
     def view(self, mode, zoom=1.0, pan_x=0.0, pan_y=0.0, rect=None):
         self.send(P.view(mode, zoom, pan_x, pan_y, rect or {"x": 0, "y": 0, "w": 1280, "h": 800}))
@@ -375,7 +389,8 @@ def scene(W, H):
     return p1, p2, mask
 
 
-SCENE_LAYERS = [L("base", "base"), L("p1", slot=1), L("p2", slot=2, mask={"slot": 3, "enabled": True})]
+SCENE_LAYERS = [L("base", "base", size=(IW, IH)), L("p1", slot=1, size=(IW, IH)),
+                L("p2", slot=2, mask={"slot": 3, "enabled": True}, size=(IW, IH))]
 
 
 def expected_scene(p1, p2, mask):
@@ -420,6 +435,7 @@ c = op('/project1').create(constantTOP, '_validate_in')
 c.par.outputresolution = 'custom'; c.par.resolutionw = {IW}; c.par.resolutionh = {IH}
 c.par.colorr = 1; c.par.colorg = 0; c.par.colorb = 0; c.par.alpha = 1
 comp.inputConnectors[0].connect(c)
+comp.par.Docsizemode = 'input'
 """)
 
 
@@ -470,7 +486,7 @@ print(json.dumps({'state': t, 'kids': sorted(x.name for x in d.children if x.nam
                            capture_output=True, text=True, timeout=180)
         if r.returncode != 0:
             return False, (r.stdout + r.stderr)[-1500:]
-    ORIG.update(td_json("print(json.dumps({'Port': int(comp.par.Port), 'Docw': int(comp.par.Docw), 'Doch': int(comp.par.Doch), 'Panelquery': comp.par.Panelquery.eval()}))"))
+    ORIG.update(td_json("print(json.dumps({'Port': int(comp.par.Port), 'Docw': int(comp.par.Docw), 'Doch': int(comp.par.Doch), 'Panelquery': comp.par.Panelquery.eval(), 'Docsizemode': comp.par.Docsizemode.eval(), 'Exportpath': comp.par.Exportpath.eval()}))"))
     if not args.skip_ui:
         td("comp.par.Panelquery = 'test=1'")
     if args.port != 9980:
@@ -520,7 +536,7 @@ print(json.dumps({{'std': float(a.std()), 'rng': float(a.max() - a.min()), 'size
 
 def s4_no_input(args):
     # a document size distinct from the input size used later, so a stale size would show
-    td("comp.inputConnectors[0].disconnect() if comp.inputConnectors[0].connections else None\ncomp.par.Docw = 800; comp.par.Doch = 600")
+    td("comp.inputConnectors[0].disconnect() if comp.inputConnectors[0].connections else None\ncomp.par.Docsizemode = 'input'; comp.par.Docw = 800; comp.par.Doch = 600")
     want = [800, 600]
     got = wait_for(lambda: out1_size() == want, 3)
     return bool(got), f"out1 {out1_size()} vs Docw x Doch {want}"
@@ -543,7 +559,8 @@ def s5_scene(args):
         if not ed.takeover():
             return False, f"takeover failed: {ed.texts}"
         h = ed.hello
-        if h["protocol"] != P.PROTOCOL_VERSION or h["doc"] != {"w": IW, "h": IH} or not h["hasInput"] or "hasDocument" not in h or "rev" not in h:
+        if h["protocol"] != P.PROTOCOL_VERSION or h["doc"].get("w") != IW or h["doc"].get("h") != IH or not h["hasInput"] \
+                or "hasDocument" not in h or "rev" not in h or h["doc"].get("mode") != "input" or h.get("baseSize") != {"w": IW, "h": IH}:
             return False, f"bad hello {h}"
         p1, p2, mask = scene(IW, IH)
         t0 = time.time()
@@ -755,7 +772,7 @@ print(json.dumps({'top': comp.par.top.val, 'transparent': bool(w.par.transparent
 
 
 def s10_persistence(args):
-    """Freeze/Thaw round trip; SaveTox -> loadTox into a temp COMP: document + output identical. Never saves the .toe."""
+    """Freeze/Thaw round trip; Exportdoc pulse -> loadTox into a temp COMP: document + output identical. Never saves the .toe."""
     os.makedirs(OUT_DIR, exist_ok=True)
     # the loaded copy has no input: compare on a blank base at the same document size (no cropping)
     td(f"comp.par.Docw = {IW}; comp.par.Doch = {IH}\ncomp.inputConnectors[0].disconnect()")
@@ -787,8 +804,11 @@ import hashlib, numpy as np
 o = comp.op('doc/out').numpyArray()
 print(json.dumps(hashlib.md5((o * 255 + .5).astype(np.uint8).tobytes()).hexdigest()))
 """)
-    td(f"comp.ext.RasterEditorExt.SaveTox({path!r})")
+    td(f"comp.par.Exportpath = {path!r}\ncomp.par.Exportdoc.pulse()")  # (the par_exec callback runs a frame later)
+    wait_for(lambda: os.path.exists(path), 15)
+    exported_msg = bool(wait_for(lambda: "exported with document" in status(), 5))
     size = os.path.getsize(path) if os.path.exists(path) else 0
+    td("comp.par.Exportpath = ''")
     # Load the exported file into a temporary container. The primary editor is switched off meanwhile (one port).
     td("comp.par.Active = 0")
     time.sleep(0.5)
@@ -823,9 +843,9 @@ comp.par.Active = 1
     connect_input()
     same_sig = loaded.get("sig") == before["sig"]
     ok = (ft["locked"] and ft["unlocked"] and after_ft == before["out"] and size > 0 and same_sig
-          and loaded.get("rev") == before["rev"] and loaded.get("out") == before["out"] and not loaded.get("frozen_left"))
+          and loaded.get("rev") == before["rev"] and loaded.get("out") == before["out"] and not loaded.get("frozen_left") and exported_msg)
     return bool(ok), (f"Freeze locks all surface TOPs: {ft['locked']}, Thaw unlocks: {ft['unlocked']}, output unchanged: {after_ft == before['out']}; "
-                      f"SaveTox -> {size} bytes; loaded copy: rev {loaded.get('rev')} (was {before['rev']}), surfaces identical: {same_sig}, "
+                      f"Exportdoc -> {size} bytes, Status says exported: {exported_msg}; loaded copy: rev {loaded.get('rev')} (was {before['rev']}), surfaces identical: {same_sig}, "
                       f"out identical: {loaded.get('out') == before['out']}, locked after restore: {loaded.get('frozen_left')}, err={loaded.get('err')}")
 
 def s11_reconnect_takeover(args):
@@ -833,6 +853,10 @@ def s11_reconnect_takeover(args):
     p1, p2, mask = STATE["p1"], STATE["p2"], STATE["mask"]
     a = Editor(args.port)
     a.takeover()
+    # (a reconnecting real page is authoritative and may have pushed its own document since step 10: put the scene back)
+    a.send_doc(SCENE_LAYERS, STATE["rev"])
+    fids = [a.send_surface(1, (0, 0, IW, IH), p1), a.send_surface(2, (0, 0, IW, IH), p2), a.send_surface(3, (0, 0, IW, IH), mask)]
+    wait_applied(a, fids[-1], 6)
     a.close()
     # 1. fresh page: hello.hasDocument -> requestDoc -> docState -> GET /surface per slot
     b = Editor(args.port, fresh=True)
@@ -987,6 +1011,13 @@ print(json.dumps(rows))
             f"DocNetwork.apply as seen by ext: prop change {fmt(prop)} (budget < 2 ms), structural {fmt(struct)} (budget < 10 ms); "
             f"nodes {netinfo['nodes']}")
     finally:
+        # Leave a tiny document behind: the real page is promoted when this client leaves and would otherwise download the
+        # 21 x 8 MB stack above (and be mid-load when the next step's client takes over).
+        try:
+            ed.send_doc([L("base", "base")], 800)
+            ed.run(0.3)
+        except Exception:  # noqa: BLE001
+            pass
         ed.close()
 
 
@@ -1083,12 +1114,12 @@ def centre_is(rgba, tol=6):
     return wait_for(lambda: px_near(pixel(COMP + "/out1", 0.5, 0.5), rgba, tol), 1.5, 0.05)
 
 
-def ui_ready():
+def ui_ready(timeout=10):
     """The real page is the active editor and finished loading (after a fake client left)."""
     def loaded():
         ls = js_result("window.__editorTest.loadState()") or {}
         return ls.get("active") is True and not ls.get("loadingDoc")
-    return wait_for(loaded, 10, 0.3)
+    return wait_for(loaded, timeout, 0.3)
 
 
 def ensure_test_hook():
@@ -1204,8 +1235,10 @@ def s15_parity(args):
         if not ensure_test_hook():
             return None, "test hook not reachable"
         time.sleep(1.5)
-        if not ui_ready():
-            return None, f"real page did not become active/load the document: {js_result('window.__editorTest.loadState()')}"
+        if not ui_ready(45):  # (promoted after step 12's 1080p stack: loading 23 surfaces can take well over 10 s)
+            ls_ = js_result('window.__editorTest.loadState()') or {}
+            return None, (f"real page did not become active/load the document: " + str({k: v for k, v in ls_.items() if k != 'docSpec'})
+                          + f" status={status()!r}")
         stt = js_result("window.__editorTest.loadState()")
         if len(stt["slots"]) < len(surf):
             return False, f"page did not load the document (slots {stt['slots']}): {str(stt)[:300]}"
@@ -1259,9 +1292,11 @@ def s16_ui_view_mode(args):
 
 # --------------------------------------------------------------------------- v4 steps (DESIGN_V3 section 4)
 #
-# Test-hook members the UI steps (20-22) use, on top of the v3 hook (state, addLayer, setPrimary, readPixel, docToScreen,
+# Test-hook members the UI steps (20-30) use, on top of the v3 hook (state, addLayer, setPrimary, readPixel, docToScreen,
 # loadState, ...) -- all in web/src/state/testHook.ts except the optional one; a step is SKIPPED, naming what is missing:
-#   addTextLayer(spec) -> id         addShapeLayer(spec) -> id      setRasterize(id, bool)      flatten(id)      fonts() -> string[]
+#   addTextLayer(spec) -> id         addShapeLayer(spec) -> id      flatten(id)      fonts() -> string[]
+#   v5: setTransform(id, {x, y, sx, sy})   layers()  setCanvasSize(w, h, anchor)  setCanvasMode('input'|'fixed')  canvasMode()
+#       addGuide(axis, pos)  guides()  layerBounds(id)
 #   importImageFromTop(path) -> Promise<layerId>         selectPolygon([[x, y], ...])         selectWand(x, y)
 #   setSelectionOptions({mode, wandTolerance, wandContiguous, wandSampleAll, feather, antialias})
 # Colours in specs are {r, g, b, a} 0..255.
@@ -1279,7 +1314,7 @@ def hook_call(expr, timeout=5):
 
 def td_layers():
     return td_json("L = comp.ext.RasterEditorExt.doc_layers or []\n"
-                   "print(json.dumps([{k: l.get(k) for k in ('id', 'kind', 'slot', 'rasterize')} for l in L]))")
+                   "print(json.dumps([{k: l.get(k) for k in ('id', 'kind', 'slot', 'x', 'y', 'sx', 'sy', 'surfaceW', 'surfaceH')} for l in L]))")
 
 
 def td_layer(lid):
@@ -1384,8 +1419,11 @@ for p in comp.customPars:
 print(json.dumps({'pars': out, 'pages': [pg.name for pg in comp.customPages]}))
 """)
     empty = [k for k, v in res["pars"].items() if len(v) < 20]
-    return bool(res["pars"]) and not empty, (f"{len(res['pars'])} custom parameters on page(s) {res['pages']}; "
-                                            + (f"MISSING/too short help: {empty}" if empty else "all have help text"))
+    need = {"Docsizemode", "Exportpath", "Exportdoc", "Docw", "Doch", "Premultiplied"}
+    absent = sorted(need - set(res["pars"])) + (["Savetox (should be gone)"] if "Savetox" in res["pars"] else [])
+    return bool(res["pars"]) and not empty and not absent, (
+        f"{len(res['pars'])} custom parameters on page(s) {res['pages']}; "
+        + (f"MISSING/too short help: {empty}" if empty else "all have help text") + (f"; wrong set: {absent}" if absent else ""))
 
 
 def s18_fonts(args):
@@ -1587,12 +1625,12 @@ def wait_stable(box, timeout=4.0, tol=None, pg=None):
 
 
 def s21_ui_text_shape(args):
-    """Real UI: text + shape layers rendered by TD (rasterize off) vs the browser preview; rasterize toggle round trip
-    (browser pixels in TD, then back); flatten.
+    """Real UI: text + shape layers rendered by TD vs the browser preview; Flatten (TD renders the layer, the page
+    replaces it with those pixels) leaves TD's output unchanged.
     Criteria: shapes: interior exact (<= 3), antialiased edges <= 24. Text: bbox within 2 px and colour (mean |diff| <= 24)
     are the real criteria; the glyph-coverage IoU is DELIBERATELY relaxed to >= 0.45 (design target 0.9) because the Text
     TOP's glyphs are thinner than Chromium's -- the measured IoU is printed."""
-    miss = hook_missing("addTextLayer", "addShapeLayer", "setRasterize", "flatten", "fonts") if ensure_test_hook() else ["window.__editorTest"]
+    miss = hook_missing("addTextLayer", "addShapeLayer", "flatten", "fonts") if ensure_test_hook() else ["window.__editorTest"]
     if miss:
         return None, f"skipped: test hook members missing {miss}"
     err = ui_doc(args, 512, 256)
@@ -1627,8 +1665,8 @@ def _text_shape_body():
     if not have:
         return False, f"TD did not receive the layers: {td_layers()}"
     tl = td_layer(tid)
-    if tl["kind"] != "text" or tl["rasterize"] or tl["slot"] is not None:
-        return False, f"TD layer {tl}: expected text, rasterize false, no slot"
+    if tl["kind"] != "text" or tl["slot"] is not None:
+        return False, f"TD layer {tl}: expected a text layer without a slot"
 
     def pair(box, tol=None):
         pg = page_region(*box)
@@ -1661,35 +1699,18 @@ def _text_shape_body():
         time.sleep(0.5)
     else:
         notes.append("(hook setShapeRenderer missing: canvas-mode numbers not measured)")
-    # rasterize on: the browser renders the pixels, TD shows them exactly (a surface slot appears)
-    for lid, box, label in ((tid, TEXT_BOX, "text"), (sids["rect"], SHAPE_BOXES["rect"], "rect")):
-        hook_call(f"setRasterize({lid!r}, true)")
-        got = wait_for(lambda: (td_layer(lid) or {}).get("rasterize") is True and (td_layer(lid) or {}).get("slot") is not None, 5)
-        td_img, pg = pair(box, 3)
-        if pg is None:
-            notes.append(f"{label} rasterized: FAIL pixel read failed")
-            ok_all = False
-        else:
-            diff = int(np.abs(td_img.astype(int) - pg.astype(int)).max())
-            ok = bool(got) and diff <= 3
-            ok_all &= ok
-            notes.append(f"{label} rasterized: slot {(td_layer(lid) or {}).get('slot')}, max |TD - page| {diff}: {'ok' if ok else 'FAIL'}")
-        hook_call(f"setRasterize({lid!r}, false)")
-        back = wait_for(lambda: (td_layer(lid) or {}).get("rasterize") is False and (td_layer(lid) or {}).get("slot") is None, 5)
-        ok_all &= bool(back) & judge(f"{label} back to TD rendering (slot freed {bool(back)})",
-                                     text_parity if label == "text" else shape_parity, box)
-    # flatten: the layer becomes a plain pixel layer; TD shows the browser pixels exactly
-    hook_call(f"flatten({tid!r})")
-    flat = wait_for(lambda: (td_layer(tid) or {}).get("kind") == "pixel" and (td_layer(tid) or {}).get("slot") is not None, 5)
-    td_img, pg = pair(TEXT_BOX, 3)
-    if pg is None:
-        notes.append("flatten text: FAIL pixel read failed")
-        ok_all = False
-    else:
-        diff = int(np.abs(td_img.astype(int) - pg.astype(int)).max())
+    # Flatten (DESIGN_V4): TD renders the layer alone at document size, the browser replaces the layer with those pixels;
+    # TD's output afterwards must equal what TD rendered itself before
+    for lid, box, label in ((tid, TEXT_BOX, "text"), (sids["rect"], SHAPE_BOXES["rect"], "rect"), (sids["star"], SHAPE_BOXES["star"], "star")):
+        before = wait_stable(box, 4.0)
+        hook_call(f"flatten({lid!r})")
+        flat = wait_for(lambda: (td_layer(lid) or {}).get("kind") == "pixel" and (td_layer(lid) or {}).get("slot") is not None, 8)
+        after = wait_stable(box, 4.0)
+        diff = int(np.abs(after.astype(int) - before.astype(int)).max()) if flat else 255
         ok = bool(flat) and diff <= 3
         ok_all &= ok
-        notes.append(f"flatten text: TD kind {(td_layer(tid) or {}).get('kind')}, max |TD - page| {diff}: {'ok' if ok else 'FAIL'}")
+        notes.append(f"flatten {label}: layer became {(td_layer(lid) or {}).get('kind')} with slot {(td_layer(lid) or {}).get('slot')}, "
+                     f"max |TD after - TD rendering before| {diff}: {'ok' if ok else 'FAIL'}")
     return ok_all, "\n        ".join(notes)
 
 
@@ -1799,6 +1820,535 @@ def _selection_body(W, H):
     return ok_all, "\n        ".join(notes)
 
 
+# --------------------------------------------------------------------------- v5 steps (DESIGN_V4 section 5)
+
+
+def connect_input_sized(w, h, color=(1, 0, 0)):
+    """A Constant TOP of w x h wired to the COMP's input (replaces/updates the temporary _validate_in)."""
+    td(f"""
+c = op({TMP!r})
+if c is None:
+    c = op('/project1').create(constantTOP, '_validate_in')
+c.par.outputresolution = 'custom'; c.par.resolutionw = {w}; c.par.resolutionh = {h}
+c.par.colorr, c.par.colorg, c.par.colorb, c.par.alpha = {color[0]}, {color[1]}, {color[2]}, 1
+if not comp.inputConnectors[0].connections:
+    comp.inputConnectors[0].connect(c)
+""")
+
+
+def reset_canvas(args, w=800, h=600):
+    """No input, Follow Input mode, Docw x Doch = w x h (TD with no clients' document state mattering)."""
+    td("comp.inputConnectors[0].disconnect() if comp.inputConnectors[0].connections else None\n"
+       f"t = op({TMP!r})\nif t: t.destroy()\ncomp.par.Docsizemode = 'input'; comp.par.Docw = {w}; comp.par.Doch = {h}")
+    wait_for(lambda: out1_size() == [w, h], 4)
+
+
+def premult(img):
+    """Straight RGBA uint8 -> premultiplied (as TD's output)."""
+    a = img.astype(np.float64)
+    a[..., :3] = a[..., :3] * a[..., 3:4] / 255.0
+    return np.clip(a + 0.5, 0, 255).astype(np.uint8)
+
+
+def bilinear_ref(src, X, Y, x0, y0, sx, sy):
+    """Reference of TD's magnifying sample: doc pixel centres (X + .5, Y + .5) -> layer coordinates
+    ((X + .5 - x0) / sx, (Y + .5 - y0) / sy), bilinear between texel centres, clamped at the surface edge. (X, Y) are arrays."""
+    h, w = src.shape[:2]
+    u = np.clip((X + 0.5 - x0) / sx - 0.5, 0, w - 1)
+    v = np.clip((Y + 0.5 - y0) / sy - 0.5, 0, h - 1)
+    u0, v0 = np.floor(u).astype(int), np.floor(v).astype(int)
+    u1, v1 = np.minimum(u0 + 1, w - 1), np.minimum(v0 + 1, h - 1)
+    fu, fv = (u - u0)[..., None], (v - v0)[..., None]
+    f = src.astype(np.float64)
+    return (f[v0, u0] * (1 - fu) * (1 - fv) + f[v0, u1] * fu * (1 - fv) + f[v1, u0] * (1 - fu) * fv + f[v1, u1] * fu * fv)
+
+
+XF_W, XF_H = 400, 300
+XF_A = dict(x=10.5, y=7.25, sx=10.0, sy=10.0)      # 8x8 gradient magnified 10x at a fractional position
+XF_B = dict(x=200.0, y=20.0, sx=0.25, sy=0.25)     # 128x128 stripes minified to 32x32
+XF_C = dict(x=300.0, y=100.0, sx=4.0, sy=4.0)      # 16x16 blue, mask hides its right half, scaled 4x
+XF_D = dict(x=100.0, y=200.0, sx=1.5, sy=1.5)      # the TD Input (64x48 red) with a base transform
+
+
+def xf_surfaces():
+    gx, gy = np.meshgrid(np.arange(8), np.arange(8))
+    a = np.stack([gx * 30 + 10, gy * 30 + 10, (gx + gy) * 12 + 50, np.full_like(gx, 255)], axis=2).astype(np.uint8)
+    b = np.zeros((128, 128, 4), np.uint8)
+    b[..., 3] = 255
+    rows = (np.arange(128) % 4) < 2
+    b[rows, :, :3] = 255                                # 2 white rows, 2 black rows: a 4x box average is 127.5
+    c = np.zeros((16, 16, 4), np.uint8)
+    c[...] = (0, 0, 255, 255)
+    m = np.zeros((16, 16, 4), np.uint8)
+    m[..., 3] = 255
+    m[:, :8, :3] = 255                                  # left half visible
+    return a, b, c, m
+
+
+XF_A_INT = dict(XF_A, x=11.0, y=7.0)   # the page keeps pixel / base positions whole: the UI steps use this one
+
+
+def xf_layers(a=XF_A):
+    return [L("base", "base", size=(64, 48), **XF_D),
+            L("pa", slot=1, size=(8, 8), **a), L("pb", slot=2, size=(128, 128), **XF_B),
+            L("pc", slot=3, mask={"slot": 4, "enabled": True}, size=(16, 16), **XF_C)]
+
+
+def xf_scene(args, a_tf=XF_A):
+    """Fixed 400x300 canvas, a 64x48 input with a base transform, and three transformed pixel layers (sent by a fake client).
+    Returns the images, or an error string."""
+    reset_canvas(args, 800, 600)
+    connect_input_sized(64, 48)
+    a, b, c, m = xf_surfaces()
+    ed = Editor(args.port)
+    try:
+        ed.takeover()
+        ed.send_canvas(XF_W, XF_H, "fixed")
+        if not wait_for(lambda: out1_size() == [XF_W, XF_H], 4):
+            return f"canvas did not become {XF_W}x{XF_H}: {out1_size()} status={status()!r}"
+        ed.send_doc(xf_layers(a_tf), 60)
+        fids = [ed.send_surface(1, (0, 0, 8, 8), a, (8, 8)), ed.send_surface(2, (0, 0, 128, 128), b, (128, 128)),
+                ed.send_surface(3, (0, 0, 16, 16), c, (16, 16)), ed.send_surface(4, (0, 0, 16, 16), m, (16, 16))]
+        if not wait_applied(ed, fids[-1], 6):
+            return f"no `applied`: {ed.texts[-3:]} status={status()!r}"
+        time.sleep(0.4)
+    finally:
+        ed.close()
+    return a, b, c, m
+
+
+def s23_transforms_td(args):
+    """TD output of transformed layers against numpy references: magnify (bilinear, fractional position), minify
+    (mipmapped), a mask that moves/scales with its layer, and the TD Input's base transform; outside the source is transparent."""
+    r = xf_scene(args)
+    if isinstance(r, str):
+        return False, r
+    a, b, c, m = r
+    notes, ok_all = [], True
+    full = td_rect(COMP + "/out1", 0, 0, XF_W, XF_H).astype(np.int64)
+    # A: magnified gradient. Interior (half a texel away from every edge), compared with the bilinear reference.
+    x0, y0, x1, y1 = int(XF_A["x"] + 6), int(XF_A["y"] + 6), int(XF_A["x"] + 80 - 6), int(XF_A["y"] + 80 - 6)
+    Y, X = np.mgrid[y0:y1, x0:x1]
+    ref = bilinear_ref(a, X, Y, XF_A["x"], XF_A["y"], XF_A["sx"], XF_A["sy"])
+    diff = np.abs(full[y0:y1, x0:x1] - ref).max()
+    outside = full[int(XF_A["y"]) - 4, x0:x1, 3].max(), full[y0:y1, int(XF_A["x"]) - 3, 3].max()
+    ok = diff <= 4 and max(outside) == 0
+    ok_all &= bool(ok)
+    notes.append(f"magnify 10x at ({XF_A['x']}, {XF_A['y']}): worst |TD - bilinear reference| {diff:.1f} (<= 4), alpha outside the source {tuple(int(v) for v in outside)}: {'ok' if ok else 'FAIL'}")
+    # B: minify with mipmaps: every pixel is the 4x4 average of the stripes = mid grey
+    bx, by = int(XF_B["x"]) + 2, int(XF_B["y"]) + 2
+    reg = full[by:by + 28, bx:bx + 28, :3]
+    dev = np.abs(reg - 127.5).max()
+    ok = dev <= 6
+    ok_all &= bool(ok)
+    notes.append(f"minify 0.25x of 1-px-pair stripes: worst deviation from the box average (127.5) {dev:.1f} (<= 6; no mipmaps would give 0/255): {'ok' if ok else 'FAIL'}")
+    # C: the mask travels with the layer: left half (x 300..332) blue, right half (332..364) transparent
+    px = lambda x, y: full[y, x].tolist()  # noqa: E731
+    left, right = px(310, 120), px(350, 120)
+    e1, e2, mid = px(324, 120), px(340, 120), px(332, 120)
+    # (the mask is filtered like the layer: its black/white edge is a linear ramp between the texel centres, x 330..334)
+    ok = left == [0, 0, 255, 255] and right[3] == 0 and e1[3] == 255 and e2[3] == 0 and 60 <= mid[3] <= 195
+    ok_all &= ok
+    notes.append(f"masked 4x layer: left half {left}, right half {right}, px 324 {e1} / 340 {e2}, the filtered edge at 332 {mid}: {'ok' if ok else 'FAIL'}")
+    # D: base transform: the 64x48 red input at (100, 200) scaled 1.5 -> x 100..196, y 200..272
+    inside, o1, o2, o3 = px(150, 230), px(50, 230), px(150, 280), px(200, 230)
+    ok = inside == [255, 0, 0, 255] and o1[3] == 0 and o2[3] == 0 and o3[3] == 0 and px(101, 201)[3] == 255 and px(195, 271)[3] == 255
+    ok_all &= ok
+    notes.append(f"base transform (x100 y200 scale 1.5): inside {inside}, outside alpha {o1[3]}/{o2[3]}/{o3[3]}, corners opaque: {'ok' if ok else 'FAIL'}")
+    STATE["xf"] = True
+    return ok_all, "\n        ".join(notes)
+
+
+def s24_ui_transform_parity(args):
+    """Real UI: the page loads the transformed document from TD (fresh load) and its Local preview matches TD's output
+    (scaled up/down, fractional positions, a mask on a transformed layer, the base transform)."""
+    if not ensure_test_hook():
+        return None, "test hook not reachable"
+    r = xf_scene(args, XF_A_INT)
+    if isinstance(r, str):
+        return False, r
+    time.sleep(1.5)
+    if not ui_ready():
+        return None, f"real page did not become active/load the document: {js_result('window.__editorTest.loadState()')}"
+    ls = js_result("window.__editorTest.loadState()")
+    lay = {l["id"]: l for l in (hook_call("layers()") or [])}
+    miss = [k for k in ("pa", "pb", "pc", "base") if k not in lay or "transform" not in lay[k]]
+    if miss:
+        return False, f"page did not load the layers {miss}: {str(ls)[:300]}"
+    notes, ok_all = [], True
+    tf = {k: lay[k]["transform"] for k in ("pa", "pb", "pc", "base")}
+    for k, want in (("pa", XF_A_INT), ("pb", XF_B), ("pc", XF_C), ("base", XF_D)):
+        t = tf[k]
+        same = all(abs(t[n] - want[n]) < 1e-6 for n in ("x", "y", "sx", "sy"))
+        ok_all &= same
+        if not same:
+            notes.append(f"transform of {k} did not survive the load: page {t} vs {want}: FAIL")
+    regions = {"magnify": (int(XF_A_INT["x"]) + 6, int(XF_A_INT["y"]) + 6, 68, 68, 8, 8.0),
+               "minify": (202, 22, 28, 28, 14, 10.0),   # (x, y, w, h, tolerance per pixel, tolerance of the mean)
+               "mask": (296, 96, 72, 72, 8, 4.0),
+               "base": (96, 196, 104, 80, 8, 4.0)}
+    for name, (x, y, w, h, tol, mtol) in regions.items():
+        pg = page_region(x, y, w, h)
+        td_img = td_rect(COMP + "/out1", x, y, w, h)
+        if pg is None:
+            notes.append(f"{name}: FAIL page pixels not readable")
+            ok_all = False
+            continue
+        d = np.abs(td_img.astype(int) - pg.astype(int))
+        mean = float(np.abs(td_img.astype(float).mean(axis=(0, 1)) - pg.astype(float).mean(axis=(0, 1))).max())
+        # edge pixels (where the two rasterisers place the boundary differently) are excluded from the per-pixel limit
+        edge = np.zeros(d.shape[:2], bool)
+        a_td, a_pg = td_img[..., 3].astype(int), pg[..., 3].astype(int)
+        edge |= np.abs(a_td - a_pg) > 8
+        worst = int(d[~edge].max()) if (~edge).any() else 0
+        n_edge = int(edge.sum())
+        ok = worst <= tol and mean <= mtol and n_edge <= 2 * (w + h)
+        ok_all &= ok
+        notes.append(f"{name}: worst |TD - page| {worst} (<= {tol}), mean diff {mean:.1f} (<= {mtol}), {n_edge} boundary px differ in coverage: {'ok' if ok else 'FAIL'}")
+    return ok_all, "\n        ".join(notes)
+
+
+def s25_ui_paint_scaled(args):
+    """Real UI: a brush stroke on a layer scaled 2x and offset lands under the cursor in TD's output; in the layer's own
+    surface the dab size is halved and the centre line is at the inverse-mapped position."""
+    miss = hook_missing("setTransform", "layers", "setPrimary", "addLayer") if ensure_test_hook() else ["window.__editorTest"]
+    if miss:
+        return None, f"skipped: test hook members missing {miss}"
+    W, H = 512, 256
+    err = ui_doc(args, W, H)
+    if err:
+        return False, err
+    mouse(0.5, 0.5)
+    hook_call("addLayer()")
+    time.sleep(0.3)
+    lid = (hook_call("state()") or {}).get("activeLayer")
+    T = dict(x=100, y=50, sx=2, sy=2)
+    hook_call(f"setTransform({lid!r}, {json.dumps(T)})")
+    if not wait_for(lambda: (td_layer(lid) or {}).get("sx") == 2, 5):
+        return False, f"TD did not receive the transform: {td_layer(lid)}"
+    hook_call("setPrimary('#0000ff')")
+    td("comp.op('webrender').sendKey('b', char='b')")
+    time.sleep(0.3)
+    bs = float(((hook_call("state()") or {}).get("brush") or {}).get("size", 20))
+    y0, xa, xb = 110.0, 200.0, 300.0
+    if not drag_doc([(xa, y0), (xb, y0)]):
+        return False, "could not resolve doc coordinates"
+    img = td_region_when(0, 0, W, H, lambda im: (im[..., 2] > 200).sum() > 100, 6)
+    blue = (img[..., 2] > 10) & (img[..., 0] < 128) & (img[..., 3] > 10)   # (the default brush is soft: take its visible extent)
+    bb = bbox(blue)
+    if bb is None:
+        return False, "no blue in TD's output"
+    # in the document the stroke is where the cursor went, brush-size thick
+    exp_x0, exp_x1, exp_y0, exp_y1 = xa - bs / 2, xb + bs / 2, y0 - bs / 2, y0 + bs / 2
+    d_out = max(abs(bb[0] - exp_x0), abs(bb[2] + 1 - exp_x1), abs(bb[1] - exp_y0), abs(bb[3] + 1 - exp_y1))
+    ed = Editor(args.port)
+    try:
+        ed.wait(lambda: ed.client_id is not None, 3)
+        slot = (td_layer(lid) or {}).get("slot")
+        dump = ed.dump(slot) if slot is not None else None
+    finally:
+        ed.close()
+    if dump is None:
+        return False, f"no surface dump for {lid} slot {slot}"
+    hdr, surf = dump
+    sb = bbox(surf[..., 3] > 10)
+    cx0, cx1 = (xa - T["x"]) / T["sx"] - bs / 4, (xb - T["x"]) / T["sx"] + bs / 4
+    cy0, cy1 = (y0 - T["y"]) / T["sy"] - bs / 4, (y0 - T["y"]) / T["sy"] + bs / 4
+    d_srf = max(abs(sb[0] - cx0), abs(sb[2] + 1 - cx1), abs(sb[1] - cy0), abs(sb[3] + 1 - cy1)) if sb else 999
+    ok = d_out <= 6 and d_srf <= 4 and (hdr.doc_w, hdr.doc_h) == (W, H)
+    return ok, (f"brush {bs:.0f}px, stroke ({xa:.0f},{y0:.0f})->({xb:.0f},{y0:.0f}) on a layer at (100, 50) scaled 2x: TD output bbox {bb} "
+                f"(expected ~({exp_x0:.0f},{exp_y0:.0f})-({exp_x1:.0f},{exp_y1:.0f}), worst edge error {d_out:.1f} px); layer surface bbox {sb} "
+                f"(expected ~({cx0:.0f},{cy0:.0f})-({cx1:.0f},{cy1:.0f}), worst error {d_srf:.1f} px, dab size / scale)")
+
+
+def s26_canvas_td(args):
+    """Fake client: setCanvas (fixed / input), Follow Input vs Fixed with input resolution changes, parameter edits pushed as
+    docSize with mode, baseSize + BASE frame sizes, surfaces untouched by every canvas change."""
+    reset_canvas(args, 800, 600)
+    notes, ok_all = [], True
+
+    def chk(label, cond, extra=""):
+        nonlocal ok_all
+        ok_all &= bool(cond)
+        notes.append(f"{label}: {'ok' if cond else 'FAIL'} {extra}".rstrip())
+        return cond
+    a = Editor(args.port)
+    b = Editor(args.port)
+    try:
+        a.takeover()
+        b.wait(lambda: b.hello is not None, 3)
+        wire = np.random.RandomState(7).randint(0, 256, (40, 50, 4), np.uint8)
+        wire[..., 3] = 255
+        a.send_doc([L("base", "base"), L("p1", slot=1, size=(50, 40))], 70)
+        fid = a.send_surface(1, (0, 0, 50, 40), wire, (50, 40))
+        wait_applied(a, fid, 5)
+        chk("hello carries mode", a.mode == "input" and b.mode == "input", f"({a.mode}, {b.mode}, baseSize {a.base_size})")
+        a.send_canvas(300, 200, "fixed")
+        chk("setCanvas fixed -> out1", wait_for(lambda: out1_size() == [300, 200], 4), f"out1 {out1_size()}")
+        pars = td_json("print(json.dumps([int(comp.par.Docw), int(comp.par.Doch), comp.par.Docsizemode.eval()]))")
+        chk("pars follow setCanvas", pars == [300, 200, "fixed"], str(pars))
+        b.wait(lambda: b.mode == "fixed", 3)
+        chk("other client told docSize with mode", (b.doc_w, b.doc_h, b.mode) == (300, 200, "fixed"), str((b.doc_w, b.doc_h, b.mode)))
+        # input connects while Fixed: canvas unchanged, baseSize + BASE frame at the input size
+        connect_input_sized(160, 90)
+        b.wait(lambda: b.base_size == (160, 90), 4)
+        b.wait(lambda: len(b.bases) > 0, 4)
+        hb = P.decode_frame(b.bases[-1])[0] if b.bases else None
+        chk("input connects in Fixed", out1_size() == [300, 200] and b.base_size == (160, 90) and hb is not None and (hb.doc_w, hb.doc_h) == (160, 90),
+            f"out1 {out1_size()}, baseSize {b.base_size}, BASE header {(hb.doc_w, hb.doc_h) if hb else None}")
+        n_before = len(b.bases)
+        connect_input_sized(80, 45)
+        b.wait(lambda: b.base_size == (80, 45), 4)
+        b.wait(lambda: len(b.bases) > n_before and P.decode_frame(b.bases[-1])[0].doc_w == 80, 4)
+        hb = P.decode_frame(b.bases[-1])[0]
+        chk("input resolution change while Fixed", out1_size() == [300, 200] and (hb.doc_w, hb.doc_h) == (80, 45) and (b.doc_w, b.doc_h) == (300, 200),
+            f"out1 {out1_size()}, BASE {(hb.doc_w, hb.doc_h)}")
+        # Follow Input reset
+        a.send_canvas(0, 0, "input")
+        chk("setCanvas input -> out1 = input size", wait_for(lambda: out1_size() == [80, 45], 4), f"out1 {out1_size()}")
+        a.wait(lambda: (a.doc_w, a.doc_h, a.mode) == (80, 45, "input"), 3)
+        chk("sender learns the resolved size", (a.doc_w, a.doc_h, a.mode) == (80, 45, "input"), str((a.doc_w, a.doc_h, a.mode)))
+        connect_input_sized(128, 72)
+        chk("input resolution change while following", wait_for(lambda: out1_size() == [128, 72], 4), f"out1 {out1_size()}")
+        b.wait(lambda: (b.doc_w, b.doc_h) == (128, 72), 3)
+        chk("clients follow (docSize + baseSize)", (b.doc_w, b.doc_h, b.mode, b.base_size) == (128, 72, "input", (128, 72)),
+            str((b.doc_w, b.doc_h, b.mode, b.base_size)))
+        # the user flips the parameters: Fixed keeps the current size, then Docw edits are pushed
+        td("comp.par.Docsizemode = 'fixed'")
+        b.wait(lambda: b.mode == "fixed", 3)
+        chk("user: Follow Input -> Fixed keeps the size", (b.doc_w, b.doc_h, b.mode) == (128, 72, "fixed") and out1_size() == [128, 72],
+            f"{(b.doc_w, b.doc_h, b.mode)} out1 {out1_size()}")
+        td("comp.par.Docw = 64")
+        b.wait(lambda: b.doc_w == 64, 3)
+        a.wait(lambda: a.doc_w == 64, 3)
+        chk("user: Docw edit pushed to every client", wait_for(lambda: out1_size() == [64, 72], 3) and b.doc_w == 64 and a.doc_w == 64,
+            f"out1 {out1_size()}, clients {(a.doc_w, b.doc_w)}")
+        disconnect_input()
+        b.wait(lambda: b.base_size == (0, 0), 3)
+        chk("input disconnect in Fixed", b.base_size == (0, 0) and out1_size() == [64, 72], f"baseSize {b.base_size}, out1 {out1_size()}")
+        # none of this touched the surface
+        got = a.dump(1)
+        chk("surface untouched by every canvas change", got is not None and (got[0].doc_w, got[0].doc_h) == (50, 40) and (got[1] == wire).all())
+    finally:
+        td("comp.par.Docsizemode = 'input'")
+        a.close()
+        b.close()
+    return ok_all, "\n        ".join(notes)
+
+
+def s27_ui_canvas(args):
+    """Real UI: Canvas Size with an anchor shifts the layers' transforms and resizes TD's output; Follow Input resets; input
+    resolution changes while following / fixed."""
+    miss = hook_missing("setCanvasSize", "setCanvasMode", "canvasMode", "setTransform", "layers", "addLayer") if ensure_test_hook() else ["window.__editorTest"]
+    if miss:
+        return None, f"skipped: test hook members missing {miss}"
+    err = ui_doc(args, 512, 256)
+    if err:
+        return False, err
+    notes, ok_all = [], True
+
+    def chk(label, cond, extra=""):
+        nonlocal ok_all
+        ok_all &= bool(cond)
+        notes.append(f"{label}: {'ok' if cond else 'FAIL'} {extra}".rstrip())
+
+    hook_call("addLayer()")
+    time.sleep(0.3)
+    lid = (hook_call("state()") or {}).get("activeLayer")
+    hook_call(f"setTransform({lid!r}, {{x: 20, y: 10}})")
+    wait_for(lambda: (td_layer(lid) or {}).get("x") == 20, 5)
+    hook_call("setCanvasSize(600, 300, 'br')")   # bottom-right anchor: content shifts by (+88, +44)
+    chk("canvas 600x300 anchored bottom-right -> out1", wait_for(lambda: out1_size() == [600, 300], 6), f"out1 {out1_size()}")
+    tl = wait_for(lambda: (td_layer(lid) or {}).get("x") == 108 and td_layer(lid), 5) or td_layer(lid)
+    chk("layer transform shifted by the anchor in TD's document", tl and (tl["x"], tl["y"]) == (108, 54), str(tl))
+    pars = td_json("print(json.dumps([int(comp.par.Docw), int(comp.par.Doch), comp.par.Docsizemode.eval()]))")
+    chk("Docw / Doch / Docsizemode mirror it", pars == [600, 300, "fixed"], str(pars))
+    chk("page canvasMode", hook_call("canvasMode()") == "fixed", str(hook_call("canvasMode()")))
+    # an input connects while Fixed
+    connect_input_sized(320, 200)
+    time.sleep(1.0)
+    base = next((l for l in td_layers() if l["kind"] == "base"), {})
+    chk("input connects in Fixed: canvas stays", out1_size() == [600, 300], f"out1 {out1_size()}")
+    notes.append(f"NOTE base layer in TD after connecting in Fixed mode: size {(base.get('surfaceW'), base.get('surfaceH'))} "
+                 f"transform {(base.get('x'), base.get('y'), base.get('sx'), base.get('sy'))} (design: fitted + centred = (60, 0, 1.5, 1.5))")
+    chk("base surface size = input size", (base.get("surfaceW"), base.get("surfaceH")) == (320, 200), str(base))
+    # Follow Input reset
+    hook_call("setCanvasMode('input')")
+    chk("Follow Input -> out1 = input size", wait_for(lambda: out1_size() == [320, 200], 6), f"out1 {out1_size()}")
+    chk("page canvasMode input", hook_call("canvasMode()") == "input")
+    connect_input_sized(256, 128)
+    chk("input resolution change while following", wait_for(lambda: out1_size() == [256, 128], 6), f"out1 {out1_size()}")
+    st = wait_for(lambda: (js_result("window.__editorTest.state().doc") or {}).get("w") == 256 and js_result("window.__editorTest.state().doc"), 4)
+    chk("page canvas follows the input", st and (st["w"], st["h"]) == (256, 128), str(st))
+    base = next((l for l in td_layers() if l["kind"] == "base"), {})
+    chk("base surface size follows the input", (base.get("surfaceW"), base.get("surfaceH")) == (256, 128), str(base))
+    hook_call("setCanvasSize(200, 100, 'tl')")
+    wait_for(lambda: out1_size() == [200, 100], 6)
+    connect_input_sized(300, 300)
+    time.sleep(1.0)
+    chk("input resolution change while Fixed: canvas stays 200x100", out1_size() == [200, 100], f"out1 {out1_size()}")
+    base = next((l for l in td_layers() if l["kind"] == "base"), {})
+    chk("base surface size follows the input (Fixed)", (base.get("surfaceW"), base.get("surfaceH")) == (300, 300), str(base))
+    hook_call("setCanvasMode('input')")
+    chk("Follow Input again -> 300x300", wait_for(lambda: out1_size() == [300, 300], 6), f"out1 {out1_size()}")
+    return ok_all, "\n        ".join(notes)
+
+
+def s28_render_layer(args):
+    """Fake client: renderLayer (Flatten) of a text and a shape layer equals TD's own rendering (premultiplied compare),
+    errors for a pixel layer, an unknown layer and a standby client."""
+    reset_canvas(args, 512, 256)
+    ed = Editor(args.port)
+    standby = None
+    notes, ok_all = [], True
+    try:
+        ed.takeover()
+        ed.wait(lambda: any(m["t"] == "fonts" for m in ed.texts), 5)
+        fonts = next((m["families"] for m in ed.texts if m["t"] == "fonts"), [])
+        text = dict(SPEC_TEXT, font=pick_font(fonts))
+        layers = [L("base", "base"), L("p1", slot=1, size=(512, 256)),
+                  L("t1", "text", text=text, shape=None), L("s1", "shape", text=None, shape=SPEC_SHAPES["rect"])]
+        ed.send_doc(layers, 80)
+        ed.send_surface(1, (0, 0, 512, 256), np.zeros((256, 512, 4), np.uint8), (512, 256))
+        time.sleep(1.0)
+        for lid, box, label in (("t1", TEXT_BOX, "text"), ("s1", SHAPE_BOXES["rect"], "rect")):
+            own = wait_stable(box, 4.0)
+            rid = f"rl-{lid}"
+            ed.send(P.render_layer(rid, lid))
+            ok = ed.wait(lambda: any(m["t"] in ("topReady", "topError") and m["requestId"] == rid for m in ed.texts), 20)
+            msg = next((m for m in ed.texts if m["t"] in ("topReady", "topError") and m["requestId"] == rid), None) if ok else None
+            if not msg or msg["t"] != "topReady":
+                notes.append(f"{label}: FAIL no topReady ({msg})")
+                ok_all = False
+                continue
+            st, h, img = fetch_top(ed, rid)
+            if st != 200:
+                notes.append(f"{label}: FAIL GET /top -> {st}")
+                ok_all = False
+                continue
+            full = premult(img)
+            x, y, w, hh = box
+            crop = full[y:y + hh, x:x + w]
+            diff = int(np.abs(crop.astype(int) - own.astype(int)).max())
+            # outside the layer's own region the rendering is empty (alone, at document size)
+            other_empty = int(full[:, :, 3].astype(int).sum() - full[y:y + hh, x:x + w, 3].astype(int).sum())
+            ok = (h.type, h.doc_w, h.doc_h) == (P.TYPE_TOP_IMAGE, 512, 256) and (msg["w"], msg["h"]) == (512, 256) and diff <= 3
+            ok_all &= bool(ok)
+            notes.append(f"{label}: type-6 frame {(h.doc_w, h.doc_h)}, max |renderLayer - TD output| in its box {diff} (<= 3), "
+                         f"alpha elsewhere {other_empty}: {'ok' if ok else 'FAIL'}")
+        for rid, lid, want in (("e1", "p1", "not a text or shape"), ("e2", "nope", "not a text or shape")):
+            ed.send(P.render_layer(rid, lid))
+            ok = ed.wait(lambda: any(m["t"] == "topError" and m["requestId"] == rid for m in ed.texts), 5)
+            msg = next((m for m in ed.texts if m["t"] == "topError" and m["requestId"] == rid), None)
+            good = bool(ok and msg and want in msg["msg"])
+            ok_all &= good
+            notes.append(f"renderLayer {lid!r} -> topError {msg and msg['msg']!r}: {'ok' if good else 'FAIL'}")
+        standby = Editor(args.port)
+        standby.ws.send(P.render_layer("e3", "t1"))
+        ok = standby.wait(lambda: any(m["t"] == "topError" and m["requestId"] == "e3" for m in standby.texts), 5)
+        notes.append(f"standby client renderLayer -> topError: {'ok' if ok else 'FAIL'}")
+        ok_all &= bool(ok)
+    finally:
+        ed.close()
+        if standby:
+            standby.close()
+    return ok_all, "\n        ".join(notes)
+
+
+def s29_export(args):
+    """Exportpath / Exportdoc: round trip through a real file (temp + rename, no .part left), the result in Status, guides +
+    canvas mode persisted and restored by loadTox into a temp COMP; errors for a missing folder; help + file filter."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    reset_canvas(args, 320, 200)
+    path = os.path.join(OUT_DIR, "export_roundtrip.tox")
+    part = os.path.join(OUT_DIR, "export_roundtrip.part.tox")
+    for f in (path, part):
+        if os.path.exists(f):
+            os.remove(f)
+    notes, ok_all = [], True
+
+    def chk(label, cond, extra=""):
+        nonlocal ok_all
+        ok_all &= bool(cond)
+        notes.append(f"{label}: {'ok' if cond else 'FAIL'} {extra}".rstrip())
+
+    ed = Editor(args.port)
+    try:
+        ed.takeover()
+        ed.send_canvas(320, 200, "fixed")
+        wait_for(lambda: out1_size() == [320, 200], 4)
+        px = np.random.RandomState(3).randint(0, 256, (30, 40, 4), np.uint8)
+        px[..., 3] = 255
+        ed.send_doc([L("base", "base"), L("p1", slot=1, size=(40, 30), x=12.5, y=3.25, sx=2.0, sy=2.0)], 90,
+                    guides={"h": [10.0, 55.5], "v": [100.0]}, canvas={"mode": "fixed"})
+        fid = ed.send_surface(1, (0, 0, 40, 30), px, (40, 30))
+        wait_applied(ed, fid, 5)
+        time.sleep(0.3)
+        before = td_json("""
+import hashlib
+x = comp.ext.RasterEditorExt
+print(json.dumps({'sig': {str(s): hashlib.md5(b.tobytes()).hexdigest() for s, b in sorted(x.surfaces.items())}, 'guides': x.guides, 'rev': x.doc_rev}))
+""")
+        # a missing folder is refused with a clear message and nothing is written
+        td(f"comp.par.Exportpath = {os.path.join(OUT_DIR, 'no_such_dir', 'x.tox')!r}\ncomp.par.Exportdoc.pulse()")
+        msg = wait_for(lambda: "export failed" in status() and status(), 5)
+        chk("missing folder -> clear error in Status, no file", bool(msg) and "does not exist" in status(), status()[-110:])
+        # the real export
+        td(f"comp.par.Exportpath = {path!r}\ncomp.par.Exportdoc.pulse()")
+        done = wait_for(lambda: os.path.exists(path), 15)
+        wait_for(lambda: "exported with document" in status(), 5)
+        chk("Exportdoc wrote the file via temp + rename", done and not os.path.exists(part) and os.path.getsize(path) > 0,
+            f"{os.path.getsize(path) if done else 0} bytes, .part exists: {os.path.exists(part)}")
+        chk("Status reports the export and the old error is gone", "exported with document" in status() and "export failed" not in status(), status()[-110:])
+        locked = td_json("x = comp.ext.RasterEditorExt; print(json.dumps([x.frozen, [s for s in x.network.slots() if x.network.surface_top(s).lock]]))")
+        chk("thawed afterwards", locked == [False, []], str(locked))
+        # load it into a temp COMP (the live editor is switched off meanwhile: one port)
+        td("comp.par.Active = 0")
+        time.sleep(0.5)
+        td(f"""
+old = op('/project1/_validate_load')
+if old: old.destroy()
+box = op('/project1').create(baseCOMP, '_validate_load')
+box.loadTox({path!r})
+""", 120)
+        time.sleep(0.8)
+        loaded = td_json("""
+import hashlib
+box = op('/project1/_validate_load')
+kids = [c.name for c in box.children]
+c = box.op(kids[0]) if kids else None
+x = c.ext.RasterEditorExt if c is not None else None
+res = {'kids': kids}
+if x is not None and x.doc_layers is not None:
+    res.update(sig={str(s): hashlib.md5(b.tobytes()).hexdigest() for s, b in sorted(x.surfaces.items())}, guides=x.guides,
+               mode=c.par.Docsizemode.eval(), size=[int(c.par.Docw), int(c.par.Doch)], rev=x.doc_rev,
+               layer=[{k: l.get(k) for k in ('x', 'y', 'sx', 'sy', 'surfaceW', 'surfaceH')} for l in x.doc_layers if l['id'] == 'p1'][0],
+               locked=[s for s in x.network.slots() if x.network.surface_top(s).lock], err=x.last_error and x.last_error[0])
+print(json.dumps(res))
+""", 120)
+        td("""
+box = op('/project1/_validate_load')
+if box: box.destroy()
+comp.par.Active = 1
+""")
+        wait_for(lambda: "active" in status() or "waiting" in status(), 5)
+        chk("guides persisted through Export with Document -> loadTox", loaded.get("guides") == {"h": [10.0, 55.5], "v": [100.0]}, str(loaded.get("guides")))
+        chk("canvas mode + size persisted", loaded.get("mode") == "fixed" and loaded.get("size") == [320, 200], f"{loaded.get('mode')} {loaded.get('size')}")
+        chk("surface pixels + transform persisted", loaded.get("sig") == before["sig"] and loaded.get("layer") ==
+            {"x": 12.5, "y": 3.25, "sx": 2.0, "sy": 2.0, "surfaceW": 40, "surfaceH": 30} and not loaded.get("locked"),
+            f"rev {loaded.get('rev')}, layer {loaded.get('layer')}, err {loaded.get('err')}")
+        info = td_json("""
+p = comp.par.Exportpath
+print(json.dumps({'help': (p.help or ''), 'style': p.style, 'ft': str(getattr(p, 'fileTypes', None)), 'ph': (comp.par.Exportdoc.help or '')}))
+""")
+        notes.append(f"NOTE Exportpath style {info['style']}, fileTypes attribute {info['ft']} (TD has none for custom File pars; '.tox' is appended on export)")
+        chk("Exportpath / Exportdoc help", len(info["help"]) > 40 and len(info["ph"]) > 40 and info["style"] == "File")
+    finally:
+        td("comp.par.Exportpath = ''\ncomp.par.Docsizemode = 'input'")
+        ed.close()
+    return ok_all, "\n        ".join(notes)
+
+
 STEPS = [
     (1, "build component, no operator errors, document survives a rebuild", "build", False),
     (2, "web server serves the UI", "server", False),
@@ -1809,7 +2359,7 @@ STEPS = [
     (7, "TD VIEW stream for an external client: content, fps, age", "view", False),
     (8, "stroke -> TD latency (applied) and per-frame upload cost", "latency", False),
     (9, "panel TD-view overlay: view message -> panel_view background", "overlay", False),
-    (10, "persistence: Freeze/Thaw, SaveTox -> loadTox identical", "persist", False),
+    (10, "persistence: Freeze/Thaw, Exportdoc -> loadTox identical", "persist", False),
     (11, "fresh load, reconnect re-send, takeover", "reconnect", False),
     (12, "network + apply budgets (20 layers @1080p)", "perf", False),
     (13, "blend + adjustment parity TD vs browser preview (real UI)", "parity", True),
@@ -1820,15 +2370,24 @@ STEPS = [
     (18, "fonts list after hello: non-empty, sorted, common family", "fonts", False),
     (19, "TOP import: list, Constant + 4096x2160 Ramp, errors, 30 s expiry, bounded cost", "topimport", False),
     (20, "real UI: import TOPs as layers (big one scaled to fit)", "uitop", True),
-    (21, "real UI: text/shape TD-rendered vs browser preview, rasterize round trip, flatten", "uitextshape", True),
+    (21, "real UI: text/shape TD-rendered vs browser preview, Flatten equals TD's rendering", "uitextshape", True),
     (22, "real UI: lasso / wand selections clip strokes in TD output", "uiselect", True),
+    (23, "transforms in TD vs numpy: magnify, minify (mipmaps), mask on a transformed layer, base transform", "xform", False),
+    (24, "real UI: transform parity TD vs browser preview", "uixform", True),
+    (25, "real UI: painting on a scaled layer lands under the cursor", "uipaintscaled", True),
+    (26, "canvas: setCanvas, Follow Input / Fixed, input resolution changes, parameter edits, surfaces untouched", "canvas", False),
+    (27, "real UI: Canvas Size anchors, Follow Input reset, input resolution while following / fixed", "uicanvas", True),
+    (28, "renderLayer (Flatten source) equals TD's own rendering; errors", "renderlayer", False),
+    (29, "Exportpath / Exportdoc round trip; guides + canvas persisted through loadTox", "export", False),
 ]
 FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinput": "s4_no_input", "scene": "s5_scene",
          "masks": "s6_masks", "view": "s7_view_stream", "latency": "s8_latency", "overlay": "s9_panel_overlay",
          "persist": "s10_persistence", "reconnect": "s11_reconnect_takeover", "perf": "s12_perf", "parity": "s15_parity",
          "uipaint": "s14_ui_paint", "uiview": "s16_ui_view_mode", "stalled": "s13_stalled_client",
          "help": "s17_param_help", "fonts": "s18_fonts", "topimport": "s19_top_import", "uitop": "s20_ui_top_import",
-         "uitextshape": "s21_ui_text_shape", "uiselect": "s22_ui_selection_clip"}
+         "uitextshape": "s21_ui_text_shape", "uiselect": "s22_ui_selection_clip",
+         "xform": "s23_transforms_td", "uixform": "s24_ui_transform_parity", "uipaintscaled": "s25_ui_paint_scaled",
+         "canvas": "s26_canvas_td", "uicanvas": "s27_ui_canvas", "renderlayer": "s28_render_layer", "export": "s29_export"}
 
 
 def main():

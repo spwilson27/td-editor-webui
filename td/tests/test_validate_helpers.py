@@ -57,3 +57,40 @@ def test_step_table_is_consistent():
 def test_pick_font_prefers_common_families():
     assert V.pick_font(["Zapfino", "Georgia", "Arial"]) == "Arial"
     assert V.pick_font(["Zapfino"]) == "Zapfino"
+
+
+def test_bilinear_reference_matches_texel_centres_and_midpoints():
+    src = np.zeros((2, 2, 4), np.uint8)
+    src[0, 0] = (0, 0, 0, 255)
+    src[0, 1] = (100, 0, 0, 255)
+    src[1, 0] = (0, 100, 0, 255)
+    src[1, 1] = (100, 100, 0, 255)
+    Y, X = np.mgrid[0:20, 0:20]
+    ref = V.bilinear_ref(src, X, Y, 0.0, 0.0, 10.0, 10.0)   # 10x: texel centres at doc 5 and 15
+    assert abs(ref[5, 5, 0] - 5.0) < 1.0          # pixel centre 5.5 is half a pixel past the texel centre: 0.1 of the way to 100
+    assert abs(ref[10, 10, 0] - 50) < 6 and abs(ref[10, 10, 1] - 50) < 6        # the middle of four texels is the mean
+    assert np.allclose(ref[0, 0], (0, 0, 0, 255))                               # clamped at the surface edge
+
+
+def test_premult_matches_td_convention():
+    img = np.array([[[200, 100, 50, 128], [10, 20, 30, 255], [90, 90, 90, 0]]], np.uint8)
+    got = V.premult(img)
+    assert got[0, 1].tolist() == [10, 20, 30, 255] and got[0, 2].tolist() == [0, 0, 0, 0]
+    assert got[0, 0].tolist() == [100, 50, 25, 128]
+
+
+def test_v5_layer_helper_and_editor_frame_sizes():
+    layer = V.L("p", slot=3, size=(8, 4), x=1.5)
+    assert (layer["surfaceW"], layer["surfaceH"], layer["sx"], layer["sy"], layer["x"]) == (8, 4, 1, 1, 1.5)
+    assert "rasterize" not in layer and V.L("b", "base")["surfaceW"] is None
+    assert all(V.P.parse_doc({"rev": 1, "layers": V.SCENE_LAYERS}))
+    assert V.P.slot_sizes(V.SCENE_LAYERS, 1, 1) == {1: (V.IW, V.IH), 2: (V.IW, V.IH), 3: (V.IW, V.IH)}
+    assert V.P.parse_doc({"rev": 1, "layers": V.xf_layers()})
+    assert V.P.slot_sizes(V.xf_layers(), 400, 300) == {1: (8, 8), 2: (128, 128), 3: (16, 16), 4: (16, 16)}
+
+
+def test_transform_scene_surfaces_are_what_the_references_assume():
+    a, b, c, m = V.xf_surfaces()
+    assert a.shape == (8, 8, 4) and b.shape == (128, 128, 4) and c.shape == (16, 16, 4) and m.shape == (16, 16, 4)
+    assert b[0, 0, 0] == 255 and b[2, 0, 0] == 0 and b[:4, :, 0].mean() == 127.5
+    assert (m[:, :8, :3] == 255).all() and (m[:, 8:, :3] == 0).all() and (m[..., 3] == 255).all()

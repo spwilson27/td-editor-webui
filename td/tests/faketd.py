@@ -144,6 +144,22 @@ class FakeNetwork:
         self.created = 0
         self.ticks = 0
         self.input_flags = []
+        self.render_sources = {}  # layer id -> TOP (FakeTop) returned by render_layer_source
+        self.render_calls = []
+        self.token = 0          # bumped to simulate an apply() / layout refinement
+        self.not_ready = set()  # layer ids whose text measurement is still pending
+
+    def render_layer_token(self, layer_id):
+        return (self.token, id(self.render_sources.get(layer_id)))
+
+    def render_layer_ready(self, layer_id):
+        return layer_id not in self.not_ready
+
+    def render_layer_source(self, layer_id):
+        self.render_calls.append(layer_id)
+        if layer_id not in self.render_sources:
+            raise KeyError(f"no text / shape layer {layer_id!r}")
+        return self.render_sources[layer_id]
 
     def apply(self, layers, doc_w, doc_h):
         if self.raise_on_apply:
@@ -334,7 +350,7 @@ class FakeTop:
 class FakeOwner:
     def __init__(self, **par_overrides):
         pars = dict(Active=1, Port=9980, Docw=64, Doch=32, Premultiplied=1, Maxsendfps=30, Maxinputfps=30,
-                    Maxviewfps=30, Viewmode="local", Devurl="", Panelquery="", Status="", w=1280, h=800,
+                    Maxviewfps=30, Viewmode="local", Docsizemode="input", Exportpath="", Devurl="", Panelquery="", Status="", w=1280, h=800,
                     top="./webrender")
         pars.update(par_overrides)
         self.par = Pars(**pars)

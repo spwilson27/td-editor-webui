@@ -210,8 +210,10 @@ def test_json_decode_rejects(bad):
 
 def test_json_builders():
     assert json.loads(P.hello(10, 20, True, 30, False, "abc")) == {
-        "t": "hello", "protocol": 4, "doc": {"w": 10, "h": 20}, "hasInput": True, "maxSendFps": 30, "active": False,
-        "clientId": "abc", "hasDocument": False, "rev": None}
+        "t": "hello", "protocol": 5, "doc": {"w": 10, "h": 20, "mode": "input"}, "baseSize": {"w": 0, "h": 0},
+        "hasInput": True, "maxSendFps": 30, "active": False, "clientId": "abc", "hasDocument": False, "rev": None}
+    h = json.loads(P.hello(10, 20, True, 30, True, "abc", False, None, "fixed", 640, 480))
+    assert h["doc"]["mode"] == "fixed" and h["baseSize"] == {"w": 640, "h": 480}
     assert json.loads(P.hello(10, 20, False, 30, True, "abc", True, 12)) ["rev"] == 12
     assert json.loads(P.base_notice(7, 100, 50)) == {"t": "base", "frameId": 7, "docW": 100, "docH": 50,
                                                       "x": 0, "y": 0, "w": 100, "h": 50}
@@ -219,15 +221,19 @@ def test_json_builders():
                                                           "w": 100, "h": 50, "appliedFrameId": 41}
     assert json.loads(P.applied(5, 900)) == {"t": "applied", "frameId": 5, "tdFrame": 900}
     assert json.loads(P.doc_state(3, [{"id": "a"}], 10, 20)) == {"t": "docState", "rev": 3, "layers": [{"id": "a"}],
-                                                                 "docW": 10, "docH": 20}
-    assert json.loads(P.doc_size(1, 2, False)) == {"t": "docSize", "w": 1, "h": 2, "hasInput": False}
+                                                                 "docW": 10, "docH": 20, "guides": {"h": [], "v": []},
+                                                                 "canvas": {"mode": "input"}}
+    assert json.loads(P.doc_state(3, [], 10, 20, {"h": [4], "v": []}, {"mode": "fixed"}))["guides"] == {"h": [4], "v": []}
+    assert json.loads(P.doc_size(1, 2, False)) == {"t": "docSize", "w": 1, "h": 2, "hasInput": False, "mode": "input"}
+    assert json.loads(P.doc_size(1, 2, True, "fixed"))["mode"] == "fixed"
+    assert json.loads(P.base_size(640, 480)) == {"t": "baseSize", "w": 640, "h": 480}
     assert json.loads(P.active(True)) == {"t": "active", "active": True}
     assert json.loads(P.error("x")) == {"t": "error", "msg": "x"}
 
 
 def test_web_side_builders_roundtrip_through_decode():
     m = P.decode_json(P.ready("panel", "tok", True, "v1"))
-    assert (m["t"], m["protocol"], m["client"], m["token"], m["fresh"]) == ("ready", 4, "panel", "tok", True)
+    assert (m["t"], m["protocol"], m["client"], m["token"], m["fresh"]) == ("ready", 5, "panel", "tok", True)
     assert P.decode_json(P.request_doc()) == {"t": "requestDoc"}
     d = P.decode_json(P.doc(4, [LAYER]))
     assert P.parse_doc(d) == (4, [LAYER])
@@ -335,13 +341,11 @@ def text_layer(**kw):
     spec = {"text": "Hello", "font": "Arial", "size": 24, "color": rgba(1, 2, 3), "align": "center", "bold": True,
             "italic": False, "lineHeight": 1.2, "x": 5, "y": 6, "boxWidth": None}
     spec.update(kw)
-    return {"id": "t", "kind": "text", "parentId": None, "slot": None, "mask": None, "text": spec, "shape": None,
-            "rasterize": False}
+    return {"id": "t", "kind": "text", "parentId": None, "slot": None, "mask": None, "text": spec, "shape": None}
 
 
 def shape_layer(shape, **kw):
-    d = {"id": "s", "kind": "shape", "parentId": None, "slot": None, "mask": None, "text": None, "shape": shape,
-         "rasterize": False}
+    d = {"id": "s", "kind": "shape", "parentId": None, "slot": None, "mask": None, "text": None, "shape": shape}
     d.update(kw)
     return d
 
@@ -362,7 +366,7 @@ def parse(*layers):
 
 
 def test_version_and_new_frame_type():
-    assert P.PROTOCOL_VERSION == 4 and P.TYPE_TOP_IMAGE == 6 and 6 in P.VALID_TYPES
+    assert P.PROTOCOL_VERSION == 5 and P.TYPE_TOP_IMAGE == 6 and 6 in P.VALID_TYPES
 
 
 def test_top_image_frame_uses_the_tops_own_size_as_doc_size():
@@ -377,10 +381,9 @@ def test_parse_doc_accepts_text_and_shape_layers_in_every_form():
     base = {"id": "base", "kind": "base", "parentId": None}
     layers = [base, text_layer(), shape_layer(SHAPES["rect"], id="s1"), shape_layer(SHAPES["ellipse"], id="s2"),
               shape_layer(SHAPES["line"], id="s3"), shape_layer(SHAPES["polygon"], id="s4"),
-              {**text_layer(), "id": "tr", "rasterize": True, "slot": 4, "mask": {"slot": 5, "enabled": True}},
-              {**shape_layer(SHAPES["rect"]), "id": "sr", "rasterize": True, "slot": 6}]
+              {**text_layer(), "id": "tm", "mask": {"slot": 5, "enabled": True}}]
     rev, got = parse(*layers)
-    assert rev == 1 and got == layers and P.layer_slots(got) == [4, 5, 6]
+    assert rev == 1 and got == layers and P.layer_slots(got) == [5]
 
 
 def test_parse_doc_keeps_accepting_v3_layers_without_the_new_fields():
@@ -388,9 +391,7 @@ def test_parse_doc_keeps_accepting_v3_layers_without_the_new_fields():
 
 
 @pytest.mark.parametrize("mutate", [
-    lambda l: l.update(slot=3),                                   # slot but not rasterized
-    lambda l: l.update(rasterize=True),                           # rasterized but no slot
-    lambda l: l.update(rasterize="yes"),
+    lambda l: l.update(slot=3),                                   # text / shape layers never have a surface (v5)
     lambda l: l.update(text=None),
     lambda l: l.update(text="Hello"),
     lambda l: l["text"].update(text=5),
@@ -453,8 +454,8 @@ def test_parse_doc_ignores_unknown_fields_and_checks_duplicate_slots():
     l["future"] = 1
     l["text"]["future"] = 2
     parse(l)
-    a = {**text_layer(), "id": "a", "rasterize": True, "slot": 2}
-    b = {**shape_layer(SHAPES["rect"]), "id": "b", "rasterize": True, "slot": 2}
+    a = {"id": "a", "kind": "pixel", "slot": 2}
+    b = {"id": "b", "kind": "pixel", "slot": 2, "mask": None}
     with pytest.raises(P.ProtocolError):
         parse(a, b)
 
@@ -478,3 +479,86 @@ def test_v4_json_builders_and_parsers():
 def test_parse_import_top_rejects(msg):
     with pytest.raises(P.ProtocolError):
         P.parse_import_top(msg)
+
+
+# --------------------------------------------------------------------------- v5 (PROTOCOL.md section 7)
+
+def pix(id="p", **kw):
+    return {"id": id, "kind": "pixel", "parentId": None, "slot": 1, "mask": None, "x": 0, "y": 0, "sx": 1, "sy": 1,
+            "surfaceW": 10, "surfaceH": 5, **kw}
+
+
+def test_parse_doc_v5_layer_fields_and_fractional_transforms():
+    rev, got = parse({"id": "base", "kind": "base", "surfaceW": 64, "surfaceH": 32, "sx": 0.5, "sy": 0.25, "x": -3.5, "y": 0.25},
+                     pix(x=1.25, y=-9.5, sx=2.5, sy=0.1), text_layer(sx=1, sy=1))
+    assert rev == 1 and len(got) == 3
+
+
+@pytest.mark.parametrize("bad", [
+    {"sx": 0}, {"sx": -1}, {"sy": float("nan")}, {"sx": "2"}, {"sy": True}, {"sx": 1e9},
+    {"x": "1"}, {"y": float("inf")},
+    {"surfaceW": 0}, {"surfaceH": -3}, {"surfaceW": 1.5}, {"surfaceW": True}, {"surfaceW": 20000},
+    {"surfaceW": 8193, "surfaceH": 8193}, {"surfaceW": 10, "surfaceH": None}, {"surfaceW": None, "surfaceH": 5},
+])
+def test_parse_doc_v5_rejects_bad_transform_and_surface_size(bad):
+    with pytest.raises(P.ProtocolError):
+        parse(pix(**bad))
+
+
+def test_parse_doc_v5_surface_size_optional_and_ignored_on_other_kinds():
+    parse(pix(surfaceW=None, surfaceH=None))
+    parse({"id": "g", "kind": "group", "surfaceW": None, "surfaceH": None})
+    parse({"id": "p", "kind": "pixel", "slot": 1})  # a v4 layer without any of the new fields
+
+
+def test_parse_doc_guides_and_canvas():
+    msg = {"rev": 1, "layers": [], "guides": {"h": [1, 2.5], "v": []}, "canvas": {"mode": "fixed"}}
+    P.parse_doc(msg)
+    assert P.doc_extras(msg) == ({"h": [1.0, 2.5], "v": []}, {"mode": "fixed"})
+    assert P.doc_extras({"rev": 1, "layers": []}) == ({"h": [], "v": []}, {"mode": "input"})
+    assert P.doc_extras({"guides": {"h": [3]}, "canvas": None}) == ({"h": [3.0], "v": []}, {"mode": "input"})
+    for bad in ({"guides": "x"}, {"guides": {"h": ["a"]}}, {"guides": {"v": [float("nan")]}}, {"guides": {"h": [0] * 1001}},
+                {"canvas": {"mode": "auto"}}, {"canvas": 3}, {"canvas": {}}):
+        with pytest.raises(P.ProtocolError):
+            P.parse_doc({"rev": 1, "layers": [], **bad})
+
+
+def test_slot_sizes_per_surface_mask_follows_layer_and_fallbacks():
+    layers = [{"id": "b", "kind": "base"},
+              pix("a", slot=1, mask={"slot": 2, "enabled": True}, surfaceW=300, surfaceH=200),
+              pix("b2", slot=3, surfaceW=7, surfaceH=9),
+              {"id": "adj", "kind": "adjustment", "mask": {"slot": 4, "enabled": True}},
+              {"id": "old", "kind": "pixel", "slot": 5, "surfaceW": None}]
+    assert P.slot_sizes(layers, 64, 32) == {1: (300, 200), 2: (300, 200), 3: (7, 9), 4: (64, 32), 5: (64, 32)}
+    # a surface without a size in the spec keeps its buffer's size (a canvas resize never reallocates)
+    assert P.slot_sizes(layers, 99, 98, {4: (64, 32), 5: (10, 11), 1: (1, 1)}) == {1: (300, 200), 2: (300, 200), 3: (7, 9),
+                                                                                     4: (64, 32), 5: (10, 11)}
+
+
+def test_set_canvas_and_render_layer_parsers():
+    assert P.parse_set_canvas(P.decode_json(P.set_canvas(800, 600, "fixed"))) == (800, 600, "fixed")
+    assert P.parse_set_canvas({"mode": "input", "w": "junk"}) == (0, 0, "input")  # w, h ignored
+    for bad in ({"mode": "auto", "w": 1, "h": 1}, {"mode": "fixed"}, {"mode": "fixed", "w": 0, "h": 5},
+                {"mode": "fixed", "w": 5, "h": 16385}, {"mode": "fixed", "w": 1.5, "h": 5}, {"mode": "fixed", "w": True, "h": 5},
+                {"mode": "fixed", "w": float("nan"), "h": 5}):
+        with pytest.raises(P.ProtocolError):
+            P.parse_set_canvas(bad)
+    assert P.parse_render_layer(P.decode_json(P.render_layer("r1", "t1"))) == ("r1", "t1")
+    for bad in ({"requestId": "r"}, {"requestId": "r", "layerId": ""}, {"requestId": "r", "layerId": 5},
+                {"layerId": "t"}, {"requestId": None, "layerId": "t"}):
+        with pytest.raises(P.ProtocolError):
+            P.parse_render_layer(bad)
+
+
+def test_v5_frames_use_surface_and_input_sizes_in_the_header():
+    by = {e["name"]: e for e in load_fixtures()}
+    base = by["base_input_size"]
+    hb, _ = P.decode_frame(open(os.path.join(FIX, base["file"]), "rb").read())
+    assert (hb.type, hb.doc_w, hb.doc_h) == (1, 6, 3) and not P.is_stale(hb, 6, 3) and P.is_stale(hb, 5, 4)
+    dump = by["surface_dump_layer"]
+    hd, _ = P.decode_frame(open(os.path.join(FIX, dump["file"]), "rb").read())
+    cur = dump["currentSurface"]
+    assert hd.slot == cur["slot"] and (hd.doc_w, hd.doc_h) == (cur["w"], cur["h"]) and not P.is_stale(hd, cur["w"], cur["h"])
+    stale = by["stale_docsize"]
+    hs, _ = P.decode_frame(open(os.path.join(FIX, stale["file"]), "rb").read())
+    assert P.is_stale(hs, stale["currentSurface"]["w"], stale["currentSurface"]["h"])

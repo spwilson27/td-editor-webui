@@ -174,7 +174,8 @@ def test_frame_exec_calls_freeze_and_thaw_on_project_save():
 
 def test_new_parameters_are_wired_to_the_par_exec():
     pars = B.PARAMS.split()
-    assert "Maxviewfps" in pars and "Savetox" in pars and "Viewmode" not in pars
+    assert "Maxviewfps" in pars and "Exportdoc" in pars and "Docsizemode" in pars
+    assert "Savetox" not in pars and "Exportpath" not in pars and "Viewmode" not in pars  # (a File parameter has no callback)
 
 
 # --------------------------------------------------------------------------- parameter help (DESIGN_V3 section 1)
@@ -188,7 +189,8 @@ def _declared_params():
 
 def test_every_custom_parameter_has_help_text():
     declared = _declared_params()
-    assert {"Active", "Port", "Status", "Viewmode", "Savetox"} <= declared
+    assert {"Active", "Port", "Status", "Viewmode", "Exportpath", "Exportdoc", "Docsizemode"} <= declared
+    assert "Savetox" not in declared and "Savetox" not in B.HELP
     assert declared == set(B.HELP), f"missing {declared - set(B.HELP)}, stale {set(B.HELP) - declared}"
     for name, text in B.HELP.items():
         assert len(text.strip()) >= 40, name
@@ -205,3 +207,59 @@ def test_help_says_defaults_units_and_read_only():
 
 def test_params_list_matches_help_for_the_parameter_execute_dat():
     assert set(B.PARAMS.split()) <= set(B.HELP)
+
+
+def test_help_covers_the_v4_parameters_and_their_interplay():
+    h = B.HELP
+    assert "Follow Input" in h["Docsizemode"] and "Fixed" in h["Docsizemode"]
+    assert "Document Size Mode" in h["Docw"] and "Document Size Mode" in h["Doch"] and "no input" in h["Docw"]
+    assert ".tox" in h["Exportpath"] and "Export Path" in h["Exportdoc"] and "document" in h["Exportdoc"]
+    assert "Flatten" in h["Premultiplied"] and "overwritten" in h["Exportdoc"]
+    assert "resample" in h["Docsizemode"] or "resampled" in h["Docsizemode"]
+
+
+class FakeScratchParent:
+    def __init__(self, with_scratch):
+        self.scratch = FakeOp(B.TOX_NAME, [])
+        self.has = with_scratch
+
+    def op(self, name):
+        return self.scratch if self.has and name == B.TOX_NAME and not self.scratch.destroyed else None
+
+
+def test_export_tox_always_destroys_its_scratch_comp(monkeypatch):
+    parent = FakeScratchParent(True)   # (a leftover from an earlier run exists up front)
+    leftover = parent.scratch
+    monkeypatch.setattr(B, "op", lambda path: parent, raising=False)
+
+    def boom(*a, **k):
+        parent.has = True  # the build got as far as creating the temp COMP, then failed
+        parent.scratch.destroyed = False
+        raise RuntimeError("build failed half way")
+    monkeypatch.setattr(B, "build", boom)
+    with pytest.raises(RuntimeError, match="half way"):
+        B.export_tox(False)
+    assert leftover.destroyed and parent.scratch.destroyed  # leftover destroyed up front, the half-built one in the finally clause
+
+    parent = FakeScratchParent(False)
+    monkeypatch.setattr(B, "op", lambda path: parent, raising=False)
+    saved = []
+
+    class Scratch:
+        def save(self, out):
+            saved.append(out)
+            raise OSError("disk full")
+
+    def build_ok(*a, **k):
+        parent.has = True  # the build created the temp COMP
+        return Scratch(), {}
+    monkeypatch.setattr(B, "build", build_ok)
+    monkeypatch.setattr(B.os, "makedirs", lambda *a, **k: None)
+    with pytest.raises(OSError):
+        B.export_tox(False)
+    assert saved and parent.scratch.destroyed
+
+
+def test_export_tox_dev_mode_builds_nothing(monkeypatch):
+    monkeypatch.setattr(B, "build", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no")))
+    B.export_tox(True)

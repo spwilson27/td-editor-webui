@@ -42,12 +42,15 @@ hides the problem; compare `cookAbsFrame` with `absTime.frame` instead.)
 | --- | --- | --- | --- |
 | `Active` | toggle | on | off → server stopped, output = input passthrough |
 | `Port` | int | 9980 | Web Server DAT port; changing restarts the server and reloads `webrender` |
-| `Docw`, `Doch` | int | 1920, 1080 | document size when `in1` has no input |
+| `Docsizemode` | menu | Follow Input | `input` (Follow Input): document = input size (`Docw`x`Doch` with no input); `fixed`: always `Docw`x`Doch` (§8) |
+| `Docw`, `Doch` | int | 1920, 1080 | document size when `Docsizemode` is Fixed, or Follow Input with no input |
 | `Premultiplied` | toggle | on | treat TD TOP data as premultiplied alpha (unpremultiply input, premultiply output) |
 | `Maxsendfps` | int | 30 | sent to the web app in `hello` |
 | `Maxinputfps` | int | 30 | max BASE frame rate for time-dependent inputs |
 | `Devurl` | str | "" | when set, `webrender` loads this URL with `?ws=ws://127.0.0.1:<Port>/ws&client=panel` (Vite dev server workflow) |
 | `Panelquery` | str | "" | extra query string appended to the panel URL, e.g. `test=1` (installs `window.__editorTest`; it also enables the test-only `POST /__test` back-channel, see §5) |
+| `Exportpath` | file | "" | target of `Exportdoc`; empty = `raster_editor_export.tox` in the project folder (§8) |
+| `Exportdoc` | pulse | | **Export with Document** (§8); replaces the old `Savetox` |
 | `Openbrowser` | pulse | | opens `http://127.0.0.1:<Port>/?client=external&token=<token>` in the system browser |
 | `Reloadui` | pulse | | reloads `webrender` |
 | `Status` | str (read-only) | | e.g. `panel active · 1920×1080 · 24 fps out` |
@@ -188,7 +191,7 @@ Why BASE frames are pulled over HTTP (measured)
   docH}`), `view_pack` + `view_pack_glsl` (GPU unpremultiply/flip/scale to exact 0..255 float32 for the VIEW stream: the CPU
   only casts, 2.4 ms instead of ~27 ms at 1080p), `doc` (generated network, preserved across rebuilds). The COMP has
   parent shortcut `RasterEditor` (`doc/surface_callbacks` call `parent.RasterEditor.OnSurfaceCook(scriptOp)`).
-- **New parameters:** `Maxviewfps` (30), `Viewmode` (read-only mirror of the active client's mode), `Savetox` pulse.
+- **New parameters:** `Maxviewfps` (30), `Viewmode` (read-only mirror of the active client's mode), `Savetox` pulse (replaced by `Exportpath` / `Exportdoc`, §8).
 - **Surfaces:** `surfaces[slot]` uint8 `[h, w, 4]` TD order, premultiplied (masks grey, a=255), allocated from `doc`
   messages and docSize (anchored top-left). A slot new to a `doc` always starts zeroed. Removed slots keep their buffer
   5 s. SURFACE tiles paste in place; on FRAME_END the slot is marked dirty; Pump force-cooks each dirty slot once
@@ -213,6 +216,8 @@ Why BASE frames are pulled over HTTP (measured)
   slot without a Script TOP is dropped after 3 s. `Freeze` first re-encodes slots still waiting for a `Premultiplied` toggle.
 
 ## 7. Protocol v4 additions (DESIGN_V3)
+
+(Superseded in v5, §8: `rasterize` is gone, text / shape layers never have a surface slot; `SaveTox` is `ExportDoc`.)
 
 Extension (`ext.py`), all on the main thread, bounded per pump, nothing large on a WebSocket:
 
@@ -241,3 +246,34 @@ Extension (`ext.py`), all on the main thread, bounded per pump, nothing large on
 - **Parameter help:** `build_component.HELP` gives every custom parameter its `help`; the component's `comment` carries a
   short description (TD has no per-page description). The live step 17 of `scripts/validate_td.py` asserts that no
   custom parameter has an empty help.
+
+## 8. Protocol v5 additions (DESIGN_V4)
+
+`protocol.py` / `ext.py`; `docs/PROTOCOL.md` §7 is the wire contract.
+
+- **Per-surface sizes.** Every slot's buffer is `surfaceW x surfaceH` of its layer (`protocol.slot_sizes`; a mask has its layer's
+  size; a surface without a size in the spec -- adjustment / group masks, v4 documents -- keeps its existing buffer's size, else
+  the document size). Buffers are allocated for slots new to a `doc` and **reallocated only when the spec size of that slot
+  changes** (pixels kept top-left until the engine's resend); a canvas / document resize never touches them. SURFACE tiles are
+  dropped as stale when their `docW/docH` differ from the slot's current buffer, SURFACE_DUMP carries the surface size, BASE
+  frames the input size (`baseSize` message + the `base` notice). Freeze checks each locked TOP against its own slot size;
+  restore, carried-over buffers and held tiles use per-slot sizes too.
+- **Canvas.** `Docsizemode` Follow Input: document = input size (`Docw x Doch` with no input); Fixed: `Docw x Doch`. `setCanvas`
+  from the *active* client sets the parameters (`mode:"fixed"` writes `Docw/Doch`; `"input"` ignores w/h); `docSize {w,h,hasInput,mode}`
+  goes to every other client (and to the sender only when the result differs from its request, e.g. the input's size). A user
+  edit of `Docsizemode/Docw/Doch` is pushed the same way; flipping Follow Input -> Fixed with the parameter alone keeps the current
+  size (copied into `Docw/Doch` unless those were edited in the same step). `hello.doc.mode`/`hello.baseSize` carry the state on
+  connect. `doc_state` stores `{rev, layers, guides, canvas:{mode}}`; a restore puts the stored mode back into `Docsizemode`
+  (the parameter is the single source of truth while running: the `canvas` of an incoming `doc` is informational). Before a client
+  sent a document the network gets a default base layer (surface = input size; Fixed mode: fitted and centred).
+- **Flatten.** `renderLayer {requestId, layerId}` (active client): `network.render_layer_source(layerId)` -> TOP, read back through
+  the same budgeted two-step pipeline as a TOP import (shrunk/stretched on the GPU only if its size differs from the document),
+  un-premultiplied per `Premultiplied`, served as a type-6 frame of the *document* size (`topReady` + `GET /top`; errors `topError`:
+  not a text/shape layer, restoring, document too large (> 32 Mpx), document resized meanwhile). It shares the import queue
+  (one job per client, newest wins).
+- **Export with Document.** `Exportdoc` (pulse) -> `ExportDoc()`: refuse while a restore is pending, `Exportpath` made absolute
+  (relative = project folder, `.tox` appended, folder must exist), `Freeze()` -> `comp.save(<name>.part.tox)` -> rename -> `Thaw()`
+  (always). The outcome stays in `Status` for 10 s ("exported with document to ..." / "export failed: ..."); a success clears the
+  previous error. `Exportpath` is a File parameter; TD 2025.32820 has no file-type filter for custom File parameters (no `Par.fileTypes`), so a missing `.tox` ending is added on export.
+- **Build.** `export_tox` builds the clean `.tox` in `/project1/_re_tox_build` and always destroys that COMP (also when the build
+  or the save fails, and any leftover first).
