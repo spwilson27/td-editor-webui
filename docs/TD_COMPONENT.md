@@ -350,3 +350,28 @@ See `PROTOCOL.md` section 9 for the wire details. Extension behaviour:
 - **Render requests** (see "Flatten / merge" above): `network.render_open / render_source / render_token / render_status / render_close`.
 - Tests: `td/tests/test_v8.py`; live: `scripts/network_dev.py v8` (chain vs the v0.6.0 passes, requests vs layers composited alone),
   `scripts/validate_td.py` steps 48-50.
+
+## 12. Protocol v9 additions (DESIGN_V7 8): masks on groups and input layers
+
+- `PROTOCOL_VERSION = 9`. `parse_doc` always accepted a `mask` on any layer; v9 only changes what the page may send (group and input masks) and the
+  slot sizing rules in `protocol.slot_sizes`: a **group / adjustment / text / shape** mask is document sized (a leftover buffer size is never
+  inherited), an **input** mask is `surfaceW x surfaceH` of the input layer (the page sends the input's size), else the buffer's size, else the
+  document's. The mask of a disconnected input stays allocated (it is just not wired) and comes back with the input.
+- **Input mask** (`network.py`, `ext.py`): the mask surface of an input layer is `surfaceW x surfaceH` of the layer; the ext states that size
+  for masked input layers (`_fill_input_sizes`: spec, else the live input size, else the mask buffer's size, else the document's -- the same
+  answer for `protocol.slot_sizes` and the network, also after a canvas resize). When the input's resolution changes (`_adjust_inputs`), or a
+  `doc` states a new input size, the mask buffer is **stretched** (`frames.stretch_buffer`, bilinear, normalised coordinates), not padded; the
+  page's exact mask follows. A SURFACE frame produced for a size the slot does not have yet (the page's `doc` still in flight) is kept
+  (bounded, `_early`) and replayed after the next doc. `.redoc` input masks saved for another input size are resampled on load (other masks
+  must still match). A connected masked input keeps the exact path (mask rides on the blend / merged pass) while the mask has the live input's
+  size; it goes through the resample pass (`xf_L_<id>`, mask sampled in normalised layer UVs) only when the mask size is unknown or differs from
+  the In TOP's size, when it is transformed, or has effects. Hidden / opacity-0 inputs build no resample node.
+- **Group mask**: the group's isolated composite is multiplied by the mask (document space) before its effects (`xf_L_<id>` identity pass when the
+  group has effects; the group's blend pass `uHasMask` otherwise), then opacity / blend. A masked group without effects never joins a merged run
+  (`solo` in `_emit`; its mask is not a merged-pass mask input); with effects the mask is baked first and the group is an ordinary merge member.
+- **Render requests**: `renderLayer` flatten of a group bakes its mask (the request keeps the layer's mask, drops opacity / blend / visibility);
+  `renderLayers` takes the selected layers as roots, so a parent's mask is ignored; mergeDown is unchanged. Request layers share the mask slots.
+- tdPreview layers show the masked content (the chain's input is already masked).
+- Tests: `td/tests/test_network.py` (v9 block), `test_protocol_v7.py`, `test_ext.py` (v9 block); live: `scripts/network_dev.py v9` (masked input with
+  integer offset / rotation / skew and a half-size mask, with an effect, disconnect + resolution change; masked group with a multiply child,
+  group effects, between plain layers, flatten, renderLayers), `scripts/validate_td.py` step 53.

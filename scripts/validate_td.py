@@ -1,4 +1,4 @@
-"""Live validation of the raster_editor COMP (protocol v8) against a running TouchDesigner
+"""Live validation of the raster_editor COMP (protocol v9) against a running TouchDesigner
 (docs/TESTING.md section 3, docs/DESIGN_V2.md section 7).
 
     .venv/bin/python scripts/validate_td.py                  # every step (the real UI drives the UI steps)
@@ -6,7 +6,7 @@
     .venv/bin/python scripts/validate_td.py --fake-client    # same, but keeps the UI steps that tolerate it
     .venv/bin/python scripts/validate_td.py --only 5,7,9     # run chosen steps (numbers below)
 
-The fake client speaks protocol v8 over a stdlib WebSocket: it sends `doc` + SURFACE tiles like the web
+The fake client speaks protocol v9 over a stdlib WebSocket: it sends `doc` + SURFACE tiles like the web
 app, pulls BASE / VIEW / SURFACE over HTTP and measures `applied` latency.
 
 Flags: --no-build (reuse the COMP that exists), --port N, --only. Only operators inside
@@ -2801,6 +2801,154 @@ def s51_ui_copy_paste(args):
     return ok_all, "\n        ".join(notes)
 
 
+def s53_ui_group_input_masks(args):
+    """Real UI (v9, DESIGN_V7 8): a mask on a TD input layer and on a group through the page test hook -- add mask, paint mask strokes in mask
+    edit mode, transform the input (the mask follows), a group with effects + a multiply child + opacity, Flatten of the masked group, undo of
+    a mask stroke and of the flatten: the page composite equals TD each time, TD's document carries the masks."""
+    W, H = 320, 200
+    err = ui_doc(args, W, H)
+    if err:
+        return None, err
+    miss = hook_missing("addMask", "setPaintTarget", "setTransform", "stroke", "addGroup", "moveLayer", "setEffects", "flatten", "undo", "setPrimary")
+    if miss:
+        return None, f"mask hooks not available: {miss}"
+    notes, ok_all = [], True
+
+    def chk(label, cond, extra=""):
+        nonlocal ok_all
+        ok_all &= bool(cond)
+        notes.append(f"{label}: {'ok' if cond else 'FAIL'} {extra}".rstrip())
+
+    def parity(label, tol=3, mean=1.0, edge=0.02):
+        time.sleep(0.8)
+        box = {}
+
+        def same():       # (the page and TD converge a few frames apart: retry for a few seconds)
+            box["ok"], box["n"] = compare_page_td([(label, (0, 0, W, H), tol, mean, edge)])
+            return box["ok"]
+        wait_for(same, 8, 0.7)
+        chk(f"{label}: page composite equals TD", box["ok"], " ".join(box["n"]))
+
+    def td_mask(lid):
+        return td_json("L = comp.ext.RasterEditorExt.doc_layers or []\n"
+                       f"m = next((l.get('mask') for l in L if l.get('id') == {lid!r}), None)\n"
+                       "print(json.dumps(m))")
+
+    def mask_sig(lid):
+        m = td_mask(lid)
+        return None if not m else (td_surface_sigs() or {}).get(str(m["slot"]))
+
+    def band(y0, y1, x0=-5, x1=W + 5, step=9):
+        pts, flip = [], False
+        for yy in range(y0, y1 + 1, step):
+            row = [(x0, yy), (x1, yy)]
+            pts += row[::-1] if flip else row
+            flip = not flip
+        hook_call(f"stroke('brush', {json.dumps(pts)})", 30)
+
+    try:
+        # an input with content that varies (a ramp), same size as the document
+        td(f"""
+c = op({TMP!r})
+if c is None:
+    c = op('/project1').create(rampTOP, '_validate_in')
+c.par.outputresolution = 'custom'; c.par.resolutionw = {W}; c.par.resolutionh = {H}
+if not comp.inputConnectors[0].connections:
+    comp.inputConnectors[0].connect(c)
+""")
+        chk("input layer connected in the page", wait_for(lambda: any(l.get("input") == 1 and l.get("inputConnected") for l in (hook_call("layers()") or [])), 8))
+        inp = next((l["id"] for l in (hook_call("layers()") or []) if l.get("input") == 1), None)
+        if inp is None:
+            return False, "no input layer in the page"
+        time.sleep(1.0)
+        chk("page loaded the input and agrees with TD", settle_page(30))
+        parity("input alone")
+        base_img = td_rect(COMP + "/out1", 0, 0, W, H)
+
+        def td_px(x, y):
+            return td_rect(COMP + "/out1", x, y, 1, 1)[0, 0].astype(int)
+
+        # ---- mask on the input
+        slot = hook_call(f"addMask({inp!r})")
+        chk("addMask on an input layer", isinstance(slot, int) and slot >= 0, str(slot))
+        chk("TD document carries the input's mask", wait_for(lambda: (td_mask(inp) or {}).get("slot") == slot, 6), str(td_mask(inp)))
+        time.sleep(0.5)
+        chk("baseline: a fresh (white) mask changes nothing in TD", int(np.abs(td_rect(COMP + "/out1", 0, 0, W, H).astype(int) - base_img.astype(int)).max()) <= 1)
+        hook_call(f"setPaintTarget({inp!r}, 'mask')")
+        hook_call("setPrimary('#000000')")
+        s0 = mask_sig(inp)
+        band(20, 70, 30, 260)
+        chk("mask strokes reach TD's mask surface", wait_for(lambda: mask_sig(inp) != s0, 8))
+        parity("masked input (mask strokes)")
+        hit, miss_ = td_px(150, 45), td_px(150, 170)
+        chk("baseline: the stroke hides the input under it in TD (and only there)", hit.max() <= 8 and np.abs(miss_ - base_img[170, 150].astype(int)).max() <= 2,
+            f"under stroke {hit.tolist()}, away {miss_.tolist()} vs unmasked {base_img[170, 150].tolist()}")
+        hook_call(f"setTransform({inp!r}, {{x: 40, y: 25, sx: 0.8, sy: 0.8, rot: 0, kx: 0, ky: 0}})")
+        time.sleep(0.5)
+        parity("masked input scaled 0.8 and moved (mask follows)", 4, 1.0, 0.05)
+        hook_call(f"setTransform({inp!r}, {{x: 60, y: 10, sx: 0.8, sy: 0.8, rot: 14, kx: 0, ky: 0}})")
+        time.sleep(0.5)
+        parity("masked input rotated 14 degrees", 10, 1.0, 0.06)
+        # undo of one mask stroke: TD's mask is restored
+        hook_call(f"setPaintTarget({inp!r}, 'mask')")
+        s1 = mask_sig(inp)
+        band(120, 150, 30, 260)
+        chk("second mask stroke changes TD's mask", wait_for(lambda: mask_sig(inp) != s1, 8))
+        hook_call("undo()")
+        chk("undo restores TD's mask surface", wait_for(lambda: mask_sig(inp) == s1, 8))
+        parity("after undo of the stroke", 10, 1.0, 0.06)
+        hook_call(f"setTransform({inp!r}, {{x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0}})")
+
+        # ---- masked group: two painted children (the upper multiplies), group effects, opacity
+        hook_call(f"setLayerVisible({inp!r}, false)")
+        g = hook_call("addGroup()")
+        kids = []
+        for color in ("#c04020", "#40a0e0"):
+            kids.append(hook_call("addLayer()"))
+            paint_all(W, H, color)
+        for k in kids:
+            hook_call(f"moveLayer({k!r}, {g!r}, 0)")
+        hook_call(f"engine().setLayerProps({kids[1]!r}, {{blend: 'multiply'}})")
+        hook_call(f"setLayerVisible({inp!r}, true)")
+        time.sleep(0.8)
+        parity("group with a multiply child over the input")
+        before_g = td_rect(COMP + "/out1", 0, 0, W, H)
+        gslot = hook_call(f"addMask({g!r})")
+        chk("addMask on a group", isinstance(gslot, int) and gslot >= 0, str(gslot))
+        chk("TD document carries the group's mask", wait_for(lambda: (td_mask(g) or {}).get("slot") == gslot, 6), str(td_mask(g)))
+        gs0 = mask_sig(g)
+        hook_call(f"setPaintTarget({g!r}, 'mask')")
+        hook_call("setPrimary('#000000')")
+        band(40, 100, 20, 200)
+        chk("group mask strokes reach TD", wait_for(lambda: mask_sig(g) != gs0, 8))
+        parity("masked group")
+        after_g = td_rect(COMP + "/out1", 0, 0, W, H)
+        chk("baseline: the group mask hides the group under the stroke in TD, nowhere else",
+            int(np.abs(after_g[60:80, 100:120].astype(int) - before_g[60:80, 100:120].astype(int)).max()) > 40
+            and int(np.abs(after_g[170:190, 100:120].astype(int) - before_g[170:190, 100:120].astype(int)).max()) <= 2)
+        hook_call(f"engine().setLayerProps({g!r}, {{opacity: 0.8, blend: 'multiply'}})")
+        parity("masked group, multiply 0.8")
+        hook_call(f"setEffects({g!r}, [{{type:'colorOverlay', color:{{r:255,g:128,b:0,a:255}}, opacity:0.35}}])")
+        parity("masked group with an effect (mask, effect, opacity)", 4, 1.0, 0.02)
+        hook_call(f"engine().setLayerProps({g!r}, {{blend: 'normal'}})")
+        hook_call(f"setEffects({g!r}, [])")
+
+        # ---- flatten the masked group: baked into one pixel layer, group (and its mask) gone
+        n_before = len(hook_call("layers()") or [])
+        fid = hook_call(f"flatten({g!r})", 60)
+        time.sleep(1.5)
+        lays = hook_call("layers()") or []
+        chk("flatten replaced the group by one pixel layer", not any(l["id"] == g for l in lays) and len(lays) < n_before, f"{n_before} -> {len(lays)} ({fid})")
+        parity("after flatten of the masked group", 3, 0.5, 0.02)
+        hook_call("undo()")
+        chk("undo of the flatten brings the masked group back in TD", wait_for(lambda: (td_mask(g) or {}).get("slot") == gslot, 8), str(td_mask(g)))
+        parity("after undo of the flatten", 4, 1.0, 0.02)
+        hook_call(f"setPaintTarget({g!r}, 'pixels')")
+    finally:
+        td(f"t = op({TMP!r})\nif t: t.destroy()")
+    return ok_all, "\n        ".join(notes)
+
+
 def s29_export(args):
     """Exportpath / Exportdoc: round trip through a real file (temp + rename, no .part left), the result in Status, guides +
     canvas mode persisted and restored by loadTox into a temp COMP; errors for a missing folder; help + file filter."""
@@ -4356,6 +4504,7 @@ STEPS = [
     (50, "real UI: merge down, merge selected, flatten group, group / delete selected via the hook -- page equals TD, same layers", "uimulti", True),
     (51, "real UI: copy/paste a pixel layer with effects + a group via the page test hook -- page equals TD, new surfaces present", "uicopy", True),
     (52, "real UI: scrub the blend mode dropdown + font size with real pointer events -- click still opens a list, drag is live, page equals TD, one undo", "uiscrub", True),
+    (53, "real UI: masks on a TD input layer and on a group (add, paint, transform, effects, flatten, undo) -- page equals TD", "uimasks", True),
     (99, "deleting the COMP with clients connected does not freeze TD; undo of the delete restores the pixels (run last)", "delete", False),
 ]
 FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinput": "s4_no_input", "scene": "s5_scene",
@@ -4371,7 +4520,7 @@ FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinp
          "uifilters": "s39_ui_filters_parity", "uigroupfx": "s40_ui_filter_adjust_group_fx", "uiselectadj": "s41_ui_selection_adjustment",
          "uibrush": "s42_ui_brush_tips_presets", "layerpreview": "s43_layer_preview", "uihistory": "s44_ui_history_reload",
          "uiredoc": "s45_ui_redoc_history", "ttc": "s46_ttc_fonts", "active": "s47_active_layer_hint",
-         "migrate": "s48_migration_v6_docs", "renderreq": "s49_render_requests", "uimulti": "s50_ui_flatten_merge_multiselect", "uicopy": "s51_ui_copy_paste", "uiscrub": "s52_ui_scrub"}
+         "migrate": "s48_migration_v6_docs", "renderreq": "s49_render_requests", "uimulti": "s50_ui_flatten_merge_multiselect", "uicopy": "s51_ui_copy_paste", "uiscrub": "s52_ui_scrub", "uimasks": "s53_ui_group_input_masks"}
 
 
 def main():

@@ -168,7 +168,7 @@ def test_v7_builders_and_parsers():
     st = json.loads(P.doc_state(1, [], 2, 3, brush_presets=[preset()]))
     assert st["brushPresets"] == [preset()] and "brushPresets" not in json.loads(P.doc_state(1, [], 2, 3))
     assert json.loads(P.doc(1, [], brush_presets=[])) ["brushPresets"] == []
-    assert P.PROTOCOL_VERSION == 8
+    assert P.PROTOCOL_VERSION == 9
 
 
 def test_layer_preview_fixtures_match_the_generator():
@@ -182,3 +182,26 @@ def test_layer_preview_fixtures_match_the_generator():
     assert bad["valid"] is False
     with pytest.raises(P.ProtocolError):
         P.decode_frame(open(os.path.join(root, bad["file"]), "rb").read())
+
+
+# ---- v9: masks on groups and input layers ----------------------------------------------------------------------
+
+def test_v9_masks_on_group_and_input_layers_parse_and_get_their_own_sizes():
+    layers = [layer(id="g", kind="group", slot=None, mask={"slot": 5, "enabled": True}),
+              layer(id="i", kind="input", slot=None, input=2, surfaceW=40, surfaceH=30, mask={"slot": 6, "enabled": True}),
+              layer(id="j", kind="input", slot=None, input=3, mask={"slot": 7, "enabled": False}),
+              layer(id="p", kind="pixel", slot=8, surfaceW=16, surfaceH=9, mask={"slot": 9, "enabled": True}),
+              layer(id="a", kind="adjustment", slot=None, mask={"slot": 10, "enabled": True})]
+    _, out = parse(*layers)
+    assert [l["mask"]["slot"] for l in out] == [5, 6, 7, 9, 10]
+    assert P.mask_slots(out) == [5, 6, 7, 9, 10] and P.layer_slots(out) == [5, 6, 7, 8, 9, 10]
+    # group / adjustment masks are document sized; an input mask follows the input surface (document size without a stated one)
+    assert P.slot_sizes(out, 100, 50) == {5: (100, 50), 6: (40, 30), 7: (100, 50), 8: (16, 9), 9: (16, 9), 10: (100, 50)}
+    # a surface-less input mask keeps the size of its buffer; a group mask never inherits a stale buffer size
+    assert P.slot_sizes(out, 100, 50, {7: (64, 48), 5: (1920, 1080)}) == {5: (100, 50), 6: (40, 30), 7: (64, 48), 8: (16, 9), 9: (16, 9), 10: (100, 50)}
+
+
+def test_v9_duplicate_mask_slots_across_group_and_input_are_refused():
+    with pytest.raises(P.ProtocolError):
+        parse(layer(id="g", kind="group", slot=None, mask={"slot": 5, "enabled": True}),
+              layer(id="i", kind="input", slot=None, input=1, mask={"slot": 5, "enabled": True}))

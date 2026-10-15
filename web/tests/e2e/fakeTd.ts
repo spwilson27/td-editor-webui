@@ -32,7 +32,7 @@ interface FakeInput { w: number; h: number; connected: boolean; stored: { id: nu
 export interface FakeTop { path: string; w: number; h: number; rgba: Uint8Array }
 
 /**
- * A stand-in for the TouchDesigner web server DAT (protocol v8: `renderLayer {mode}` and `renderLayers` serve synthetic flatten / merge images; protocol v7: `activeLayer` log, `POST/GET /history` (blob + `X-Doc-Rev`), `layerPreview` notices + `GET /layer` (frame type 7), `brushPresets` in the doc; protocol v6: several inputs with BASE frames per input, `inputs`, effects/transforms stored verbatim in the doc, `saveProject`/`openProject`/`exportPng` with an in-memory file map + `reload`/`files`, plus the v5 `setCanvas`/`renderLayer` features): WebSocket for JSON and SURFACE tiles (stored per
+ * A stand-in for the TouchDesigner web server DAT (protocol v9: group + input masks are plain `mask` slots in the doc; protocol v8: `renderLayer {mode}` and `renderLayers` serve synthetic flatten / merge images; protocol v7: `activeLayer` log, `POST/GET /history` (blob + `X-Doc-Rev`), `layerPreview` notices + `GET /layer` (frame type 7), `brushPresets` in the doc; protocol v6: several inputs with BASE frames per input, `inputs`, effects/transforms stored verbatim in the doc, `saveProject`/`openProject`/`exportPng` with an in-memory file map + `reload`/`files`, plus the v5 `setCanvas`/`renderLayer` features): WebSocket for JSON and SURFACE tiles (stored per
  * slot with the last `doc`), HTTP `GET /base` / `/surface` / `/view` / `/top`; `fonts` after `hello`; `listTops` / `importTop` over a registry of fake TOPs; `applied` replies per finished SURFACE frame.
  */
 export class FakeTd {
@@ -374,7 +374,7 @@ export class FakeTd {
 
   hello(): TdMessage {
     return {
-      t: 'hello', protocol: 8, doc: { w: this.w, h: this.h, mode: this.mode }, hasInput: this.opts.hasInput ?? false, maxSendFps: this.opts.maxSendFps ?? 30,
+      t: 'hello', protocol: 9, doc: { w: this.w, h: this.h, mode: this.mode }, hasInput: this.opts.hasInput ?? false, maxSendFps: this.opts.maxSendFps ?? 30,
       inputs: this.inputList(),
       active: this.active, clientId: this.clientId, hasDocument: this.doc !== null, rev: this.doc?.rev ?? null,
     };

@@ -1,6 +1,6 @@
 """Live harness for td/raster_editor/network.py (blend.glsl + DocNetwork) inside TouchDesigner.
 
-    .venv/bin/python scripts/network_dev.py [all|blend|adjust|misc|perf|view|persist|shapes|shapes-gl|text|v3perf|v6|v7|fonts] [--keep]
+    .venv/bin/python scripts/network_dev.py [all|blend|adjust|misc|perf|view|persist|shapes|shapes-gl|text|v3perf|v6|v7|v9|fonts] [--keep]
 
 Works only inside the scratch COMP ``/project1/_netdev`` (created and destroyed here).  A stand-in
 for the extension (``Stub.OnSurfaceCook``) serves surface buffers that this script uploads.  Nothing
@@ -20,6 +20,7 @@ Checks (each prints PASS/FAIL with numbers):
   text    v3 text layers vs Chromium Canvas 2D (textShape.ts conventions): bbox +-2 px, coverage IoU
   v3perf  apply() timings for text/shape edits, GPU cost per layer @1080p
   v6      v6 performance network (merged passes, bounding boxes, skip rules, 8 bit, blur pyramid) vs the v5 network
+  v9      masks on input layers and groups (stretched input masks, masked group with effects / blend, flatten) vs numpy / EffectChain
   fonts   bold / italic of font-collection (.ttc) families vs Regular (glyph coverage, stem slant)
   v7      filter adjustments, effects on groups / adjustments, aux images, tdPreview layers vs an independent EffectChain reference
 """
@@ -3222,6 +3223,207 @@ def test_fonts_ttc():
     td(PRELUDE + "_emit(1)")
 
 
+def test_v9():
+    """v9 (DESIGN_V7 8): masks on TD input layers and on groups, vs numpy / an independent EffectChain.  Input masks live in the input's
+    layer space and are sampled in normalised UVs (a mask of another size is stretched); a masked group masks its composite before the
+    group effects, then opacity / blend; a masked group never joins a merged run."""
+    sys.path.insert(0, os.path.join(ROOT, "td", "tests"))
+    import fakenet
+    S = 96
+    setup(S, S)
+    setup_legacy()
+    A, B, MA, MB, K = xform_sources()
+    IW, IH, MW, MH = 70, 50, 35, 25
+    im = K[:IH, :IW].copy()
+    _input_script(1, premul_f(im)[::-1])
+    _connect_input(1)
+    gy, gx = np.mgrid[0:MH, 0:MW]
+    grad = np.zeros((MH, MW, 4), np.uint8)               # mask half the size of the input: 0.5 u + 0.5 v ramp (linear stretch is exact)
+    grad[..., :3] = np.rint(255 * (0.5 * (gx + 0.5) / MW + 0.5 * (gy + 0.5) / MH))[..., None]
+    grad[..., 3] = 255
+    upload2(7, grad)
+    mref = grad[..., 0].astype(np.float64) / 255.0
+
+    def run(layers):
+        apply(layers, S, S)
+        return read_out(True) * 255.0
+
+    def spec(sw=MW, sh=MH, slot=7, **kw):
+        # (sw, sh) = the size the document states for the layer: here the MASK's size while the input is already IW x IH, the window in which
+        # the ext has not re-stated the input's size yet; the planner then resamples (mask in normalised UVs)
+        return layer("i", "input", input=1, surfaceW=sw, surfaceH=sh, mask={"slot": slot, "enabled": True}, **kw)
+
+    ii, jj = np.meshgrid(np.arange(S), np.arange(S))
+    P = premul_f(im)
+
+    def placed_ref(mfun, x0, y0):
+        lx, ly = ii - x0, jj - y0
+        inside = (lx >= 0) & (lx < IW) & (ly >= 0) & (ly < IH)
+        u, v = (lx + 0.5) / IW, (ly + 0.5) / IH
+        ref = np.zeros((S, S, 4))
+        ref[inside] = P[ly[inside], lx[inside]] * mfun(lx, ly, u, v)[inside][:, None] * 255.0
+        return ref, inside
+
+    # 1. integer offset, mask of another size: the blend path would index the mask in document texels
+    out = run([spec(x=12.0, y=7.0)])
+    ref, inside = placed_ref(lambda lx, ly, u, v: 0.5 * np.clip(u, 0.5 / MW, 1 - 0.5 / MW) + 0.5 * np.clip(v, 0.5 / MH, 1 - 0.5 / MH), 12, 7)
+    d = np.abs(out - ref).max(-1)
+    check("v9 masked input at an integer offset, smooth mask half the input size (stretched in UVs)", d.max() < 4.0, f"max {d.max():.2f} over {int(inside.sum())} px")
+    w = td(PRELUDE + "st = _st(); _emit([st.net._ops['s7'].width, st.net._ops['s7'].height, 'xf_L_i' in st.net._ops])")
+    check("v9 the stale-size input mask went through the resample pass", w[2] is True, str(w))
+    # 1b. sharp-edged mask (vertical edge between mask columns 17 / 18, a horizontal one between rows 12 / 13): the edge position and the filter
+    #     (linear: a 2 layer px ramp centred on the texel boundary; nearest would be a step) are visible
+    step = np.zeros((MH, MW, 4), np.uint8)
+    step[..., 3] = 255
+    step[:, 18:, :3] = 255
+    step[13:, :, :3] = 255 - step[13:, :, :3]
+    upload2(9, step)
+    sref = step[..., 0].astype(np.float64) / 255.0
+
+    def lin_mask(lx, ly, u, v):
+        mx, my = (lx + 0.5) * (MW / IW) - 0.5, (ly + 0.5) * (MH / IH) - 0.5
+        x0, y0 = np.clip(np.floor(mx), 0, MW - 1).astype(int), np.clip(np.floor(my), 0, MH - 1).astype(int)
+        x1, y1 = np.minimum(x0 + 1, MW - 1), np.minimum(y0 + 1, MH - 1)
+        fx, fy = np.clip(mx - x0, 0, 1), np.clip(my - y0, 0, 1)
+        top = sref[y0, x0] * (1 - fx) + sref[y0, x1] * fx
+        bot = sref[y1, x0] * (1 - fx) + sref[y1, x1] * fx
+        return top * (1 - fy) + bot * fy
+    out = run([spec(slot=9, x=12.0, y=7.0)])
+    ref, inside = placed_ref(lin_mask, 12, 7)
+    d = np.abs(out - ref).max(-1)
+    check("v9 masked input, sharp-edged half-size mask: edge position and linear filtering", d.max() < 5.0, f"max {d.max():.2f}")
+    near = lambda lx, ly, u, v: sref[np.clip((ly * MH) // IH, 0, MH - 1), np.clip((lx * MW) // IW, 0, MW - 1)]      # noqa: E731
+    refn, _ = placed_ref(near, 12, 7)
+    check("v9 (control) a nearest-filtered reference would differ clearly from the linear result", np.abs(out - refn).max() > 40.0, f"{np.abs(out - refn).max():.1f}")
+    # 1c. mask of the input's own size: exact path (no resample pass), texel exact edge
+    big = np.zeros((IH, IW, 4), np.uint8)
+    big[..., 3] = 255
+    big[:, IW // 2:, :3] = 255
+    upload2(8, big)
+    out = run([spec(sw=IW, sh=IH, slot=8, x=12.0, y=7.0)])
+    ref, inside = placed_ref(lambda lx, ly, u, v: (lx >= IW // 2).astype(float), 12, 7)
+    d = np.abs(out - ref).max(-1)
+    xf = td(PRELUDE + "_emit('xf_L_i' in _st().net._ops)")
+    check("v9 masked input with a mask of the input's size: exact path, texel exact edge", d.max() < 2.0 and xf is False, f"max {d.max():.2f} xf={xf}")
+
+    # 2. transform + mask of another size
+    kw = dict(x=14.5, y=9.25, sx=1.3, sy=0.9, rot=17.0, kx=8.0)
+    out = run([spec(**kw)])
+    r = fakenet.sample_reference(P, S, S, kw["x"], kw["y"], kw["sx"], kw["sy"], rot=kw["rot"], kx=kw["kx"])
+    mm = fakenet.sample_reference(mref[..., None], S, S, kw["x"], kw["y"], kw["sx"] * IW / MW, kw["sy"] * IH / MH, coverage=False, rot=kw["rot"], kx=kw["kx"])
+    ref = r * mm * 255.0
+    cov = fakenet.coverage_supersampled(fakenet.affine_forward(kw["sx"], kw["sy"], rot=kw["rot"], kx=kw["kx"]), kw["x"], kw["y"], IW, IH, S, S)
+    e = (cov > 0) & (cov < 1)
+    edge = e | np.roll(e, 1, 0) | np.roll(e, -1, 0) | np.roll(e, 1, 1) | np.roll(e, -1, 1)
+    d = np.abs(out - ref).max(-1)
+    check("v9 masked input with rotation / skew / scale, mask of another size", d[~edge].max() < 4.5, f"max {d[~edge].max():.2f} over {int((~edge).sum())} px")
+
+    # 3. same size mask + effect: the mask is applied before the effects
+    ovl = {"type": "colorOverlay", "enabled": True, "opacity": 0.7, "color": {"r": 255, "g": 40, "b": 0, "a": 255}}
+    mk_same = np.zeros((IH, IW, 4), np.uint8)
+    yy2, xx2 = np.mgrid[0:IH, 0:IW]
+    mk_same[..., :3] = np.rint(255 * (xx2 + 0.5) / IW)[..., None]
+    mk_same[..., 3] = 255
+    upload2(8, mk_same)
+    out = run([layer("i", "input", input=1, surfaceW=IW, surfaceH=IH, x=10, y=6, effects=[ovl], mask={"slot": 8, "enabled": True})])
+    placed = np.zeros((S, S, 4), np.float32)
+    placed[6:6 + IH, 10:10 + IW] = P * (mk_same[..., :1] / 255.0)
+    ref = ref_chain([ovl], placed) * 255.0
+    d = np.abs(out - ref).max(-1)
+    check("v9 masked input with an effect (mask before the effect)", d.max() < 4.0, f"max {d.max():.2f}")
+
+    # 4. disconnected input keeps its mask: transparent, same picture after reconnecting
+    full = run([spec(x=12.0, y=7.0)])
+    _connect_input(1, False)
+    off = run([spec(x=12.0, y=7.0)])
+    check("v9 disconnected masked input is transparent", off.max() < 0.5, f"max {off.max():.2f}")
+    _connect_input(1, True)
+    again = run([spec(x=12.0, y=7.0)])
+    check("v9 reconnecting the masked input restores the picture (mask kept)", np.abs(again - full).max() < 0.5, f"max {np.abs(again - full).max():.2f}")
+    # input changes resolution, mask unchanged in pixels: stretched over the new size
+    im2 = K[:60, :100].copy()
+    _input_script(1, premul_f(im2)[::-1].copy())
+    apply([spec(x=0.0, y=0.0)], S, S)
+    print("  mask TOP after the input resize:", td(PRELUDE + "t = _st().net.surface_top(7); t.cook(force=True); _emit([t.width, t.height, _st().net.surface_size(7)])"))
+    out = read_out(True) * 255.0
+    u2, v2 = (ii + 0.5) / 100, (jj + 0.5) / 60
+    ins2 = (ii < 100) & (jj < 60)
+    m2 = 0.5 * np.clip(u2, 0.5 / MW, 1 - 0.5 / MW) + 0.5 * np.clip(v2, 0.5 / MH, 1 - 0.5 / MH)
+    P2 = premul_f(im2)
+    ref = np.zeros((S, S, 4))
+    ref[ins2] = P2[jj[ins2], ii[ins2]] * m2[ins2][:, None] * 255.0
+    d = np.abs(out - ref).max(-1)
+    check("v9 input changing resolution: the mask keeps its pixels, stretched to the new input size", d.max() < 4.0, f"max {d.max():.2f}")
+
+    # 5. masked groups (v6 and v5 networks against numpy / EffectChain)
+    yy, xx = np.mgrid[0:S, 0:S]
+    a1 = np.zeros((S, S, 4), np.uint8)
+    a1[..., 0] = 127 + 120 * np.sin(xx / 9.0)
+    a1[..., 1] = 127 + 120 * np.cos(yy / 7.0)
+    a1[..., 2] = 90
+    a1[..., 3] = 255
+    a2 = np.zeros((50, 60, 4), np.uint8)
+    a2[..., 0] = 230
+    a2[..., 1] = np.linspace(40, 250, 60)[None, :]
+    a2[..., 2] = 60
+    a2[..., 3] = 200
+    upload2(1, a1)
+    upload2(2, a2)
+    gm = np.zeros((S, S, 4), np.uint8)
+    gm[..., :3] = np.rint(255 * (xx / (S - 1.0)) * (0.35 + 0.65 * (yy / (S - 1.0))))[..., None]
+    gm[..., 3] = 255
+    upload2(5, gm)
+    mf = (gm[..., 0] / 255.0)[..., None]
+
+    def both(layers):
+        apply_both(layers, S, S)
+        return read_both()
+
+    def cmp(label, layers, ref, tol=3.5):
+        a, b = both(layers)
+        d6, d5 = np.abs(a - ref).max() * 255.0, np.abs(b - ref).max() * 255.0
+        check(f"v9 {label}: v6 {d6:.2f}, v5 {d5:.2f} vs reference <= {tol:g}/255", d6 <= tol and d5 <= tol)
+
+    bg = premul_f(a1)
+    kids = [layer("b", slot=2, x=20, y=15, surfaceW=60, surfaceH=50, parentId="g"),
+            layer("c", slot=1, x=-30, y=-30, surfaceW=S, surfaceH=S, parentId="g", blend="multiply", opacity=0.9)]
+    b_pre = np.zeros((S, S, 4), np.float32)
+    b_pre[15:65, 20:80] = premul_f(a2)
+    c_full = premul_f(a1)
+    c_pre = np.zeros((S, S, 4), np.float32)
+    c_pre[0:S - 30, 0:S - 30] = c_full[30:, 30:]
+    gcomp = w3c_over("multiply", _straight(b_pre), _straight(c_pre), 0.9).astype(np.float32)
+    mask5 = {"slot": 5, "enabled": True}
+    base_a = layer("a", slot=1, surfaceW=S, surfaceH=S)
+    ref = w3c_over("multiply", _straight(bg), _straight(gcomp * mf), 0.8)
+    cmp("masked group (multiply child, group multiply 0.8)", [base_a, layer("g", "group", mask=mask5, blend="multiply", opacity=0.8)] + kids, ref)
+    # in a run of plain layers (the masked group must not be merged away from its isolation)
+    z = layer("z", slot=2, x=40, y=40, surfaceW=60, surfaceH=50, opacity=0.6)
+    z_pre = np.zeros((S, S, 4), np.float32)
+    z_pre[40:90, 40:96] = (premul_f(a2) * 0.6)[:, :56]
+    mid = w3c_over("multiply", _straight(bg), _straight(gcomp * mf), 0.8).astype(np.float32)
+    cmp("masked group between plain layers (isolated, not merged)", [base_a, layer("g", "group", mask=mask5, blend="multiply", opacity=0.8)] + kids + [z], _over(mid, z_pre))
+    ovl2 = {"type": "colorOverlay", "enabled": True, "opacity": 0.7, "color": {"r": 255, "g": 40, "b": 0, "a": 255}}
+    gfx = ref_chain([ovl2], (gcomp * mf).astype(np.float32))
+    ref = w3c_over("normal", _straight(bg), _straight(gfx), 0.9)
+    cmp("masked group with effects (mask, effects, opacity)", [base_a, layer("g", "group", mask=mask5, effects=[ovl2], opacity=0.9)] + kids, ref)
+    cmp("disabled group mask is ignored", [base_a, layer("g", "group", mask={"slot": 5, "enabled": False}, blend="multiply", opacity=0.8)] + kids,
+        w3c_over("multiply", _straight(bg), _straight(gcomp), 0.8))
+    # flatten the group (mask baked, group opacity / blend dropped) and renderLayers of its children (parent mask ignored)
+    lays = [base_a, layer("g", "group", mask=mask5, blend="multiply", opacity=0.8)] + kids
+    apply_both(lays, S, S)
+    print("  flatten request:", req_open("f", "layer", "g", mode="flatten"))
+    fl = read_req("f")
+    req_close("f")
+    check("v9 flatten of a masked group bakes the mask", np.abs(fl - gcomp * mf).max() * 255.0 < 3.5, f"max {np.abs(fl - gcomp * mf).max() * 255.0:.2f}")
+    print("  renderLayers request:", req_open("m", "layers", layer_ids=["b", "c"]))
+    mg = read_req("m")
+    req_close("m")
+    check("v9 renderLayers of the children ignores the parent's mask", np.abs(mg - gcomp).max() * 255.0 < 3.5, f"max {np.abs(mg - gcomp).max() * 255.0:.2f}")
+
+
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("what", nargs="?", default="all")
@@ -3266,6 +3468,8 @@ def main() -> int:
             test_v7()
         if which in ("all", "v8"):
             test_v8()
+        if which in ("all", "v9"):
+            test_v9()
         if which in ("all", "fonts"):
             test_fonts_ttc()
         if which == "wrap-fixture":

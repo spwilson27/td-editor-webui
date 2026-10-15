@@ -2456,7 +2456,15 @@ def test_disconnected_input_layer_has_no_mask_wiring(env):
     assert net._ops["blend_L_i"].par.value("vec0valuez") == 0.0 and source_of(net, "blend_L_i", 2) == "blank"
     connect_inputs(comp, 3)
     net.apply([b], W, H)
+    # v9: a connected masked input whose mask has the input's size keeps the exact path: the mask rides on the blend pass
+    assert "xf_L_i" not in net._ops
     assert net._ops["blend_L_i"].par.value("vec0valuez") == 1.0 and source_of(net, "blend_L_i", 2) == "s6"
+    disconnect = comp.inputConnectors[2]
+    disconnect.source = None
+    net.set_inputs({3: False})
+    net.apply([b], W, H)                                                       # the mask stays allocated, nothing is wired
+    assert "s6" in net._ops and "xf_L_i" not in net._ops and net._ops["blend_L_i"].par.value("vec0valuez") == 0.0
+    assert source_of(net, "blend_L_i", 2) == "blank"
 
 
 def test_effect_chain_failure_backs_off_and_cleans_partial_nodes(env, monkeypatch):
@@ -4193,3 +4201,97 @@ def test_extraction_uses_unique_temp_names_and_leaves_no_part_files(fonts, tmp_p
     second = network.extract_ttc_face(str(fonts / "Quux.ttc"), 1, d)
     assert first == second and len(names) == 2 and names[0] != names[1] and all(n.endswith(".part") for n in names)
     assert not [f for f in os.listdir(d) if f.endswith(".part")]
+
+
+# ---- v9 (DESIGN_V7 8): masks on groups and input layers ------------------------------------------------------
+
+def test_masked_input_of_the_inputs_size_keeps_the_exact_path(both):
+    net, comp, log, _ = both
+    connect_inputs(comp, 1)
+    comp.in1.width, comp.in1.height = 40, 30
+    net.apply([inp("i", 1, x=3, y=2, surfaceW=40, surfaceH=30, mask={"slot": 7, "enabled": True})], W, H)
+    assert "xf_L_i" not in net._ops                                            # mask == input size: no resample pass
+    wired = [source_of(net, r, k) for r in net._ops if r.startswith(("blend_L_", "mrg_L_")) for k in range(len(net._ops[r].inputConnectors))]
+    assert "s7" in wired                                                       # the mask is consumed by the blend / merged pass directly
+    assert (net._ops["s7"].par.value("resolutionw"), net._ops["s7"].par.value("resolutionh")) == (40, 30)
+
+
+def test_masked_input_whose_mask_size_is_unknown_or_differs_resamples(both):
+    net, comp, log, _ = both
+    connect_inputs(comp, 1)
+    comp.in1.width, comp.in1.height = 80, 60                                   # the input is already 80x60, the spec still says 40x30
+    net.apply([inp("i", 1, surfaceW=40, surfaceH=30, mask={"slot": 7, "enabled": True})], W, H)
+    assert source_of(net, "xf_L_i", 0) == "src_in1" and source_of(net, "xf_L_i", 1) == "s7"
+    assert net._ops["xf_L_i"].par.value("vec0valuez") == 1.0
+    if not net._opt:
+        assert source_of(net, "blend_L_i", 1) == "xf_L_i" and net._ops["blend_L_i"].par.value("vec0valuez") == 0.0
+    comp.in1.width, comp.in1.height = 40, 30                                   # sizes agree again (the ext re-applies on the change)
+    net.apply([inp("i", 1, surfaceW=40, surfaceH=31, mask={"slot": 7, "enabled": True})], W, H)
+    assert "xf_L_i" in net._ops
+    net.apply([inp("i", 1, surfaceW=40, surfaceH=30, mask={"slot": 7, "enabled": True})], W, H)
+    assert "xf_L_i" not in net._ops
+    del comp.in1.width, comp.in1.height                                        # unreadable live size: trust the spec
+    net.apply([inp("i", 1, surfaceW=None, surfaceH=None, mask={"slot": 7, "enabled": True})], W, H)
+    assert "xf_L_i" in net._ops                                                # no mask size at all: resample (normalised UVs)
+    # the disabled mask never stages
+    net.apply([inp("i", 1, surfaceW=80, surfaceH=60, mask={"slot": 7, "enabled": False})], W, H)
+    assert "xf_L_i" not in net._ops
+
+
+def test_masked_input_with_effects_masks_before_the_effects(both):
+    net, comp, log, _ = both
+    connect_inputs(comp, 1)
+    net.apply([inp("i", 1, rot=10, surfaceW=40, surfaceH=30, effects=[overlay()], mask={"slot": 7, "enabled": True})], W, H)
+    assert source_of(net, "xf_L_i", 1) == "s7" and chain_in(net, "i") == "xf_L_i"
+
+
+def test_masked_group_never_joins_a_merged_run(opt):
+    net, comp, log, _ = opt
+    st = [base(), px("a", 1), L("g", "group", mask={"slot": 9, "enabled": True}), px("x", 2, parentId="g"), px("y", 3, parentId="g"),
+          px("z", 4), px("w", 5)]
+    net.apply(st, W, H)
+    assert "blend_L_g" in net._ops and net._ops["blend_L_g"].par.value("vec0valuez") == 1.0 and source_of(net, "blend_L_g", 2) == "s9"
+    assert source_of(net, "blend_L_g", 0) in ("mrg_L_base", "blend_L_a")
+    runs = [r for r in net._ops if r.startswith("mrg_L_")]
+    for r in runs:
+        assert "s9" not in ins(net, r)
+    assert (net._ops["s9"].par.value("resolutionw"), net._ops["s9"].par.value("resolutionh")) == (W, H)
+    # the layers above the group start a new run on the group's output
+    above = [r for r in runs if ins(net, r)[0] == "blend_L_g"]
+    assert above and ins(net, above[0])[1:3] == ["s4", "s5"]
+    # an unmasked group still joins the run
+    st[2] = L("g", "group")
+    net.apply(st, W, H)
+    assert "blend_L_g" not in net._ops
+
+
+def test_masked_group_mask_disabled_is_unwired_but_allocated(both):
+    net, comp, log, _ = both
+    net.apply([base(), L("g", "group", mask={"slot": 9, "enabled": False}), px("a", 1, parentId="g")], W, H)
+    assert "s9" in net._ops
+    assert "s9" not in [source_of(net, r, i) for r in net._ops if r.startswith(("blend_L_", "mrg_L_")) for i in range(len(net._ops[r].inputConnectors))]
+
+
+def test_v9_preview_of_a_masked_group_and_input_is_post_mask_post_effects(both):
+    """The tdPreview image of a masked group / input: mask applied before the chain, chain output is the preview (pre opacity / blend)."""
+    net, comp, log, _ = both
+    connect_inputs(comp, 1)
+    net.apply([L("g", "group", effects=[psort()], mask={"slot": 6, "enabled": True}, opacity=0.4, blend="multiply"),
+               px("c", 3, parentId="g", surfaceW=8, surfaceH=8),
+               inp("i", 1, surfaceW=40, surfaceH=30, effects=[psort()], mask={"slot": 7, "enabled": True}, opacity=0.5)], W, H)
+    assert net.preview_layers() == ["g", "i"]
+    for lid in ("g", "i"):
+        assert net.layer_preview_source(lid) is fx_chain_nodes(net, lid)[-1]
+        assert chain_in(net, lid) == "xf_L_" + lid and source_of(net, "xf_L_" + lid, 1) == ("s6" if lid == "g" else "s7")
+
+
+def test_surfaceless_input_mask_is_allocated_at_the_live_input_size(both):
+    net, comp, log, _ = both
+    connect_inputs(comp, 1)
+    comp.in1.width, comp.in1.height = 48, 24
+    net.apply([inp("i", 1, mask={"slot": 7, "enabled": True})], W, H)
+    assert (net._ops["s7"].par.value("resolutionw"), net._ops["s7"].par.value("resolutionh")) == (48, 24)
+    assert net.surface_size(7) == (48, 24)
+    del comp.in1.width, comp.in1.height
+    net.apply([inp("i", 1, opacity=0.9, mask={"slot": 7, "enabled": True})], W, H)
+    assert net.surface_size(7) == (W, H)                                    # unknown input size: the document's (as protocol.slot_sizes)

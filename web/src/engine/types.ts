@@ -124,7 +124,7 @@ export interface LayerInfo {
   expanded?: boolean; // groups only
   parentId: string | null;
   slot: number | null; // pixel surface slot (pixel layers)
-  mask: { slot: number; enabled: boolean } | null; // pixel + adjustment layers
+  mask: { slot: number; enabled: boolean } | null; // any layer except the root (v9: groups and inputs too)
   adjustment: AdjustmentSpec | null; // adjustment layers
   text: TextSpec | null; // text layers
   shape: ShapeSpec | null; // shape layers

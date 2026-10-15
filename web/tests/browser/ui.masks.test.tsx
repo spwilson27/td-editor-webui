@@ -18,12 +18,15 @@ beforeEach(async () => {
 afterEach(unmount);
 
 describe('layer masks UI', () => {
-  it('Add mask is disabled for the base layer and groups, enabled for pixel and adjustment layers', async () => {
+  it('Add mask is enabled for every layer kind (inputs and groups too) until the layer has one', async () => {
     const add = () => q('[aria-label="Add mask"]');
-    expect(add().getAttribute('aria-disabled')).toBe('true'); // base is active
+    expect(add().getAttribute('aria-disabled')).toBe('false'); // the TD Input is active
     store.addGroup();
     await settle();
-    expect(add().getAttribute('aria-disabled')).toBe('true');
+    expect(add().getAttribute('aria-disabled')).toBe('false');
+    add().click();
+    await settle();
+    expect(add().getAttribute('aria-disabled')).toBe('true'); // the group has one now
     store.addLayer();
     await settle();
     expect(add().getAttribute('aria-disabled')).toBe('false');
@@ -106,6 +109,45 @@ describe('layer masks UI', () => {
     await settle();
     expect(has(id)).toBe(true);
     expect(q('canvas', row(id))).toBeTruthy(); // the mask thumbnail
+  });
+});
+
+describe('v7.3 masks on groups and TD inputs', () => {
+  it('a group row shows the folder icon plus a mask thumbnail; click paints on the mask, shift-click toggles it', async () => {
+    store.addGroup();
+    await settle();
+    const id = engine.activeLayerId()!;
+    expect(has(id)).toBe(false);
+    q('[aria-label="Add mask"]').click();
+    await settle();
+    expect(last('addMask')).toBe(`addMask:${id}`);
+    expect(has(id)).toBe(true);
+    expect(row(id).querySelector('[data-act=thumb]')).toBeTruthy();
+    maskBtn(id).click();
+    await settle();
+    expect(last('paintTarget')).toBe(`paintTarget:${id}:mask`);
+    expect(maskBtn(id).getAttribute('aria-pressed')).toBe('true');
+    maskBtn(id).dispatchEvent(new MouseEvent('click', { bubbles: true, shiftKey: true }));
+    await settle();
+    expect(last('maskEnabled')).toBe(`maskEnabled:${id}:false`);
+    expect(row(id).querySelector('[data-mask-off]')).toBeTruthy();
+  });
+
+  it('the TD Input row can get a mask, enable / disable it and delete it (Layer menu)', async () => {
+    store.engine.setActiveLayer('base');
+    await settle();
+    expect(has('base')).toBe(false);
+    q('[aria-label="Add mask"]').click();
+    await settle();
+    expect(last('addMask')).toBe('addMask:base');
+    expect(has('base')).toBe(true);
+    maskBtn('base').dispatchEvent(new MouseEvent('click', { bubbles: true, shiftKey: true }));
+    await settle();
+    expect(last('maskEnabled')).toBe('maskEnabled:base:false');
+    store.deleteMask();
+    await settle();
+    expect(last('deleteMask')).toBe('deleteMask:base');
+    expect(has('base')).toBe(false);
   });
 });
 

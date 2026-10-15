@@ -151,6 +151,26 @@ def resize_buffer(old, w: int, h: int, white: bool = False) -> np.ndarray:
     return out
 
 
+def stretch_buffer(old, w: int, h: int) -> np.ndarray:
+    """``old`` (TD-order uint8 (h', w', 4)) resampled to w x h with bilinear filtering over the whole surface (normalised coordinates, pixel
+    centres aligned): an input mask whose input changed resolution keeps its picture instead of being padded."""
+    oh, ow = old.shape[:2]
+    if (ow, oh) == (w, h):
+        return old.copy()
+
+    def axis(n, on):
+        c = np.clip((np.arange(n) + 0.5) * (on / n) - 0.5, 0, on - 1)
+        i0 = np.floor(c).astype(np.intp)
+        return i0, np.minimum(i0 + 1, on - 1), (c - i0).astype(np.float32)
+    y0, y1, fy = axis(h, oh)
+    x0, x1, fx = axis(w, ow)
+    src = old.astype(np.float32)
+    top = src[y0][:, x0] * (1 - fx)[None, :, None] + src[y0][:, x1] * fx[None, :, None]
+    bot = src[y1][:, x0] * (1 - fx)[None, :, None] + src[y1][:, x1] * fx[None, :, None]
+    out = top * (1 - fy)[:, None, None] + bot * fy[:, None, None]
+    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+
+
 def from_float(arr: np.ndarray, w: int, h: int, white: bool = False) -> np.ndarray:
     """float32 (h', w', 4) TD-order TOP readback (0..1) -> uint8 buffer of w x h, anchored top-left."""
     arr = _check(arr)

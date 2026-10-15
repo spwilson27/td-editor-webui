@@ -225,8 +225,8 @@ describe('store: v2 view mode, masks, adjustments', () => {
     expect(store.layerTab.value).toBe('history');
   });
 
-  it('adds a mask only to pixel and adjustment layers that have none', () => {
-    expect(store.canAddMask()).toBe(false); // base
+  it('adds a mask to any layer (inputs and groups too, v7.3) that has none', () => {
+    expect(store.canAddMask()).toBe(true); // the TD Input
     store.addLayer();
     expect(store.canAddMask()).toBe(true);
     store.addMask();
@@ -235,6 +235,8 @@ describe('store: v2 view mode, masks, adjustments', () => {
     store.deleteMask();
     expect(store.canAddMask()).toBe(true);
     store.addGroup();
+    expect(store.canAddMask()).toBe(true);
+    store.addMask();
     expect(store.canAddMask()).toBe(false);
   });
 

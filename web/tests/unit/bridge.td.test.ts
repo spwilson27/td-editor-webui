@@ -47,7 +47,7 @@ class FakeSocket {
 }
 
 const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({
-  t: 'hello', protocol: 8, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
+  t: 'hello', protocol: 9, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
 });
 
 interface TestStatus {
@@ -97,7 +97,7 @@ describe('tdBridge session', () => {
     expect(sock().url).toBe('ws://td:9980/ws');
     expect(sock().binaryType).toBe('arraybuffer');
     sock().open();
-    expect(sock().json()).toEqual([{ t: 'ready', protocol: 8, client: 'panel', version: '0.1.0', token: 'tok-123', fresh: true }]);
+    expect(sock().json()).toEqual([{ t: 'ready', protocol: 9, client: 'panel', version: '0.1.0', token: 'tok-123', fresh: true }]);
   });
 
   it('becomes linked on hello and pushes doc + every surface in full when TD has no document', () => {

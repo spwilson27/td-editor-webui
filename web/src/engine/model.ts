@@ -1,5 +1,5 @@
 import type { AdjustmentSpec, BlendMode, CanvasMode, Effect, Guides, LayerInfo, LayerSpec, Rect, ShapeSpec, TextSpec } from './types';
-import type { Surface } from './surface';
+import { resampled, type Surface } from './surface';
 import type { SelState } from './selection';
 import type { TileBackup } from './tiles';
 import { union } from './rect';
@@ -67,7 +67,7 @@ export interface InputState { w: number; h: number; connected: boolean; surface:
 
 /** What a paint tool edits: a pixel layer's surface or a mask surface (layer space, offset by the layer). */
 export interface EditTarget {
-  readonly layer: PixelLayer | AdjustmentLayer | VectorLayer;
+  readonly layer: PixelLayer | AdjustmentLayer | VectorLayer | GroupLayer;
   readonly quick?: boolean; // v5: the quick mask (document sized, alpha = selection coverage)
   readonly surface: Surface;
   readonly isMask: boolean;
@@ -77,6 +77,7 @@ export interface EditTarget {
 }
 export interface GroupLayer extends LayerCommon {
   kind: 'group';
+  mask: Mask | null; // v7.3: document sized, document space; applied to the group's composite before its effects
   children: Layer[]; // display order, index 0 = top
   expanded: boolean;
 }
@@ -213,7 +214,7 @@ export class Document {
   constructor(width: number, height: number, first: Layer | null) {
     this.width = width;
     this.height = height;
-    this.root = { id: 'root', kind: 'group', name: 'root', visible: true, locked: false, opacity: 1, blend: 'normal', effects: [], children: first ? [first] : [], expanded: true };
+    this.root = { id: 'root', kind: 'group', name: 'root', visible: true, locked: false, opacity: 1, blend: 'normal', effects: [], mask: null, children: first ? [first] : [], expanded: true };
     this.activeId = first ? first.id : null;
   }
 
@@ -305,7 +306,7 @@ export class Document {
   /** Every mask surface owner. */
   masks(): Mask[] {
     const out: Mask[] = [];
-    for (const l of this.all()) if (l.kind !== 'group' && l.mask) out.push(l.mask);
+    for (const l of this.all()) if (l.mask) out.push(l.mask);
     return out;
   }
 
@@ -324,7 +325,7 @@ export class Document {
           input: c.kind === 'input' ? c.input ?? 1 : null,
           effects: c.effects.map(cloneEffect),
           slot: c.kind === 'pixel' ? c.slot : null,
-          mask: c.kind !== 'group' && c.mask ? { slot: c.mask.slot, enabled: c.mask.enabled } : null,
+          mask: c.mask ? { slot: c.mask.slot, enabled: c.mask.enabled } : null,
           adjustment: null,
           text: c.kind === 'text' ? cloneText(c.spec) : null,
           shape: c.kind === 'shape' ? cloneShape(c.spec) : null,
@@ -342,7 +343,7 @@ export class Document {
     const out: number[] = [];
     for (const l of this.all()) {
       if (l.kind === 'pixel' && l.slot !== null) out.push(l.slot);
-      if (l.kind !== 'group' && l.mask) out.push(l.mask.slot);
+      if (l.mask) out.push(l.mask.slot);
     }
     return out;
   }
@@ -356,7 +357,7 @@ export class Document {
           id: c.id, name: c.name, kind: c.kind, visible: c.visible, locked: c.locked,
           opacity: c.opacity, blend: c.blend, depth, parentId: g === this.root ? null : g.id,
           slot: c.kind === 'pixel' ? c.slot : null,
-          mask: c.kind !== 'group' && c.mask ? { slot: c.mask.slot, enabled: c.mask.enabled } : null,
+          mask: c.mask ? { slot: c.mask.slot, enabled: c.mask.enabled } : null,
           adjustment: null,
           text: c.kind === 'text' ? cloneText(c.spec) : null,
           shape: c.kind === 'shape' ? cloneShape(c.spec) : null,
@@ -384,7 +385,7 @@ export class Document {
       rot: isPixel(l) ? l.rot : 0, kx: isPixel(l) ? l.kx : 0, ky: isPixel(l) ? l.ky : 0, effects: l.effects,
       sw: isPixel(l) ? l.surface.width : 0, sh: isPixel(l) ? l.surface.height : 0,
       surface: l.kind === 'pixel' ? l.surface : null, // an input surface is TouchDesigner's: never part of history
-      mask: l.kind === 'group' ? null : l.mask, maskEnabled: l.kind !== 'group' && l.mask ? l.mask.enabled : true,
+      mask: l.mask, maskEnabled: l.mask ? l.mask.enabled : true,
       adjustment: null,
       children: l.kind === 'group' ? l.children.map(snap) : null,
       spec: isVector(l) ? l.spec : null,
@@ -392,17 +393,28 @@ export class Document {
     return { stamp: this.nextStamp(), active: this.activeId, root: snap(this.root) };
   }
 
-  restore(s: StructureSnapshot): void {
+  /**
+   * Put a snapshot back. Returns the mask surfaces of TD input layers that were replaced because the input changed resolution since the
+   * snapshot was taken (v7.3: the mask is stretched to the layer's surface in normalised UVs, as resizeInput does); they are not released.
+   */
+  restore(s: StructureSnapshot): Surface[] {
+    const replaced: Surface[] = [];
     const apply = (n: NodeSnap): void => {
       const l = n.layer;
       l.name = n.name; l.visible = n.visible; l.locked = n.locked; l.opacity = n.opacity; l.blend = n.blend;
       l.effects = n.effects;
       if (l.kind === 'group' && n.children) {
+        l.mask = n.mask;
+        if (l.mask) l.mask.enabled = n.maskEnabled;
         l.children = n.children.map((c) => c.layer);
         n.children.forEach(apply);
       } else if (l.kind !== 'group') {
         l.mask = n.mask;
         if (l.mask) l.mask.enabled = n.maskEnabled;
+        if (l.kind === 'input' && l.mask && (l.mask.surface.width !== l.surface.width || l.mask.surface.height !== l.surface.height)) {
+          replaced.push(l.mask.surface);
+          l.mask.surface = resampled(l.mask.surface, l.surface.width, l.surface.height, true);
+        }
         if (isVector(l)) (l as { spec: unknown }).spec = n.spec;
         else if (l.kind !== 'adjustment') { // adjustment layers: effects[] (restored above) is everything
           l.x = n.x;
@@ -431,6 +443,7 @@ export class Document {
     }
     // View state is not history: keep the current active layer when it still exists; group expansion is never touched.
     if (!this.find(this.activeId)) this.activeId = this.find(s.active) ? s.active : this.root.children[0]?.id ?? null;
+    return replaced;
   }
 }
 

@@ -412,7 +412,7 @@ export class Compositor {
 
   private ownSig(l: Layer): unknown[] {
     const px = l.kind === 'pixel' || l.kind === 'input' ? l : null;
-    return [l.effects, px?.x, px?.y, px?.sx, px?.sy, px?.rot, px?.kx, px?.ky, px?.surface, l.kind === 'group' ? null : l.mask, l.kind === 'group' ? null : l.mask?.enabled,
+    return [l.effects, px?.x, px?.y, px?.sx, px?.sy, px?.rot, px?.kx, px?.ky, px?.surface, l.mask, l.mask?.enabled,
       l.kind === 'text' || l.kind === 'shape' ? l.spec : null];
   }
 
@@ -561,6 +561,7 @@ export class Compositor {
         const s = this.scratch(tgt, depth, r);
         s.ctx.clearRect(r.x, r.y, r.w, r.h);
         this.renderGroup(s, l, r, depth + 1);
+        if (l.mask && l.mask.enabled) this.maskIn(s.ctx, l.mask, IDENT, r); // v7.3: mask before opacity / blend
         this.blit(ctx, s.canvas, pixRect(s, r), r, l.opacity, l.blend);
       } else if (l.kind === 'adjustment') {
         if (this.adjusts(l, tgt.k)) this.applyAdjustment(tgt, l, r, depth);
@@ -588,8 +589,9 @@ export class Compositor {
     let aux = false; // a descendant displaces by a layer outside the group: its result depends on pixels this signature cannot see
     const walk = (x: GroupLayer): void => { for (const c of x.children) { sum += this.layerEpoch.get(c) ?? 0; if (auxRef(c.effects)) aux = true; if (c.kind === 'group') walk(c); } };
     walk(g);
-    const res = this.fxResult(g, [this.propsEpoch, sum, this.doc.shapeRenderer], vis, f, (c, cr, p) => {
+    const res = this.fxResult(g, [this.propsEpoch, sum, this.layerEpoch.get(g), g.mask, g.mask?.enabled, this.doc.shapeRenderer], vis, f, (c, cr, p) => {
       this.renderGroup({ ctx: c, canvas: p.src.canvas, ox: 0, oy: 0, k: 1, pool: p.pool }, g, cr, 0);
+      if (g.mask && g.mask.enabled) this.maskIn(c, g.mask, IDENT, cr); // v7.3: mask -> group effects -> opacity / blend
     }, !aux);
     if (res) this.blit(tgt.ctx, res.src, res.s, res.d, g.opacity, g.blend);
   }

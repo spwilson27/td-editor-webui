@@ -44,7 +44,7 @@ const spec = (over: Partial<LayerSpec> & { id: string }): LayerSpec => ({
 const tdLayers: LayerSpec[] = [spec({ id: 'base', kind: 'input', input: 1 }), spec({ id: 'p1', slot: 1 })];
 const docState = (rev = 7, layers = tdLayers): TdMessage => ({ t: 'docState', rev, layers, docW: 64, docH: 48, guides: { h: [], v: [] }, canvas: { mode: 'input' } });
 const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({
-  t: 'hello', protocol: 8, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
+  t: 'hello', protocol: 9, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
 });
 const dump = (slot: number, w: number, h: number, v: number) =>
   encodeBands({ type: FRAME_SURFACE_DUMP, slot, frameId: 1, docW: w, docH: h, rect: { x: 0, y: 0, w, h }, pixels: new Uint8Array(w * h * 4).fill(v), maxPayload: 1 << 30 }).next().value as Uint8Array;
@@ -100,10 +100,10 @@ beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(100000); FakeSocket.all 
 afterEach(() => { bridge?.dispose(); vi.useRealTimers(); });
 
 describe('v7: protocol and activeLayer', () => {
-  it('speaks protocol 8 and rejects a v7 hello', () => {
+  it('speaks protocol 9 and rejects a v7 hello', () => {
     start();
     sock().open();
-    expect(sock().json()[0]).toMatchObject({ t: 'ready', protocol: 8 });
+    expect(sock().json()[0]).toMatchObject({ t: 'ready', protocol: 9 });
     sock().tell(hello({ protocol: 7 }));
     expect(status.notices.at(-1)).toMatch(/Protocol mismatch/);
   });

@@ -410,7 +410,7 @@ export function createStore() {
     },
     canAddMask() {
       const l = store.activeLayer();
-      return !!l && (l.kind === 'pixel' || l.kind === 'adjustment' || l.kind === 'text' || l.kind === 'shape') && !l.mask;
+      return !!l && !l.mask; // v7.3: every layer kind (groups and TD inputs too)
     },
     addMask() {
       const l = store.activeLayer();
@@ -434,7 +434,7 @@ export function createStore() {
     invertSelection: () => engine?.invertSelection(),
     canMaskFromSelection() {
       const l = engine ? store.activeLayer() : undefined;
-      return !!l && !!engine?.selection() && (l.kind === 'pixel' || l.kind === 'adjustment' || l.kind === 'text' || l.kind === 'shape');
+      return !!l && !!engine?.selection();
     },
     maskFromSelection() {
       const l = store.activeLayer();

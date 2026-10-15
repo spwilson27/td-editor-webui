@@ -215,7 +215,7 @@ def test_first_client_becomes_active_and_gets_hello(env):
     env.pump()
     a = env.connect("external")
     (hello,) = env.s.messages(a, "hello")
-    assert hello["protocol"] == 8 and hello["active"] is True and hello["hasInput"] is False
+    assert hello["protocol"] == 9 and hello["active"] is True and hello["hasInput"] is False
     assert hello["doc"] == {"w": 64, "h": 32, "mode": "input"} and hello["inputs"] == [IN(1)] and "baseSize" not in hello and hello["maxSendFps"] == 30
     assert hello["hasDocument"] is False and hello["rev"] is None
 
@@ -4502,3 +4502,138 @@ def test_applied_is_sent_even_when_td_cooked_the_script_tops_before_the_pump():
     n = len(e.s.messages(a, "applied"))
     e.pump(3)
     assert len(e.s.messages(a, "applied")) == n    # still only once per newest frame
+
+
+# ----------------------------------------------------------------------------- v9: masks on groups and input layers
+
+def test_group_mask_is_document_sized_and_follows_the_canvas_resize(env):
+    env.pump()
+    a = env.connect("panel")
+    layers = [L("base", "input", input=1), L("g", "group", mask={"slot": 4, "enabled": True}), L("p", slot=1, surfaceW=9, surfaceH=5)]
+    layers[2]["parentId"] = "g"
+    env.doc(a, layers)
+    assert env.x.surfaces[4].shape == (32, 64, 4) and (env.x.surfaces[4] == 255).all()
+    black = np.zeros((32, 64, 4), np.uint8)
+    black[..., 3] = 255
+    env.surface(a, 4, (0, 0, 64, 32), black)
+    assert (env.dump(a, 4)[1] == black).all()
+    env.send(a, {"t": "setCanvas", "w": 128, "h": 64, "mode": "fixed"})
+    env.doc(a, layers, rev=2)
+    m = env.dump(a, 4)[1]
+    assert m.shape == (64, 128, 4) and (m[:32, :64] == black).all() and (m[32:] == 255).all() and (m[:, 64:] == 255).all()
+
+
+def test_input_mask_has_the_input_surface_size_and_survives_an_input_resize(env):
+    env.pump()
+    a = env.connect("panel")
+    layers = [L("i", "input", input=1, surfaceW=40, surfaceH=20, mask={"slot": 5, "enabled": True})]
+    env.doc(a, layers)
+    assert env.x.surfaces[5].shape == (20, 40, 4) and (env.x.surfaces[5] == 255).all()
+    black = np.zeros((20, 40, 4), np.uint8)
+    black[..., 3] = 255
+    env.surface(a, 5, (0, 0, 40, 20), black, dw=40, dh=20)
+    assert (env.dump(a, 5)[1] == black).all()
+    layers[0].update(surfaceW=80, surfaceH=40)                           # the input changed size: the page stretches the mask and resends
+    env.doc(a, layers, rev=2)
+    assert env.x.surfaces[5].shape == (40, 80, 4)
+    big = np.zeros((40, 80, 4), np.uint8)
+    big[..., 3] = 255
+    env.surface(a, 5, (0, 0, 80, 40), big, dw=80, dh=40)
+    assert (env.dump(a, 5)[1] == big).all()
+    env.doc(a, [L("i", "input", input=1, surfaceW=80, surfaceH=40)], rev=3)      # mask deleted: the surface is freed
+    assert 5 not in env.x.surfaces
+
+
+def _half_mask(w, h):
+    m = np.zeros((h, w, 4), np.uint8)
+    m[..., 3] = 255
+    m[:, w // 2:, :3] = 255                     # left half hides, right half shows
+    return m
+
+
+def _mask_halves(buf):
+    """(left mean, right mean) of a TD-order mask buffer."""
+    w = buf.shape[1]
+    return float(buf[:, : w // 4, 0].mean()), float(buf[:, -(w // 4):, 0].mean())
+
+
+def test_frames_stretch_buffer_is_a_normalised_bilinear_resample():
+    from_ = np.zeros((2, 2, 4), np.uint8)
+    from_[..., 3] = 255
+    from_[:, 1, :3] = 200
+    big = frames.stretch_buffer(from_, 8, 6)
+    assert big.shape == (6, 8, 4) and big[0, 0, 0] == 0 and big[0, -1, 0] == 200 and (big[..., 3] == 255).all()
+    assert list(big[3, :, 0]) == sorted(big[3, :, 0])                      # monotone ramp between the two columns
+    assert (frames.stretch_buffer(big, 8, 6) == big).all() and frames.stretch_buffer(big, 8, 6) is not big
+    assert frames.stretch_buffer(big, 2, 2).shape == (2, 2, 4)
+
+
+def test_realloc_of_an_input_mask_stretches_instead_of_padding(env):
+    env.pump()
+    a = env.connect("panel")
+    lay = lambda w, h: [L("i", "input", input=1, surfaceW=w, surfaceH=h, mask={"slot": 5, "enabled": True})]   # noqa: E731
+    env.doc(a, lay(40, 20))
+    env.surface(a, 5, (0, 0, 40, 20), _half_mask(40, 20), dw=40, dh=20)
+    env.doc(a, lay(80, 40), rev=2)                                       # the input doubled its resolution
+    buf = env.x.surfaces[5]
+    assert buf.shape == (40, 80, 4)
+    left, right = _mask_halves(buf)
+    assert left < 5 and right > 250 and (buf[..., 3] == 255).all()       # padding would leave the right 3/4 white and the left 1/4 black only
+
+
+def test_input_resolution_change_stretches_the_input_mask_at_once(env):
+    env.set_input(40, 20)
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, [L("i", "input", input=1, surfaceW=40, surfaceH=20, mask={"slot": 5, "enabled": True})])
+    env.surface(a, 5, (0, 0, 40, 20), _half_mask(40, 20), dw=40, dh=20)
+    env.set_input(80, 40)
+    for _ in range(6):
+        env.pump()
+    assert env.x.in_sizes[1] == (80, 40)
+    assert env.x.surfaces[5].shape == (40, 80, 4)
+    left, right = _mask_halves(env.x.surfaces[5])
+    assert left < 5 and right > 250
+    assert env.x.doc_layers[0]["surfaceW"] == 80 and env.x._slot_size[5] == (80, 40)
+
+
+@pytest.mark.parametrize("surface_first", [False, True])
+def test_input_mask_surface_and_doc_in_either_order(env, surface_first):
+    env.pump()
+    a = env.connect("panel")
+    lay = lambda w, h: [L("i", "input", input=1, surfaceW=w, surfaceH=h, mask={"slot": 5, "enabled": True})]   # noqa: E731
+    env.doc(a, lay(40, 20))
+    new = _half_mask(80, 40)
+    new[:, :, :3] = 255 - new[:, :, :3]                                  # the exact mask the page sends: inverted halves
+    if surface_first:
+        env.surface(a, 5, (0, 0, 80, 40), new, dw=80, dh=40)            # arrives before the doc that gives the slot its new size
+        assert env.x.surfaces[5].shape == (20, 40, 4)
+        env.doc(a, lay(80, 40), rev=2)
+    else:
+        env.doc(a, lay(80, 40), rev=2)
+        env.surface(a, 5, (0, 0, 80, 40), new, dw=80, dh=40)
+    h, got = env.dump(a, 5)
+    assert (h.w, h.h) == (80, 40) and (got[..., 0] == new[..., 0]).all()
+
+
+def test_stale_frames_of_a_size_that_never_comes_are_dropped_after_the_next_doc(env):
+    env.pump()
+    a = env.connect("panel")
+    lay = [L("i", "input", input=1, surfaceW=40, surfaceH=20, mask={"slot": 5, "enabled": True})]
+    env.doc(a, lay)
+    env.surface(a, 5, (0, 0, 80, 40), _half_mask(80, 40), dw=80, dh=40)
+    assert env.x._early
+    env.doc(a, lay, rev=2)                                               # still 40x20: the early frame is stale for good
+    assert not env.x._early and (env.x.surfaces[5] == 255).all() and env.x.surfaces[5].shape == (20, 40, 4)
+
+
+def test_surfaceless_input_mask_uses_the_live_input_size_in_the_slot_and_the_network(env):
+    env.set_input(48, 24)
+    env.pump()
+    a = env.connect("panel")
+    env.doc(a, [L("i", "input", input=1, mask={"slot": 5, "enabled": True})])
+    assert env.x.surfaces[5].shape == (24, 48, 4) and env.x._slot_size[5] == (48, 24)
+    assert env.x.doc_layers[0]["surfaceW"] == 48
+    env.send(a, {"t": "setCanvas", "w": 128, "h": 64, "mode": "fixed"})   # a canvas change keeps the input mask at the input's size
+    env.pump()
+    assert env.x.surfaces[5].shape == (24, 48, 4)

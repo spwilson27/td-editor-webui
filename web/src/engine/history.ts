@@ -152,11 +152,16 @@ export class History {
 
   /** Remove every entry carrying `tag`, wherever it is (the redo tail and the other entries are kept; returns how many went). */
   discardTagged(tag: string): number {
+    return this.discardWhere((it) => it.tag === tag);
+  }
+
+  /** Remove every entry `drop` selects (never call it from inside an undo / redo closure). Returns how many went. */
+  discardWhere(drop: (it: { label: string; ser?: Ser; tag?: string }) => boolean): number {
     this.version++;
     let removed = 0;
     let cur = this.cur;
     this.items = this.items.filter((it, i) => {
-      if (it.tag !== tag) return true;
+      if (!drop(it)) return true;
       this.total -= it.bytes;
       removed++;
       if (i <= this.cur) cur--;

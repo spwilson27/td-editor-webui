@@ -332,3 +332,26 @@ Further v5 details (TD implementation):
 - `renderLayer` gains `mode: "flatten" | "mergeDown"` (default `"flatten"`; v7 `renderLayer` on text/shape = flatten).
 - New `renderLayers {requestId, layerIds: string[]}` → isolated composite of those layers (stack order) → `topReady` /
   `topError`, fetched with `GET /top` (frame type 6, doc-sized).
+
+## 11. Version 9 additions (DESIGN_V7 §8)
+
+`ready.protocol` / `hello.protocol` = **9**.
+- `LayerSpec.mask` (`{ref/blob, enabled, ...}` exactly as on pixel layers) is allowed on `group` and `input` layers (it was
+  `null`-only before). Wire shape is unchanged; only the validity rule changed. An older TD (protocol < 9) answers with the
+  existing version-mismatch notice.
+- **Group mask**: doc-sized (`docW x docH`, doc space). Group composite -> mask -> group `effects[]` -> opacity / blend.
+  A group with an enabled mask always composites isolated (no merged-run / pass-through).
+- **Input mask**: in the input layer's own space, size = the input's surface size at the time the mask was created / last
+  stretched; follows the layer's move / scale / rotate / skew (same as a pixel layer's mask). Mask is applied to the input
+  content before `effects[]`. The input cannot be painted, only its mask. When the input's resolution changes the mask pixels
+  are kept and stretched to the new input size (sampling in normalised layer UVs); a disconnected input keeps its mask.
+- Flatten / merge of a group bakes its mask (`renderLayer`); `renderLayers` / Merge Selected ignore the parent group's mask
+  (as for opacity). `replaceLayersWithPixels` is unchanged.
+- Copy / paste / duplicate and history carry masks of any kind; `docState` returns them.
+- **tdPreview of masked layers.** A layer preview (frame type 7) is post-mask, post-effects and pre-opacity / blend for every layer kind
+  that has a mask: pixel / input / text / shape layers (masked, transformed content through the chain) and groups (isolated composite ->
+  group mask -> chain). Adjustment previews are the adjusted result before the opacity x mask mix, as before. The page compares previews by
+  the layer's mask identity / enabled flag, so toggling or repainting a mask makes the image stale until TD sends a new one.
+- **Mask resampling.** When an input changes resolution the page stretches that input layer's mask to the new surface size (also those
+  restored by undo / redo) and re-sends the mask slot as a full `SURFACE` upload; the new size also appears in the next `doc` (`surfaceW/H`).
+  Group masks are document sized: a canvas resize or Follow Input reallocates them and re-sends them the same way.

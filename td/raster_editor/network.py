@@ -1797,8 +1797,10 @@ class DocNetwork:
                 if mask and kind in ("pixel", "adjustment", "group", "input", "base", "text", "shape") and mask.get("slot") is not None:
                     # a mask lives in layer space: same size as the layer's surface (document size for the rest)
                     own = kind in ("pixel", "input", "base")
-                    mask_name = surface(int(mask["slot"]), bx - 700, y - 60,
-                                        l.get("surfaceW") if own else None, l.get("surfaceH") if own else None)
+                    mw, mh = (l.get("surfaceW"), l.get("surfaceH")) if own else (None, None)
+                    if own and kind in ("input", "base") and (not mw or not mh):
+                        mw, mh = self._live_input_size(input_index(l)) or (None, None)      # (the ext normally states the input's size)
+                    mask_name = surface(int(mask["slot"]), bx - 700, y - 60, mw, mh)
                     if not mask.get("enabled", True):
                         mask_name = None   # surface exists, but is not cooked / wired
                 visible = bool(l.get("visible", True))
@@ -1890,7 +1892,17 @@ class DocNetwork:
                     skip_why = skip_why or "empty"
                 staged = False
                 crop = None
-                if kind in ("pixel", "input", "base") and src != "blank" and (not aff.exact or docspace):
+                # v9: a masked input whose mask is not provably the input's size resamples (the pass samples the mask in normalised layer
+                # UVs, so a mask of another size still covers the whole input); a mask of the input's size keeps the exact path
+                mask_mismatch = False
+                if has_mask and kind in ("input", "base") and src != "blank":
+                    live = self._live_input_size(input_index(l))
+                    msz = (l.get("surfaceW"), l.get("surfaceH"))
+                    mask_mismatch = msz[0] is None or msz[1] is None or (live is not None and live != (int(msz[0]), int(msz[1])))
+                # a layer that is skipped anyway (hidden / opacity 0) gets no resample node: nothing would read it (effects / aux users keep theirs)
+                pre_skipped = bool(opt and SKIP_RULES and skip_why is not None and not docspace)
+                if (kind in ("pixel", "input", "base") and src != "blank" and not pre_skipped
+                        and (not aff.exact or docspace or mask_mismatch)):
                     # non-integer position / scale, rotation or skew (or effects, which need the masked content in
                     # document space): a resample pass renders the layer (and its mask) into document space; it is the
                     # only node that reads through a mipmap filter, the blend below only fetches
@@ -2039,6 +2051,15 @@ class DocNetwork:
         rq["sig"] = json.dumps(syn, sort_keys=True, separators=(",", ":"), default=str)
         add(_Node(rq["out"], "nullTOP", {}, [rroot], pos=(1000, -300)))
 
+    def _live_input_size(self, n):
+        """(w, h) of the COMP's In TOP ``n`` right now, None when unknown (not connected / not readable)."""
+        try:
+            op = self.comp.op("in%d" % int(n))
+            w, h = int(op.width), int(op.height)
+        except Exception:      # noqa: BLE001
+            return None
+        return (w, h) if w > 0 and h > 0 else None
+
     def _surface_size(self, layer, doc_w, doc_h):
         """(w, h) of a pixel layer's surface (document size when the spec has none)."""
         w, h = layer.get("surfaceW"), layer.get("surfaceH")
@@ -2068,6 +2089,10 @@ class DocNetwork:
             after[i] = ok
             ok = ok and plain[i]
 
+        def solo(it):
+            """v9: a group with an enabled mask always composites isolated: its own blend pass, never a merged run."""
+            return it["kind"] == "group" and it["has_mask"] and not it.get("fx")    # (with effects the mask is baked first: see resolve)
+
         def resolve(i):
             it = items[i]
             if it["kids"] is not None and not it.get("resolved"):
@@ -2092,11 +2117,11 @@ class DocNetwork:
         while i < n:
             it = items[i]
             run = [it]
-            if opt and MERGE_RUNS and it["adjust"] == 0:
+            if opt and MERGE_RUNS and it["adjust"] == 0 and not solo(it):
                 resolve(i)
                 masks_n = 1 if it["has_mask"] else 0
                 j = i + 1
-                while (j < n and items[j]["adjust"] == 0 and len(run) < MERGE_MAX and it["id"] != self._active
+                while (j < n and items[j]["adjust"] == 0 and not solo(items[j]) and len(run) < MERGE_MAX and it["id"] != self._active
                        and items[j]["id"] != self._active):
                     resolve(j)
                     m = 1 if items[j]["has_mask"] else 0

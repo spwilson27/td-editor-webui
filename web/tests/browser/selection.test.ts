@@ -364,8 +364,12 @@ describe('maskFromSelection', () => {
     expect(maskAt(e, slot, 20, 20)).toBe(0);
     e.maskFromSelection('base'); // the input may have a mask
     expect(e.layers().find((l) => l.id === 'base')?.mask).not.toBeNull();
-    e.maskFromSelection(e.addGroup());
-    expect(notices.length).toBe(2);
+    const g = e.addGroup(); // v7.3: groups take a (document sized) mask from the selection too
+    e.maskFromSelection(g);
+    expect(e.layers().find((l) => l.id === g)?.mask).not.toBeNull();
+    expect(maskAt(e, e.layers().find((l) => l.id === g)!.mask!.slot, 25, 25)).toBe(255);
+    expect(maskAt(e, e.layers().find((l) => l.id === g)!.mask!.slot, 5, 5)).toBe(0);
+    expect(notices.length).toBe(1);
   });
 });
 

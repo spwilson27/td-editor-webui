@@ -37,6 +37,8 @@ LOOPBACK_ORIGIN = re.compile(r"^http://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
 LOOPBACK = ("127.0.0.1", "::1", "[::1]", "localhost")
 CONVERT_BUDGET_S = 0.004  # input / output -> wire conversion time per pump (per stream)
 STALL_S = 10.0  # a client that has not fetched its last `base` / `view` notice for this long is 'stalled'
+EARLY_MAX_BYTES = 96 * 1024 * 1024  # SURFACE frames kept for a doc that has not arrived yet (replayed after it)
+EARLY_MAX_FRAMES = 512  # ... per slot
 STATUS_PERIOD_S = 0.25
 LOG_PER_SECOND = 20
 STAT_WINDOW = 300
@@ -269,6 +271,7 @@ class RasterEditorExt:
         self._slot_set = frozenset()
         self._slot_size = {}  # slot -> (w, h) of its surface (v5: per surface, independent of the document size)
         self._mask_slots = frozenset()  # mask surfaces: start white, grey on the wire
+        self._early = {}  # slot -> SURFACE frames (bytes) that arrived for a size the slot does not have yet (replayed after the next doc)
         self._stale_enc = set()  # slots still encoded for the previous `Premultiplied` setting (converted one per pump)
         self._held = []  # messages held while a restore is pending: ("doc", client, msg) / ("bin", client, data)
         self._held_bytes = 0
@@ -939,6 +942,8 @@ class RasterEditorExt:
         if buf is None or hdr.slot not in self._slot_set:
             return  # a slot that is not in the last `doc`
         if P.is_stale(hdr, buf.shape[1], buf.shape[0]):
+            if not _replay:
+                self._stash_early_surface(hdr.slot, data)
             return  # produced for another surface size (v5: docW/docH = the slot's surface size)
         t0 = self._now()
         self.frames.paste_band(buf, hdr.x, hdr.y, hdr.w, hdr.h, payload, self._slot_premult(hdr.slot))
@@ -1077,6 +1082,47 @@ class RasterEditorExt:
         # (the canvas mode of a doc is informational: the Docsizemode parameter is the single source of truth)
         self._apply_doc(rev, layers, guides, self.protocol.brush_presets_of(msg) if "brushPresets" in msg else None)
 
+    def _fill_input_sizes(self, layers):
+        """Masked input layers that state no surface size get the live size of their input (else the size of their mask's buffer, else they stay
+        without one = document size): protocol.slot_sizes and the network then agree on the size of an input layer's mask."""
+        if not layers:
+            return layers
+        out, changed = [], False
+        for l in layers:
+            if (l.get("kind") == "input" and isinstance(l.get("mask"), dict)
+                    and (l.get("surfaceW") is None or l.get("surfaceH") is None)):      # (only a mask depends on the size)
+                size = self.in_sizes.get(l.get("input"))
+                m = l.get("mask")
+                if size is None and isinstance(m, dict) and self.surfaces.get(m.get("slot")) is not None:
+                    b = self.surfaces[m["slot"]]
+                    size = (b.shape[1], b.shape[0])
+                if size is not None:
+                    l = dict(l, surfaceW=int(size[0]), surfaceH=int(size[1]))
+                    changed = True
+            out.append(l)
+        return out if changed else layers
+
+    def _input_mask_slots(self, layers):
+        return frozenset(l["mask"]["slot"] for l in layers or ()
+                         if l.get("kind") == "input" and isinstance(l.get("mask"), dict) and l["mask"].get("slot") is not None)
+
+    def _stash_early_surface(self, slot, data):
+        """A SURFACE frame produced for a size this slot does not have (yet): the page's doc with the new size may still be on its way.
+        Kept (bounded) and replayed after the next doc; a really stale frame is dropped then."""
+        early = self._early
+        if sum(len(d) for lst in early.values() for d in lst) + len(data) > EARLY_MAX_BYTES or len(early.get(slot, ())) >= EARLY_MAX_FRAMES:
+            return
+        early.setdefault(slot, []).append(bytes(data))
+
+    def _replay_early_surfaces(self):
+        early, self._early = self._early, {}
+        c = next((c for c in self.clients.values() if c.ready and c.active), None)
+        if c is None:
+            return
+        for slot, lst in early.items():
+            for data in lst:
+                self.OnWebSocketBinary(c.id, data, _replay=True)
+
     def _surface_sizes(self, layers):
         """{slot: (w, h)} for a layer stack (protocol.slot_sizes; a surface without a size in the spec keeps its buffer's)."""
         return self.protocol.slot_sizes(layers, self.doc_w, self.doc_h,
@@ -1092,8 +1138,10 @@ class RasterEditorExt:
         size), diff-apply it to the generated network, remember it (stored to `doc_state` in the next pump)."""
         t0 = self._now()
         P = self.protocol
+        layers = self._fill_input_sizes(layers)
         slots = P.layer_slots(layers)
         masks = frozenset(P.mask_slots(layers))
+        in_masks = self._input_mask_slots(layers)
         sizes = self._surface_sizes(layers)
         # buffers first: a failed allocation leaves the previous document untouched. A slot that was not in the
         # previously applied doc always starts blank (masks white): the engine resends pixels itself when a slot
@@ -1104,7 +1152,10 @@ class RasterEditorExt:
         for s in slots:
             old = self.surfaces.get(s)
             if s in self._slot_set and old is not None and (old.shape[1], old.shape[0]) != sizes[s]:
-                resized[s] = self.frames.resize_buffer(old, sizes[s][0], sizes[s][1], s in masks)
+                # an input mask follows its input's resolution: the picture is stretched (the page sends the exact mask a moment later);
+                # every other surface keeps its pixels anchored top-left
+                resized[s] = (self.frames.stretch_buffer(old, sizes[s][0], sizes[s][1]) if s in in_masks
+                              else self.frames.resize_buffer(old, sizes[s][0], sizes[s][1], s in masks))
         before = set(self.network.slots()) if self.network is not None else set()
         self._track_bounds(slots, fresh, resized, unknown, masks)
         if self.network is not None and (layers != self.doc_layers or not self._net_applied):
@@ -1126,6 +1177,7 @@ class RasterEditorExt:
             self._dirty.update(set(self.network.slots()) - before)  # new Script TOPs need their pixels
         self._dirty.update(fresh)
         self._dirty.update(resized)
+        self._replay_early_surfaces()
         if guides is not None:
             self.guides = guides
         if brush_presets is not None:
@@ -1410,7 +1462,7 @@ class RasterEditorExt:
             self.o.par.Docsizemode = canvas["mode"]
         self._slot_set = frozenset(self.protocol.layer_slots(layers))
         self._mask_slots = frozenset(self.protocol.mask_slots(layers))
-        self._slot_size = self.protocol.slot_sizes(layers, int(self._p("Docw")), int(self._p("Doch")))
+        self._slot_size = self.protocol.slot_sizes(self._fill_input_sizes(layers), int(self._p("Docw")), int(self._p("Doch")))
         self._sync_doc_size()  # allocates the buffers and applies the network once
         if self._restore_pending and self._net_applied:  # (else the first successful apply finishes it)
             self._finish_restore()
@@ -1685,6 +1737,7 @@ class RasterEditorExt:
             ok = all(isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= P.MAX_CANVAS_DIM for v in (w, h))
             if not ok:
                 w, h = cur_w, cur_h
+            in_masks = self._input_mask_slots(layers)
             known = {}  # slots whose layer spec states the size
             for l in layers:
                 if l.get("surfaceW") is not None and l.get("surfaceH") is not None:
@@ -1697,13 +1750,18 @@ class RasterEditorExt:
                 if slot not in pngs:
                     raise RuntimeError(f"project file has no surface for slot {slot}")
                 sw, sh = frames.png_size(pngs[slot])
+                stretch_to = None
                 if slot in known and known[slot] != (sw, sh):
-                    raise RuntimeError(f"surface {slot} is {sw}x{sh}, the document says {known[slot][0]}x{known[slot][1]}")
+                    if slot not in in_masks:
+                            raise RuntimeError(f"surface {slot} is {sw}x{sh}, the document says {known[slot][0]}x{known[slot][1]}")
+                    stretch_to = known[slot]      # an input mask saved for another input resolution: resample it
                 total += sw * sh
                 if total > 3 * frames.PNG_MAX_PIXELS:
                     raise RuntimeError("project file holds too many pixels")
                 img = frames.decode_png(pngs.pop(slot))
                 bufs[slot] = frames.straight_to_buffer(img, premult)
+                if stretch_to is not None:
+                    bufs[slot] = frames.stretch_buffer(bufs[slot], *stretch_to)
                 del img
             return {"rev": rev, "layers": layers, "guides": guides, "canvas": canvas, "w": w, "h": h, "bufs": bufs,
                     "meta": meta, "history": history, "presets": P.brush_presets_of(doc)}
@@ -2450,7 +2508,7 @@ class RasterEditorExt:
         if first:
             # a restored document: allocate every surface at its own size (a v4 document without sizes: the document's)
             if self.doc_layers is not None:
-                self._slot_size = self.protocol.slot_sizes(self.doc_layers, w, h)
+                self._slot_size = self.protocol.slot_sizes(self._fill_input_sizes(self.doc_layers), w, h)
             surfaces = {s: self.frames.resize_buffer(self.surfaces.get(s), *self._slot_size.get(s, (w, h)), s in self._mask_slots)
                         for s in set(self.surfaces) | self._slot_set}
             self.surfaces = surfaces
@@ -2521,6 +2579,13 @@ class RasterEditorExt:
                         b["sx"] = b.get("sx", 1) * ow / iw
                         b["sy"] = b.get("sy", 1) * oh / ih
                     b["surfaceW"], b["surfaceH"] = iw, ih
+                    m = b.get("mask")
+                    buf = self.surfaces.get(m.get("slot")) if isinstance(m, dict) else None
+                    if buf is not None and (buf.shape[1], buf.shape[0]) != (iw, ih):
+                        # the input's mask follows the resolution at once (stretched); the page sends its exact version a moment later
+                        self.surfaces[m["slot"]] = self.frames.stretch_buffer(buf, iw, ih)
+                        self._slot_size[m["slot"]] = (iw, ih)
+                        self._dirty.add(m["slot"])
             changed = changed or b != l
             out.append(b)
         if changed:

@@ -28,15 +28,15 @@ describe('masks: creation and bookkeeping', () => {
     expect(e.addMask(id)).toBe(slot); // idempotent
   });
 
-  it('allows masks on the input; refuses groups and unknown layers', () => {
+  it('allows masks on the input and on groups (v7.3); refuses unknown layers', () => {
     e = newEngine(10, 10);
     const notices: string[] = [];
     e.on((ev) => ev.type === 'notice' && notices.push(ev.message));
     const g = e.addGroup();
     expect(e.addMask('base')).toBeGreaterThanOrEqual(0);
-    expect(e.addMask(g)).toBe(-1);
+    expect(e.addMask(g)).toBeGreaterThanOrEqual(0);
     expect(e.addMask('nope')).toBe(-1);
-    expect(notices).toHaveLength(2);
+    expect(notices).toHaveLength(1);
   });
 
   it('setPaintTarget makes the layer active; unknown masks fall back to pixels with a notice', () => {

@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { PROTOCOL_VERSION, type WebMessage, decodeTdMessage, decodeWebMessage, encodeMessage } from '../../src/bridge/codec';
+import { PROTOCOL_VERSION, type WebMessage, decodeTdMessage, normalizeLayer, decodeWebMessage, encodeMessage } from '../../src/bridge/codec';
 
 describe('protocol v8 messages', () => {
-  it('is protocol 8 (hello / ready)', () => {
-    expect(PROTOCOL_VERSION).toBe(8);
-    expect(decodeWebMessage(encodeMessage({ t: 'ready', protocol: 8, client: 'panel', version: '1', token: 't', fresh: true }))).toMatchObject({ t: 'ready', protocol: 8 });
-    expect(decodeTdMessage('{"t":"hello","protocol":8,"doc":{"w":4,"h":4},"hasInput":true,"maxSendFps":30,"active":true,"clientId":"c","hasDocument":false,"rev":null}')).toMatchObject({ t: 'hello', protocol: 8 });
+  it('is protocol 9 (hello / ready)', () => {
+    expect(PROTOCOL_VERSION).toBe(9);
+    expect(decodeWebMessage(encodeMessage({ t: 'ready', protocol: 9, client: 'panel', version: '1', token: 't', fresh: true }))).toMatchObject({ t: 'ready', protocol: 9 });
+    expect(decodeTdMessage('{"t":"hello","protocol":9,"doc":{"w":4,"h":4},"hasInput":true,"maxSendFps":30,"active":true,"clientId":"c","hasDocument":false,"rev":null}')).toMatchObject({ t: 'hello', protocol: 9 });
   });
 
   it('renderLayer carries mode flatten | mergeDown; without a mode (v7 shape) it still decodes', () => {
@@ -24,5 +24,14 @@ describe('protocol v8 messages', () => {
     expect(decodeWebMessage('{"t":"renderLayers","requestId":"m","layerIds":["a",3]}')).toBeNull();
     expect(decodeWebMessage('{"t":"renderLayers","layerIds":["a"]}')).toBeNull();
     expect(decodeWebMessage('{"t":"renderLayers","requestId":"m"}')).toBeNull();
+  });
+});
+
+describe('protocol v9 layer masks', () => {
+  it('a group / input LayerSpec with a mask survives normalizeLayer (v9 allows it)', () => {
+    for (const kind of ['group', 'input'] as const) {
+      const l = normalizeLayer({ id: 'x', kind, parentId: null, name: 'x', visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0, input: kind === 'input' ? 1 : null, effects: [], slot: null, mask: { slot: 7, enabled: false }, adjustment: null, text: null, shape: null, surfaceW: null, surfaceH: null } as never);
+      expect(l.mask).toEqual({ slot: 7, enabled: false });
+    }
   });
 });

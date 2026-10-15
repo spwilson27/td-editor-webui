@@ -179,6 +179,9 @@ export class Engine implements EditorEngine, Host {
   scratch: Scratch;
   private compositor: Compositor;
   private hist = new History();
+  /** Mask surfaces replaced by an input resolution change: patches that target them can no longer be applied (skipped, then pruned). */
+  private staleSurfaces = new WeakSet<Surface>();
+  private staleDirty = false;
   private listeners = new Set<(e: EngineEvent) => void>();
   private ctx = defaultContext();
   private tip: { shape: TipShape; dynamics: BrushDynamics; custom: CustomTip | null } = { shape: 'round', dynamics: { ...DEFAULT_DYNAMICS }, custom: null }; // v6
@@ -289,13 +292,14 @@ export class Engine implements EditorEngine, Host {
   editableLayer(): EditTarget | null {
     if (this.qm) return this.qmTarget(this.qm);
     const l = this.doc.active();
-    const toMask = l !== null && l.kind !== 'group' && l.mask !== null && this.paintTarget().target === 'mask';
-    const why = !l || l.kind === 'group' ? 'Select a pixel layer'
+    const toMask = l !== null && l.mask !== null && this.paintTarget().target === 'mask';
+    const why = !l ? 'Select a pixel layer'
+      : l.kind === 'group' && !toMask ? 'Select a pixel layer'
       : isVector(l) && !toMask ? 'Flatten the layer to paint on it'
         : l.kind === 'adjustment' && !toMask ? 'Select a pixel layer or a mask'
           : l.kind === 'input' && !toMask ? 'The TD Input cannot be painted on (its mask can)'
             : !l.visible ? 'Layer is hidden' : l.locked && !(l.kind === 'input' && toMask) ? 'Layer is locked' : null;
-    if (why || !l || l.kind === 'group') {
+    if (why || !l) {
       this.emit({ type: 'notice', message: why ?? 'Select a pixel layer' });
       return null;
     }
@@ -317,7 +321,7 @@ export class Engine implements EditorEngine, Host {
     return { layer: q.layer, isMask: true, quick: true, surface: q.surface, slot: null, tf: IDENT };
   }
 
-  private makeTarget(layer: PixelLayer | AdjustmentLayer | VectorLayer, mask: boolean): EditTarget {
+  private makeTarget(layer: PixelLayer | AdjustmentLayer | VectorLayer | GroupLayer, mask: boolean): EditTarget {
     const m = layer.mask as Mask;
     const tf = layerXf(layer); // the live layer for pixel layers (a mask shares its layer's mapping), identity otherwise
     return {
@@ -450,7 +454,10 @@ export class Engine implements EditorEngine, Host {
     this.doc.width = nw;
     this.doc.height = nh;
     for (const l of this.doc.all()) {
-      if (l.kind === 'group') continue;
+      if (l.kind === 'group') { // v7.3: a group mask is document sized like an adjustment's
+        if (l.mask && (dx || dy || nw !== ow || nh !== oh)) l.mask = { slot: l.mask.slot, enabled: l.mask.enabled, surface: shiftedMask(l.mask.surface, nw, nh, dx, dy) };
+        continue;
+      }
       if (isPixel(l)) {
         l.x += dx;
         l.y += dy;
@@ -611,12 +618,29 @@ export class Engine implements EditorEngine, Host {
         l.mask.surface = resampled(l.mask.surface, nw, nh, true);
       }
     }
-    oldMasks.forEach(releaseSurface);
+    // Pixel patches recorded against the old mask surfaces cannot be applied to the new size: they are dropped from the history (the
+    // structural steps stay; an undo of Delete mask / redo of Add mask re-stretches the mask in Document.restore). Old surfaces are not
+    // released: other history data may still hold them.
+    oldMasks.forEach((s) => this.staleSurfaces.add(s));
+    if (oldMasks.length) { this.pruneStale(); this.emit({ type: 'history' }); }
     releaseSurface(old);
     st.surface = surface;
     st.w = nw;
     st.h = nh;
     this.inputDirty.delete(n);
+  }
+
+  private markStale(list: Surface[]): void {
+    if (!list.length) return;
+    list.forEach((s) => this.staleSurfaces.add(s));
+    this.staleDirty = true;
+  }
+
+  /** Drop the history entries (paint patches, floating-selection steps) whose target surface was replaced by an input resize. */
+  private pruneStale(): void {
+    this.staleDirty = false;
+    const n = this.hist.discardWhere((it) => !!it.ser && (it.ser.k === 'patch' || it.ser.k === 'fsel') && this.staleSurfaces.has(it.ser.target.surface));
+    if (n) this.emit({ type: 'history' });
   }
 
   /** Is any input layer in the stack referencing input `n`? */
@@ -914,12 +938,12 @@ export class Engine implements EditorEngine, Host {
 
   addMask(layerId: string): number {
     const l = this.doc.find(layerId);
-    if (!l || l.kind === 'group') {
-      this.emit({ type: 'notice', message: 'Masks need a pixel or adjustment layer' });
+    if (!l || l.id === 'root') {
+      this.emit({ type: 'notice', message: 'Masks need a layer' });
       return -1;
     }
     if (l.mask) return l.mask.slot;
-    // A pixel layer's mask has the size of its surface (layer space); other layers' masks are document sized.
+    // A pixel / input layer's mask has the size of its surface (layer space); other layers' (and groups') masks are document sized.
     const mask: Mask = { slot: this.doc.newSlot(), surface: isPixel(l) ? whiteMask(l.surface.width, l.surface.height) : whiteMask(this.doc.width, this.doc.height), enabled: true };
     this.structural('Add mask', () => { l.mask = mask; }, false); // white: nothing visible changes
     return mask.slot;
@@ -927,21 +951,22 @@ export class Engine implements EditorEngine, Host {
 
   deleteMask(layerId: string): void {
     const l = this.doc.find(layerId);
-    if (!l || l.kind === 'group' || !l.mask) return;
+    if (!l || !l.mask) return;
     const visible = l.mask.enabled ? layerExtent(l, this.docRect()) : false;
     this.structural('Delete mask', () => { l.mask = null; }, visible);
+    if (this.maskTargetLayer === layerId) this.maskTargetLayer = null; // re-adding a mask must not drop into mask edit
   }
 
   setMaskEnabled(layerId: string, enabled: boolean): void {
     const l = this.doc.find(layerId);
-    if (!l || l.kind === 'group' || !l.mask || l.mask.enabled === enabled) return;
+    if (!l || !l.mask || l.mask.enabled === enabled) return;
     const mask = l.mask;
     this.structural(enabled ? 'Enable mask' : 'Disable mask', () => { mask.enabled = enabled; }, layerExtent(l, this.docRect()));
   }
 
   setPaintTarget(layerId: string, target: PaintTarget): void {
     const l = this.doc.find(layerId);
-    if (!l || l.kind === 'group') return;
+    if (!l || (l.kind === 'group' && !l.mask)) return;
     let t = target;
     if (t === 'mask' && !l.mask) {
       this.emit({ type: 'notice', message: 'Layer has no mask' });
@@ -957,14 +982,14 @@ export class Engine implements EditorEngine, Host {
 
   paintTarget(): { layerId: string | null; target: PaintTarget } {
     const l = this.doc.active();
-    const mask = l !== null && l.kind !== 'group' && l.mask !== null && this.maskTargetLayer === l.id;
+    const mask = l !== null && l.mask !== null && this.maskTargetLayer === l.id;
     return { layerId: this.doc.activeId, target: mask ? 'mask' : 'pixels' };
   }
 
   addGroup(name?: string): string {
     const group: GroupLayer = {
       id: this.doc.newId(), kind: 'group', name: name ?? `Group ${++this.groupCount}`, visible: true, locked: false,
-      opacity: 1, blend: 'normal', children: [], expanded: true, effects: [],
+      opacity: 1, blend: 'normal', children: [], expanded: true, effects: [], mask: null,
     };
     this.insertAboveActive('Add group', group, false);
     return group.id;
@@ -1140,7 +1165,7 @@ export class Engine implements EditorEngine, Host {
     const unchanged = contiguous && plain;
     const group: GroupLayer = {
       id: this.doc.newId(), kind: 'group', name: name ?? `Group ${++this.groupCount}`, visible: true, locked: false,
-      opacity: 1, blend: 'normal', children: sel.slice(), expanded: true, effects: [],
+      opacity: 1, blend: 'normal', children: sel.slice(), expanded: true, effects: [], mask: null,
     };
     this.structuralIf('Group layers', () => {
       for (const l of sel) {
@@ -1164,7 +1189,7 @@ export class Engine implements EditorEngine, Host {
       effects: l.effects.map(cloneEffect), expanded: l.kind === 'group' ? l.expanded : true,
       tf: isPixel(l) ? { x: l.x, y: l.y, sx: l.sx, sy: l.sy, rot: l.rot, kx: l.kx, ky: l.ky } : null,
       surface: l.kind === 'pixel' ? copy(l.surface) : null,
-      mask: l.kind !== 'group' && l.mask ? { surface: copy(l.mask.surface), enabled: l.mask.enabled } : null,
+      mask: l.mask ? { surface: copy(l.mask.surface), enabled: l.mask.enabled } : null,
       spec: l.kind === 'text' ? cloneText(l.spec) : l.kind === 'shape' ? cloneShape(l.spec) : null,
       children: l.kind === 'group' ? l.children.map((c) => this.snapNode(c, deep, made)).filter((c): c is ClipNode => !!c) : null,
     };
@@ -1220,7 +1245,7 @@ export class Engine implements EditorEngine, Host {
         id: idMap.get(n.src) as string, name: top && !keepNames ? `${n.name} copy` : n.name, visible: n.visible, locked: n.locked, opacity: n.opacity, blend: n.blend,
         effects: remapAux(n.effects, idMap, foreign),
       };
-      const docSpace = n.kind !== 'pixel' && n.kind !== 'group';
+      const docSpace = n.kind !== 'pixel';
       let mask: Mask | null = null;
       if (n.mask) {
         let surface: Surface;
@@ -1230,7 +1255,7 @@ export class Engine implements EditorEngine, Host {
       }
       switch (n.kind) {
         case 'group':
-          return { ...common, kind: 'group', children: (n.children as ClipNode[]).map((c) => build(c, false)), expanded: n.expanded };
+          return { ...common, kind: 'group', children: (n.children as ClipNode[]).map((c) => build(c, false)), expanded: n.expanded, mask };
         case 'pixel':
           return newPixelLayer(common.id, common.name, mk(n.surface as Surface), { ...common, ...(n.tf as NonNullable<ClipNode['tf']>), slot: this.doc.newSlot(), mask });
         case 'text':
@@ -1501,7 +1526,7 @@ export class Engine implements EditorEngine, Host {
     const c = target.getContext('2d');
     if (!l || !c) return;
     c.clearRect(0, 0, target.width, target.height);
-    if (l.kind === 'group' || !l.mask) return;
+    if (!l.mask) return;
     const k = Math.min(target.width / this.doc.width, target.height / this.doc.height);
     const w = this.doc.width * k;
     const h = this.doc.height * k;
@@ -1540,7 +1565,6 @@ export class Engine implements EditorEngine, Host {
   /** Surface behind a slot (its own size), or null when no layer or mask of the current stack owns it. */
   private surfaceOf(slot: number): { surface: Surface; isMask: boolean; tf: Xf; layer: Layer } | null {
     for (const l of this.doc.all()) {
-      if (l.kind === 'group') continue;
       const tf = layerXf(l);
       if (l.kind === 'pixel' && l.slot === slot) return { surface: l.surface, isMask: false, tf, layer: l };
       if (l.mask && l.mask.slot === slot) return { surface: l.mask.surface, isMask: true, tf, layer: l };
@@ -1680,7 +1704,7 @@ export class Engine implements EditorEngine, Host {
       const xf = cleanXf({ x: sp.x, y: sp.y, sx: sp.sx ?? 1, sy: sp.sy ?? 1, rot: sp.rot ?? 0, kx: sp.kx ?? 0, ky: sp.ky ?? 0 }) as Xf;
       let layer: Layer;
       if (sp.kind === 'group') {
-        layer = { ...common, kind: 'group', children: [], expanded: true };
+        layer = { ...common, kind: 'group', children: [], expanded: true, mask: mk(sp.mask, w, h) };
         kids.set(sp.id, []);
       } else if (sp.kind === 'adjustment') {
         layer = { ...common, effects: migrateAdjustmentEffects(sp.adjustment as AdjustmentSpec | null, common.effects), blend: 'normal', kind: 'adjustment', adjustment: null, mask: mk(sp.mask, w, h) };
@@ -1788,8 +1812,7 @@ export class Engine implements EditorEngine, Host {
         try { if (l.kind === 'text') sanitizeText(l.text as TextSpec); else sanitizeShape(l.shape as ShapeSpec); } catch { bad(`${l.kind} spec of ${l.id}`); }
         if (l.slot !== null && l.slot !== undefined) bad(`${l.kind} layer ${l.id} cannot own a surface`);
       } else bad(`unknown kind ${String(l.kind)}`);
-      if (l.mask && l.kind !== 'group') take(l.mask.slot);
-      else if (l.mask) bad('groups cannot have masks');
+      if (l.mask) take(l.mask.slot);
     });
     return spec.layers;
   }
@@ -1935,8 +1958,8 @@ export class Engine implements EditorEngine, Host {
 
   maskFromSelection(layerId: string): void {
     const l = this.doc.find(layerId);
-    if (!l || l.kind === 'group') {
-      this.emit({ type: 'notice', message: 'Masks need a pixel or adjustment layer' });
+    if (!l || l.id === 'root') {
+      this.emit({ type: 'notice', message: 'Masks need a layer' });
       return;
     }
     const s = this.sel;
@@ -2020,8 +2043,9 @@ export class Engine implements EditorEngine, Host {
       this.compositor.ensure(null);
       return this.compositor.surface.ctx.getImageData(0, 0, W, H).data;
     };
-    if (sampleAll || !l || l.kind === 'group' || l.kind === 'adjustment') return composite();
-    if (this.paintTarget().target === 'mask' && l.mask) {
+    const toMask = !!l && !!l.mask && this.paintTarget().target === 'mask';
+    if (sampleAll || !l || (!toMask && (l.kind === 'group' || l.kind === 'adjustment'))) return composite();
+    if (toMask && l.mask) {
       const m = l.mask.surface;
       const d = m.ctx.getImageData(0, 0, m.width, m.height).data; // alpha-stored: expose the value as grey
       const grey = new Uint8ClampedArray(d.length);
@@ -2560,7 +2584,7 @@ export class Engine implements EditorEngine, Host {
     }
     this.active = (p.alt && PAINT_TOOLS.includes(this.toolId) ? this.tools.picker : this.tools[this.toolId]) ?? null;
     const al = this.doc.active();
-    if (this.active && this.active !== this.tools.picker && STROKE_TOOLS.includes(this.toolId) && al && al.kind !== 'group') this.compositor.holdBelow(al.id); // v6: cache the composite below the stroke's layer
+    if (this.active && this.active !== this.tools.picker && STROKE_TOOLS.includes(this.toolId) && al) this.compositor.holdBelow(al.id); // v6: cache the composite below the stroke's layer
     this.active?.down(p);
   }
 
@@ -2597,12 +2621,14 @@ export class Engine implements EditorEngine, Host {
     if (this.doc.floating) return this.cancelFloating(); // undo while floating = cancel (Esc)
     this.finishStroke();
     if (this.hist.undo()) this.emit({ type: 'history' });
+    if (this.staleDirty) this.pruneStale();
   }
 
   redo(): void {
     if (this.doc.floating) return this.cancelFloating();
     this.finishStroke();
     if (this.hist.redo()) this.emit({ type: 'history' });
+    if (this.staleDirty) this.pruneStale();
   }
 
   history(): { entries: HistoryEntry[]; index: number } {
@@ -2615,6 +2641,7 @@ export class Engine implements EditorEngine, Host {
     const before = this.hist.index;
     this.hist.jumpTo(index);
     if (this.hist.index !== before) this.emit({ type: 'history' });
+    if (this.staleDirty) this.pruneStale();
   }
 
   clearHistory(): void {
@@ -2681,8 +2708,8 @@ export class Engine implements EditorEngine, Host {
   }
 
   /**
-   * TD's render of a tdPreview layer after its effects (doc sized, straight RGBA; masked for pixel / text / shape layers, group composite for
-   * groups, the adjusted + filtered result before the opacity x mask mix for adjustment layers). null clears it. Images of other layers or
+   * TD's render of a tdPreview layer after its effects (doc sized, straight RGBA; masked for pixel / input / text / shape layers, the masked group composite
+   * (mask first, then effects, before opacity / blend) for groups, the adjusted + filtered result before the opacity x mask mix for adjustment layers). null clears it. Images of other layers or
    * of the wrong size are ignored.
    */
   setLayerPreview(layerId: string, rgba: Uint8Array | Uint8ClampedArray | null): void {
@@ -3004,6 +3031,7 @@ export class Engine implements EditorEngine, Host {
         const { target, patches } = ser;
         const apply = (which: 'before' | 'after') => () => {
           if (target.quick && this.qm?.layer !== target.layer) return; // that quick mask session is over
+          if (this.staleSurfaces.has(target.surface)) return; // its input changed resolution since
           for (const p of patches) {
             target.surface.ctx.putImageData(p[which], p.rect.x, p.rect.y);
             this.paintChanged(target, p.rect);
@@ -3014,7 +3042,7 @@ export class Engine implements EditorEngine, Host {
       case 'struct': {
         const apply = (sn: StructureSnapshot) => () => {
           const prev = this.doc.snapshot();
-          this.doc.restore(sn);
+          this.markStale(this.doc.restore(sn));
           this.structureChanged(null, !specSame(prev, this.doc.snapshot()));
         };
         return pair(256 + surfDiff(ser.before, ser.after), apply(ser.before), apply(ser.after));
@@ -3034,9 +3062,11 @@ export class Engine implements EditorEngine, Host {
       case 'fsel': {
         const { target, patches } = ser;
         const apply = (which: 'before' | 'after') => () => {
-          for (const p of patches) {
-            target.surface.ctx.putImageData(p[which], p.rect.x, p.rect.y);
-            this.paintChanged(target, p.rect);
+          if (!this.staleSurfaces.has(target.surface)) {
+            for (const p of patches) {
+              target.surface.ctx.putImageData(p[which], p.rect.x, p.rect.y);
+              this.paintChanged(target, p.rect);
+            }
           }
           this.setSel(ser[which]);
         };
@@ -3045,7 +3075,7 @@ export class Engine implements EditorEngine, Host {
       case 'canvas': {
         const go = (snap: StructureSnapshot, cs: CanvasState) => () => {
           const prev = { w: this.doc.width, h: this.doc.height, sel: this.sel };
-          this.doc.restore(snap);
+          this.markStale(this.doc.restore(snap));
           this.doc.width = cs.w;
           this.doc.height = cs.h;
           this.doc.canvasMode = cs.mode;
@@ -3200,7 +3230,6 @@ export class Engine implements EditorEngine, Host {
   private slotSurfaces(): Map<number, Surface> {
     const out = new Map<number, Surface>();
     for (const l of this.doc.all()) {
-      if (l.kind === 'group') continue;
       if (l.kind === 'pixel' && l.slot !== null) out.set(l.slot, l.surface);
       if (l.mask) out.set(l.mask.slot, l.mask.surface);
     }
@@ -3241,7 +3270,7 @@ export class Engine implements EditorEngine, Host {
 
   /** A group whose subtree is all normal-blend, no adjustment layers: compositing it isolated equals compositing its children in place. */
   private isPlainGroup(g: GroupLayer): boolean {
-    return g.effects.length === 0 && g.opacity === 1 && g.children.every((c) => c.blend === 'normal' && c.kind !== 'adjustment' && (c.kind !== 'group' || this.isPlainGroup(c)));
+    return g.effects.length === 0 && g.opacity === 1 && !g.mask && g.children.every((c) => c.blend === 'normal' && c.kind !== 'adjustment' && (c.kind !== 'group' || this.isPlainGroup(c)));
   }
 
   private isInside(group: GroupLayer, maybeDescendant: Layer): boolean {

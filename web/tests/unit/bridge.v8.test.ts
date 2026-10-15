@@ -37,7 +37,7 @@ class FetchMock {
 const flush = () => vi.advanceTimersByTimeAsync(0);
 const raf = (cb: () => void) => setTimeout(cb, 16);
 const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({
-  t: 'hello', protocol: 8, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
+  t: 'hello', protocol: 9, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
 });
 const bytes = (b: Uint8Array, headers: Record<string, string> = {}) => new Response(b as BufferSource, { status: 200, headers });
 
@@ -244,13 +244,29 @@ describe('v8: protocol mismatch notices', () => {
     start();
     sock().open();
     sock().tell(hello({ protocol: 7 }));
-    expect(status.notices.at(-1)).toMatch(/Protocol mismatch.*protocol 8.*speaks 7.*update the component/);
+    expect(status.notices.at(-1)).toMatch(/Protocol mismatch.*protocol 9.*speaks 7.*update the component/);
   });
 
-  it('a newer component (protocol 9) tells the user to reload the page', () => {
+  it('a newer component (protocol 10) tells the user to reload the page', () => {
+    start();
+    sock().open();
+    sock().tell(hello({ protocol: 10 }));
+    expect(status.notices.at(-1)).toMatch(/Protocol mismatch.*protocol 10.*reload the page/);
+  });
+});
+
+describe('v9: protocol mismatch notices', () => {
+  it('a protocol 8 component (no group / input masks) tells the user to update it', () => {
+    start();
+    sock().open();
+    sock().tell(hello({ protocol: 8 }));
+    expect(status.notices.at(-1)).toMatch(/Protocol mismatch.*protocol 9.*speaks 8.*update the component/);
+  });
+
+  it('a protocol 9 component links without a notice', () => {
     start();
     sock().open();
     sock().tell(hello({ protocol: 9 }));
-    expect(status.notices.at(-1)).toMatch(/Protocol mismatch.*protocol 9.*reload the page/);
+    expect(status.notices.filter((n) => /mismatch/i.test(n))).toEqual([]);
   });
 });

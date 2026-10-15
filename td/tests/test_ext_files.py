@@ -676,3 +676,33 @@ def test_client_leaving_releases_a_loading_image(tmp_path):
     e.pump(3)
     e.x.OnWebSocketClose(a)
     assert movie.destroyed
+
+
+def test_open_resamples_an_input_mask_saved_for_another_input_size(tmp_path):
+    e = Env()
+    e.pump()
+    path = tmp_path / "m.redoc"
+    mask = np.zeros((4, 8, 4), np.uint8)
+    mask[..., 3] = 255
+    mask[:, 4:, :3] = 255
+    doc = {"rev": 1, "layers": [L("i", "input", input=1, surfaceW=16, surfaceH=8, mask={"slot": 3, "enabled": True}),
+                                L("p", slot=1, surfaceW=2, surfaceH=2, mask={"slot": 4, "enabled": True})],
+           "guides": {"h": [], "v": []}, "canvas": {"mode": "input"}, "width": 16, "height": 8}
+    frames.write_redoc(str(path), json.dumps(doc), [], {"format": 1})
+    with zipfile.ZipFile(path, "a") as z:
+        z.writestr("surfaces/3.png", frames.encode_png(mask))                   # saved at 8x4, the layer says 16x8
+        z.writestr("surfaces/1.png", frames.encode_png(wire_img(2, 2)))
+        z.writestr("surfaces/4.png", frames.encode_png(wire_img(2, 2)))
+    a = e.connect("panel")
+    assert open_project(e, a, path)["ok"]
+    buf = e.x.surfaces[3]
+    assert buf.shape == (8, 16, 4) and buf[:, :3, 0].max() < 5 and buf[:, -3:, 0].min() > 250
+    # a pixel layer's mask of another size is still refused
+    doc2 = dict(doc, layers=[L("p", slot=1, surfaceW=2, surfaceH=2, mask={"slot": 4, "enabled": True})])
+    p2 = tmp_path / "bad.redoc"
+    frames.write_redoc(str(p2), json.dumps(doc2), [], {"format": 1})
+    with zipfile.ZipFile(p2, "a") as z:
+        z.writestr("surfaces/1.png", frames.encode_png(wire_img(2, 2)))
+        z.writestr("surfaces/4.png", frames.encode_png(wire_img(3, 2)))
+    r = open_project(e, a, p2)
+    assert r["ok"] is False and "3x2" in r["msg"]

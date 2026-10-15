@@ -83,7 +83,7 @@ class Writer {
       this.live.add(l);
       if (l.kind === 'pixel') this.liveSurf.set(l.surface, { t: 'L', layer: l });
       else if (l.kind === 'input') this.liveSurf.set(l.surface, { t: 'I', layer: l, input: l.input ?? 1 });
-      if (l.kind !== 'group' && l.mask) {
+      if (l.mask) {
         this.maskOwner.set(l.mask, l);
         this.liveSurf.set(l.mask.surface, { t: 'M', layer: l });
       }
@@ -351,7 +351,6 @@ function readTables(head: J, bin: Uint8Array, doc: Document, created: Surface[],
       s = doc.inputs.get(int(v.input, 'input', 1, 8))?.surface ?? null;
     } else if (v.t === 'L' || v.t === 'M') {
       const l = layerAt(v.layer, 'surface layer');
-      if (l.kind === 'group') bad('surface of a group');
       s = v.t === 'L' ? (l.kind === 'pixel' ? l.surface : null) : l.mask ? l.mask.surface : null;
     } else bad('surface kind');
     if (!s || s.width !== w || s.height !== h) bad('live surface differs');
@@ -365,7 +364,7 @@ function readTables(head: J, bin: Uint8Array, doc: Document, created: Surface[],
     const slot = int(v.slot, 'mask slot', 0, 65535);
     if (v.alive === 1) {
       const l = layerAt(v.layer, 'mask layer');
-      if (l.kind === 'group' || !l.mask || l.mask.slot !== slot) bad('mask differs');
+      if (!l.mask || l.mask.slot !== slot) bad('mask differs');
       return l.mask;
     }
     return { slot, surface: surfAt(v.surf), enabled: true };
@@ -435,7 +434,7 @@ function readTables(head: J, bin: Uint8Array, doc: Document, created: Surface[],
   const readTarget = (v: unknown): EditTarget => {
     if (!isObj(v)) bad('target');
     const layer = layerAt(v.layer, 'target layer');
-    if (layer.kind === 'group') bad('target is a group');
+    if (layer.kind === 'group' && v.mask !== true) bad('target is a group');
     const slot = v.slot === null ? null : int(v.slot, 'target slot', 0, 65535);
     return { layer, isMask: bool(v.mask, 'target mask'), surface: surfAt(v.surf), slot, tf: layerXf(layer) };
   };
@@ -507,7 +506,7 @@ function readTables(head: J, bin: Uint8Array, doc: Document, created: Surface[],
 function makeDead(doc: Document, id: string, kind: string, v: J, deadInputLayers: PixelLayer[]): Layer {
   const common = { id, name: id, visible: true, locked: false, opacity: 1, blend: 'normal' as BlendMode, effects: [] as Effect[] };
   switch (kind) {
-    case 'group': return { ...common, kind: 'group', children: [], expanded: true } as GroupLayer;
+    case 'group': return { ...common, kind: 'group', children: [], expanded: true, mask: null } as GroupLayer;
     case 'adjustment': return { ...common, kind: 'adjustment', adjustment: null, mask: null } as AdjustmentLayer;
     case 'text': return { ...common, kind: 'text', spec: sanitizeText({} as TextSpec), mask: null } as TextLayer;
     case 'shape': return { ...common, kind: 'shape', spec: sanitizeShape({} as ShapeSpec), mask: null } as ShapeLayer;
