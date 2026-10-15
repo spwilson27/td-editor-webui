@@ -372,6 +372,23 @@ describe('transforms: painting lands under the cursor', () => {
     expect(px(e, 30, 35)[3]).toBe(0);
   });
 
+  it('a smaller brush of another colour leaves no stale-tip lines (fractional dabs sample just outside the stamp)', () => {
+    // Regression: the stamp canvas was only cleared over the new tip size, so a previous bigger / differently coloured tip
+    // bled into the dab edges as 1 px rows and columns of the old colour (visible in a scaled, soft-brushed layer).
+    e = newEngine(500, 500);
+    const id = e.importImage(new Uint8ClampedArray(256 * 256 * 4), 256, 256, 'L');
+    e.setTransform(id, { x: 0, y: 0, sx: 1.953125, sy: 1.953125 });
+    e.setToolContext(brushCtx({ size: 60, hardness: 0.4 }, { primary: rgba(230, 100, 50) }));
+    stroke(e, 'brush', [[400, 400], [420, 410]]);
+    e.setToolContext(brushCtx({ size: 24, hardness: 1 }, { primary: rgba(0, 0, 0) }));
+    stroke(e, 'brush', [[100, 100], [130.5, 112.3], [150.7, 160.2], [120.1, 170.9]]);
+    const l = layer(id);
+    const d = l.surface.ctx.getImageData(0, 0, 150, 150).data; // layer px around the black stroke (document ~40..290)
+    let bad = 0;
+    for (let i = 0; i < d.length; i += 4) if (d[i + 3] > 0 && d[i] > 8) bad++;
+    expect(bad).toBe(0);
+  });
+
   it('pencil paints whole layer pixels: a 4x4 document block on a 4x layer', () => {
     const id = scaledLayer({ x: 0, y: 0, sx: 4, sy: 4 });
     e.setToolContext(brushCtx({ size: 1 }));

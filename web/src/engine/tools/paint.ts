@@ -190,7 +190,10 @@ export class StrokeTool implements Tool {
     this.stampW = sw;
     this.stampH = sh;
     const s = this.host.scratch.stamp;
-    s.ctx.clearRect(0, 0, sw, sh);
+    // Clear the whole scratch canvas, not just sw x sh: the stamp is drawn at fractional positions with bilinear sampling, which
+    // reads the texels just outside its source rect; leftovers of a previous (larger / differently coloured) tip there showed up
+    // as 1 px lines of the old colour along the dab edges (rows and columns) on scaled layers.
+    s.ctx.clearRect(0, 0, s.canvas.width, s.canvas.height);
     s.ctx.save();
     s.ctx.translate(sw / 2, sh / 2);
     s.ctx.scale((dx / 2) * (sw / this.drawW), (dy / 2) * (sh / this.drawH));
