@@ -4,6 +4,7 @@ import { DEFAULT_DYNAMICS, DYNAMICS_FIELDS, MAX_IMPORT_BYTES, TIP_SHAPES } from 
 import type { PresetEntry, PresetSource } from '../state/brushesSlice';
 import { store } from '../state/store';
 import { Icon } from './Icon';
+import { ScrubSelect } from './Scrub';
 
 const BTN = 'height:24px;padding:0 8px;border:1px solid #474747;border-radius:4px;background:#262626;color:#e3e3e3';
 const SECTION = 'padding:6px 12px 2px;font-size:10px;letter-spacing:0.04em;text-transform:uppercase;color:#8f8f8f';
@@ -119,10 +120,10 @@ function SavePreset() {
         <input data-preset-name aria-label="New preset name" placeholder="Preset name" value={name} onInput={(e) => setName((e.target as HTMLInputElement).value)}
           onKeyDown={(e) => { e.stopPropagation(); if (e.key === 'Enter') save(); }}
           style="flex:1 1 auto;min-width:0;height:24px;box-sizing:border-box;padding:0 6px;background:#1f1f1f;border:1px solid #474747;border-radius:4px" />
-        <select aria-label="Save preset in" data-preset-where value={where} onChange={(e) => setWhere((e.target as HTMLSelectElement).value as 'user' | 'document')} style="flex:none;max-width:104px">
+        <ScrubSelect aria-label="Save preset in" data-preset-where value={where} onChange={(e) => setWhere((e.target as HTMLSelectElement).value as 'user' | 'document')} style="flex:none;max-width:104px">
           <option value="user" selected={where === 'user'}>This browser</option>
           <option value="document" selected={where === 'document'}>Document</option>
-        </select>
+        </ScrubSelect>
         <button data-preset-save-btn style={BTN} onClick={save}>Save</button>
       </div>
     </div>

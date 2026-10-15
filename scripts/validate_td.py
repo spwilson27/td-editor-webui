@@ -4119,6 +4119,191 @@ EF_V5 = {
 }
 
 
+PANEL = (1280, 800)  # the Web Render panel in CSS px (the page's innerWidth x innerHeight)
+
+
+def el_rect(selector):
+    """[x, y, w, h] of the first element matching the CSS selector in the page (top-left origin)."""
+    return js_result("(function(){var e=document.querySelector(%s);if(!e)return null;var b=e.getBoundingClientRect();return [b.x,b.y,b.width,b.height];})()" % json.dumps(selector))
+
+
+def panel_uv(x, y):
+    return x / PANEL[0], 1 - y / PANEL[1]  # web origin is top-left, TD's is bottom-left
+
+
+def real_press(x, y):
+    mouse(*panel_uv(x, y))
+    mouse(*panel_uv(x, y), left=True)
+
+
+def real_move(x, y):
+    mouse(*panel_uv(x, y), left=True)
+
+
+def real_release(x, y):
+    mouse(*panel_uv(x, y), left=False)
+
+
+def real_click(x, y):
+    real_press(x, y)
+    time.sleep(0.08)
+    real_release(x, y)
+
+
+def s52_ui_scrub(args):
+    """Real UI (real mouse events through the Web Render panel): (a) a click on the blend mode dropdown still opens a usable list
+    (select.showPicker() in this CEF build; the popup is painted in the panel and choosing a row applies), (b) press + drag on it
+    scrubs the blend mode live -- the page composite equals TD's while the button is still down and after release -- and the drag is
+    ONE undo step, (c) the font size box scrubbed up re-renders the text layer live in TD (one undo step too), (d) Escape reverts."""
+    W, H = 320, 200
+    err = ui_doc(args, W, H)
+    if err:
+        return None, err
+    miss = hook_missing("addTextLayer", "setTool", "setLayerVisible", "history", "undo", "layers", "selectLayers")
+    if miss:
+        return None, f"scrub hooks not available: {miss}"
+    notes, ok_all = [], True
+
+    def chk(label, cond, extra=""):
+        nonlocal ok_all
+        ok_all &= bool(cond)
+        notes.append(f"{label}: {'ok' if cond else 'FAIL'} {extra}".rstrip())
+
+    def parity(label, tol=3):
+        time.sleep(0.8)
+        ok, n = compare_page_td([(label, (0, 0, W, H), tol, 2.0, 0.02)])
+        chk(f"{label}: page composite equals TD", ok, " ".join(n))
+
+    def hist():
+        return hook_call("history()") or {}
+
+    def td_field(lid, key):
+        v = td_json("L = comp.ext.RasterEditorExt.doc_layers or []\n"
+                    "m = next((l for l in L if l.get('id') == %r), None)\n"
+                    "print(json.dumps(m.get(%r) if m else None))" % (lid, key))
+        return v
+
+    def page_layer(lid):
+        return next((l for l in (hook_call("layers()") or []) if l["id"] == lid), {})
+
+    ua = js_result("navigator.userAgent") or ""
+    has_picker = js_result("typeof HTMLSelectElement.prototype.showPicker") == "function"
+    notes.append(f"(page engine: {ua.split(' ')[-2] if ua else '?'}; select.showPicker: {has_picker})")
+
+    # scene: two painted layers so the blend mode of the top one changes the composite
+    hook_call("addLayer()")
+    paint_all(W, H, "#c08040")
+    top = hook_call("addLayer()")
+    paint_all(W, H, "#4080c0")
+    chk("scene reached TD", wait_for(lambda: td_layer(top) is not None, 8))
+    parity("scene (normal blend)")
+    sel = "select[aria-label='Blend mode']"
+    r = el_rect(sel)
+    if not r:
+        return False, "blend mode select not found"
+    cx, cy = r[0] + r[2] / 2, r[1] + r[3] / 2
+
+    # (a) a click opens a usable list in the panel
+    h0 = hist().get("index", 0)
+    snap = "import numpy as np\ncomp.store('scrub_snap', np.array(comp.op('webrender').numpyArray()))\nprint(1)"
+    td(snap)
+    real_click(cx, cy)
+    time.sleep(0.6)
+    opened = js_result("document.querySelector(%s).getAttribute('data-scrub-opened')" % json.dumps(sel))
+    box = td_json("import numpy as np\na = np.array(comp.op('webrender').numpyArray()); b = comp.fetch('scrub_snap')\n"
+                  "d = (np.abs(a[..., :3] - b[..., :3]).max(axis=2) > 0.3)[:, %d:%d]   # the popup is painted in the select's column\n"
+                  "ys = np.where(d.any(axis=1))[0]\nH = a.shape[0]\n"
+                  "print(json.dumps(None if len(ys) < 40 else [int(H - 1 - ys.max()), int(H - 1 - ys.min())]))" % (int(r[0]), int(r[0] + r[2])))
+    chk("a click (no movement) opens the list", opened in ("native", "list") and box is not None, f"path={opened} popup rows y0..y1 in the panel={box}")
+    chk("a click alone changes nothing", page_layer(top).get("blend") == "normal" and hist().get("index", 0) == h0)
+    if box:
+        # pick the last row of the painted popup (Luminosity): its bottom edge minus half a row
+        real_click(cx, box[1] - 12)
+        got = wait_for(lambda: page_layer(top).get("blend") not in (None, "normal"), 3)
+        chk("choosing a row in the opened list applies it", got, f"blend={page_layer(top).get('blend')}")
+        chk("TD got the same blend", wait_for(lambda: td_field(top, "blend") == page_layer(top).get("blend"), 6), str(td_field(top, "blend")))
+        parity("after choosing from the list")
+        hook_call("undo()")
+        chk("undo of the list choice -> normal in page and TD", wait_for(lambda: page_layer(top).get("blend") == "normal" and td_field(top, "blend") == "normal", 6))
+    td("comp.unstore('scrub_snap')")
+    if opened == "native" and not box:
+        real_click(40, 40)
+
+    # (b) press + drag scrubs live, one undo step
+    h0 = hist().get("index", 0)
+    real_press(cx, cy)
+    for dy in range(6, 43, 6):  # 42 px: three 12 px steps
+        real_move(cx, cy + dy)
+    live = page_layer(top).get("blend")
+    chk("mid-drag (button still down): the blend mode already changed", live not in (None, "normal"), f"blend={live}")
+    chk("mid-drag: TD has it too", wait_for(lambda: td_field(top, "blend") == live, 6), str(td_field(top, "blend")))
+    parity("mid-drag scrub (live)")
+    chk("no list opened by the drag", not js_result("!!document.querySelector('[data-scrub-list]')"))
+    for dy in range(48, 61, 6):
+        real_move(cx, cy + dy)
+    real_release(cx, cy + 60)
+    time.sleep(0.4)
+    final = page_layer(top).get("blend")
+    chk("the drag moved through several modes", final not in (None, "normal", live), f"{live} -> {final}")
+    chk("TD has the final blend", wait_for(lambda: td_field(top, "blend") == final, 6), str(td_field(top, "blend")))
+    chk("select shows the final blend", js_result("document.querySelector(%s).value" % json.dumps(sel)) == final)
+    parity("after the scrub")
+    chk("the whole drag is ONE history step", hist().get("index", 0) == h0 + 1, f"{h0} -> {hist().get('index')}")
+    hook_call("undo()")
+    chk("one undo reverts to normal in page and TD", wait_for(lambda: page_layer(top).get("blend") == "normal" and td_field(top, "blend") == "normal", 6))
+    parity("after the undo")
+    # (d) Escape mid-drag reverts and leaves no step
+    h1 = hist().get("index")
+    real_press(cx, cy)
+    for dy in range(6, 31, 6):
+        real_move(cx, cy + dy)
+    moved = page_layer(top).get("blend") != "normal"
+    td("comp.op('webrender').sendKey('esc')")
+    ok_esc = wait_for(lambda: page_layer(top).get("blend") == "normal", 3)
+    real_release(cx, cy + 30)
+    chk("Escape mid-drag reverts the blend (no step left)", moved and ok_esc and hist().get("index") == h1, f"moved={moved} index {h1} -> {hist().get('index')}")
+    chk("TD is back at normal", wait_for(lambda: td_field(top, "blend") == "normal", 6))
+
+    # (c) font size scrub
+    for lid in [l["id"] for l in hook_call("layers()") if l["kind"] in ("pixel", "base", "input")]:
+        hook_call(f"setLayerVisible({lid!r}, false)")
+    text = dict(SPEC_TEXT, font=pick_font(hook_call("fonts()") or []), size=40)
+    tid = hook_call(f"addTextLayer({json.dumps(text)})")
+    hook_call("setTool('text')")
+    chk("text layer reached TD", wait_for(lambda: td_layer(tid) is not None, 6))
+    sr = el_rect("#ts")
+    if not sr:
+        return False, "font size box not found"
+    sx, sy = sr[0] + sr[2] / 2, sr[1] + sr[3] / 2
+    chk("font size box shows 40", js_result("document.querySelector('#ts').value") == "40")
+    h0 = hist().get("index", 0)
+    real_press(sx, sy)
+    for dy in range(-4, -25, -4):  # 24 px up = +12 pt
+        real_move(sx, sy + dy)
+    size_live = (page_layer(tid).get("text") or {}).get("size")
+    chk("mid-drag: the page text size grew live", isinstance(size_live, int) and 40 < size_live <= 52, f"size={size_live}")
+    chk("mid-drag: TD re-rendered it (size in TD's doc)", wait_for(lambda: (td_field(tid, "text") or {}).get("size") == size_live, 6), str((td_field(tid, "text") or {}).get("size")))
+    real_move(sx, sy - 24)
+    real_release(sx, sy - 24)
+    time.sleep(0.4)
+    final_size = (page_layer(tid).get("text") or {}).get("size")
+    chk("final size = 40 + 12", final_size == 52, f"size={final_size}")
+    chk("box shows the final size", js_result("document.querySelector('#ts').value") == str(final_size))
+    chk("TD has the final size", wait_for(lambda: (td_field(tid, "text") or {}).get("size") == final_size, 6))
+    time.sleep(0.8)
+    td_img, pg = td_rect(COMP + "/out1", 0, 0, W, 100), page_region(0, 0, W, 100)
+    if pg is not None:
+        ok, d = text_parity(td_img, pg)
+        chk("scrubbed text: TD render matches the page (bbox, colour)", ok, d)
+    chk("the font size drag is ONE history step", hist().get("index", 0) == h0 + 1, f"{h0} -> {hist().get('index')}")
+    hook_call("undo()")
+    chk("one undo restores size 40 in page and TD", wait_for(lambda: (page_layer(tid).get("text") or {}).get("size") == 40 and (td_field(tid, "text") or {}).get("size") == 40, 6))
+    chk("box shows 40 again", wait_for(lambda: js_result("document.querySelector('#ts').value") == "40", 3))
+    for lid in [l["id"] for l in hook_call("layers()") if l["kind"] in ("pixel", "base", "input")]:
+        hook_call(f"setLayerVisible({lid!r}, true)")
+    return ok_all, "\n        ".join(notes)
+
+
 STEPS = [
     (1, "build component, no operator errors, document survives a rebuild", "build", False),
     (2, "web server serves the UI", "server", False),
@@ -4170,6 +4355,7 @@ STEPS = [
     (49, "renderLayer flatten / mergeDown + renderLayers equal TD's composite of those layers; temporary nodes cleaned up", "renderreq", False),
     (50, "real UI: merge down, merge selected, flatten group, group / delete selected via the hook -- page equals TD, same layers", "uimulti", True),
     (51, "real UI: copy/paste a pixel layer with effects + a group via the page test hook -- page equals TD, new surfaces present", "uicopy", True),
+    (52, "real UI: scrub the blend mode dropdown + font size with real pointer events -- click still opens a list, drag is live, page equals TD, one undo", "uiscrub", True),
     (99, "deleting the COMP with clients connected does not freeze TD; undo of the delete restores the pixels (run last)", "delete", False),
 ]
 FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinput": "s4_no_input", "scene": "s5_scene",
@@ -4185,7 +4371,7 @@ FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinp
          "uifilters": "s39_ui_filters_parity", "uigroupfx": "s40_ui_filter_adjust_group_fx", "uiselectadj": "s41_ui_selection_adjustment",
          "uibrush": "s42_ui_brush_tips_presets", "layerpreview": "s43_layer_preview", "uihistory": "s44_ui_history_reload",
          "uiredoc": "s45_ui_redoc_history", "ttc": "s46_ttc_fonts", "active": "s47_active_layer_hint",
-         "migrate": "s48_migration_v6_docs", "renderreq": "s49_render_requests", "uimulti": "s50_ui_flatten_merge_multiselect", "uicopy": "s51_ui_copy_paste"}
+         "migrate": "s48_migration_v6_docs", "renderreq": "s49_render_requests", "uimulti": "s50_ui_flatten_merge_multiselect", "uicopy": "s51_ui_copy_paste", "uiscrub": "s52_ui_scrub"}
 
 
 def main():

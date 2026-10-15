@@ -4,6 +4,7 @@ import { MODES } from '../state/tools';
 import { formatZoom } from '../state/view';
 import { EffectCatalogue } from './EffectCatalogue';
 import { Icon, NOT_IN_VERSION } from './Icon';
+import { ScrubSelect } from './Scrub';
 
 type Item = 'sep' | { label: string; hint?: string; flyout?: 'adjustments'; run?: (s: Store) => void; checked?: (s: Store) => boolean; enabled?: (s: Store) => boolean; title?: (s: Store) => string | undefined };
 interface MenuDef { label: string; items: Item[] | ((s: Store) => Item[]) }
@@ -140,10 +141,10 @@ function ZoomSelect() {
   return (
     <>
       <label for="zoomSel" style="color:#a8a8a8">Zoom</label>
-      <select id="zoomSel" value={String(z)} onChange={onChange}>
+      <ScrubSelect id="zoomSel" value={String(z)} onChange={onChange}>
         {options.map((o) => <option key={o} value={String(o)} selected={o === z}>{formatZoom(o)}</option>)}
         <option value="fit">Fit</option>
-      </select>
+      </ScrubSelect>
     </>
   );
 }

@@ -2,6 +2,7 @@ import { useState } from 'preact/hooks';
 import { store } from '../state/store';
 import { GREYS, PALETTE } from '../state/tools';
 import { Icon } from './Icon';
+import { ScrubSelect } from './Scrub';
 
 const SETS: Record<string, string> = { landscape: 'Landscape palette', greys: 'Greys', document: 'Document colours' };
 
@@ -11,9 +12,9 @@ export function SwatchesPanel() {
   const list = set === 'document' ? colours : [...colours, ...store.customSwatches.value];
   return (
     <div style="display:flex;flex-direction:column;gap:10px;padding:12px">
-      <select aria-label="Palette" value={set} onChange={(e) => setSet((e.target as HTMLSelectElement).value)}>
+      <ScrubSelect aria-label="Palette" value={set} onChange={(e) => setSet((e.target as HTMLSelectElement).value)}>
         {Object.entries(SETS).map(([id, name]) => <option key={id} value={id}>{name}</option>)}
-      </select>
+      </ScrubSelect>
       <div style="display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:5px">
         {list.map((h, i) => (
           <button key={h + i} class="sw" data-swatch-colour={h} aria-label={`Use ${h}`} title={h} onClick={() => store.setPrimaryHex(h)}

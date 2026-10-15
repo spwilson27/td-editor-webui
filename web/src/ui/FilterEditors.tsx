@@ -9,6 +9,7 @@ import { curveEvalTable } from '../engine/effects/filters';
 import { store } from '../state/store';
 import { capture } from './capture';
 import { BoolField, ColorField, EnumField, NumField, SeedField, clamp, parseHex, rgbHex } from './fields';
+import { ScrubSelect } from './Scrub';
 
 /** An edit of one effect: fields to merge, or a function from the current effect to the new one (always applied to the latest draft). */
 export type Patch = Record<string, unknown> | ((cur: Record<string, unknown>) => Record<string, unknown>);
@@ -195,9 +196,9 @@ export function SelectiveColorEditor({ vals, fieldKey, onSet }: { vals: Vals; fi
     <div data-selective style="display:flex;flex-direction:column;gap:8px">
       <label style="display:flex;align-items:center;gap:6px;color:#a8a8a8">
         <span style="flex:none;width:62px">Colours</span>
-        <select aria-label="Colour range" value={String(range)} style="flex:1 1 auto;min-width:0" onChange={(ev) => setRange(Number((ev.target as HTMLSelectElement).value))}>
+        <ScrubSelect aria-label="Colour range" value={String(range)} style="flex:1 1 auto;min-width:0" onChange={(ev) => setRange(Number((ev.target as HTMLSelectElement).value))}>
           {SC_RANGES.map((n, i) => <option key={n} value={String(i)} selected={i === range}>{n}</option>)}
-        </select>
+        </ScrubSelect>
       </label>
       {SC_INKS.map((ink, k) => {
         const idx = range * 4 + k;
@@ -295,13 +296,13 @@ export function AuxPicker({ vals, onSet, selfId }: { vals: Vals; onSet: (p: Patc
   return (
     <label style="display:flex;align-items:center;gap:6px;color:#a8a8a8">
       <span style="flex:none;width:62px">Source</span>
-      <select aria-label="Displace source" data-fx-aux value={value} style="flex:1 1 auto;min-width:0" onChange={(ev) => choose((ev.target as HTMLSelectElement).value)}>
+      <ScrubSelect aria-label="Displace source" data-fx-aux value={value} style="flex:1 1 auto;min-width:0" onChange={(ev) => choose((ev.target as HTMLSelectElement).value)}>
         <option value="noise" selected={value === 'noise'}>Noise</option>
         {value === 'aux:' && <option value="aux:" selected>Choose a source…</option>}
         {!known && <option value={value} selected>{value.startsWith('layer:') ? 'Layer (missing)' : 'TD input (missing)'}</option>}
         {layers.length > 0 && <optgroup label="Another layer">{layers.map((l) => <option key={l.id} value={`layer:${l.id}`} selected={value === `layer:${l.id}`}>{l.name}</option>)}</optgroup>}
         {inputs.length > 0 && <optgroup label="TD input">{inputs.map((i) => <option key={i.input} value={`input:${i.input}`} selected={value === `input:${i.input}`}>TD input {i.input}</option>)}</optgroup>}
-      </select>
+      </ScrubSelect>
     </label>
   );
 }

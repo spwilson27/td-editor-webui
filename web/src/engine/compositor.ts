@@ -75,6 +75,9 @@ export class Compositor {
   private dirty: Rect | null = null;
   private layerEpoch = new WeakMap<object, number>(); // per layer: strokes since the last global epoch bump
   private propsEpoch = 0; // property / transform edits (not pixels): stale group effect results
+  private streamBumps = 0; // how many of the epoch bumps were streamed TD input frames (they change no other layer)
+  private streamInput: number | null = null;
+  private inputFrames = new Map<number, number>(); // per TD input: frames published so far
   private epoch = 0; // bumped by every invalidation that may change layer content (not by property / transform edits)
   private fxCache = new Map<object, FxEntry>(); // per layer: the effects output over a rect, valid while the signature matches
   private handle: unknown = null;
@@ -100,7 +103,13 @@ export class Compositor {
       // pixels changed somewhere: cached effect results are stale (a stroke on the held layer only stales that layer's own entry)
       const held = activeOnly && this.holdId ? this.doc.find(this.holdId) : null;
       if (held) this.layerEpoch.set(held, (this.layerEpoch.get(held) ?? 0) + 1);
-      else this.epoch++;
+      else {
+        this.epoch++;
+        if (this.streamInput !== null) {
+          this.streamBumps++;
+          this.inputFrames.set(this.streamInput, (this.inputFrames.get(this.streamInput) ?? 0) + 1);
+        }
+      }
     }
     const full = { x: 0, y: 0, w: this.doc.width, h: this.doc.height };
     const clipped = r ? clipToSize(r, full.w, full.h) : full;
@@ -108,6 +117,9 @@ export class Compositor {
     this.dirty = union(this.dirty, clipped);
     if (this.enabled && this.handle === null) this.schedule();
   }
+
+  /** The next invalidations come from frames of TD input `n` (null = back to normal edits). */
+  streamFrom(n: number | null): void { this.streamInput = n; }
 
   private schedule(): void {
     this.handle = raf(() => {
@@ -582,6 +594,59 @@ export class Compositor {
     if (res) this.blit(tgt.ctx, res.src, res.s, res.d, g.opacity, g.blend);
   }
 
+  private pixelSig(pl: PixelLayer): unknown[] {
+    return [this.layerEpoch.get(pl), pl.surface, pl.mask, pl.mask?.enabled, pl.x, pl.y, pl.sx, pl.sy, pl.rot, pl.kx, pl.ky];
+  }
+
+  /**
+   * Layer thumbnails with effects: the signature the thumbnail of pixel / input layer `l` depends on (null = it has no effects to show, draw it plain).
+   * It is the key of the fx result cache plus what the thumbnail adds (aux source, TD image, frame size).
+   */
+  thumbFxSig(l: Layer): unknown[] | null {
+    if (l.kind !== 'pixel' && l.kind !== 'input') return null;
+    const f = this.fxOf(l, 1);
+    if (!f) return null;
+    const pl = l as PixelLayer;
+    const aux = auxRef(f.effects);
+    const t = aux && aux.kind === 'layer' ? this.doc.find(aux.id) : null;
+    const frames = (n: number): number => this.inputFrames.get(n) ?? 0;
+    // only this layer's own inputs: streamed input frames (epoch bumps that came from TD) count for the input layers that show that input
+    return [this.epoch - this.streamBumps, this.doc.width, this.doc.height, f.effects, f.preview, this.doc.inputConnected(pl), ...this.pixelSig(pl),
+      l.kind === 'input' ? frames(l.input ?? 0) : 0,
+      aux ? this.propsEpoch : 0, t ? this.layerEpoch.get(t) : 0, t && 'surface' in t ? t.surface : 0, t && t.kind === 'input' ? frames(t.input ?? 0) : 0,
+      aux && aux.kind === 'input' ? frames(aux.input) : 0];
+  }
+
+  /** Is a TD image of `l` showing (its thumbnail needs no effect render)? */
+  thumbFromPreview(l: Layer): boolean { return !!this.fxOf(l, 1)?.preview; }
+
+  /**
+   * Render pixel / input layer `l` with its effects (and mask) over the whole document and scale the result into `dst` (document framed, centred).
+   * Reuses the fx result cache when it covers the document; otherwise runs the effects once at full resolution without keeping the output.
+   * Returns false when the layer has no effects to show.
+   */
+  renderFxThumb(l: Layer, dst: HTMLCanvasElement): boolean {
+    if (l.kind !== 'pixel' && l.kind !== 'input') return false;
+    const f = this.fxOf(l, 1);
+    if (!f) return false;
+    const pl = l as PixelLayer;
+    const c = dst.getContext('2d') as CanvasRenderingContext2D;
+    c.clearRect(0, 0, dst.width, dst.height);
+    if (!this.doc.inputConnected(pl)) return true;
+    const W = this.doc.width;
+    const H = this.doc.height;
+    const k = Math.min(dst.width / W, dst.height / H);
+    const masked = !!pl.mask && pl.mask.enabled;
+    const res = this.fxResult(pl, this.pixelSig(pl), { x: 0, y: 0, w: W, h: H }, f, (cc, cr) => {
+      drawMapped(cc, pl.surface.canvas as CanvasImageSource, pl.surface.width, pl.surface.height, pl, cr);
+      if (masked) this.maskIn(cc, pl.mask as Mask, pl, cr);
+    }, true, false);
+    if (!res) return true;
+    c.imageSmoothingQuality = 'high';
+    c.drawImage(res.src as CanvasImageSource, res.s.x, res.s.y, res.s.w, res.s.h, res.d.x * k + (dst.width - W * k) / 2, res.d.y * k + (dst.height - H * k) / 2, res.d.w * k, res.d.h * k);
+    return true;
+  }
+
   /**
    * A pixel / input layer under its transform. Pixel-aligned layers (scale 1, whole-pixel position, no rotation or skew)
    * are copied; others are resampled by drawImage (bilinear, 'high' quality when minifying) under the layer's full affine,
@@ -618,7 +683,7 @@ export class Compositor {
     }
     if (f) {
       // (the mask is applied BEFORE the effects, as in TD; a TD preview image already contains it)
-      const res = this.fxResult(pl, [this.layerEpoch.get(pl), pl.surface, pl.mask, pl.mask?.enabled, pl.x, pl.y, pl.sx, pl.sy, pl.rot, pl.kx, pl.ky], vis, f, (c, cr) => {
+      const res = this.fxResult(pl, this.pixelSig(pl), vis, f, (c, cr) => {
         drawMapped(c, pl.surface.canvas as CanvasImageSource, pl.surface.width, pl.surface.height, pl, cr);
         if (masked) this.maskIn(c, pl.mask as Mask, pl, cr);
       });
@@ -674,7 +739,7 @@ export class Compositor {
    * `sig` keys the result cache (layer content that is not in the epoch); `cache` false = never cache (groups: their content depends
    * on children's properties that do not bump the epoch).
    */
-  private fxResult(layer: object, sig: unknown[], vis: Rect, f: FxPlan, paint: (c: Ctx2D, cr: Rect, p: FxPair) => void, cache = true): { src: Surface['canvas']; s: Rect; d: Rect } | null {
+  private fxResult(layer: object, sig: unknown[], vis: Rect, f: FxPlan, paint: (c: Ctx2D, cr: Rect, p: FxPair) => void, cache = true, keep = true): { src: Surface['canvas']; s: Rect; d: Rect } | null {
     const W = this.doc.width;
     const H = this.doc.height;
     const v = clipToSize(vis, W, H);
@@ -712,7 +777,7 @@ export class Compositor {
     const from = valid ? out : src;
     const got = valid ? intersect(valid, v) : v;
     if (!got) return null;
-    if (valid && cache) { // keep the result (v is what was asked for; got ⊇ v unless clipped)
+    if (valid && cache && keep) { // keep the result (v is what was asked for; got ⊇ v unless clipped)
       const old = this.fxCache.get(layer);
       if (old) releaseSurface(old.surf);
       const surf = createSurface(got.w, got.h);

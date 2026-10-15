@@ -185,6 +185,7 @@ export type EngineEvent =
   | { type: 'pick'; color: RGBA } // picker tool sampled a colour
   | { type: 'notice'; message: string } // e.g. "Layer is locked"
   | { type: 'surface'; slot: number; rect: Rect } // surface pixels changed (paint, fill, undo patch, load)
+  | { type: 'thumbs' } // a layer thumbnail with effects finished rendering (redraw thumbnails)
   | { type: 'docspec' }; // docSpec() changed (structure, props, adjustment params, masks, offsets)
 
 export interface EditorEngine {
@@ -226,6 +227,8 @@ export interface EditorEngine {
   pointerUp(p: ToolPointer): void;
 
   // History
+  beginGesture?(): void; // v7.2: a scrub drag starts: the edits until endGesture are one undo step
+  endGesture?(cancel?: boolean): 'dropped' | 'kept' | 'none'; // cancel = aborted: the gesture's step is dropped ('dropped'); 'kept' = it stays; 'none' = nothing was pushed
   undo(): void;
   redo(): void;
   history(): { entries: HistoryEntry[]; index: number }; // index = last applied entry

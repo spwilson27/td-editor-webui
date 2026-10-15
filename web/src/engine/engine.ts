@@ -49,6 +49,9 @@ const MAX_DIM = 16384;
 const MAX_IMPORT = 8192; // longest side of an imported image kept at native resolution
 const MAX_PIXELS = 8192 * 8192; // largest surface a bake (applyTransform) may produce
 const MAX_GUIDES = 512;
+const FX_THUMB_MS = 250; // per layer: at most 4 effect thumbnail renders a second
+const FX_THUMB_HELD_MS = 100; // a layer a stroke is painting waits (polled) until the stroke ends: a full-document effect render must never delay a dab
+const sameSig = (a: readonly unknown[], b: readonly unknown[]): boolean => a.length === b.length && a.every((x, i) => x === b[i]);
 const PAINT_TOOLS: ToolId[] = ['brush', 'pencil', 'eraser', 'fill', 'gradient'];
 const SELECT_TOOLS: ToolId[] = ['marquee', 'lasso', 'wand'];
 const STROKE_TOOLS: ToolId[] = ['brush', 'pencil', 'eraser', 'smudge', 'blur', 'dodge', 'clone']; // dab tools: the composite below the layer is cached while they stroke
@@ -192,6 +195,15 @@ export class Engine implements EditorEngine, Host {
   private groupCount = 0;
   private version = 0; // bumped on every visible change; keys the group thumbnail cache
   private thumbs = new Map<string, { version: number; canvas: HTMLCanvasElement }>();
+  /** Thumbnails of layers with effects: layer id -> the effect-rendered thumb (thumb-size canvas) and the signature it was made for. */
+  private fxThumbs = new Map<string, { sig: unknown[]; canvas: HTMLCanvasElement }>();
+  private fxQueue = new Map<string, { w: number; h: number }>();
+  /** Per layer: when its last effect thumbnail render ended and how long it took (back-off), and the signature that failed (not retried until it changes). */
+  private fxMeta = new Map<string, { at: number; dur: number; failed: unknown[] | null }>();
+  private fxTimer: ReturnType<typeof setTimeout> | null = null;
+  private fxWaiters: Array<() => void> = [];
+  /** Test / perf counters: effect-thumbnail renders. */
+  thumbStats = { fx: 0, ms: 0 };
   private rev = 0;
   private liveSpec = false; // a move drag already announced its offsets
   private docEpoch = 0; // bumped by loadDocument: layer clips remember the document they came from
@@ -262,6 +274,7 @@ export class Engine implements EditorEngine, Host {
   }
 
   emit(e: EngineEvent): void {
+    if (e.type === 'structure' && this.fxThumbs.size + this.fxMeta.size + this.fxQueue.size) this.pruneFxThumbs();
     for (const l of Array.from(this.listeners)) {
       try { l(e); } catch (err) { console.error('engine listener failed', err); }
     }
@@ -1301,6 +1314,111 @@ export class Engine implements EditorEngine, Host {
     return layer.id;
   }
 
+  /** Render the effect thumbnail of `id` now (full-res effects once, or the TD image) into its cache entry. A throwing render marks the layer failed until its signature changes. */
+  private renderFxThumb(id: string, w: number, h: number): void {
+    const l = this.doc.find(id);
+    if (!l) return;
+    const sig = this.compositor.thumbFxSig(l);
+    if (!sig) { this.fxThumbs.delete(id); return; }
+    const prev = this.fxThumbs.get(id);
+    const canvas = prev && prev.canvas.width === w && prev.canvas.height === h ? prev.canvas : document.createElement('canvas');
+    canvas.width = w; // (also clears)
+    canvas.height = h;
+    const t0 = performance.now();
+    const meta = this.fxMeta.get(id) ?? { at: Number.NEGATIVE_INFINITY, dur: 0, failed: null };
+    this.fxMeta.set(id, meta);
+    try {
+      if (!this.compositor.renderFxThumb(l, canvas)) return;
+    } catch (err) {
+      if (!meta.failed) console.error('layer thumbnail failed', err);
+      meta.failed = sig;
+      meta.at = performance.now();
+      return;
+    }
+    meta.failed = null;
+    meta.dur = performance.now() - t0;
+    meta.at = performance.now();
+    this.thumbStats.fx++;
+    this.thumbStats.ms += meta.dur;
+    this.fxThumbs.set(id, { sig, canvas });
+  }
+
+  /** Has rendering this layer's current thumbnail failed (until something changes, do not retry)? */
+  private fxFailed(id: string, sig: unknown[]): boolean {
+    const f = this.fxMeta.get(id)?.failed;
+    return !!f && sameSig(f, sig);
+  }
+
+  /** Forget thumbnails of layers that are gone. */
+  private pruneFxThumbs(): void {
+    for (const k of Array.from(this.fxThumbs.keys())) if (!this.doc.find(k)) this.fxThumbs.delete(k);
+    for (const k of Array.from(this.fxMeta.keys())) if (!this.doc.find(k)) this.fxMeta.delete(k);
+    for (const k of Array.from(this.fxQueue.keys())) if (!this.doc.find(k)) this.fxQueue.delete(k);
+  }
+
+  private clearFxThumbs(): void {
+    this.fxThumbs.clear();
+    this.fxMeta.clear();
+    this.fxQueue.clear();
+    this.pumpFxThumbs(false); // settles waiters
+  }
+
+  private queueFxThumb(id: string, w: number, h: number): void {
+    this.fxQueue.set(id, { w, h });
+    this.pumpFxThumbs(false);
+  }
+
+  /**
+   * Effect thumbnails are rendered one per idle slot. A layer's next render is allowed max(250 ms, 4 x its last render time) after the last one
+   * (input layers, whose content streams: max(1 s, 8 x)); among the due layers the one rendered longest ago goes first. Nothing renders while a
+   * stroke is held or a gesture (effect scrub) is open: the queue is polled and resumes afterwards.
+   */
+  private pumpFxThumbs(run: boolean): void {
+    if (!run && this.fxTimer !== null) return;
+    if (run) this.fxTimer = null;
+    const now = performance.now();
+    const busy = this.compositor.held !== null || this.hist.groupOpen;
+    let wait = Infinity;
+    let pick: string | null = null;
+    let oldest = Infinity;
+    for (const id of Array.from(this.fxQueue.keys())) {
+      const l = this.doc.find(id);
+      const sig = l ? this.compositor.thumbFxSig(l) : null;
+      const cur = this.fxThumbs.get(id);
+      if (!l || !sig || (cur && sameSig(cur.sig, sig)) || this.fxFailed(id, sig)) { this.fxQueue.delete(id); continue; }
+      if (busy) { wait = Math.min(wait, FX_THUMB_HELD_MS); continue; }
+      const m = this.fxMeta.get(id);
+      const gap = l.kind === 'input' ? Math.max(4 * FX_THUMB_MS, 8 * (m?.dur ?? 0)) : Math.max(FX_THUMB_MS, 4 * (m?.dur ?? 0));
+      const at = m?.at ?? Number.NEGATIVE_INFINITY;
+      const due = at + gap - now;
+      if (due <= 0) { if (at < oldest) { oldest = at; pick = id; } } else wait = Math.min(wait, due);
+    }
+    if (run && pick !== null) {
+      const q = this.fxQueue.get(pick) as { w: number; h: number };
+      this.renderFxThumb(pick, q.w, q.h);
+      this.fxQueue.delete(pick);
+      this.emit({ type: 'thumbs' });
+      if (this.fxQueue.size) wait = Math.min(wait, 0);
+    } else if (pick !== null) wait = 0;
+    if (!this.fxQueue.size) {
+      const ws = this.fxWaiters;
+      this.fxWaiters = [];
+      ws.forEach((f) => f());
+      return;
+    }
+    if (wait === Infinity) wait = FX_THUMB_MS;
+    this.fxTimer = setTimeout(() => {
+      const ric = (globalThis as { requestIdleCallback?: (f: () => void, o?: { timeout: number }) => number }).requestIdleCallback;
+      if (ric) ric(() => this.pumpFxThumbs(true), { timeout: 100 }); else this.pumpFxThumbs(true);
+    }, Math.max(0, wait));
+  }
+
+  /** Resolves when every pending effect thumbnail has been rendered (tests / perf probes). */
+  thumbnailsSettled(): Promise<void> {
+    if (!this.fxQueue.size) return Promise.resolve();
+    return new Promise((res) => { this.fxWaiters.push(res); });
+  }
+
   drawThumbnail(id: string, target: HTMLCanvasElement): void {
     const l = this.doc.find(id);
     const c = target.getContext('2d');
@@ -1333,6 +1451,26 @@ export class Engine implements EditorEngine, Host {
       return;
     }
     c.imageSmoothingQuality = 'high';
+    if (l.kind === 'pixel' || l.kind === 'input') {
+      const sig = this.compositor.thumbFxSig(l);
+      if (sig) { // the layer as rendered with its effects
+        const ok = (e: { sig: unknown[]; canvas: HTMLCanvasElement } | undefined) => !!e && e.canvas.width === target.width && e.canvas.height === target.height;
+        let cur = this.fxThumbs.get(id);
+        if ((!ok(cur) || !sameSig(cur!.sig, sig)) && this.compositor.thumbFromPreview(l)) { // TD's image: a downscale, no effect render
+          this.renderFxThumb(id, target.width, target.height);
+          cur = this.fxThumbs.get(id);
+        }
+        if (ok(cur) && sameSig(cur!.sig, sig)) {
+          c.drawImage(cur!.canvas, 0, 0);
+          return;
+        }
+        if (!this.fxFailed(id, sig)) this.queueFxThumb(id, target.width, target.height);
+        if (ok(cur)) { // out of date: the last one stays until the new one is ready
+          c.drawImage(cur!.canvas, 0, 0);
+          return;
+        }
+      }
+    }
     if (l.kind === 'group') {
       const src = this.compositor.renderIsolated(l, k); // groups render at thumbnail scale
       const sw = Math.max(1, Math.round(this.doc.width * k));
@@ -1584,6 +1722,7 @@ export class Engine implements EditorEngine, Host {
     else this.compositor.invalidate(null);
     this.version++;
     this.thumbs.clear();
+    this.clearFxThumbs();
     const hadSel = this.sel.rect !== null;
     this.dropSelCaches();
     this.sel = NO_SEL;
@@ -1681,7 +1820,10 @@ export class Engine implements EditorEngine, Host {
     for (const l of this.doc.all()) {
       if (l.kind === 'input' && l.input === input) d = union(d, dirtyDoc(l, r));
     }
-    if (d) this.changed(d);
+    if (d) {
+      this.compositor.streamFrom(input); // a streamed frame is not a content change of the other layers (their thumbnails stay valid)
+      try { this.changed(d); } finally { this.compositor.streamFrom(null); }
+    }
   }
 
   // ---- Output ----
@@ -2438,6 +2580,19 @@ export class Engine implements EditorEngine, Host {
 
   // ---- History ----
 
+  /** v7.2: a scrub drag starts -- every edit until `endGesture` is ONE undo step. */
+  beginGesture(): void {
+    this.hist.beginGroup();
+  }
+
+  /** The drag ended; `cancel` (Escape) drops the gesture's step again (the caller already reverted its value). */
+  endGesture(cancel = false): 'dropped' | 'kept' | 'none' {
+    const r = this.hist.endGroup(cancel);
+    if (r === 'dropped') this.emit({ type: 'history' });
+    if (this.fxQueue.size) this.pumpFxThumbs(false); // effect thumbnails deferred during the gesture
+    return r;
+  }
+
   undo(): void {
     if (this.doc.floating) return this.cancelFloating(); // undo while floating = cancel (Esc)
     this.finishStroke();
@@ -2469,6 +2624,12 @@ export class Engine implements EditorEngine, Host {
   }
 
   dispose(): void {
+    if (this.fxTimer !== null) clearTimeout(this.fxTimer);
+    this.fxTimer = null;
+    this.fxQueue.clear();
+    this.fxThumbs.clear();
+    this.fxMeta.clear();
+    this.fxWaiters.splice(0).forEach((f) => f());
     this.cancelFloating();
     if (this.qm) releaseSurface(this.qm.surface);
     this.qm = null;

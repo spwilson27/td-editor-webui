@@ -8,6 +8,7 @@ import { store } from '../state/store';
 import { effectLabel } from '../state/effectDefaults';
 import { BLEND_LABELS, BLEND_MODES, TOOLS, shapeKind } from '../state/tools';
 import { Icon, NOT_IN_VERSION } from './Icon';
+import { ScrubSelect } from './Scrub';
 
 const EYE = 'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12zM12 9a3 3 0 100 6 3 3 0 000-6z';
 const EYE_OFF = 'M3 3l18 18M10.6 5.1A10 10 0 0112 5c6 0 10 7 10 7a17 17 0 01-3 3.7M6.6 6.6C3.9 8.4 2 12 2 12s4 7 10 7a9.6 9.6 0 005.4-1.6';
@@ -232,10 +233,10 @@ function LayerSettings({ layer }: { layer: LayerInfo | undefined }) {
   return (
     <>
     <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid #1f1f1f">
-      <select aria-label="Blend mode" disabled={!layer || layer.kind === 'adjustment'} value={layer?.blend || 'normal'} style="flex:1 1 auto"
+      <ScrubSelect aria-label="Blend mode" disabled={!layer || layer.kind === 'adjustment'} value={layer?.blend || 'normal'} style="flex:1 1 auto"
         onChange={(ev) => layer && e.setLayerProps(layer.id, { blend: (ev.target as HTMLSelectElement).value as LayerInfo['blend'] })}>
         {BLEND_MODES.map((b) => <option key={b} value={b} selected={layer?.blend === b}>{BLEND_LABELS[b]}</option>)}
-      </select>
+      </ScrubSelect>
       <label for="lop" style="color:#a8a8a8">Opacity</label>
       <span style="display:flex;align-items:center;min-width:38px;box-sizing:border-box;padding:3px 6px;background:#1f1f1f;border:1px solid #474747;border-radius:4px">
         <input id="lop" key={(layer?.id || '') + opacity} defaultValue={opacity} inputMode="numeric" aria-label="Layer opacity" disabled={!layer}

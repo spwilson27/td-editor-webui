@@ -19,6 +19,8 @@ interface Stored extends HistoryItem {
   time: number;
 }
 
+export type GroupEnd = 'dropped' | 'kept' | 'none';
+
 export interface HistoryOptions {
   maxSteps?: number;
   maxBytes?: number;
@@ -37,6 +39,8 @@ export class History {
   private readonly maxBytes: number;
   private readonly coalesceMs: number;
   private readonly now: () => number;
+  /** v7.2: an open gesture (a scrub drag): every push until `endGroup` merges into one entry, whatever its key or timing. */
+  private group: { entry: Stored | null; sig: string } | null = null;
 
   constructor(o: HistoryOptions = {}) {
     this.maxSteps = o.maxSteps ?? 100;
@@ -63,7 +67,14 @@ export class History {
     this.dropRedoTail();
     const t = this.now();
     const top = this.items[this.cur];
-    if (item.coalesceKey && top && top.coalesceKey === item.coalesceKey && t - top.time < this.coalesceMs) {
+    const g = this.group;
+    const sig = `${item.ser?.k ?? ''}|${item.coalesceKey ?? ''}|${item.label}`;
+    // a push that is foreign to the open gesture's entry (another kind / key / label: a stroke, a delete, a remote edit) is its own
+    // undoable entry and ends that entry's merging; later pushes of the gesture start a fresh entry
+    const foreign = !!g && !!g.entry && top === g.entry && sig !== g.sig;
+    if (foreign && g && g.entry) { g.entry.coalesceKey = undefined; g.entry.time = Number.NEGATIVE_INFINITY; g.entry = null; }
+    const merge = g ? !foreign && !!g.entry && top === g.entry : !!item.coalesceKey && !!top && top.coalesceKey === item.coalesceKey && t - top.time < this.coalesceMs;
+    if (merge && top) {
       this.total += item.bytes - top.bytes;
       top.redo = item.redo;
       // the merged step goes from the first `before` to the latest `after`
@@ -75,7 +86,9 @@ export class History {
       top.time = t;
       return;
     }
-    this.items.push({ ...item, id: this.nextId++, time: t });
+    const stored: Stored = { ...item, id: this.nextId++, time: t };
+    this.items.push(stored);
+    if (g && !foreign) { g.entry = stored; g.sig = sig; }
     this.total += item.bytes;
     this.cur = this.items.length - 1;
     while (this.items.length > 1 && (this.items.length > this.maxSteps || this.total > this.maxBytes)) {
@@ -83,6 +96,35 @@ export class History {
       this.items.shift();
       this.cur--;
     }
+  }
+
+  /** v7.2: a gesture (scrub drag) is open. */
+  get groupOpen(): boolean { return this.group !== null; }
+
+  /** Start a gesture: the pushes until `endGroup` become ONE undo step (the first never merges into an older entry). */
+  beginGroup(): void {
+    this.group = { entry: null, sig: '' };
+  }
+
+  /**
+   * End the gesture. The entry stays closed to later coalescing. With `cancel` the gesture's entry is undone and dropped (no redo
+   * step). Returns 'dropped' (cancelled and removed: the state is back at the gesture's start), 'kept' (it has an entry that stays: not
+   * cancelled, or no longer the top step because of an external undo / foreign edit) or 'none' (nothing was pushed).
+   */
+  endGroup(cancel = false): GroupEnd {
+    const g = this.group;
+    this.group = null;
+    const e = g?.entry;
+    if (!e) return 'none';
+    e.coalesceKey = undefined;
+    e.time = Number.NEGATIVE_INFINITY;
+    if (!cancel || this.items[this.cur] !== e) return 'kept';
+    this.version++;
+    e.undo();
+    this.items.splice(this.cur, 1);
+    this.total -= e.bytes;
+    this.cur--;
+    return 'dropped';
   }
 
   undo(): boolean {

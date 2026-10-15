@@ -8,6 +8,7 @@ import { MAX_SKEW, boxAabb, keepCentre, normDeg } from '../state/affine';
 import { orientedTarget, type OTarget } from '../state/xtarget';
 import type { DodgeBurnRange, ToolId } from '../engine/types';
 import { Icon, NOT_IN_VERSION } from './Icon';
+import { ScrubNumber, ScrubSelect } from './Scrub';
 
 const BOX = 'padding:3px 6px;color:#e3e3e3;background:#1f1f1f;border:1px solid #474747;border-radius:4px;text-align:right';
 const CHK = 'accent-color:#4a8fe0;margin:0';
@@ -121,13 +122,13 @@ function TextOptions() {
   const fonts = store.fonts.value.includes(v.font) ? store.fonts.value : [v.font, ...store.fonts.value];
   return (
     <div class="opts">
-      <select id="tf" aria-label="Font" value={v.font} style="max-width:150px" onChange={(e) => store.setTextOpt({ font: (e.target as HTMLSelectElement).value })}>
+      <ScrubSelect id="tf" aria-label="Font" value={v.font} style="max-width:150px" onChange={(e) => store.setTextOpt({ font: (e.target as HTMLSelectElement).value })}>
         {fonts.map((f) => <option key={f} value={f} selected={f === v.font}>{f}</option>)}
-      </select>
+      </ScrubSelect>
       <div style="display:flex;align-items:center;gap:6px">
         <label for="ts" style="color:#a8a8a8">Size</label>
-        <input id="ts" type="number" min={1} max={1000} value={v.size} aria-label="Font size"
-          onChange={(e) => { const n = Math.round(Number((e.target as HTMLInputElement).value)); if (n >= 1) store.setTextOpt({ size: Math.min(1000, n) }); }}
+        <ScrubNumber id="ts" min={1} max={1000} step={1} value={v.size} aria-label="Font size" title="Drag up / down to scrub (Shift x10, Alt x0.1)"
+          onChange={(n) => store.setTextOpt({ size: n })}
           style={`width:52px;${BOX}`} />
       </div>
       <div role="group" aria-label="Style" style={SEG}>

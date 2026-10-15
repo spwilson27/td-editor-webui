@@ -1,5 +1,6 @@
 // Parameter field editors shared by the Effects panel (effects, filters) and the Adjustment panel (filter adjustments).
 import type { RGBA } from '../engine/types';
+import { ScrubSelect } from './Scrub';
 
 const hex2 = (n: number) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, '0');
 export const rgbHex = (c: RGBA) => `#${hex2(c.r)}${hex2(c.g)}${hex2(c.b)}`;
@@ -41,9 +42,9 @@ export function EnumField({ f, value, onChange }: { f: { label: string; options:
   return (
     <label style="display:flex;align-items:center;gap:6px;color:#a8a8a8">
       <span style="flex:none;width:62px">{f.label}</span>
-      <select aria-label={f.label} value={value} style="flex:1 1 auto;min-width:0" onChange={(ev) => onChange((ev.target as HTMLSelectElement).value)}>
+      <ScrubSelect aria-label={f.label} value={value} style="flex:1 1 auto;min-width:0" onChange={(ev) => onChange((ev.target as HTMLSelectElement).value)}>
         {f.options.map(([v, t]) => <option key={v} value={v} selected={v === value}>{t}</option>)}
-      </select>
+      </ScrubSelect>
     </label>
   );
 }

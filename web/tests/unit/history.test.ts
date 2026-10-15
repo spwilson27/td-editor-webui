@@ -134,4 +134,90 @@ describe('History', () => {
     s.h.clear();
     expect([s.h.index, s.h.bytes, s.h.entries().length]).toEqual([-1, 0, 0]);
   });
+
+  describe('gestures (v7.2 scrub drags)', () => {
+    it('everything pushed between beginGroup and endGroup is one entry, whatever the keys and timing', () => {
+      let t = 0;
+      const s = setup({ now: () => t });
+      s.edit('before', 1);
+      s.h.beginGroup();
+      s.edit('a', 2);
+      t += 5000; // far past the coalesce window
+      s.edit('a', 3);
+      s.edit('a', 4);
+      expect(s.h.endGroup()).toBe('kept');
+      expect(s.h.entries().map((e) => e.label)).toEqual(['before', 'a']);
+      s.h.undo();
+      expect(s.v).toBe(1);
+      s.h.redo();
+      expect(s.v).toBe(4);
+    });
+
+    it('the first push does not merge into an older entry with the same key, and the closed entry takes no later merges', () => {
+      const s = setup();
+      s.edit('x', 1, 10, 'text:L1');
+      s.h.beginGroup();
+      s.edit('x', 2, 10, 'text:L1');
+      s.edit('x', 3, 10, 'text:L1');
+      s.h.endGroup();
+      s.edit('x', 4, 10, 'text:L1'); // still inside the 1 s window, but the gesture closed its entry
+      expect(s.h.entries()).toHaveLength(3);
+      s.h.undo();
+      expect(s.v).toBe(3);
+      s.h.undo();
+      expect(s.v).toBe(1);
+    });
+
+    it('endGroup(true) undoes and drops the gesture entry without leaving a redo step', () => {
+      const s = setup();
+      s.edit('a', 1);
+      s.h.beginGroup();
+      s.edit('b', 2);
+      s.edit('b', 3);
+      expect(s.h.endGroup(true)).toBe('dropped');
+      expect(s.v).toBe(1);
+      expect(s.h.entries().map((e) => e.label)).toEqual(['a']);
+      expect(s.h.redo()).toBe(false);
+      expect(s.h.index).toBe(0);
+    });
+
+    it('an empty gesture changes nothing', () => {
+      const s = setup();
+      s.edit('a', 1);
+      s.h.beginGroup();
+      expect(s.h.endGroup(true)).toBe('none');
+      expect(s.h.entries()).toHaveLength(1);
+    });
+
+    it('a foreign push during an open gesture is its own undoable entry; the gesture continues in a fresh entry; redo stays correct', () => {
+      const s = setup();
+      const edit2 = (label: string, to: number, key?: string) => s.edit(label, to, 10, key);
+      s.h.beginGroup();
+      edit2('Layer blend', 1);
+      edit2('Layer blend', 2);
+      edit2('Delete layer', 10); // foreign (a keyboard / remote / stroke edit)
+      edit2('Layer blend', 11);
+      edit2('Layer blend', 12);
+      expect(s.h.endGroup()).toBe('kept');
+      expect(s.h.entries().map((e) => e.label)).toEqual(['Layer blend', 'Delete layer', 'Layer blend']);
+      s.h.undo();
+      expect(s.v).toBe(10);
+      s.h.undo();
+      expect(s.v).toBe(2);
+      s.h.undo();
+      expect(s.v).toBe(0);
+      s.h.redo(); s.h.redo(); s.h.redo();
+      expect(s.v).toBe(12);
+    });
+
+    it('a foreign key (same label) also closes the entry; cancel after it keeps the foreign step', () => {
+      const s = setup();
+      s.h.beginGroup();
+      s.edit('Edit text', 1, 10, 'text:A');
+      s.edit('Edit text', 2, 10, 'text:B'); // another layer
+      expect(s.h.entries()).toHaveLength(2);
+      expect(s.h.endGroup(true)).toBe('none'); // the open entry was closed by the foreign push: nothing of the gesture is left to drop
+      expect(s.h.entries()).toHaveLength(2);
+    });
+  });
 });

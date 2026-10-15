@@ -222,6 +222,7 @@ export function createStore() {
           case 'pixels':
             if (!thumbTimer) thumbTimer = setTimeout(() => { thumbTimer = null; thumbTick.value++; }, 250);
             break;
+          case 'thumbs': thumbTick.value++; break;
           case 'selection': selectionVersion.value++; break;
           case 'history': historyVersion.value++; break;
           case 'resize':
@@ -423,6 +424,9 @@ export function createStore() {
     addLayer: () => store.engine.addPixelLayer(),
     addGroup: () => store.engine.addGroup(),
     flatten: () => store.engine.flattenToNewLayer(),
+    /** v7.2 scrub drags (ScrubSelect / ScrubNumber): everything edited between begin and end is one undo step. */
+    beginGesture: () => engine?.beginGesture?.(),
+    endGesture: (cancel = false): 'dropped' | 'kept' | 'none' => engine?.endGesture?.(cancel) ?? 'none',
     undo: () => engine?.undo(),
     redo: () => engine?.redo(),
     deselect: () => engine?.deselect(),
