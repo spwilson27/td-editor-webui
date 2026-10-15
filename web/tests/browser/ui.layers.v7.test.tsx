@@ -474,6 +474,26 @@ describe('Delete key rules', () => {
     expect(deletes()).toHaveLength(1);
   });
 
+  it('Backspace (the Mac delete key) deletes like Delete, with the same guards', async () => {
+    await four();
+    const input = document.createElement('input');
+    document.body.appendChild(input);
+    expect(del({ key: 'Backspace', target: input })).toBe(false);
+    expect(deletes()).toHaveLength(0);
+    expect(del({ key: 'Backspace' })).toBe(true);
+    expect(deletes()).toHaveLength(1);
+    input.remove();
+  });
+
+  it('with a pixel selection, the key still deletes layers when aimed at the layer list (a row was clicked)', async () => {
+    await four();
+    engine.setSelection({ x: 1, y: 1, w: 5, h: 5 });
+    expect(del({ key: 'Backspace' })).toBe(false); // aimed at the page/canvas: the selection keeps the layers
+    expect(del({ key: 'Backspace', target: row('L1') })).toBe(true);
+    expect(deletes()).toHaveLength(1);
+    engine.setSelection(null);
+  });
+
   it('skips locked layers: the key and the footer button delete the unlocked ones; all locked = no-op with a message', async () => {
     await four();
     engine.setLayerProps('L3', { locked: true });

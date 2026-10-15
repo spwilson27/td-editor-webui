@@ -32,6 +32,11 @@ export function deleteKeyTarget(target: unknown): boolean {
   return tag === 'BODY' || tag === 'HTML' || tag === 'CANVAS' || !!t.closest?.('[data-layer-list]');
 }
 
+function inLayerList(target: unknown): boolean {
+  const t = target as { closest?: (s: string) => unknown } | null;
+  return !!t?.closest?.('[data-layer-list]');
+}
+
 const toolKeys = new Map<string, ToolId[]>();
 for (const t of TOOLS) toolKeys.set(t.key.toLowerCase(), [...(toolKeys.get(t.key.toLowerCase()) || []), t.id]);
 
@@ -97,9 +102,13 @@ export function onKeyDown(store: Store, e: KeyLike): void {
       if (store.isFloating()) { store.cancelFloating(); e.preventDefault(); }
       else if (store.cropBox.peek()) { store.cancelCrop(); e.preventDefault(); }
       return;
-    case 'Delete': // Backspace is left alone
+    case 'Delete':
+    case 'Backspace': // the Mac "delete" key
       if (e.defaultPrevented || !deleteKeyTarget(e.target)) return;
-      if (store.isFloating() || store.cropBox.peek() || store.engine.selection()) return; // a pixel selection: the engine has no clear op, so layers stay
+      if (store.isFloating() || store.cropBox.peek()) return;
+      // A pixel selection keeps the layers when the key was aimed at the canvas (the engine has no clear op); focus in the layer list
+      // (a row was just clicked) means the layers.
+      if (store.engine.selection() && !inLayerList(e.target)) return;
       store.deleteSelected();
       e.preventDefault();
       return;
