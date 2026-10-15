@@ -1,12 +1,12 @@
 """TouchDesigner network cost at 4K with 30+ layers (hardening / performance report).
 
-    .venv/bin/python scripts/perf_td.py [--ref v0.4.0] [--w 3840 --h 2160] [--keep] [--only SECTION[,SECTION]]
+    .venv/bin/python scripts/perf_td.py [--ref v0.4.0|WORKTREE] [--w 3840 --h 2160] [--no-opt] [--keep] [--only SECTION[,SECTION]]
 
 Builds a THROWAWAY COMP ``/project1/_hard_perf`` from ``td/raster_editor/{network.py,blend.glsl,shape.glsl}`` read
 from git ``--ref`` (default v0.4.0; ``--ref WORKTREE`` uses the working tree), modelled on scripts/network_dev.py
 (stand-in extension serving surface buffers).  Nothing outside the scratch COMP is touched; the project is never saved.
 
-Sections: build, gpu, idle, update, apply, memory, offenders  (default: all)
+Sections: build, gpu, idle, update, position, firstuse, apply, memory, offenders  (default: all)
 GPU timers resolve a frame later and TD runs frames only BETWEEN calls, so every sample is its own td call that
 (1) reads gpuCookTime of the nodes that cooked since the previous call, then (2) performs the action.
 """
@@ -59,8 +59,9 @@ def src(ref: str, name: str) -> str:
     return subprocess.check_output(["git", "show", f"{ref}:{path}"], cwd=ROOT).decode()
 
 
-def setup(ref: str, w: int, h: int) -> None:
+def setup(ref: str, w: int, h: int, optimize: bool = True) -> None:
     net_src, glsl_src, shape_src = src(ref, "network.py"), src(ref, "blend.glsl"), src(ref, "shape.glsl")
+    opt_arg = "" if optimize else ", optimize=False"        # (the v0.4.0 / v5 DocNetwork has no such argument: only pass it when off)
     td(f'''
 p = op("/project1")
 if p.op("_hard_perf"): p.op("_hard_perf").destroy()
@@ -92,7 +93,8 @@ net_mod = _load("re_network", {net_src!r})
 st = types.ModuleType("hp_state"); sys.sys = sys; sys.modules["hp_state"] = st
 st.buffers = {{}}
 st.comp = c
-st.net = net_mod.DocNetwork(c, {glsl_src!r}, shape_glsl={shape_src!r})
+st.t = 100.0
+st.net = net_mod.DocNetwork(c, {glsl_src!r}, shape_glsl={shape_src!r}, clock=lambda: st.t{opt_arg})
 st.w, st.h = {w}, {h}
 st.prev = {{}}
 _emit("ok")
@@ -125,15 +127,16 @@ def layer(id_, kind="pixel", **kw):
 def big_doc(W, H, blur_radius=8, with_blur=True, n_full=6, n_half=8, n_small=8, n_shape=4, n_text=4):
     """base + n_full full-size layers + n_half 1920x1080 layers at 2x + n_small 800x600 (0.5x / 1.5x) layers,
     4 masks, 3 adjustments (hueSaturation, blur, levels), shapes, text.  Returns (layers, buffers{slot: (w, h)})."""
+    f = W / 3840.0                       # the 4K content scales with the document (1080p: f = 0.5)
     ls = [layer("base", "base")]
     sizes: dict[int, tuple[int, int]] = {}
     slot = 1
     blends = ("normal", "multiply", "screen", "overlay", "soft-light", "normal", "hue")
-    plan = [(W, H, 1.0)] * n_full + [(W // 2, H // 2, 2.0)] * n_half + [(800, 600, 0.5)] * (n_small // 2) + [(800, 600, 1.5)] * (n_small - n_small // 2)
+    plan = [(W, H, 1.0)] * n_full + [(W // 2, H // 2, 2.0)] * n_half + [(int(800 * f), int(600 * f), 0.5)] * (n_small // 2) + [(int(800 * f), int(600 * f), 1.5)] * (n_small - n_small // 2)
     masked = {1, 7, 9, 15}
     for i, (sw, sh, sc) in enumerate(plan):
         kw = dict(slot=slot, surfaceW=sw, surfaceH=sh, sx=sc, sy=sc, blend=blends[i % len(blends)], opacity=0.85,
-                  x=float((i * 37) % 400) + 0.5 * (sc != 1.0), y=float((i * 53) % 300) + 0.25 * (sc != 1.0))
+                  x=float(int(((i * 37) % 400) * f)) + 0.5 * (sc != 1.0), y=float(int(((i * 53) % 300) * f)) + 0.25 * (sc != 1.0))
         sizes[slot] = (sw, sh)
         if i in masked:
             kw["mask"] = {"slot": 100 + i, "enabled": True}
@@ -147,16 +150,16 @@ def big_doc(W, H, blur_radius=8, with_blur=True, n_full=6, n_half=8, n_small=8, 
     ls.append(layer("a_lev", "adjustment", adjustment={"type": "levels", "inLow": 0.05, "inHigh": 0.95, "gamma": 1.2, "outLow": 0.0, "outHigh": 1.0}))
     for i in range(n_shape):
         if i % 2:
-            sp = {"type": "ellipse", "x": 300.0 + 700 * i, "y": 400.0 + 200 * i, "w": 900.0, "h": 600.0, "fill": {"enabled": True, "color": RED},
-                  "stroke": {"enabled": True, "color": BLUE, "width": 12.0}, "rotation": 10.0 * i}
+            sp = {"type": "ellipse", "x": (300.0 + 700 * i) * f, "y": (400.0 + 200 * i) * f, "w": 900.0 * f, "h": 600.0 * f, "fill": {"enabled": True, "color": RED},
+                  "stroke": {"enabled": True, "color": BLUE, "width": 12.0 * f}, "rotation": 10.0 * i}
         else:
-            sp = {"type": "rect", "x": 300.0 + 700 * i, "y": 400.0 + 200 * i, "w": 900.0, "h": 600.0, "radius": 40.0, "fill": {"enabled": True, "color": RED},
-                  "stroke": {"enabled": True, "color": BLUE, "width": 12.0}, "rotation": 10.0 * i}
+            sp = {"type": "rect", "x": (300.0 + 700 * i) * f, "y": (400.0 + 200 * i) * f, "w": 900.0 * f, "h": 600.0 * f, "radius": 40.0 * f, "fill": {"enabled": True, "color": RED},
+                  "stroke": {"enabled": True, "color": BLUE, "width": 12.0 * f}, "rotation": 10.0 * i}
         ls.append(layer(f"s{i}", "shape", shape=sp))
     for i in range(n_text):
-        ls.append(layer(f"t{i}", "text", text={"text": f"Hardening layer {i}\nsecond line", "font": "Helvetica", "size": 120.0,
+        ls.append(layer(f"t{i}", "text", text={"text": f"Hardening layer {i}\nsecond line", "font": "Helvetica", "size": 120.0 * f,
                                               "color": {"r": 255, "g": 255, "b": 255, "a": 255}, "align": "left", "bold": True, "italic": False,
-                                              "lineHeight": 1.2, "x": 200.0 + 800 * i, "y": 200.0 + 300 * i, "boxWidth": None}))
+                                              "lineHeight": 1.2, "x": (200.0 + 800 * i) * f, "y": (200.0 + 300 * i) * f, "boxWidth": None}))
     return ls, sizes
 
 
@@ -188,10 +191,15 @@ def settle():
     return td('''
 net = _st().net
 n = 0
+st = _st()
 while n < 400:
     s = net.stats()
     if not (s["garbage"] or s["junk"]) and s["pool"] >= 6 and not net._pending: break
+    st.t += 0.05       # a fake clock: ticks happen back to back here, a real session has ~16 ms between them
     net.tick(); n += 1
+st.t += 1.0
+for _ in range(40):    # idle frames: spare nodes are pre-warmed (v6)
+    net.tick()
 _emit(n)
 ''', timeout=600)
 
@@ -352,6 +360,82 @@ def sec_apply(ctx):
     print(f"apply() re-apply after settle          {r['ms']:7.3f} ms")
 
 
+def sec_position(ctx):
+    """Cost of editing ONE layer property (opacity via apply()) as a function of the layer's position in the stack:
+    TD cooks lazily, so everything below the edited layer is a cache hit and only the passes from it upwards recook."""
+    W, H = ctx["w"], ctx["h"]
+    ls = json.loads(json.dumps(ctx["layers"]))
+    apply(ls, W, H)
+    settle()
+    ids = [l["id"] for l in ls]
+    pick = [i for i in ("p0", "p5", "p10", "p15", "p20", "a_lev", "s0", "s3", "t3") if i in ids]
+    for lid in pick:
+        pos = ids.index(lid)
+        act = f"""
+        cur = json.loads({json.dumps(json.dumps(ls))})
+        for l in cur:
+            if l["id"] == {lid!r}:
+                l["opacity"] = 0.5 + 0.01 * (st.tog % 20)
+        st.tog += 1
+        net.apply(cur, st.w, st.h)
+        net.output().cook(force=True)
+        """
+        td("st = _st(); st.tog = getattr(st, 'tog', 0); _emit(1)")
+        r = sample(act, 22)
+        print(f"EDIT opacity of {lid:6s} (stack position {pos + 1:2d}/{len(ids)}): {fmt(r)}")
+
+
+def sec_firstuse(ctx):
+    """First-use spikes: the frame in which a freshly created node cooks for the first time (shader compile, texture
+    allocation).  A document without scaled layers gets a rotated layer / a new merge group; the cook of the output is timed
+    (wall clock incl. GPU sync by a tiny readback) in the apply frame and the following one."""
+    W, H = ctx["w"], ctx["h"]
+    ls = json.loads(json.dumps(ctx["layers"]))
+    for l in ls:
+        if l["kind"] == "pixel":
+            l["sx"] = l["sy"] = 1.0
+            l["x"] = float(int(l["x"]))
+            l["y"] = float(int(l["y"]))
+    apply(ls, W, H)
+    settle()
+    td(f"""
+st = _st(); net = st.net
+net.output().cook(force=True)
+_emit(1)
+""")
+    probe = """
+st = _st(); net = st.net
+import numpy as np
+cur = json.loads(%r)
+for l in cur:
+    if l["id"] == %r:
+        l.update(%s)
+t0 = time.perf_counter()
+net.apply(cur, st.w, st.h)
+t1 = time.perf_counter()
+net.output().cook(force=True)
+tiny = net.doc.op("fu_tiny")
+if tiny is None:
+    tiny = net.doc.create(resolutionTOP, "fu_tiny"); tiny.par.outputresolution = "custom"; tiny.par.resolutionw = 4; tiny.par.resolutionh = 4
+    tiny.inputConnectors[0].connect(net.output())
+tiny.cook(force=True); tiny.numpyArray()
+t2 = time.perf_counter()
+_emit({"apply_ms": (t1 - t0) * 1e3, "cook_ms": (t2 - t1) * 1e3, "pool": net.stats()["pool"], "mpool": net.stats().get("mpool")})
+"""
+    cases = [("p9", {"rot": 20.0}), ("p10", {"sx": 1.5, "sy": 1.5}), ("p11", {"rot": 40.0}), ("p12", {"kx": 15.0}),
+             ("p13", {"opacity": 0.5}), ("p14", {"visible": False}), ("p14", {"visible": True})]
+    cur = json.loads(json.dumps(ls))
+    for lid, upd in cases:
+        for l in cur:
+            if l["id"] == lid:
+                l.update(upd)
+        r = td(probe % (json.dumps(cur), lid, repr(upd)))
+        print(f"FIRST USE {lid} {upd}: apply {r['apply_ms']:.2f} ms, next output cook {r['cook_ms']:.2f} ms (pool {r['pool']}, mpool {r['mpool']})")
+        settle()
+        td("_st().net.output().cook(force=True); _emit(1)")
+    td('n = _st().net.doc.op("fu_tiny")\nif n: n.destroy()\n_emit(1)')
+
+
 def sec_memory(ctx):
     r = td('''
 st = _st(); net = st.net
@@ -438,7 +522,7 @@ def sec_offenders(ctx):
     print("per-layer GPU cost for the shape / text nodes: see 'heaviest nodes' list of the baseline gpu section")
 
 
-SECTIONS = ("build", "gpu", "idle", "update", "apply", "memory", "offenders")
+SECTIONS = ("build", "gpu", "idle", "update", "position", "firstuse", "apply", "memory", "offenders")
 
 
 def main() -> int:
@@ -447,11 +531,12 @@ def main() -> int:
     ap.add_argument("--w", type=int, default=3840)
     ap.add_argument("--h", type=int, default=2160)
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--no-opt", action="store_true", help="DocNetwork(optimize=False): the v5 node-per-layer network (A/B)")
     ap.add_argument("--only", default=",".join(SECTIONS))
     a = ap.parse_args()
     todo = a.only.split(",")
     ctx = {"w": a.w, "h": a.h}
-    setup(a.ref, a.w, a.h)
+    setup(a.ref, a.w, a.h, not a.no_opt)
     try:
         sec_build(ctx)
         for s in SECTIONS[1:]:

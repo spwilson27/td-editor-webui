@@ -10,6 +10,7 @@ import numpy as np
 
 COMPANIONS = {
     "glslTOP": ("_info", "_pixel", "_compute"),
+    "glslmultiTOP": ("_info", "_pixel", "_compute"),
     "scriptTOP": ("_callbacks",),
 }
 
@@ -73,7 +74,7 @@ class FakeConnector:
         self.source = other
         self.op._log.connects.append((self.op.name, self.index, other.name))
         op = self.op       # TD keeps one free connector after the last used one (glsl TOPs: any number)
-        while op.OPType in ("glslTOP", "overTOP") and op.inputConnectors[-1].source is not None:
+        while op.OPType in ("glslTOP", "glslmultiTOP", "overTOP") and op.inputConnectors[-1].source is not None:
             op.inputConnectors.append(FakeConnector(op, len(op.inputConnectors)))
 
     def disconnect(self):
@@ -145,12 +146,13 @@ class FakeOp:
         c = FakeOp(self, optype, name, self._log)
         self.children_list.append(c)
         self._log.creates.append((optype, name))
-        if optype == "glslTOP" or optype == "scriptTOP":
+        if optype in COMPANIONS:
             for suf in COMPANIONS[optype]:
                 comp = FakeOp(self, "textDAT", name + suf, self._log)
                 self.children_list.append(comp)
                 self._log.creates.append(("textDAT", name + suf))
-        if optype in ("glslTOP", "levelTOP", "blurTOP", "thresholdTOP", "hsvadjustTOP", "overTOP", "nullTOP"):
+        if optype in ("glslTOP", "glslmultiTOP", "levelTOP", "blurTOP", "thresholdTOP", "hsvadjustTOP", "overTOP", "nullTOP",
+                      "resolutionTOP"):
             c.inputConnectors = [FakeConnector(c, 0)]
         return c
 

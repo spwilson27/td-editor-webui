@@ -36,7 +36,7 @@ def px(id_, slot, **kw):
 def env():
     clock = fakenet.Clock()
     comp, log = fakenet.make_comp()
-    net = DocNetwork(comp, GLSL, clock=clock)
+    net = DocNetwork(comp, GLSL, clock=clock, optimize=False)       # the v5 node-per-layer network; v6 has its own tests below
     return net, comp, log, clock
 
 
@@ -81,7 +81,7 @@ def test_creates_doc_and_text_dats(env):
 def test_existing_doc_is_reused():
     comp, log = fakenet.make_comp()
     comp.create("baseCOMP", "doc")
-    DocNetwork(comp, GLSL)
+    DocNetwork(comp, GLSL, optimize=False)
     assert len([c for c in comp.children if c.name == "doc"]) == 1
 
 
@@ -561,7 +561,7 @@ def test_adopts_existing_network_without_creating(env):
     settle(net)
     for s in (1, 2, 9):
         net.surface_top(s).lock = True
-    net2 = DocNetwork(comp, GLSL, clock=clock)
+    net2 = DocNetwork(comp, GLSL, clock=clock, optimize=False)
     m = log.mark()
     net2.apply(st, W, H)
     d = log.since(m)
@@ -577,7 +577,7 @@ def test_adoption_removes_stale_roles_but_recycles_glsl(env):
     net, comp, log, clock = env
     net.apply([base(), px("a", 1), px("gone", 2)], W, H)
     settle(net)
-    net2 = DocNetwork(comp, GLSL, clock=clock)
+    net2 = DocNetwork(comp, GLSL, clock=clock, optimize=False)
     m = log.mark()
     net2.apply([base(), px("a", 1)], W, H)
     d = log.since(m)
@@ -850,7 +850,7 @@ def test_resize_while_surface_pending_then_undo(env):
 
 def test_blur_tiny_radius_is_identity(env):
     net, comp, log, _ = env
-    net.apply([base(), px("a", 1), adj("bl", {"type": "blur", "radius": 0.08})], W, H)
+    net.apply([base(), px("a", 1), adj("bl", {"type": "blur", "radius": 0.03})], W, H)
     assert net._ops["adj_L_bl"].bypass is True
 
 
@@ -859,7 +859,7 @@ def test_unknown_removal_survives_children_dying_with_parent(env, monkeypatch):
     net.apply([base(), px("a", 1)], W, H)            # leaves companion DATs (g*_info, s1_callbacks ...) behind
     assert net.stats()["junk"] > 0
     monkeypatch.setattr(network, "POOL_MAX", 0)       # spares cannot be recycled -> destroyed as unknown
-    net2 = DocNetwork(comp, GLSL, clock=clock)
+    net2 = DocNetwork(comp, GLSL, clock=clock, optimize=False)
     net2.apply([base()], W, H)                        # must not touch the dead companions
     names = {c.name for c in comp.op("doc").children}
     assert not any(n.endswith(("_info", "_pixel", "_compute")) or re.match(r"s\d+_callbacks", n) for n in names), names
@@ -1239,10 +1239,10 @@ def test_shape_glsl_contract():
 
 def test_shape_node_adopted_after_reload():
     comp, log = fakenet.make_comp()
-    n1 = DocNetwork(comp, GLSL)
+    n1 = DocNetwork(comp, GLSL, optimize=False)
     n1.apply([base(), shp("s"), txt("t")], W, H)
     log.clear()
-    n2 = DocNetwork(comp, GLSL)
+    n2 = DocNetwork(comp, GLSL, optimize=False)
     n2.apply([base(), shp("s"), txt("t")], W, H)
     assert not [c for c in log.creates if c[0] in ("glslTOP", "textTOP")]
     assert n2._ops["shape_s"].tags == ["role:shape_s"]
@@ -2581,7 +2581,7 @@ def test_recycled_stale_nodes_get_neutral_parameters(env):
     settle(net)
     tagged = _stale_glsl(comp, "g90", ["role:xf_L_gone"])                    # a tagged stale resample node
     spare = _stale_glsl(comp, "g91", [])                                      # an untagged spare
-    net2 = DocNetwork(comp, GLSL, clock=clock)
+    net2 = DocNetwork(comp, GLSL, clock=clock, optimize=False)
     net2.apply([base()], W, H)
     pooled = [n for n, c in net2._pool]
     for node in (tagged, spare):
@@ -2599,7 +2599,7 @@ def test_v4_document_adoption_resets_stale_resample_and_drops_old_names(env):
     old_blend = _stale_glsl(comp, "g1", ["role:blend_base"], res="useinput", filt="linear")
     stale_xf = _stale_glsl(comp, "g2", ["role:xf_L_old"])
     base_src = doc.create("selectTOP", "base_src")
-    net2 = DocNetwork(comp, GLSL, clock=clock)
+    net2 = DocNetwork(comp, GLSL, clock=clock, optimize=False)
     net2.apply([base(), px("a", 1, surfaceW=16, surfaceH=8)], W, H)
     assert net2.output() is not None
     assert not base_src.valid                                                  # v4 name no longer part of the network
@@ -2681,3 +2681,948 @@ def test_glsl_pins_for_exact_mask_branch_and_footprint_early_out():
         assert old in GLSL
         mutated = GLSL.replace(old, new, 1)
         assert any(t not in mutated for t in pins.values())
+
+
+# =========================================================================== v6 phase A: performance
+# bounding boxes, skip rules, merged passes, 8 bit intermediates, blur pyramid, spare-node pool (docs/DESIGN_V6.md 2)
+
+
+@pytest.fixture
+def opt():
+    clock = fakenet.Clock()
+    comp, log = fakenet.make_comp()
+    net = DocNetwork(comp, GLSL, clock=clock)
+    assert net._opt
+    return net, comp, log, clock
+
+
+def fmt(net, role):
+    return net._ops[role].par.value("format")
+
+
+def plan(net):
+    return net.stats()["plan"]
+
+
+def uL(net, role, k):
+    pv = net._ops[role].par.value
+    return tuple(pv("vec%dvalue%s" % (4 + k, c)) for c in "xyzw")
+
+
+def ins(net, role):
+    """Role names wired to the inputs of ``role``."""
+    names = {id(o): r for r, o in net._ops.items()}
+    return [names.get(id(c.source)) for c in net._ops[role].inputConnectors if c.source is not None]
+
+
+# ---- bounds math
+
+
+def test_affine_box_pure_scale_offset_and_rotation():
+    a = network.Affine(10.0, 20.0, 2.0, 3.0)
+    assert network.affine_box(a, (0, 0, 8, 4)) == (10.0, 20.0, 26.0, 32.0)
+    r = network.Affine(0.0, 0.0, 1.0, 1.0, rot=90.0)          # 90 degrees clockwise on screen: (u, v) -> (-v, u)
+    b = network.affine_box(r, (0, 0, 8, 4))
+    assert all(abs(x - y) < 1e-9 for x, y in zip(b, (-4.0, 0.0, 0.0, 8.0)))
+    k = network.Affine(0.0, 0.0, 1.0, 1.0, kx=45.0)           # x += y * tan(45)
+    b = network.affine_box(k, (0, 0, 8, 4))
+    assert all(abs(x - y) < 1e-9 for x, y in zip(b, (0.0, 0.0, 12.0, 4.0)))
+
+
+def test_clip_box_outward_rounding_clipping_and_empty():
+    assert network.clip_box((1.2, 2.7, 9.1, 6.0), 64, 48) == (1, 2, 10, 6)
+    assert network.clip_box((1.2, 2.7, 9.1, 6.0), 64, 48, pad=1) == (0, 1, 11, 7)
+    assert network.clip_box((-5.0, -5.0, 200.0, 200.0), 64, 48) == (0, 0, 64, 48)
+    assert network.clip_box((70.0, 0.0, 80.0, 10.0), 64, 48) is None
+    assert network.clip_box((10.0, 10.0, 10.0, 20.0), 64, 48) is None            # zero width
+    assert network.clip_box((float("nan"), 0, 1, 1), 64, 48) == (0, 0, 64, 48)
+
+
+def test_layer_box_cases():
+    ex = network.layer_affine({"kind": "pixel", "x": 10, "y": 5})
+    assert network.layer_box(ex, 20, 10, 64, 48) == (10, 5, 30, 15)                           # exact: no padding
+    assert network.layer_box(network.layer_affine({"kind": "pixel", "x": 60, "y": 5}), 20, 10, 64, 48) == (60, 5, 64, 15)
+    assert network.layer_box(network.layer_affine({"kind": "pixel", "x": 64, "y": 5}), 20, 10, 64, 48) is None
+    assert network.layer_box(network.layer_affine({"kind": "pixel", "x": -30, "y": 0}), 20, 10, 64, 48) is None
+    sc = network.layer_affine({"kind": "pixel", "x": 0.5, "y": 0.0, "sx": 2.0, "sy": 2.0})
+    assert network.layer_box(sc, 10, 10, 64, 48) == (0, 0, 22, 21)                          # 0.5..20.5 -> 1 px pad
+    assert network.layer_box(network.layer_affine({"kind": "pixel", "sx": 1.5, "sy": 1.5, "x": .5}), 10_000, 10_000, 64, 48) == (0, 0, 64, 48)
+    dead = network.Affine(0, 0, 1e-12, 1.0)
+    assert network.layer_box(dead, 20, 10, 64, 48) is None
+
+
+def test_layer_box_content_hint():
+    aff = network.layer_affine({"kind": "pixel", "x": 10.5, "y": 5.0})
+    full = network.layer_box(aff, 40, 30, 64, 48)
+    assert full == (9, 4, 52, 36)                                                                    # 10.5..50.5, 1 px pad
+    tight = network.layer_box(aff, 40, 30, 64, 48, hint=(5.0, 5.0, 15.0, 10.0))
+    assert tight is not None and tight[0] > full[0] and tight[3] < full[3]
+    assert tight[0] <= 10.5 + 5.0 - 1 and tight[2] >= 10.5 + 15.0 + 1                        # padded by the filter reach
+    assert network.layer_box(aff, 40, 30, 64, 48, hint=network.EMPTY_HINT) is None
+    assert network.layer_box(aff, 40, 30, 64, 48, hint=(50.0, 50.0, 60.0, 60.0)) == full    # outside the surface: no hint
+    assert network.layer_box(aff, 40, 30, 64, 48, hint=(9.0, 9.0, 9.0, 12.0)) == full         # degenerate rect: no hint
+    assert network.layer_box(aff, 40, 30, 64, 48, hint=("a", 1, 2, 3)) == full                # not numeric: no hint
+    # the exact path keeps no padding
+    ex = network.layer_affine({"kind": "pixel", "x": 10, "y": 5})
+    assert network.layer_box(ex, 40, 30, 64, 48, hint=(5.0, 5.0, 15.0, 10.0)) == (15, 10, 25, 15)
+
+
+def test_shape_box_rect_ellipse_polygon_line_and_nothing():
+    base_ = {"type": "rect", "x": 10, "y": 5, "w": 20, "h": 10, "radius": 0, "fill": FILL, "stroke": NOSTROKE, "rotation": 0}
+    assert network.shape_box(base_, 64, 48) == (8, 3, 32, 17)                                # +2 px antialiasing margin
+    assert network.shape_box(dict(base_, stroke=STROKE), 64, 48) == (6, 1, 34, 19)           # + half stroke width (2)
+    flipped = dict(base_, x=30, y=15, w=-20, h=-10)                                           # dragged up / left: the same box
+    assert network.shape_box(flipped, 64, 48) == network.shape_box(base_, 64, 48)
+    assert network.shape_box(dict(base_, rotation=90), 64, 48) == (13, 0, 27, 22)            # 20x10 about (20, 10) turned: 10x20, clipped at 0
+    el = dict(base_, type="ellipse")
+    assert network.shape_box(el, 64, 48) == (8, 3, 32, 17)
+    poly = {"type": "polygon", "cx": 30, "cy": 20, "radius": 10, "sides": 5, "innerRatio": 1, "fill": FILL, "stroke": NOSTROKE}
+    assert network.shape_box(poly, 64, 48) == (18, 8, 42, 32)
+    line = {"type": "line", "x1": 5, "y1": 5, "x2": 25, "y2": 15, "fill": NOSTROKE, "stroke": STROKE}
+    assert network.shape_box(line, 64, 48) == (1, 1, 29, 19)                                  # reach = 2 (half stroke) + 2
+    arrow = dict(line, arrowEnd=True)
+    assert network.shape_box(arrow, 64, 48) == (0, 0, 45, 35)                                 # arrowhead reach 1.1 * H (H = 16)
+    # nothing drawn
+    assert network.shape_box(dict(base_, fill={"enabled": False, "color": RED}), 64, 48) is None
+    assert network.shape_box(dict(base_, fill={"enabled": True, "color": dict(RED, a=0)}), 64, 48) is None
+    assert network.shape_box(dict(base_, x=100), 64, 48) is None                              # outside the canvas
+    assert network.shape_box({"type": "line", "x1": 0, "y1": 0, "x2": 5, "y2": 5, "fill": NOSTROKE, "stroke": NOSTROKE}, 64, 48) is None
+    assert network.shape_box({"type": "banana", "fill": FILL}, 64, 48) == (0, 0, 64, 48)       # unknown type: the whole canvas, no exception
+
+
+def test_text_empty_and_adjustment_noop_and_opacity_value():
+    assert network.text_is_empty({"text": "", "color": RED}) and network.text_is_empty({"text": " \n ", "color": RED})
+    assert network.text_is_empty({"text": "x", "color": dict(RED, a=0)})
+    assert not network.text_is_empty({"text": "x", "color": RED}) and network.text_is_empty(None)
+    assert network.adjustment_is_noop({"type": "blur", "radius": 0.04}) and not network.adjustment_is_noop({"type": "blur", "radius": 0.06})
+    assert network.adjustment_is_noop({"type": "mystery"}) and not network.adjustment_is_noop(LEVELS)
+    assert network.opacity_value(None) == 1.0 and network.opacity_value("x") == 1.0 and network.opacity_value(0.25) == 0.25
+    assert network.opacity_value(float("nan")) == 1.0
+
+
+# ---- skip rules
+
+
+def test_skip_rules_remove_the_blend_pass_but_keep_sources_and_surfaces(opt):
+    net, comp, log, _ = opt
+    st = [base(), px("hid", 1, visible=False), px("zero", 2, opacity=0.0), px("noslot", None),
+          px("off", 3, x=500), px("ok", 4),
+          txt("t_empty", dict(TEXT, text="  ")), shp("s_empty", dict(RECT, fill={"enabled": False, "color": RED}, stroke=NOSTROKE)),
+          adj("noop_blur", {"type": "blur", "radius": 0.01}), adj("noop_unknown", {"type": "mystery"}),
+          L("empty_group", "group"),
+          shp("s_hidden", visible=False), txt("t_hidden", visible=False), px("ok2", 5)]
+    net.apply(st, W, H)
+    live = [r for r in net._ops if r.startswith(("blend_L_", "mrg_L_"))]
+    assert plan(net)["skipped"] == 11 and plan(net)["layers"] == 14
+    assert sorted(plan(net)["skip_reasons"]) == ["empty", "hidden", "noop", "opacity", "outside"]
+    # base, ok, ok2 remain (one merged pass, three layers)
+    assert live == ["mrg_L_base"] and ins(net, "mrg_L_base")[1:4] == ["src_in1", "s4", "s5"]
+    # the surfaces of the skipped pixel layers stay allocated (the ext writes them), hidden text / shape keep their source
+    assert net.slots() == [1, 2, 3, 4, 5]
+    assert "text_t_hidden" in net._ops and "shape_s_hidden" not in net._ops            # (the shape node is built when asked for)
+    assert net.render_layer_source("t_hidden") is net._ops["text_t_hidden"]
+    src = net.render_layer_source("s_hidden")
+    assert src is net._ops["shape_s_hidden"] and src.par.value("resolutionw") == W
+    net.apply(st, W, H)                                                                # stays after the next apply()
+    assert net.render_layer_source("s_hidden") is src and net._ops["shape_s_hidden"] is src
+    assert net.render_layer_source("t_empty") is net._ops["text_t_empty"]
+    assert source_of(net, "out") == "mrg_L_base"
+
+
+def test_skip_off_screen_and_zero_opacity_reappear_when_edited(opt):
+    net, comp, log, _ = opt
+    mk = lambda **kw: [base(), px("a", 1, **kw)]
+    net.apply(mk(opacity=0.0), W, H)
+    assert "blend_L_a" not in net._ops and source_of(net, "out") == "blend_L_base"
+    net.apply(mk(opacity=0.4), W, H)
+    assert source_of(net, "out") == "mrg_L_base" and uL(net, "mrg_L_base", 1)[1] == 0.4
+    net.apply(mk(opacity=0.4, x=1000), W, H)                                        # moved off the canvas
+    assert plan(net)["skip_reasons"] == {"outside": 1} and source_of(net, "out") == "blend_L_base"
+    net.apply(mk(visible=False), W, H)
+    assert plan(net)["skip_reasons"] == {"hidden": 1}
+
+
+def test_skip_hidden_group_keeps_children_text_source(opt):
+    net, comp, log, _ = opt
+    net.apply([base(), L("g", "group", visible=False), txt("t", parentId="g"), px("p", 1, parentId="g")], W, H)
+    assert source_of(net, "out") == "blend_L_base"
+    assert "text_t" in net._ops and net.render_layer_source("t") is net._ops["text_t"]
+    assert not any(r.startswith(("blend_L_t", "blend_L_p", "blend_L_g", "mrg_L_t", "mrg_L_p")) for r in net._ops)
+    net.apply([base(), L("g", "group"), px("p", 1, parentId="g")], W, H)
+    assert ins(net, "mrg_L_base")[1:3] == ["src_in1", "blend_L_p"]
+
+
+def test_group_whose_children_are_all_skipped_is_skipped(opt):
+    net, comp, log, _ = opt
+    net.apply([base(), L("g", "group"), px("p", 1, parentId="g", visible=False)], W, H)
+    assert source_of(net, "out") == "blend_L_base" and plan(net)["skip_reasons"] == {"hidden": 1, "empty": 1}
+
+
+def test_optimize_off_keeps_the_v5_network(env):
+    net, comp, log, _ = env
+    net.apply([base(), px("hid", 1, visible=False), px("a", 2), px("b", 3, blend="multiply"), px("z", 4, opacity=0.0)], W, H)
+    assert [r for r in net._ops if r.startswith("blend_L_")] == ["blend_L_base", "blend_L_hid", "blend_L_a", "blend_L_b", "blend_L_z"]
+    assert net._ops["blend_L_hid"].bypass is True and not any(r.startswith("mrg_L_") for r in net._ops)
+    assert all(fmt(net, r) == "rgba16fixed" for r in net._ops if r.startswith("blend_L_"))
+    assert net.stats()["mpool"] == 0
+
+
+# ---- merged passes
+
+
+def test_merged_runs_and_single_layers(opt):
+    net, comp, log, _ = opt
+    st = [base()] + [px("p%d" % i, i + 1) for i in range(1, 11)]
+    net.apply(st, W, H)
+    assert plan(net)["passes"] == 2 and plan(net)["merged"] == 2 and plan(net)["merged_layers"] == 11
+    assert ins(net, "mrg_L_base")[0] == "blank"
+    assert ins(net, "mrg_L_base")[1:9] == ["src_in1"] + ["s%d" % i for i in range(2, 9)]
+    # the second run starts from the first and holds the remaining three layers
+    r2 = ins(net, "mrg_L_p8")
+    assert r2[0] == "mrg_L_base" and r2[1:4] == ["s9", "s10", "s11"] and r2[4:] == ["blank"] * 12      # 16 inputs, always
+    assert len(net._ops["mrg_L_base"].inputConnectors) >= 16 and source_of(net, "out") == "mrg_L_p8"
+    # slot uniforms: (mode + 16 * mask input, opacity, x, y); unused slots are zero
+    assert uL(net, "mrg_L_p8", 0) == (0.0, 1.0, 0.0, 0.0) and uL(net, "mrg_L_p8", 3) == (0.0, 0.0, 0.0, 0.0)
+    assert net._ops["mrg_L_base"].par.value("vec0valuew") == network.ADJ_MERGED_CODE
+    assert net._ops["mrg_L_base"].par.value("vec4name") == "uL0" and net._ops["mrg_L_base"].par.value("vec11name") == "uL7"
+    assert net._ops["mrg_L_base"].OPType == "glslmultiTOP"
+    # a single leftover layer keeps its own v5 pass
+    net.apply(st[:9], W, H)                                  # 9 layers: 8 + 1
+    assert plan(net)["passes"] == 2 and "blend_L_p8" in net._ops and "mrg_L_p8" not in net._ops
+
+
+def test_merged_slots_modes_opacity_offsets_and_masks(opt):
+    net, comp, log, _ = opt
+    st = [base(), px("a", 1, blend="multiply", opacity=0.5, x=3, y=-2), px("b", 2, mask={"slot": 9, "enabled": True}, blend="color-burn"),
+          px("c", 3, mask={"slot": 10, "enabled": False}), px("d", 4, mask={"slot": 11, "enabled": True}, x=2.00004)]
+    net.apply(st, W, H)
+    assert plan(net)["merged"] == 1
+    assert uL(net, "mrg_L_base", 0) == (0.0, 1.0, 0.0, 0.0)
+    assert uL(net, "mrg_L_base", 1) == (1.0, 0.5, 3.0, -2.0)
+    assert uL(net, "mrg_L_base", 2) == (9.0 + 16 * 9, 1.0, 0.0, 0.0)                         # colour-burn, mask = input 9
+    assert uL(net, "mrg_L_base", 3) == (0.0, 1.0, 0.0, 0.0)                                  # disabled mask: not wired
+    assert uL(net, "mrg_L_base", 4) == (0.0 + 16 * 10, 1.0, 2.0, 0.0)                         # second mask = input 10, offset rounded
+    w = ins(net, "mrg_L_base")
+    assert w[9] == "s9" and w[10] == "s11" and w[11:] == ["blank"] * 5 and w[1:6] == ["src_in1", "s1", "s2", "s3", "s4"]
+
+
+def test_merge_breaks_at_adjustments_and_respects_the_mask_limit(opt):
+    net, comp, log, _ = opt
+    st = [base(), px("a", 1), px("b", 2), adj("lv", LEVELS), px("c", 3), px("d", 4)]
+    net.apply(st, W, H)
+    assert [r for r in net._ops if r.startswith(("blend_L_", "mrg_L_"))] == ["mrg_L_base", "blend_L_lv", "mrg_L_c"]
+    assert source_of(net, "blend_L_lv", 0) == "mrg_L_base" and source_of(net, "mrg_L_c", 0) == "blend_L_lv"
+    masked = [base()] + [px("m%d" % i, 20 + i, mask={"slot": 40 + i, "enabled": True}) for i in range(9)]
+    net.apply(masked, W, H)
+    runs = [r for r in net._ops if r.startswith(("blend_L_", "mrg_L_"))]
+    assert len(runs) == 2                                                                  # 7 masks per node: base + 6 | m6.. rest
+    first = ins(net, runs[0])
+    assert first[9:16] == ["s%d" % (40 + i) for i in range(7)] and len(ins(net, runs[1])) == 16
+
+
+def test_group_is_a_merge_member_and_its_inner_chain_is_merged(opt):
+    net, comp, log, _ = opt
+    st = [base(), px("a", 1), L("g", "group", blend="multiply", opacity=0.5), px("x", 2, parentId="g"), px("y", 3, parentId="g"),
+          px("z", 4)]
+    net.apply(st, W, H)
+    inner = [r for r in net._ops if r.startswith("mrg_L_x")]
+    assert inner and ins(net, inner[0])[0] == "blank" and ins(net, inner[0])[1:3] == ["s2", "s3"]
+    outer = ins(net, "mrg_L_base")
+    assert outer[1:5] == ["src_in1", "s1", inner[0], "s4"]
+    assert uL(net, "mrg_L_base", 2) == (1.0, 0.5, 0.0, 0.0)
+
+
+def test_merged_pass_structure_survives_edits_with_par_sets_only(opt):
+    net, comp, log, _ = opt
+    st = [base()] + [px("p%d" % i, i) for i in range(1, 8)]
+    net.apply(st, W, H)
+    settle(net)
+    m = log.mark()
+    st[3]["opacity"] = 0.3
+    net.apply(st, W, H)
+    d = log.since(m)
+    assert not d["creates"] and not d["destroys"] and not d["connects"] and not d["disconnects"]
+    assert len(d["par_sets"]) == 1 and d["par_sets"][0][1:] == ("vec7valuey", 0.3)
+
+
+# ---- merged pass = chained passes (numpy reference of blend.glsl)
+
+
+def _lum(c):
+    return c @ np.array([0.3, 0.59, 0.11])
+
+
+def _clip_color(c):
+    lum, n, x = _lum(c)[..., None], c.min(-1)[..., None], c.max(-1)[..., None]
+    with np.errstate(all="ignore"):
+        c = np.where(n < 0, lum + (c - lum) * lum / (lum - n), c)
+        c = np.where(x > 1, lum + (c - lum) * (1 - lum) / (x - lum), c)
+    return c
+
+
+def _set_lum(c, l):
+    return _clip_color(c + (l - _lum(c))[..., None])
+
+
+def _sat(c):
+    return c.max(-1) - c.min(-1)
+
+
+def _set_sat(c, s):
+    mn, mx = c.min(-1)[..., None], c.max(-1)[..., None]
+    with np.errstate(all="ignore"):
+        return np.where(mx > mn, (c - mn) * s[..., None] / (mx - mn), 0.0)
+
+
+def _hard(cb, cs):
+    return np.where(cs <= 0.5, cb * 2 * cs, cb + (2 * cs - 1) - cb * (2 * cs - 1))
+
+
+def _soft(cb, cs):
+    d = np.where(cb <= 0.25, ((16 * cb - 12) * cb + 4) * cb, np.sqrt(np.maximum(cb, 0)))
+    return np.where(cs <= 0.5, cb - (1 - 2 * cs) * cb * (1 - cb), cb + (2 * cs - 1) * (d - cb))
+
+
+def _dodge(cb, cs):
+    with np.errstate(all="ignore"):
+        return np.where(cb <= 0.0005, 0.0, np.where(cs >= 0.9995, 1.0, np.minimum(1.0, cb / (1 - cs))))
+
+
+def _burn(cb, cs):
+    with np.errstate(all="ignore"):
+        return np.where(cb >= 0.9995, 1.0, np.where(cs <= 0.0005, 0.0, 1 - np.minimum(1.0, (1 - cb) / cs)))
+
+
+def blend_fn(mode, cb, cs):
+    if mode == 0:
+        return cs
+    if mode == 1:
+        return cb * cs
+    if mode == 2:
+        return cb + cs - cb * cs
+    if mode == 3:
+        return _hard(cs, cb)
+    if mode == 4:
+        return _soft(cb, cs)
+    if mode == 5:
+        return _hard(cb, cs)
+    if mode == 6:
+        return np.minimum(cb, cs)
+    if mode == 7:
+        return np.maximum(cb, cs)
+    if mode == 8:
+        return _dodge(cb, cs)
+    if mode == 9:
+        return _burn(cb, cs)
+    if mode == 10:
+        return np.abs(cb - cs)
+    if mode == 11:
+        return cb + cs - 2 * cb * cs
+    if mode == 12:
+        return _set_lum(_set_sat(cs, _sat(cb)), _lum(cb))
+    if mode == 13:
+        return _set_lum(_set_sat(cb, _sat(cs)), _lum(cb))
+    if mode == 14:
+        return _set_lum(cs, _lum(cb))
+    return _set_lum(cb, _lum(cs))
+
+
+def compose_general(below, src, mode, opacity, m):
+    """composeOver() of blend.glsl WITHOUT the Normal shortcut (the v5 formula), float64, premultiplied (h, w, 4)."""
+    src = src * (opacity * m)[..., None] if np.ndim(m) else src * (opacity * m)
+    asrc, ab = src[..., 3], below[..., 3]
+    with np.errstate(all="ignore"):
+        cs = np.where(asrc[..., None] > 0, src[..., :3] / asrc[..., None], 0.0)
+        cb = np.where(ab[..., None] > 0, below[..., :3] / ab[..., None], 0.0)
+    bl = np.where(((asrc > 0) & (ab > 0))[..., None], np.clip(blend_fn(mode, np.clip(cb, 0, 1), np.clip(cs, 0, 1)), 0, 1), 0.0)
+    out = np.empty_like(below)
+    out[..., :3] = (1 - ab)[..., None] * src[..., :3] + (1 - asrc)[..., None] * below[..., :3] + (asrc * ab)[..., None] * bl
+    out[..., 3] = asrc + ab - asrc * ab
+    return out
+
+
+def compose_shader(below, src, mode, opacity, m):
+    """composeOver() as written in blend.glsl (Normal shortcut included)."""
+    if mode != 0:
+        return compose_general(below, src, mode, opacity, m)
+    src = src * (opacity * m)[..., None] if np.ndim(m) else src * (opacity * m)
+    asrc, ab = src[..., 3], below[..., 3]
+    out = np.empty_like(below)
+    out[..., :3] = ((1 - ab)[..., None] * src[..., :3] + (1 - asrc)[..., None] * below[..., :3]
+                    + ab[..., None] * np.minimum(src[..., :3], asrc[..., None]))
+    out[..., 3] = asrc + ab - asrc * ab
+    return out
+
+
+def place(img, x, y, w, h):
+    """The layer image (h', w', c) at integer offset (x, y) in a (h, w) canvas (zeros outside), top row first."""
+    out = np.zeros((h, w, img.shape[2]))
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(w, x + img.shape[1]), min(h, y + img.shape[0])
+    if x1 > x0 and y1 > y0:
+        out[y0:y1, x0:x1] = img[y0 - y:y1 - y, x0 - x:x1 - x]
+    return out
+
+
+def merged_port(net, role, images, w, h):
+    """blend.glsl merged() applied to the uniforms / wiring the network produced for ``role`` (a numpy port; images:
+    node role -> float (h, w, c) top row first in that node's own size)."""
+    wired = ins(net, role)
+    acc = images[wired[0]].copy()
+    for k in range(network.MERGE_MAX):
+        mode_code, opa, ox, oy = uL(net, role, k)
+        if opa <= 0:
+            continue
+        code = int(mode_code + 0.5)
+        mi, mode = code >> 4, code & 15
+        src = place(images[wired[1 + k]], int(np.floor(ox + 0.5)), int(np.floor(oy + 0.5)), w, h)
+        inside = place(np.ones(images[wired[1 + k]].shape[:2] + (1,)), int(np.floor(ox + 0.5)), int(np.floor(oy + 0.5)), w, h)[..., 0] > 0
+        m = np.ones((h, w))
+        if mi > 0:
+            mk = images[wired[mi]]
+            m = np.where(inside, place(mk[..., :1], int(np.floor(ox + 0.5)), int(np.floor(oy + 0.5)), w, h)[..., 0], 1.0)
+            msk_inside = place(np.ones(mk.shape[:2] + (1,)), int(np.floor(ox + 0.5)), int(np.floor(oy + 0.5)), w, h)[..., 0] > 0
+            m = np.where(inside & ~msk_inside, 0.0, m)
+        comp = compose_shader(acc, src, mode, min(1.0, opa), m)
+        acc = np.where(inside[..., None], comp, acc)
+    return acc
+
+
+def _rand_layer(rng, w, h):
+    a = rng.random((h, w, 1)) * (rng.random((h, w, 1)) > 0.2)
+    return np.concatenate([rng.random((h, w, 3)) * a, a], axis=-1)
+
+
+@pytest.mark.parametrize("mode_set", [[0] * 7, list(range(7)), list(range(7, 14)), [15, 9, 8, 4, 12, 13, 3]])
+def test_merged_pass_equals_chained_passes(opt, mode_set):
+    net, comp, log, _ = opt
+    rng = np.random.default_rng(len(mode_set) + sum(mode_set))
+    k = len(mode_set)                                              # base + k <= 8 layers: ONE merged pass
+    st = [base()]
+    images = {"blank": np.zeros((H, W, 4)), "src_in1": _rand_layer(rng, W, H)}
+    lay = [dict(x=int(rng.integers(-5, 20)), y=int(rng.integers(-5, 15)), sw=int(rng.integers(10, 50)), sh=int(rng.integers(8, 40)))
+           for _ in range(k)]
+    for i in range(k):
+        masked = i % 3 == 1
+        st.append(px("p%d" % i, i + 1, blend=network.BLEND_MODES[mode_set[i]], opacity=float(rng.choice([1.0, 0.7, 0.35])),
+                     x=lay[i]["x"], y=lay[i]["y"], surfaceW=lay[i]["sw"], surfaceH=lay[i]["sh"],
+                     mask={"slot": 100 + i, "enabled": True} if masked else None))
+        images["s%d" % (i + 1)] = _rand_layer(rng, lay[i]["sw"], lay[i]["sh"])
+        if masked:
+            images["s%d" % (100 + i)] = np.concatenate([rng.random((lay[i]["sh"], lay[i]["sw"], 1))] * 4, axis=-1)
+    net.apply(st, W, H)
+    runs = [r for r in net._ops if r.startswith(("mrg_L_", "blend_L_"))]
+    out = images["blank"]
+    for r in runs:
+        images_r = dict(images)
+        images_r[ins(net, r)[0]] = out
+        out = merged_port(net, r, images_r, W, H) if r.startswith("mrg_L_") else out
+    # the chained v5 result: one general composeOver per layer in the same order, 16 bit fixed after each pass
+    ref = images["blank"].copy()
+    layers = [("src_in1", 0, 1.0, 0, 0, None)]
+    for i in range(k):
+        layers.append(("s%d" % (i + 1), mode_set[i], st[i + 1]["opacity"], lay[i]["x"], lay[i]["y"], "s%d" % (100 + i) if (i % 3 == 1) else None))
+    for name, mode, opa, x, y, mk in layers:
+        img = images[name]
+        src = place(img, x, y, W, H)
+        inside = place(np.ones(img.shape[:2] + (1,)), x, y, W, H)[..., 0] > 0
+        m = np.ones((H, W))
+        if mk:
+            m = np.where(inside, place(images[mk][..., :1], x, y, W, H)[..., 0], 1.0)
+        ref = compose_general(ref, src, mode, opa, m)
+        ref = np.round(ref * 65535) / 65535
+    # ``mrg_L_base`` covers the base too (input layer on src_in1)
+    assert np.abs(out - ref).max() < 4 / 255, np.abs(out - ref).max()      # colour-burn / dodge amplify the 16 bit steps
+    if set(mode_set) == {0}:
+        assert np.abs(out - ref).max() < 1e-4
+
+
+def test_normal_shortcut_equals_the_general_formula():
+    rng = np.random.default_rng(3)
+    below, src = _rand_layer(rng, 40, 30), _rand_layer(rng, 40, 30)
+    for opa, m in ((1.0, np.ones((30, 40))), (0.4, rng.random((30, 40))), (0.0, np.ones((30, 40)))):
+        a, b = compose_general(below, src, 0, opa, m), compose_shader(below, src, 0, opa, m)
+        assert np.abs(a - b).max() < 1e-12
+    bad = src.copy()
+    bad[..., :3] += 0.3                                                          # invalid premultiplied input (rgb > a): clamped identically
+    assert np.abs(compose_general(below, bad, 0, 0.8, np.ones((30, 40))) - compose_shader(below, bad, 0, 0.8, np.ones((30, 40)))).max() < 1e-12
+
+
+# ---- 8 bit intermediates
+
+
+def test_eight_bit_rule_suffix_of_plain_normal_blends(opt):
+    net, comp, log, _ = opt
+    net.apply([base(), px("a", 1), adj("lv", LEVELS), px("b", 2), px("c", 3, blend="multiply"), px("d", 4), px("e", 5)], W, H)
+    assert fmt(net, "mrg_L_base") == "rgba16fixed"                       # an adjustment is downstream
+    assert fmt(net, "blend_L_lv") == "rgba16fixed"                       # multiply is downstream
+    assert fmt(net, "mrg_L_b") == "rgba8fixed"                            # b, multiply c, d, e merged: nothing needs precision after
+    net.apply([base(), px("a", 1), adj("lv", LEVELS), px("b", 2), px("c", 3, blend="multiply"), adj("lv2", LEVELS), px("d", 4), px("e", 5)], W, H)
+    assert fmt(net, "mrg_L_b") == "rgba16fixed" and fmt(net, "mrg_L_d") == "rgba8fixed"
+    assert fmt(net, "blend_L_lv2") == "rgba8fixed" and plan(net)["fmt8"] == 2
+    # a non-Normal blend that is the last layer: its own output may be 8 bit (nothing reads it), what is below may not
+    net.apply([base(), px("a", 1), adj("lv", LEVELS), px("b", 2, blend="screen")], W, H)
+    assert fmt(net, "blend_L_lv") == "rgba16fixed" and fmt(net, "blend_L_b") == "rgba8fixed"
+    # a lone normal layer above an adjustment
+    net.apply([base(), adj("lv", LEVELS), px("b", 2)], W, H)
+    assert fmt(net, "blend_L_lv") == "rgba8fixed"
+
+
+def test_eight_bit_rule_groups(opt):
+    net, comp, log, _ = opt
+    st = [base(), L("g", "group"), px("x", 1, parentId="g"), px("y", 2, parentId="g"), px("z", 3)]
+    net.apply(st, W, H)
+    assert fmt(net, "mrg_L_x") == "rgba8fixed" and fmt(net, "mrg_L_base") == "rgba8fixed"          # Normal group, plain layers above
+    st[1]["blend"] = "overlay"
+    net.apply(st, W, H)
+    assert fmt(net, "mrg_L_x") == "rgba16fixed"                    # the group's inner result is the SOURCE of an overlay blend
+    st[1]["blend"] = "normal"
+    st.append(adj("lv", LEVELS))
+    net.apply(st, W, H)
+    assert fmt(net, "mrg_L_x") == "rgba16fixed" and fmt(net, "mrg_L_base") == "rgba16fixed" and fmt(net, "blend_L_lv") == "rgba8fixed"
+
+
+def test_eight_bit_error_bound_and_the_reason_for_the_rule():
+    """One 8 bit rounding between Normal blends is below 1/255; the same rounding below a colour-burn is amplified."""
+    rng = np.random.default_rng(11)
+    layers = [_rand_layer(rng, 48, 40) for _ in range(6)]
+    exact = q = np.zeros((40, 48, 4))
+    for i, l in enumerate(layers):
+        exact = compose_general(exact, l, 0, 0.8, np.ones((40, 48)))
+        q = compose_general(q, l, 0, 0.8, np.ones((40, 48)))
+        if i in (2, 5):                                                 # two merged-pass boundaries in 8 bit
+            q = np.round(q * 255) / 255
+    assert np.abs(exact - q).max() <= 1.0 / 255
+    # the same 8 bit step below a colour-burn layer
+    below = np.ones((40, 48, 4))
+    below[..., :3] = 0.97 + 0.03 * rng.random((40, 48, 3))                 # bright, opaque
+    top = np.ones((40, 48, 4))
+    top[..., :3] = 0.04                                                    # dark opaque source: burn divides by it
+    burned = compose_general(below, top, 9, 1.0, np.ones((40, 48)))
+    burned_q = compose_general(np.round(below * 255) / 255, top, 9, 1.0, np.ones((40, 48)))
+    assert np.abs(burned - burned_q).max() > 4.0 / 255
+
+
+# ---- cropped resample passes
+
+
+@pytest.mark.parametrize("kw", [dict(x=5.5, y=3.25, sx=1.5, sy=1.5), dict(x=10.0, y=8.0, rot=30.0), dict(x=4.0, y=2.0, sx=0.4, sy=0.4),
+                                dict(x=8.5, y=6.0, kx=20.0, sy=1.2, sx=0.8), dict(x=-12.0, y=-6.0, sx=2.0, sy=2.0)])
+def test_staged_layer_is_cropped_and_places_exactly(opt, kw):
+    net, comp, log, _ = opt
+    net.apply([base(), px("a", 1, surfaceW=24, surfaceH=18, **kw)], W, H)
+    box = net.content_box("a")
+    assert box is not None and "xf_L_a" in net._ops
+    x0, y0, x1, y1 = box
+    xf = net._ops["xf_L_a"]
+    pv = xf.par.value
+    assert (pv("resolutionw"), pv("resolutionh")) == (x1 - x0, y1 - y0)
+    assert pv("vec2valuex") == pytest.approx(kw.get("x", 0.0) - x0) and pv("vec2valuey") == pytest.approx(kw.get("y", 0.0) - y0)
+    assert uL(net, "mrg_L_base", 1)[2:] == (float(x0), float(y0))
+    # numpy: resample into the crop with the shifted translation == the full-size resample cropped
+    rng = np.random.default_rng(5)
+    img = _rand_layer(rng, 24, 18)
+    full = fakenet.resample_port(img[::-1], None, W, H, kw.get("x", 0.0), kw.get("y", 0.0), kw.get("sx", 1.0), kw.get("sy", 1.0),
+                                 rot=kw.get("rot", 0.0), kx=kw.get("kx", 0.0), ky=kw.get("ky", 0.0))
+    crop = fakenet.resample_port(img[::-1], None, x1 - x0, y1 - y0, kw.get("x", 0.0) - x0, kw.get("y", 0.0) - y0,
+                                 kw.get("sx", 1.0), kw.get("sy", 1.0), rot=kw.get("rot", 0.0), kx=kw.get("kx", 0.0), ky=kw.get("ky", 0.0))
+    assert np.abs(full[y0:y1, x0:x1] - crop).max() < 1e-9
+    outside = full.copy()
+    outside[y0:y1, x0:x1] = 0
+    assert np.abs(outside).max() < 1e-9                                       # nothing is lost outside the box
+
+
+def test_crop_off_when_effects_inputs_or_optimize_off(env, opt):
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1, surfaceW=24, surfaceH=18, x=5.5, sx=1.5, sy=1.5)], W, H)
+    assert net.content_box("a") is None and net._ops["xf_L_a"].par.value("resolutionw") == W
+    net, comp, log, _ = opt
+    comp.inputConnectors[0].connect(comp.in1)
+    net.apply([base(), px("a", 1, surfaceW=24, surfaceH=18, x=5.5, sx=1.5, sy=1.5, kind="input", input=1)], W, H)
+    assert net.content_box("a") is None and net._ops["xf_L_a"].par.value("resolutionw") == W      # input resolution unknown: full canvas
+
+
+def test_crop_formats_normal_8_bit_otherwise_16(opt):
+    net, comp, log, _ = opt
+    net.apply([base(), px("a", 1, surfaceW=24, surfaceH=18, x=5.5, sx=1.5, sy=1.5), px("b", 2, surfaceW=24, surfaceH=18, x=2.5, sx=1.5, sy=1.5, blend="screen")], W, H)
+    assert fmt(net, "xf_L_a") == "rgba8fixed" and fmt(net, "xf_L_b") == "rgba16fixed"
+
+
+def test_content_bounds_hint_shrinks_the_resample_pass_and_skips_empty(opt):
+    net, comp, log, _ = opt
+    st = [base(), px("a", 1, surfaceW=40, surfaceH=30, x=5.5, sx=1.5, sy=1.5), px("b", 2, surfaceW=40, surfaceH=30, x=2.5, sx=1.5, sy=1.5)]
+    net.apply(st, W, H)
+    full_a = net.content_box("a")
+    net.set_content_bounds({"a": (4.0, 4.0, 12.0, 10.0), "b": None})
+    assert net._prev_layers is None                                       # the next apply() re-plans
+    net.apply(st, W, H)
+    tight = net.content_box("a")
+    assert (tight[2] - tight[0]) < (full_a[2] - full_a[0]) and "b" not in plan(net)["skip_reasons"] and plan(net)["skip_reasons"] == {"outside": 1}
+    net.set_content_bounds({"a": (4.0, 4.0, 12.0, 10.0), "b": None})      # identical hint: no re-plan
+    snap = net._prev_layers
+    net.set_content_bounds({"a": (4, 4, 12, 10), "b": ()})
+    assert net._prev_layers == snap
+    net.set_content_bounds({})
+    net.apply(st, W, H)
+    assert net.content_box("a") == full_a and plan(net)["skipped"] == 0
+
+
+# ---- blur pyramid
+
+
+def test_blur_shrink_factor_and_sigma_band():
+    assert network.blur_shrink(0) == 1 and network.blur_shrink(6.9) == 1
+    for r, s in ((7, 2), (13.9, 2), (14, 4), (27, 4), (28, 8), (56, 16), (100, 16), (200, 32), (400, 64), (1000, 256)):
+        assert network.blur_shrink(r) == s, r
+    for r in (7, 9, 20, 55, 100, 150, 399, 700):
+        sigma = r / network.blur_shrink(r)
+        assert 3.5 <= sigma < 7.0 + 1e-9
+
+
+def test_blur_pyramid_nodes_and_legacy_path(opt, env):
+    net, comp, log, _ = opt
+    net.apply([base(), px("a", 1), adj("b", {"type": "blur", "radius": 100})], 1920, 1080)
+    assert ins(net, "adj_L_b")[0] == "adj_L_b_dn" and ins(net, "adj_L_b_dn")[0] == "mrg_L_base"
+    assert ins(net, "adj_L_b_up")[0] == "adj_L_b" and source_of(net, "blend_L_b", 1) == "adj_L_b_up"
+    dn, bl, up = (net._ops[n].par.value for n in ("adj_L_b_dn", "adj_L_b", "adj_L_b_up"))
+    size = round(100 / 16 * network.BLUR_SIZE_PER_RADIUS)
+    k = size + 1
+    assert (dn("resolutionw"), dn("resolutionh")) == (120 + 2 * k, 68 + 2 * k) and dn("vec0valuew") == network.ADJ_SHRINK
+    assert dn("vec1valuex") == 16.0 and dn("vec2valuex") == float(k) and net._ops["adj_L_b_dn"].OPType == "glslTOP"
+    assert (up("resolutionw"), up("resolutionh")) == (1920, 1080) and up("inputfiltertype") == "linear" and up("vec0valuew") == network.ADJ_ENLARGE
+    assert up("vec1valuex") == 16.0 and up("vec2valuex") == float(k)
+    assert bl("size") == size and bl("preshrink") == 1 and bl("extend") == "hold"
+    assert all(net._ops[n].par.value("format") == "rgba16float" for n in ("adj_L_b_dn", "adj_L_b", "adj_L_b_up"))
+    # cost of the filter no longer depends on the radius
+    net.apply([base(), px("a", 1), adj("b", {"type": "blur", "radius": 400})], 1920, 1080)
+    assert net._ops["adj_L_b"].par.value("size") == round(400 / 64 * network.BLUR_SIZE_PER_RADIUS)
+    net.apply([base(), px("a", 1), adj("b", {"type": "blur", "radius": 5})], 1920, 1080)     # small radii: the single Blur TOP
+    assert "adj_L_b_dn" not in net._ops and net._ops["adj_L_b"].par.value("preshrink") == 1
+    net, comp, log, _ = env
+    net.apply([base(), px("a", 1), adj("b", {"type": "blur", "radius": 100})], 1920, 1080)   # optimize off: v5 preshrink
+    assert "adj_L_b_dn" not in net._ops and net._ops["adj_L_b"].par.value("preshrink") == 8
+
+
+def shrink_port(img, s, k):
+    """numpy port of shrinkPass() (texel space, edge hold): mean of the clamped s x s block of every padded cell."""
+    h, w = img.shape[:2]
+    gh, gw = -(-h // s) + 2 * k, -(-w // s) + 2 * k
+    ys = np.clip((np.arange(gh)[:, None] - k) * s + np.arange(s)[None, :], 0, h - 1)
+    xs = np.clip((np.arange(gw)[:, None] - k) * s + np.arange(s)[None, :], 0, w - 1)
+    return np.stack([[img[ys[j]][:, xs[i]].mean(axis=(0, 1)) for i in range(gw)] for j in range(gh)])
+
+
+def test_pyramid_shrink_pad_cells_are_the_edge_pixels_not_block_means():
+    """The reason for the padded GLSL shrink: with a mipmapped downsample the cell outside the image would be the mean of the
+    s x s border block; here it is the mean of clamped (repeated) edge pixels."""
+    img = np.zeros((32, 32, 1))
+    img[:2, :, 0] = 1.0                                         # two bright rows on the border
+    g = shrink_port(img, 16, 2)
+    assert g.shape == (6, 6, 1)
+    assert g[1, 3, 0] == pytest.approx(1.0)                      # pad cell below the border: the repeated edge row, fully bright
+    assert g[2, 3, 0] == pytest.approx(2 / 16)                   # first real cell: the block mean
+    assert g[0, 0, 0] == pytest.approx(1.0)                      # corner pad: the corner texel
+
+
+def test_blur_pyramid_tracks_document_size(opt):
+    net, comp, log, _ = opt
+    st = [base(), adj("b", {"type": "blur", "radius": 64})]
+    net.apply(st, 1000, 500)
+    k = net._ops["adj_L_b_dn"].par.value("vec2valuex")
+    assert (net._ops["adj_L_b_dn"].par.value("resolutionw"), net._ops["adj_L_b_dn"].par.value("resolutionh")) == (63 + 2 * k, 32 + 2 * k)
+    net.apply(st, 640, 480)
+    assert (net._ops["adj_L_b_dn"].par.value("resolutionw"), net._ops["adj_L_b_dn"].par.value("resolutionh")) == (40 + 2 * k, 30 + 2 * k)
+    assert net._ops["adj_L_b_up"].par.value("resolutionw") == 640
+
+
+# ---- pools
+
+
+def test_multi_pool_is_topped_up_recycled_and_adopted(opt):
+    net, comp, log, clock = opt
+    settle(net)
+    for _ in range(40):
+        net.tick()
+    assert net.stats()["mpool"] == network.MPOOL_TARGET
+    m = log.mark()
+    net.apply([base(), px("a", 1), px("b", 2)], W, H)
+    d = log.since(m)
+    assert not [c for c in d["creates"] if c[0] == "glslmultiTOP"]                      # served from the spare pool
+    assert net.stats()["last"]["recycled"] >= 1
+    for _ in range(40):
+        net.tick()
+    assert net.stats()["mpool"] == network.MPOOL_TARGET
+    net.apply([base()], W, H)                                                           # the merged node goes back to the pool
+    assert "mrg_L_base" not in net._ops
+    # a second DocNetwork adopts the tagged multi node of the first without creating anything
+    net.apply([base(), px("a", 1), px("b", 2)], W, H)
+    settle(net)
+    net2 = DocNetwork(comp, GLSL, clock=clock)
+    m = log.mark()
+    net2.apply([base(), px("a", 1), px("b", 2)], W, H)
+    assert not [c for c in log.since(m)["creates"] if c[0] in ("glslmultiTOP", "glslTOP")]
+    assert source_of(net2, "out") == "mrg_L_base"
+
+
+def test_visibility_toggle_costs_few_operations(opt):
+    net, comp, log, _ = opt
+    st = [base()] + [px("p%d" % i, i) for i in range(1, 20)]
+    net.apply(st, W, H)
+    settle(net)
+    for _ in range(40):
+        net.tick()
+    m = log.mark()
+    st[5]["visible"] = False
+    net.apply(st, W, H)
+    d = log.since(m)
+    assert not d["creates"] and len(d["connects"]) + len(d["disconnects"]) < 100 and len(d["par_sets"]) < 80
+    m = log.mark()
+    st[5]["visible"] = True
+    net.apply(st, W, H)
+    assert not log.since(m)["creates"]
+
+
+def test_default_construction_matches_the_ext_call_and_public_api():
+    comp, log = fakenet.make_comp()
+    net = DocNetwork(comp, GLSL)                          # exactly how ext.py constructs it
+    net.apply([base(), px("a", 1)], W, H)
+    net.set_inputs({1: True})
+    assert net.output() is not None and net.slots() == [1] and net.surface_top(1) is not None
+    assert set(net.stats()) >= {"nodes", "surfaces", "pool", "mpool", "plan", "last", "totals"}
+
+
+def test_spares_are_prewarmed_when_idle_only_once_and_wiring_is_replaced(opt):
+    net, comp, log, clock = opt
+    net.apply([base(), px("a", 1)], W, H)
+    for _ in range(40):
+        net.tick()
+    spares = [o for o, c in net._pool + net._mpool]
+    assert spares and all(o.cooks == 0 for o in spares)            # an apply() just happened: nothing is pre-cooked yet
+    clock.t += 1.0
+    for _ in range(60):
+        net.tick()
+    warmed = [(o, c) for o, c in net._pool + net._mpool if c.get("warm")]
+    assert len(warmed) == len(net._pool) + len(net._mpool) and all(o.cooks == 1 for o, _ in warmed)
+    assert all(len([k for k in o.inputConnectors if k.source is not None]) == (16 if o.OPType == "glslmultiTOP" else 3) for o, _ in warmed)
+    n_cooks = sum(o.cooks for o, _ in warmed)
+    for _ in range(20):
+        net.tick()
+    assert sum(o.cooks for o, _ in net._pool + net._mpool) == n_cooks          # never twice
+    # a warmed spare is rewired by the first real use
+    net.apply([base(), px("a", 1), px("b", 2)], W, H)
+    assert ins(net, "mrg_L_base")[:2] == ["blank", "src_in1"]
+
+
+def test_shift_shape_spec_and_cropped_shape_node(opt):
+    spec = dict(RECT, x=40, y=30, w=10, h=8)
+    sh = network.shift_shape_spec(spec, -35, -25)
+    assert (sh["x"], sh["y"], sh["w"], sh["h"]) == (5, 5, 10, 8) and spec["x"] == 40
+    ln = network.shift_shape_spec({"type": "line", "x1": 5, "y1": 6, "x2": 9, "y2": 10}, -1, -2)
+    assert (ln["x1"], ln["y1"], ln["x2"], ln["y2"]) == (4, 4, 8, 8)
+    net, comp, log, _ = opt
+    net.apply([base(), shp("s", spec)], 200, 100)
+    box = net.content_box("s")
+    assert box == network.shape_box(spec, 200, 100) and "shapec_s" in net._ops and "shape_s" not in net._ops
+    cw, ch = box[2] - box[0], box[3] - box[1]
+    pv = net._ops["shapec_s"].par.value
+    assert (pv("resolutionw"), pv("resolutionh")) == (cw, ch)
+    # TD-space uniforms of the cropped node == the full node's, moved by the box origin (y flipped)
+    full = network.shape_uniforms(spec, 100)
+    assert pv("vec1valuex") == pytest.approx(full["vec1valuex"] - box[0])
+    assert pv("vec1valuey") == pytest.approx(full["vec1valuey"] - (100 - box[3]))
+    assert uL(net, "mrg_L_base", 1)[2:] == (float(box[0]), float(box[1]))
+    assert source_of(net, "out") == "mrg_L_base" and ins(net, "mrg_L_base")[2] == "shapec_s"
+    # the Flatten source stays the full document-size node
+    tok0 = net.render_layer_token("s")
+    flat = net.render_layer_source("s")                          # built lazily, pooled, uncooked
+    assert flat is net._ops["shape_s"] and flat.par.value("resolutionw") == 200 and flat.par.value("resolutionh") == 100
+    assert flat.par.value("vec1valuex") == pytest.approx(network.shape_uniforms(spec, 100)["vec1valuex"])
+    assert net.render_layer_token("s") is not None and net.render_layer_token("s") == net.render_layer_token("s")
+    net.apply([base(), shp("s", spec)], 200, 100)
+    assert net.render_layer_source("s") is flat and "shapec_s" in net._ops             # kept, still cropped
+    net.apply([base()], 200, 100)
+    assert "shape_s" not in net._ops and "s" not in net._flat_want
+    # a mask, a big shape or effects: no crop
+    net.apply([base(), shp("s", dict(spec, w=190, h=90, x=2, y=2)), shp("m", spec, mask={"slot": 3, "enabled": True})], 200, 100)
+    assert "shapec_s" not in net._ops and "shapec_m" not in net._ops
+
+
+def test_active_layer_hint_splits_merged_runs(opt):
+    net, comp, log, _ = opt
+    st = [base()] + [px("p%d" % i, i) for i in range(1, 8)]
+    net.apply(st, W, H)
+    assert [r for r in net._ops if r.startswith(("mrg_L_", "blend_L_"))] == ["mrg_L_base"]
+    net.set_active_layer("p4")
+    assert net._prev_layers is None
+    net.apply(st, W, H)
+    assert [r for r in net._ops if r.startswith(("mrg_L_", "blend_L_"))] == ["mrg_L_base", "blend_L_p4", "mrg_L_p5"]
+    assert source_of(net, "blend_L_p4", 0) == "mrg_L_base" and source_of(net, "mrg_L_p5", 0) == "blend_L_p4"
+    net.set_active_layer("p4")                                   # same layer: no re-plan
+    snap = net._prev_layers
+    net.set_active_layer("p4")
+    assert net._prev_layers == snap
+    net.set_active_layer(None)
+    net.apply(st, W, H)
+    assert [r for r in net._ops if r.startswith(("mrg_L_", "blend_L_"))] == ["mrg_L_base"]
+
+
+def test_content_bounds_hint_validation_and_pruning(opt):
+    net, comp, log, _ = opt
+    st = [base(), px("a", 1, surfaceW=40, surfaceH=30, x=5.5, sx=1.5, sy=1.5)]
+    net.apply(st, W, H)
+    full = net.content_box("a")
+    net.set_content_bounds({"a": (5, 5, 5, 9), "zz": ("x", 1, 2, 3), "bad": 7, "nan": (0, 0, float("nan"), 3)})
+    assert net._hints == {}                                  # degenerate / non-numeric entries are dropped, nothing skips
+    net.set_content_bounds(None)
+    net.set_content_bounds({"a": (4.0, 4.0, 12.0, 10.0), "gone": (0, 0, 5, 5), "e": None})
+    assert net._hints["e"] == network.EMPTY_HINT and set(net._hints) == {"a", "gone", "e"}
+    net.apply(st, W, H)
+    assert set(net._hints) == {"a"} and net.content_box("a") != full          # stale ids pruned
+    net.set_content_bounds({"a": ()})
+    net.apply(st, W, H)
+    assert plan(net)["skip_reasons"] == {"outside": 1}
+
+
+def test_shape_crop_hysteresis(opt):
+    net, comp, log, _ = opt
+    mk = lambda w: [base(), shp("s", dict(RECT, x=10, y=10, w=w, h=50, stroke=NOSTROKE))]
+    net.apply(mk(60), 200, 100)                                  # 64 x 54 box: 17 % of the canvas -> cropped
+    assert "shapec_s" in net._ops
+    # canvas 200x100 = 20000 px: 0.5 -> box area 10000; 0.65 -> 13000
+    net.apply(mk(150), 200, 100)                                 # 154 x 54 = 8316 <= 10000 still cropped
+    assert "shapec_s" in net._ops
+    net.apply(mk(170), 200, 100)                                 # 174 x 54 = 9396 <= 10000 cropped
+    net.apply(mk(190), 200, 100)                                 # 194 x 54 = 10476: above 0.5 but below 0.65 -> stays cropped
+    assert "shapec_s" in net._ops
+    net.apply(mk(260), 200, 100)                                 # clipped to the canvas: 200 x 54 = 10800 -> still cropped
+    assert "shapec_s" in net._ops
+    net.apply([base(), shp("s", dict(RECT, x=0, y=0, w=200, h=100, stroke=NOSTROKE))], 200, 100)      # whole canvas: full node
+    assert "shapec_s" not in net._ops and "shape_s" in net._ops
+    net.apply(mk(190), 200, 100)                                 # re-entering needs <= 50 %: 10476 > 10000 stays full
+    assert "shapec_s" not in net._ops and "shape_s" in net._ops
+
+
+def test_dropped_multi_nodes_keep_their_16_connections(opt):
+    net, comp, log, _ = opt
+    net.apply([base(), px("a", 1), px("b", 2)], W, H)
+    op = net._ops["mrg_L_base"]
+    net.apply([base()], W, H)
+    assert "mrg_L_base" not in net._ops
+    assert len([c for c in op.inputConnectors if c.source is not None]) == 16            # nothing disconnected on drop
+    m = log.mark()
+    net.apply([base(), px("a", 1), px("b", 2)], W, H)
+    d = log.since(m)
+    mine = lambda lst: [x for x in lst if x[0] == op.name]
+    assert net._ops["mrg_L_base"] is op and not mine(d["disconnects"]) and len(mine(d["connects"])) <= 3        # only what differs
+    assert ins(net, "mrg_L_base")[:3] == ["blank", "src_in1", "s1"]
+
+
+def test_blur_radius_is_clamped_to_the_web_limit(opt):
+    net, comp, log, _ = opt
+    net.apply([base(), adj("b", {"type": "blur", "radius": 900})], 1920, 1080)
+    net.apply([base(), adj("c", {"type": "blur", "radius": 200})], 1920, 1080)
+    c200 = (net._ops["adj_L_c"].par.value("size"), net._ops["adj_L_c_dn"].par.value("vec1valuex"))
+    net.apply([base(), adj("b", {"type": "blur", "radius": 900})], 1920, 1080)
+    assert (net._ops["adj_L_b"].par.value("size"), net._ops["adj_L_b_dn"].par.value("vec1valuex")) == c200
+    assert network.adjustment_plan({"type": "blur", "radius": 5000}, "z").nodes[0][3] is False
+    assert network.adjustment_plan({"type": "blur", "radius": 5000}, "z").nodes[0][2]["size"] == round(200 * network.BLUR_SIZE_PER_RADIUS / 8)
+
+
+def test_materialised_lazy_shape_persists_with_the_same_op_and_token(opt):
+    net, comp, log, _ = opt
+    spec = dict(RECT, x=40, y=30, w=10, h=8)
+    st = [base(), shp("s", spec)]
+    net.apply(st, 200, 100)
+    assert "shape_s" not in net._ops
+    flat = net.render_layer_source("s")
+    tok = net.render_layer_token("s")
+    assert "s" in net._flat_want and tok is not None
+    for opacity in (1.0, 0.5):                                            # unrelated edits and plain re-applies
+        st[1]["opacity"] = opacity
+        net.apply(st, 200, 100)
+        assert net._ops["shape_s"] is flat and net.render_layer_source("s") is flat
+        assert net.render_layer_token("s") == tok
+    st[1]["visible"] = False                                              # hidden: still there
+    net.apply(st, 200, 100)
+    assert net.render_layer_source("s") is flat and net.render_layer_token("s") == tok
+    st[1]["shape"] = dict(spec, w=12)                                     # an edit of the layer's own spec changes the token
+    net.apply(st, 200, 100)
+    assert net.render_layer_source("s") is flat and net.render_layer_token("s") != tok
+
+
+# ---- blur pyramid shaders: text pins + numpy ports
+
+
+def enlarge_port(grid, s, k, out_w, out_h):
+    """numpy port of enlargePass(): bilinear (clamp) at ((x + .5) / s + k) / gridSize, texel space."""
+    gh, gw = grid.shape[:2]
+    xs, ys = (np.arange(out_w) + 0.5) / s + k, (np.arange(out_h) + 0.5) / s + k
+    fx, fy = xs - 0.5, ys - 0.5
+    x0, y0 = np.floor(fx).astype(int), np.floor(fy).astype(int)
+    tx, ty = (fx - x0)[None, :, None], (fy - y0)[:, None, None]
+    g = lambda yy, xx: grid[np.clip(yy, 0, gh - 1)[:, None], np.clip(xx, 0, gw - 1)[None, :]]
+    return (g(y0, x0) * (1 - tx) * (1 - ty) + g(y0, x0 + 1) * tx * (1 - ty) + g(y0 + 1, x0) * (1 - tx) * ty + g(y0 + 1, x0 + 1) * tx * ty)
+
+
+def _gauss(img, sigma):
+    r = int(np.ceil(sigma * 4))
+    k = np.exp(-np.arange(-r, r + 1) ** 2 / (2 * sigma * sigma))
+    k /= k.sum()
+    for ax in (0, 1):
+        pad = [(0, 0)] * 3
+        pad[ax] = (r, r)
+        p = np.pad(img, pad, mode="edge")
+        img = sum(k[i] * np.take(p, np.arange(i, i + img.shape[ax]), axis=ax) for i in range(len(k)))
+    return img
+
+
+@pytest.mark.parametrize("w,h,s", [(96, 80, 4), (100, 70, 8), (130, 65, 16)])
+def test_pyramid_shrink_blur_enlarge_matches_a_direct_gaussian_incl_border(w, h, s):
+    rng = np.random.default_rng(w + s)
+    img = np.zeros((h, w, 4))
+    img[..., 3] = 1.0
+    img[:3, :, :3] = 1.0
+    img[:, -2:, 0] = 1.0
+    img[h // 3:2 * h // 3, w // 4:w // 2, :3] = rng.random(3)
+    sigma = 3.5 * s
+    size = round(sigma * network.BLUR_SIZE_PER_RADIUS / s)
+    k = size + 1
+    grid = _gauss(shrink_port(img, s, k), sigma / s)
+    out = enlarge_port(grid, s, k, w, h)
+    ref = _gauss(img, sigma)
+    assert np.abs(out - ref).max() * 255 < 12, np.abs(out - ref).max() * 255
+    bad = enlarge_port(grid, s, 0, w, h)                    # the mutation: no k offset in enlarge
+    assert np.abs(bad - ref).max() * 255 > 12
+    wrong_shrink = _gauss(shrink_port(img, s, k + 1), sigma / s)       # shrink grid and enlarge disagree on k
+    assert np.abs(enlarge_port(wrong_shrink, s, k, w, h) - ref).max() * 255 > 12
+
+
+PYRAMID_PINS = {
+    "shrink -k offset": "ivec2 o = (ivec2(gl_FragCoord.xy) - ivec2(k)) * s;",
+    "shrink clamp x": "int xx = clamp(o.x + x, 0, src.x - 1);",
+    "shrink clamp y": "int yy = clamp(o.y + y, 0, src.y - 1);",
+    "shrink mean": "fragColor = TDOutputSwizzle(sum / n);",
+    "enlarge k offset": "vec2 q = (gl_FragCoord.xy / s) + vec2(k);",
+    "enlarge grid uv": "texture(sTD2DInputs[0], q / grid)",
+    "pass dispatch": "if (uParams.w > 9.5) { enlargePass(); return; }",
+}
+
+
+def test_pyramid_glsl_pins_present():
+    for name, text in PYRAMID_PINS.items():
+        assert text in GLSL, name
+
+
+@pytest.mark.parametrize("pin,old,new", [
+    ("shrink -k offset", "ivec2(gl_FragCoord.xy) - ivec2(k)", "ivec2(gl_FragCoord.xy)"),
+    ("shrink clamp x", "clamp(o.x + x, 0, src.x - 1)", "o.x + x"),
+    ("shrink clamp y", "clamp(o.y + y, 0, src.y - 1)", "o.y + y"),
+    ("shrink mean", "sum / n", "sum"),
+    ("enlarge k offset", "+ vec2(k);", ";"),
+    ("enlarge grid uv", "q / grid", "q"),
+    ("pass dispatch", "uParams.w > 9.5", "uParams.w > 10.5"),
+])
+def test_pyramid_shader_mutations_are_caught(pin, old, new):
+    assert old in GLSL
+    mutated = GLSL.replace(old, new, 1)
+    assert mutated != GLSL and pin in [k for k, v in PYRAMID_PINS.items() if v not in mutated]

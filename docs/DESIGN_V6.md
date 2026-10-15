@@ -26,6 +26,57 @@ Builds on `DESIGN_V5.md`. Phase A starts while v5 finishes (isolated files); pha
   multi-input pass for runs of plain Normal layers, pre-warmed resample/pool nodes, TD Blur TOP / pyramid
   for adjustment blur. Measured with `scripts/perf_td.py` at 4K/34 layers vs `docs/HARDENING.md`.
 
+### 2.1 TD performance: implemented design (network.py / blend.glsl)
+
+`DocNetwork(..., optimize=True)` (default; `optimize=False` = the v5 network, kept for A/B). Everything below is internal to
+`network.py`; the ext-facing API is unchanged. Measured with `scripts/perf_td.py --ref WORKTREE [--no-opt] [--w 1920 --h 1080]`;
+parity with `scripts/network_dev.py all` (new section `v6`: the v6 network against a second `optimize=False` network).
+
+**What TD offers.** A TOP owns its output texture, there is no scissor / viewport / in-place update on a GLSL TOP, and the plain
+GLSL TOP has at most 3 inputs. So a "cropped pass + composite back" costs the full-frame pass it tries to avoid. The savings
+come from (a) fewer full-frame passes (merging) and (b) smaller *source* textures (cropping resample / shape passes), plus
+shader early-outs outside each layer's rect.
+
+* **Skip rules** (no blend pass; sources / surfaces stay, uncooked): hidden, opacity <= 0, pixel layer without slot / input layer
+  on a disconnected input / singular matrix, content outside the canvas (or an empty content hint), text without printable
+  characters or alpha 0, shape without enabled fill / stroke with alpha, empty group (or all children skipped), no-op adjustment
+  (blur < 0.1 px, unknown type). Surfaces (`s<slot>`) and the text / shape nodes behind Flatten always exist.
+* **Bounds.** `layer_box` = transformed surface rect (`affine_box`) clipped to the canvas, 1 px pad (partial coverage; with a hint
+  also the filter reach); `shape_box` = rotated geometry + half stroke + arrowhead reach (1.1 x H) + 2 px AA, clipped; text / group /
+  adjustment / input layers: whole canvas (input resolution is not known at plan time; text bounds need measured glyph widths: gap).
+  A transformed pixel layer's resample pass `xf_L_<id>` renders only its box (custom resolution; `uA.xy` shifted by the box origin) and
+  the blend places it at the integer box origin; a shape with a box < half the canvas (no mask / effects) renders into a second,
+  cropped node `shapec_<id>` (same shader, shifted uniforms); the full-size `shape_<id>` stays the Flatten source (never cooked by
+  the blend). Optional hint API: `set_content_bounds({id: (x0,y0,x1,y1)|None})` (layer pixels, must be a superset of the
+  non-transparent pixels; takes effect at the next apply); `content_box(id)` reports the box used.
+* **Merged passes.** Runs of consecutive plain layers (pixel / input / text / shape / group; any blend mode, masks, opacity, integer
+  offsets; up to 8 layers, 7 masks) become ONE `mrg_L_<first id>` **GLSL Multi TOP** (`blend.glsl` uAdjust 8; slot uniforms
+  `uL0..uL7` = (mode + 16 x mask input, opacity, x, y)). It always has 16 wired inputs (blank padding) because TD recompiles the
+  shader whenever the input count changes (~15 ms). The accumulator stays float32 across the run; each slot reads only its own
+  rect and skips transparent texels; Normal uses the division-free source-over. Adjustments end a run and keep their own pass; a
+  single leftover layer keeps `blend_L_<id>`. Optional `set_active_layer(id)` splits runs around the layer being edited.
+* **8 bit rule.** A pass's output is `rgba8fixed` iff everything downstream (later items of the chain, and for a group chain the
+  group's own blend and everything above the group) is a plain Normal blend; Normal source-over never amplifies an input error and
+  the browser canvas is 8 bit too. Anything that divides by alpha / colour (non-Normal modes, adjustments' unpremultiply, blur,
+  effects) keeps `rgba16fixed` inputs (colour-burn amplifies an 8 bit step to > 4/255; tested). Cropped resample passes are 8 bit
+  for Normal layers.
+* **Blur pyramid.** Radius >= 7: `adj_L_<id>_dn` (GLSL, blend.glsl uAdjust 9: padded grid of ceil(w/s)+2k cells, each the mean of the
+  s x s source block with coordinates clamped to the image = exact edge hold) -> `adj_L_<id>` (Blur TOP, size = r/s x 4.698, k = size+1
+  pad cells so no extend mode is needed) -> `adj_L_<id>_up` (GLSL uAdjust 10, bilinear at ((x+.5)/s + k)), s = 2^floor(log2(r / 3.5)).
+  Cost ~constant (4K: ~0.5 ms for r = 8..100, ~5 ms at r = 400 vs 4.4 / 12 / 245 ms). Parity vs a numpy gaussian with edge hold:
+  <= 9/255 on test images (radii 7..200) and 5.5/255 with thin bright bands ON the document border (v5 Blur TOP: 4..9, and 131 on
+  the border bands). Not converged with blurlib's variance-compensated pyramid.
+* **Pre-warmed spares.** Spare GLSL TOPs (3 inputs) and Multi TOPs (16 inputs) are cooked once against a 16x16 constant
+  (`warm_in`) from `tick()` after >= 0.3 s without `apply()`; their first real use no longer compiles the shader.
+* **Cache of the stack below the edit.** TD already cooks only nodes downstream of a change; nothing else recooks the chain
+  (checked: parameter sets touch only the edited node; idle cooks 0 nodes). Edit cost is therefore (passes from the edited layer
+  up); fewer passes make it cheaper (table in the report). Remaining whole-chain triggers are inherent: a changed input wiring below,
+  a format change, a resolution change, an inserted / removed / reordered layer (also shifts merge boundaries).
+
+Gaps / follow-ups: text layers are not cropped (Flatten and metrics refresh need the document-size Text TOP; bounds need glyph
+metrics); group results and adjustment / effect layers are full-canvas; the ext does not yet call `set_content_bounds` /
+`set_active_layer`; the Script TOP upload (`OnSurfaceCook` copies the whole buffer) is ext-side and untouched.
+
 ## 3. Phase B (after v5 commit)
 
 Engine (selection-limited adjustments, effects on groups/adjustments, brush presets + textured tips +

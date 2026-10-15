@@ -1,6 +1,6 @@
 """Live harness for td/raster_editor/network.py (blend.glsl + DocNetwork) inside TouchDesigner.
 
-    .venv/bin/python scripts/network_dev.py [all|blend|adjust|misc|perf|view|persist|shapes|shapes-gl|text|v3perf] [--keep]
+    .venv/bin/python scripts/network_dev.py [all|blend|adjust|misc|perf|view|persist|shapes|shapes-gl|text|v3perf|v6] [--keep]
 
 Works only inside the scratch COMP ``/project1/_netdev`` (created and destroyed here).  A stand-in
 for the extension (``Stub.OnSurfaceCook``) serves surface buffers that this script uploads.  Nothing
@@ -19,6 +19,7 @@ Checks (each prints PASS/FAIL with numbers):
   shapes-gl  same, offline: shape.glsl in headless Chromium WebGL2 (no TouchDesigner)
   text    v3 text layers vs Chromium Canvas 2D (textShape.ts conventions): bbox +-2 px, coverage IoU
   v3perf  apply() timings for text/shape edits, GPU cost per layer @1080p
+  v6      v6 performance network (merged passes, bounding boxes, skip rules, 8 bit, blur pyramid) vs the v5 network
 """
 
 from __future__ import annotations
@@ -88,17 +89,11 @@ def _st(): return sys.modules["re_state"]
 
 def setup(doc_w: int = 64, doc_h: int = 64) -> None:
     """(Re)create the scratch COMP, the stand-in extension and a DocNetwork."""
-    net_src = open(os.path.join(ROOT, "td", "raster_editor", "network.py"), encoding="utf-8").read()
-    glsl_src = open(os.path.join(ROOT, "td", "raster_editor", "blend.glsl"), encoding="utf-8").read()
-    shape_src = open(os.path.join(ROOT, "td", "raster_editor", "shape.glsl"), encoding="utf-8").read()
-    fx_src = open(os.path.join(ROOT, "td", "raster_editor", "effects.py"), encoding="utf-8").read()
+    # The sources are read by TD itself (this machine): network.py + effects.py + shaders no longer fit the 200 kB
+    # limit of one td_call.
+    raster_dir = os.path.join(ROOT, "td", "raster_editor")
     fx_dir = os.path.join(ROOT, "shared", "effects")
-    fx_common, fx_bodies = "", {}
-    if os.path.isfile(os.path.join(fx_dir, "common.glsl")):
-        fx_common = open(os.path.join(fx_dir, "common.glsl"), encoding="utf-8").read()
-        for t in ("dropShadow", "outerGlow", "innerGlow", "stroke", "bevel", "colorOverlay", "pixelSort", "glitch",
-                  "chromaticAberration", "halftone"):
-            fx_bodies[t] = open(os.path.join(fx_dir, t + ".glsl"), encoding="utf-8").read()
+    opt_arg = ", optimize=False" if os.environ.get("NETDEV_OPT", "1") == "0" else ""      # NETDEV_OPT=0: the v5 node-per-layer network
     code = PRELUDE + f'''
 p = op("/project1")
 if p.op("_netdev"): p.op("_netdev").destroy()
@@ -128,17 +123,19 @@ c.initializeExtensions()
 def _load(name, src):
     m = types.ModuleType(name); m.__dict__["__name__"] = name
     exec(compile(src, name, "exec"), m.__dict__); sys.modules[name] = m; return m
-GLSL_SRC = {glsl_src!r}
-FX_COMMON = {fx_common!r}
-FX_BODIES = {fx_bodies!r}
-net_mod = _load("re_network", {net_src!r})
-fx_mod = _load("re_effects", {fx_src!r})
+import os
+def _rd(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+GLSL_SRC = _rd({os.path.join(raster_dir, "blend.glsl")!r})
+net_mod = _load("re_network", _rd({os.path.join(raster_dir, "network.py")!r}))
+fx_mod = _load("re_effects", _rd({os.path.join(raster_dir, "effects.py")!r}))
 st = types.ModuleType("re_state"); sys.modules["re_state"] = st
 st.buffers = {{}}
 st.net_mod = net_mod
 st.glsl = GLSL_SRC
 st.comp = c
-st.net = net_mod.DocNetwork(c, GLSL_SRC, shape_glsl={shape_src!r}, effects=fx_mod, effect_shaders={{t: FX_COMMON + chr(10) + b for t, b in FX_BODIES.items()}})
+st.net = net_mod.DocNetwork(c, GLSL_SRC, shape_glsl=_rd({os.path.join(raster_dir, 'shape.glsl')!r}), effects=fx_mod, effect_shaders=fx_mod.load_shader_texts({fx_dir!r}){opt_arg})
 st.w, st.h = {doc_w}, {doc_h}
 _emit("ok")
 '''
@@ -937,7 +934,7 @@ _emit(1)
         code = PRELUDE + """
 st = _st(); net = st.net
 tops = [c for c in net.doc.children if c.isTOP]
-kinds = ("glslTOP", "levelTOP", "hsvadjustTOP", "blurTOP", "thresholdTOP")
+kinds = ("glslTOP", "glslmultiTOP", "levelTOP", "hsvadjustTOP", "blurTOP", "thresholdTOP")
 g = sum(c.gpuCookTime for c in tops if c.OPType in kinds)
 cpu = sum(c.cookTime for c in tops)
 by = {(c.comment or c.name): round(c.gpuCookTime, 3) for c in tops if c.gpuCookTime > 0.15}
@@ -1604,7 +1601,7 @@ _emit(1)
         code = PRELUDE + """
 net = _st().net
 tops = [c for c in net.doc.children if c.isTOP]
-g = sum(c.gpuCookTime for c in tops if c.OPType == "glslTOP")
+g = sum(c.gpuCookTime for c in tops if c.OPType in ("glslTOP", "glslmultiTOP"))
 net.surface_top(1).cook(force=True)
 net.output().cook(force=True)
 _emit({"g": g})
@@ -1671,7 +1668,7 @@ _emit(1)
         code = PRELUDE + """
 st = _st(); net = st.net
 tops = [c for c in net.doc.children if c.isTOP]
-g = sum(c.gpuCookTime for c in tops if c.OPType == "glslTOP")
+g = sum(c.gpuCookTime for c in tops if c.OPType in ("glslTOP", "glslmultiTOP"))
 net.surface_top(1).cook(force=True)
 net.output().cook(force=True)
 _emit({"g": g})
@@ -2498,6 +2495,236 @@ _emit({"g": g, "cpu": cpu, "n": len(mine)})
     check("v3 perf: adding a shape / text layer < 10 ms", max(r["ms"], r2["ms"]) < 10.0, f"{r['ms']:.2f} / {r2['ms']:.2f} ms")
 
 
+# --------------------------------------------------------------------------- checks: v6 performance network (A/B vs v5)
+
+
+def setup_legacy() -> None:
+    """A second DocNetwork ``st.net2`` in /project1/_netdev/legacy with ``optimize=False`` (the v5 network: one 16 bit
+    pass per layer) sharing the surface buffers of the stand-in extension -- the reference the v6 network is compared to."""
+    raster_dir = os.path.join(ROOT, "td", "raster_editor")
+    td(PRELUDE + f"""
+st = _st()
+c = op("/project1/_netdev")
+c2 = c.create(baseCOMP, "legacy")
+c2.par.parentshortcut = "RasterEditor"
+c2.par.ext0object = "op('/project1/_netdev/ext_stub').module.Stub(me)"
+c2.par.ext0name = "Stub"
+c2.par.ext0promote = 1
+c2.initializeExtensions()
+st.net2 = st.net_mod.DocNetwork(c2, st.glsl, shape_glsl=open({os.path.join(raster_dir, 'shape.glsl')!r}, encoding="utf-8").read(), optimize=False)
+_emit("ok")
+""")
+
+
+def upload2(slot: int, straight_u8: np.ndarray) -> None:
+    """upload() for both networks."""
+    a = straight_u8.astype(np.float32) / 255.0
+    pre = a.copy()
+    pre[..., :3] *= a[..., 3:4]
+    pre8 = np.rint(pre * 255).astype(np.uint8)[::-1]
+    path = os.path.join(WORK, f"up_{slot}.npy")
+    np.save(path, np.ascontiguousarray(pre8))
+    td(PRELUDE + f"""
+st = _st()
+st.buffers[{slot}] = np.load({path!r})
+for n in (st.net, st.net2):
+    t = n.surface_top({slot})
+    if t is not None: t.cook(force=True)
+_emit("ok")
+""")
+
+
+def apply_both(layers, w, h, hints=None):
+    """apply() on the v6 network (st.net, with the optional content-bounds hints) and the v5 network (st.net2)."""
+    return td(PRELUDE + f"""
+st = _st()
+lay = json.loads({json.dumps(json.dumps(layers))})
+hints = json.loads({json.dumps(json.dumps(hints))})
+st.net.set_content_bounds({{k: (tuple(v) if v is not None else None) for k, v in (hints or {{}}).items()}})
+st.net.apply(lay, {w}, {h})
+st.net2.apply(lay, {w}, {h})
+s1, s2 = st.net.stats(), st.net2.stats()
+_emit({{"plan": s1["plan"], "nodes": s1["nodes"], "nodes2": s2["nodes"], "boxes": {{k: v for k, v in st.net._boxes.items()}}}})
+""")
+
+
+def read_both():
+    pa, pb = os.path.join(WORK, "out_a.npy"), os.path.join(WORK, "out_b.npy")
+    td(PRELUDE + f"""
+st = _st()
+for n, path in ((st.net, {pa!r}), (st.net2, {pb!r})):
+    o = n.output(); o.cook(force=True)
+    np.save(path, o.numpyArray().astype(np.float32))
+_emit("ok")
+""")
+    return np.load(pa)[::-1].copy(), np.load(pb)[::-1].copy()
+
+
+def test_v6():
+    S = 96
+    rng = np.random.default_rng(66)
+    setup(S, S)
+    setup_legacy()
+    full_sizes = {}
+
+    def surf(slot, w=S, h=S, alpha=True):
+        img = rng.integers(0, 256, (h, w, 4), dtype=np.uint8)
+        if not alpha:
+            img[..., 3] = 255
+        else:
+            img[..., 3] = np.where(rng.random((h, w)) < 0.25, 0, img[..., 3])
+        upload2(slot, img)
+        full_sizes[slot] = (w, h)
+        return img
+
+    def gray(slot, w=S, h=S):
+        m = np.zeros((h, w, 4), np.uint8)
+        m[..., :3] = rng.integers(0, 256, (h, w, 1))
+        m[..., 3] = 255
+        upload2(slot, m)
+        return m
+
+    def compare(label, layers, tol, hints=None, expect=None):
+        info = apply_both(layers, S, S, hints)
+        a, b = read_both()
+        d = np.abs(a - b) * 255.0
+        pl = info["plan"]
+        ok = d.max() <= tol
+        if expect:
+            for k, v in expect.items():
+                ok = ok and pl.get(k) == v
+        check(f"v6 {label}: v6 network vs v5 network <= {tol:g}/255", ok,
+              f"max {d.max():.2f} mean {d.mean():.4f} | nodes {info['nodes']} (v5 {info['nodes2']}) passes {pl['passes']} merged {pl['merged']}/"
+              f"{pl['merged_layers']} layers, skipped {pl['skipped']}, fmt8 {pl['fmt8']}, cropped {pl['cropped']}")
+        return a, b
+
+    # 1. a run of Normal layers (offsets, small surfaces, masks, opacity) -> merged passes
+    lays = [base_layer()]
+    for i in range(14):
+        w, h = (S, S) if i % 3 == 0 else (int(rng.integers(20, 70)), int(rng.integers(20, 70)))
+        surf(i + 1, w, h)
+        mk = None
+        if i % 4 == 1:
+            gray(60 + i, w, h)
+            mk = {"slot": 60 + i, "enabled": True}
+        lays.append(layer(f"n{i}", slot=i + 1, surfaceW=w, surfaceH=h, x=int(rng.integers(-10, 40)), y=int(rng.integers(-10, 40)),
+                          opacity=float(rng.choice([1.0, 0.8, 0.5])), mask=mk))
+    compare("15 plain Normal layers (offsets, masks, opacity)", lays, 1.0, expect={"merged": 2, "passes": 2})
+
+    # 2. every blend mode in one stack (the merged loop calls the same blend code, accumulating in float)
+    modes = ("normal", "multiply", "screen", "overlay", "soft-light", "hard-light", "darken", "lighten", "color-dodge",
+             "color-burn", "difference", "exclusion", "hue", "saturation", "color", "luminosity")
+    lays = [base_layer()]
+    for i, m in enumerate(modes):
+        surf(30 + i, S, S)
+        lays.append(layer(f"m{i}", slot=30 + i, blend=m, opacity=0.6 + 0.4 * (i % 2)))
+    compare("all 16 blend modes", lays, 3.0)
+
+    # 3. skip rules: hidden, zero opacity, off canvas, no slot, no-op adjustments, empty group
+    lays = [base_layer()]
+    for i in range(6):
+        surf(100 + i, 50, 40)
+    lays += [layer("h", slot=100, visible=False), layer("z", slot=101, opacity=0.0), layer("far", slot=102, x=500, y=3, surfaceW=50, surfaceH=40),
+             layer("noslot"), layer("ok1", slot=103, x=3, y=4, surfaceW=50, surfaceH=40),
+             layer("nb", "adjustment", adjustment={"type": "blur", "radius": 0.0}), layer("nu", "adjustment", adjustment={"type": "mystery"}),
+             layer("eg", "group"), layer("ok2", slot=104, x=30, y=20, surfaceW=50, surfaceH=40, blend="multiply", opacity=0.7)]
+    a, b = compare("skipped layers (hidden, opacity 0, off canvas, no slot, no-op adjustments, empty group)", lays, 0.51)
+
+    # 4. transformed layers: cropped resample passes (scale, rotation, skew, masks, effects off)
+    lays = [base_layer()]
+    for i in range(6):
+        surf(120 + i, 40, 30)
+    gray(130, 40, 30)
+    xfs = [dict(x=5.5, y=4.25, sx=1.5, sy=1.5), dict(x=20.0, y=30.0, rot=30.0), dict(x=40.0, y=-5.0, sx=0.45, sy=0.45),
+           dict(x=10.5, y=50.0, kx=25.0, sx=2.0, sy=1.2), dict(x=60.0, y=60.0, sx=1.0, sy=1.0, ky=-30.0), dict(x=-20.0, y=10.0, sx=3.0, sy=3.0)]
+    for i, t in enumerate(xfs):
+        lays.append(layer(f"x{i}", slot=120 + i, surfaceW=40, surfaceH=30, blend="normal" if i % 2 == 0 else "screen", opacity=0.9,
+                          mask={"slot": 130, "enabled": True} if i == 3 else None, **t))
+    compare("transformed layers -> cropped resample passes", lays, 1.5)
+    # the same through the content-bounds hint: the surface content is confined to a sub-rect
+    img = np.zeros((30, 40, 4), np.uint8)
+    img[8:20, 10:30] = (200, 60, 90, 255)
+    for i in (0, 3):
+        upload2(120 + i, img)
+    hint = {"x0": (10.0, 8.0, 30.0, 20.0), "x3": (10.0, 8.0, 30.0, 20.0)}
+    a, b = compare("content-bounds hint (superset of the non-transparent pixels) on rescaled layers", lays, 1.0, hints=hint)
+    info = apply_both(lays, S, S, hint)
+    info0 = apply_both(lays, S, S, {})
+    sm = {k: (v[2] - v[0]) * (v[3] - v[1]) for k, v in info["boxes"].items()}
+    fu = {k: (v[2] - v[0]) * (v[3] - v[1]) for k, v in info0["boxes"].items()}
+    check("v6 content-bounds hint: the resample passes of x0 / x3 are smaller than their full box",
+          all(sm[k] < fu[k] for k in ("x0", "x3")), f"areas {sm['x0']} / {sm['x3']} vs {fu['x0']} / {fu['x3']}")
+
+    # 5. groups inside merged runs + adjustments between runs + the 8 bit rule
+    lays = [base_layer()]
+    for i in range(10):
+        surf(140 + i, S, S)
+    lays += [layer("a0", slot=140), layer("g", "group", blend="multiply", opacity=0.7), layer("g0", slot=141, parentId="g"),
+             layer("g1", slot=142, parentId="g", blend="screen"), layer("g2", slot=143, parentId="g"),
+             layer("lv", "adjustment", adjustment={"type": "levels", "inLow": 0.05, "inHigh": 0.95, "gamma": 1.4, "outLow": 0.0, "outHigh": 1.0}),
+             layer("a1", slot=144), layer("a2", slot=145, opacity=0.5), layer("a3", slot=146, blend="color-burn", opacity=0.9),
+             layer("a4", slot=147), layer("a5", slot=148)]
+    compare("group + adjustment + burn (16 bit below, 8 bit Normal tail)", lays, 3.0)
+    lays = [base_layer(), layer("p", slot=140), layer("q", slot=141, opacity=0.5), layer("r", slot=142, opacity=0.3)]
+    compare("pure Normal stack (every pass 8 bit)", lays, 1.0, expect={"fmt8": 1})
+
+    # 5b. shapes: cropped shape nodes (geometry + stroke + arrowheads + antialiasing margin) vs the full-size v5 nodes
+    red, blue = {"r": 230, "g": 40, "b": 30, "a": 255}, {"r": 20, "g": 60, "b": 220, "a": 200}
+    fl, st_ = {"enabled": True, "color": red}, {"enabled": True, "color": blue, "width": 7.0}
+    shapes = [
+        {"type": "rect", "x": 10.0, "y": 8.0, "w": 40.0, "h": 24.0, "radius": 5.0, "fill": fl, "stroke": st_, "rotation": 25.0},
+        {"type": "ellipse", "x": 50.0, "y": 40.0, "w": 36.0, "h": 20.0, "fill": fl, "stroke": {"enabled": False, "color": blue, "width": 0.0}, "rotation": -40.0},
+        {"type": "line", "x1": 8.0, "y1": 80.0, "x2": 60.0, "y2": 70.0, "fill": {"enabled": False, "color": red}, "stroke": dict(st_, width=3.0),
+         "arrowStart": True, "arrowEnd": True},
+        {"type": "polygon", "cx": 70.0, "cy": 20.0, "radius": 18.0, "sides": 5, "innerRatio": 0.5, "fill": fl, "stroke": st_},
+        {"type": "rect", "x": -10.0, "y": 60.0, "w": 30.0, "h": 50.0, "radius": 0.0, "fill": fl, "stroke": st_, "rotation": 0.0},
+    ]
+    lays = [base_layer(), layer("pl", slot=140, blend="multiply", opacity=0.8)]
+    for i, sp in enumerate(shapes):
+        lays.append(layer(f"sh{i}", "shape", shape=sp, blend="normal" if i % 2 == 0 else "overlay", opacity=0.9))
+    compare("shape layers (cropped shape nodes: rect/ellipse/line+arrows/star, partly off canvas)", lays, 1.5, expect={"cropped": 5})
+
+    # 6. blur pyramid vs numpy gaussian (edge hold) and vs the v5 Blur TOP
+    worst = 0.0
+    for S2, rad in ((256, 7.0), (256, 12.0), (256, 24.0), (512, 50.0), (512, 100.0), (512, 200.0)):
+        img = np.zeros((S2, S2, 4), np.uint8)
+        img[..., 3] = 255
+        img[S2 // 4:3 * S2 // 4, S2 // 4:3 * S2 // 4, :3] = (230, 40, 40)
+        img[S2 // 2:, S2 // 3:S2 // 2, :] = (30, 200, 255, 100)
+        img[S2 // 8:S2 // 8 + 8, :, :3] = 255                      # a bright band (8 rows) next to the border, not on it
+        img[S2 // 5:S2 // 5 + 2, 20:S2 - 20, :3] = 0               # 2 px dark line: the pyramid's worst case
+        setup(S2, S2)
+        setup_legacy()
+        upload2(1, img)
+        lays = [base_layer(), layer("b", slot=1), layer("adj", "adjustment", adjustment={"type": "blur", "radius": rad})]
+        info = apply_both(lays, S2, S2)
+        a, b = read_both()
+        ref = ref_adjust({"type": "blur", "radius": rad}, premul_f(img), 1.0, None)
+        # b is the v5 chain over an empty base: layer premultiplied then blurred
+        d = np.abs(a - ref) * 255
+        dl = np.abs(b - ref) * 255
+        worst = max(worst, d.max())
+        check(f"v6 blur pyramid radius {rad:g} @ {S2}^2 vs numpy gaussian (edge hold) <= 12/255 (v5 Blur TOP: max {dl.max():.1f})",
+              d.max() <= 12.0, f"max {d.max():.2f} mean {d.mean():.4f}")
+    # detail thinner than the shrink factor ON the document border (the padded shrink repeats the edge pixels exactly)
+    for S2, rad in ((512, 100.0), (512, 200.0)):
+        img = np.zeros((S2, S2, 4), np.uint8)
+        img[..., 3] = 255
+        img[:8, :, :3] = 255
+        img[:, S2 - 3:, :3] = 255
+        img[S2 // 2:, :5, :] = (30, 200, 255, 90)
+        setup(S2, S2)
+        setup_legacy()
+        upload2(1, img)
+        apply_both([base_layer(), layer("b", slot=1), layer("adj", "adjustment", adjustment={"type": "blur", "radius": rad})], S2, S2)
+        a, b = read_both()
+        ref = ref_adjust({"type": "blur", "radius": rad}, premul_f(img), 1.0, None)
+        check(f"v6 blur pyramid radius {rad:g}: thin bands ON the document border vs numpy gaussian <= 12/255 (v5 Blur TOP {np.abs(b - ref).max() * 255:.1f})",
+              np.abs(a - ref).max() * 255 <= 12.0, f"max {np.abs(a - ref).max() * 255:.2f}")
+    setup(S, S)
+    setup_legacy()
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -2540,6 +2767,8 @@ def main() -> int:
             test_text()
         if which in ("all", "v3perf"):
             test_v3perf()
+        if which in ("all", "v6"):
+            test_v6()
         if which == "wrap-fixture":
             make_wrap_fixture()
         if which == "shapes-chromium":

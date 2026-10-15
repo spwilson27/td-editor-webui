@@ -23,6 +23,20 @@
 //   Canvas 2D drawImage imageSmoothingQuality 'medium' does); the network sets this node's "Input Smoothness" to
 //   mipmap while lod > 0 and linear otherwise, input extend = hold.
 //   Only this pass ever reads through a mipmap filter; the blend passes below use texelFetch only.
+// uAdjust = 8: MERGED pass (v6; GLSL *Multi* TOP, any number of inputs): composites up to 8 layers over input 0 in ONE
+//   full-frame pass.  Inputs: 0 = below, 1..K = the sources of the K layers (bottom -> top), K+1.. = the masks of the
+//   masked layers.  Layer slot i (uniform uL<i>, i < 8; unused slots are all zero => opacity 0 => skipped):
+//     uL<i>.x = mode + 16 * maskInputIndex   (maskInputIndex 9..15, 0 = no mask)      uL<i>.y = opacity
+//     uL<i>.zw = integer document offset of the source (same placement rule as the single pass)
+//   The accumulator stays in float32 registers between the layers (more exact than K chained 16-bit passes); each
+//   layer reads only the texels inside its own rect (the bounding-box skip).  Pixel-for-pixel the result equals K
+//   chained uAdjust 0 passes within the rounding of the intermediate format.
+// uAdjust = 9 / 10: BLUR PYRAMID passes (v6, adjustment blur with radius >= 7).  Texel space of the textures (origin
+//   bottom-left), premultiplied RGBA.  9 = SHRINK: input 0 = the image (w x h), output (custom resolution) = padded grid of
+//   ceil(w/s) + 2k by ceil(h/s) + 2k cells, uXform.x = s, uA.x = k.  Cell (i, j) is the mean of the s x s source block starting at
+//   ((i-k) s, (j-k) s) with the source coordinates CLAMPED to the image (edge hold, exact: the k pad cells are the edge pixels'
+//   means, not a block average of the border).  10 = ENLARGE: input 0 = the blurred padded grid, output (custom resolution = the
+//   document) = bilinear (linear input filter) at ((x + .5) / s + k) / gridSize; the same s / k.
 // uAdjust 0..6 (blend / adjust passes): inputs 0 = below, 1 = source, 2 = mask.  The source is at document
 //   size (a resample result, group result, adjustment source) or a surface placed by an INTEGER offset:
 //   source texel = document pixel - round(uXform.xy)  (outside the source, or outside the mask = transparent / 0).
@@ -40,6 +54,14 @@ uniform vec4 uParams;
 uniform vec4 uXform;
 uniform vec4 uA;      // adjustment parameters (uAdjust 2..6)
 uniform vec4 uB;
+uniform vec4 uL0;     // merged pass layer slots (uAdjust 8)
+uniform vec4 uL1;
+uniform vec4 uL2;
+uniform vec4 uL3;
+uniform vec4 uL4;
+uniform vec4 uL5;
+uniform vec4 uL6;
+uniform vec4 uL7;
 
 out vec4 fragColor;
 
@@ -237,7 +259,97 @@ void resample() {
     fragColor = TDOutputSwizzle(src);
 }
 
+// W3C source-over with blend mode, premultiplied in / out.  src is NOT yet scaled by opacity * mask.
+vec4 composeOver(vec4 below, vec4 src, int mode, float opacity, float m) {
+    src *= opacity * m;                       // premultiplied: scales colour and alpha
+    float as = src.a, ab = below.a;
+    if (mode == 0) {
+        // Normal: the general formula below reduces to  src + (1 - as) below  for premultiplied input (as * ab * clamp(cs)
+        // = ab * min(src.rgb, as)); no divisions, no blend switch (the dominant case of a merged pass)
+        vec4 r;
+        r.rgb = (1.0 - ab) * src.rgb + (1.0 - as) * below.rgb + ab * min(src.rgb, vec3(as));
+        r.a = as + ab - as * ab;
+        return r;
+    }
+    vec3 cs = as > 0.0 ? src.rgb / as : vec3(0.0);
+    vec3 cb = ab > 0.0 ? below.rgb / ab : vec3(0.0);
+    vec3 bl = (as > 0.0 && ab > 0.0) ? clamp(blendFn(mode, clamp(cb, 0.0, 1.0), clamp(cs, 0.0, 1.0)), 0.0, 1.0) : vec3(0.0);
+    vec4 res;
+    res.rgb = (1.0 - ab) * src.rgb + (1.0 - as) * below.rgb + as * ab * bl;
+    res.a = as + ab - as * ab;
+    return res;
+}
+
+vec4 slotParams(int i) {
+    if (i == 0) return uL0;
+    if (i == 1) return uL1;
+    if (i == 2) return uL2;
+    if (i == 3) return uL3;
+    if (i == 4) return uL4;
+    if (i == 5) return uL5;
+    if (i == 6) return uL6;
+    return uL7;
+}
+
+void merged() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec4 acc = texelFetch(sTD2DInputs[0], p, 0);
+    ivec2 outSize = textureSize(sTD2DInputs[0], 0);
+    ivec2 pd = ivec2(p.x, outSize.y - 1 - p.y);
+    for (int i = 0; i < 8; i++) {
+        vec4 u = slotParams(i);
+        if (u.y <= 0.0) continue;
+        ivec2 d = pd - ivec2(floor(u.zw + 0.5));
+        ivec2 msz = textureSize(sTD2DInputs[1 + i], 0);
+        if (d.x < 0 || d.y < 0 || d.x >= msz.x || d.y >= msz.y) continue;      // outside this layer's rect
+        int code = int(u.x + 0.5);
+        int mi = code >> 4;
+        int mode = code & 15;
+        vec4 src = texelFetch(sTD2DInputs[1 + i], ivec2(d.x, msz.y - 1 - d.y), 0);
+        if (src.a <= 0.0) continue;                      // transparent texel: every mode leaves the accumulator unchanged
+        float m = 1.0;
+        if (mi > 0) {
+            ivec2 mSize = textureSize(sTD2DInputs[mi], 0);
+            m = (d.x < mSize.x && d.y < mSize.y) ? texelFetch(sTD2DInputs[mi], ivec2(d.x, mSize.y - 1 - d.y), 0).r : 0.0;
+        }
+        acc = composeOver(acc, src, mode, clamp(u.y, 0.0, 1.0), m);
+    }
+    fragColor = TDOutputSwizzle(acc);
+}
+
+void shrinkPass() {
+    int s = int(uXform.x + 0.5);
+    int k = int(uA.x + 0.5);
+    ivec2 src = textureSize(sTD2DInputs[0], 0);
+    ivec2 o = (ivec2(gl_FragCoord.xy) - ivec2(k)) * s;
+    ivec2 lo = clamp(o, ivec2(0), src - 1);
+    ivec2 hi = clamp(o + (s - 1), ivec2(0), src - 1);
+    vec4 sum = vec4(0.0);
+    // taps that fall outside the image repeat the clamped edge texel: count them by clamped position
+    float n = 0.0;
+    for (int y = 0; y < s; y++) {
+        int yy = clamp(o.y + y, 0, src.y - 1);
+        for (int x = 0; x < s; x++) {
+            int xx = clamp(o.x + x, 0, src.x - 1);
+            sum += texelFetch(sTD2DInputs[0], ivec2(xx, yy), 0);
+            n += 1.0;
+        }
+    }
+    fragColor = TDOutputSwizzle(sum / n);
+}
+
+void enlargePass() {
+    float s = uXform.x;
+    float k = uA.x;
+    vec2 grid = vec2(textureSize(sTD2DInputs[0], 0));
+    vec2 q = (gl_FragCoord.xy / s) + vec2(k);
+    fragColor = TDOutputSwizzle(texture(sTD2DInputs[0], q / grid));
+}
+
 void main() {
+    if (uParams.w > 9.5) { enlargePass(); return; }
+    if (uParams.w > 8.5) { shrinkPass(); return; }
+    if (uParams.w > 7.5) { merged(); return; }
     if (uParams.w > 6.5) { resample(); return; }
     ivec2 p = ivec2(gl_FragCoord.xy);
     vec4 below = texelFetch(sTD2DInputs[0], p, 0);
@@ -268,13 +380,7 @@ void main() {
     } else if (uParams.w > 0.5) {
         res = mix(below, src, opacity * m);
     } else {
-        src *= opacity * m;                       // premultiplied: scales colour and alpha
-        float as = src.a, ab = below.a;
-        vec3 cs = as > 0.0 ? src.rgb / as : vec3(0.0);
-        vec3 cb = ab > 0.0 ? below.rgb / ab : vec3(0.0);
-        vec3 bl = (as > 0.0 && ab > 0.0) ? clamp(blendFn(mode, clamp(cb, 0.0, 1.0), clamp(cs, 0.0, 1.0)), 0.0, 1.0) : vec3(0.0);
-        res.rgb = (1.0 - ab) * src.rgb + (1.0 - as) * below.rgb + as * ab * bl;
-        res.a = as + ab - as * ab;
+        res = composeOver(below, src, mode, opacity, m);
     }
     fragColor = TDOutputSwizzle(res);
 }
