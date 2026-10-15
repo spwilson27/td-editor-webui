@@ -6,7 +6,7 @@ Builds on `DESIGN_V5.md`. Phase A starts while v5 finishes (isolated files); pha
 
 | Topic | Decision |
 | --- | --- |
-| Performance (#1) | All five items: blur **downsampled pyramid** (no cap beyond 200 px; cost ~constant in radius), **bounding-box blending + skip empty layers + cache of the stack below the edited layer** (TD), **8-bit intermediates / merged Normal runs** where exact, **browser below-active composite cache** during strokes, **auto TD-view at 4K in the panel** + **pre-warmed resample nodes**. |
+| Performance (#1) | All five items: blur **downsampled pyramid** (no cap beyond 200 px; cost ~constant in radius), **bounding-box blending + skip empty layers + cache of the stack below the edited layer** (TD), **8-bit intermediates / merged Normal runs** where exact, **browser below-active composite cache** during strokes, **a one-time TD-view suggestion above ~8 MP (never automatic, see §4)** + **pre-warmed resample nodes**. |
 | Filters | Four groups, each filter usable **both** as a per-layer effect and as an adjustment layer (one shared shader): **Blur & sharpen** (motion, radial, zoom, lens/bokeh, unsharp mask, high-pass); **Colour grading** (curves RGB/per-channel, gradient map, colour balance, vibrance, channel mixer, selective colour, posterize, duotone, LUT `.cube`); **Stylise & distort** (emboss, edge detect, Kuwahara/oil, pixelate, dither ordered/error-diffusion, CRT/scanlines, film grain, bloom; displace (noise or another layer/input), twirl, ripple/wave, lens distortion, polar, kaleidoscope, tile/mirror); **"Animated" set made static**: grain/noise (seeded), drift glitch, feedback/echo trails, colour cycling — **no time dependence**; iterative ones (feedback, glitch drift, echo) take an **iterations** parameter and are **recomputed only when their input or parameters change** (TD: no time-dependent nodes; cook only on input change). |
 | Rough edges (#3) | Bold/italic for font-collection fonts in TD; **adjustment layers limited by the active selection** (auto mask, as Photoshop does when creating an adjustment with a selection); **effects on groups** (applied to the group's composite) and **on adjustment layers** (applied to the adjusted result before mixing); **brush presets** (save/load/rename/delete, persisted per document + per viewer) + **textured/scatter tips + colour jitter**; **undo across saves** (bounded history persisted with the document). |
 
@@ -30,7 +30,7 @@ Builds on `DESIGN_V5.md`. Phase A starts while v5 finishes (isolated files); pha
 
 Engine (selection-limited adjustments, effects on groups/adjustments, brush presets + textured tips +
 jitter, undo persistence, browser composite cache, filter adjustment layer kinds wired to the filters
-library), UI (filter browser/menus, presets panel, tips, auto TD-view at 4K), protocol v7 (filters in
+library), UI (filter browser/menus, presets panel, tips, one-time "try TD view" notice above ~8 MP), protocol v7 (filters in
 LayerSpec/adjustments, history blob persistence `GET/PUT /history`, presets in DocSpec), ext (history
 persistence in doc_state/.redoc, TTC font faces), network integration of filter adjustments + group/
 adjustment effects.
