@@ -300,6 +300,12 @@ export class Engine implements EditorEngine, Host {
     }
     if (this.doc.canvasMode !== mode) {
       this.doc.canvasMode = mode === 'fixed' ? 'fixed' : 'input';
+      if (this.doc.canvasMode === 'input') { // following the input: it fills the canvas again (as setCanvasMode('input'))
+        const base = this.doc.find(BASE_ID) as PixelLayer;
+        base.x = base.y = 0;
+        base.sx = base.sy = 1;
+        this.compositor.invalidate(null);
+      }
       this.bumpSpec();
     }
   }

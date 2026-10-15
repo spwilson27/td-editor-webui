@@ -180,6 +180,21 @@ describe('canvas size: anchors, no resampling', () => {
   });
 });
 
+describe('adoptCanvas mode flip', () => {
+  it('fixed -> input resets the base transform to identity without history', () => {
+    e = newEngine(100, 100);
+    e.adoptCanvas(100, 100, 'fixed');
+    e.setTransform('base', { x: 10, y: 10, sx: 2, sy: 2 });
+    const n = e.history().entries.length;
+    e.adoptCanvas(100, 100, 'input');
+    expect(info('base').transform).toEqual({ x: 0, y: 0, sx: 1, sy: 1 });
+    expect(e.history().entries).toHaveLength(n);
+    e.setTransform('base', { x: 4, y: 4, sx: 1, sy: 1 });
+    e.adoptCanvas(100, 100, 'input'); // no flip: untouched
+    expect(info('base').transform.x).toBe(4);
+  });
+});
+
 describe('misc engine API', () => {
   it('docRev follows docSpec().rev without building a spec', () => {
     e = newEngine(50, 50);

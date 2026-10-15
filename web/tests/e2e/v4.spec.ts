@@ -145,6 +145,16 @@ test.describe('canvas size', () => {
     await td.waitFor(() => td.mode === 'fixed' && td.w === 320 && td.h === 180);
   });
 
+  test('a page reconnecting after the input was removed updates its base from hello.baseSize', async ({ page }) => {
+    await open(page);
+    td.sendSolidBase(10, 20, 30);
+    await expect.poll(() => hook<number[]>(page, 'readPixel', 5, 5)).toEqual([10, 20, 30, 255]);
+    td.removeInput();
+    td.dropClient();
+    await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked', { timeout: 8000 });
+    await expect.poll(async () => { const b = (await hook<any[]>(page, 'layers')).find((l) => l.kind === 'base'); return [b.surfaceW, b.surfaceH]; }).toEqual([1, 1]);
+  });
+
   test('a TD-initiated docSize (input resolution while following) updates the page without echoing setCanvas', async ({ page }) => {
     await open(page);
     td.resize(96, 54);

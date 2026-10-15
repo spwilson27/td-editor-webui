@@ -255,6 +255,14 @@ describe('json messages', () => {
     expect(decodeTdMessage('{"t":"error","msg":"nope"}')).toEqual({ t: 'error', msg: 'nope' });
   });
 
+  it('v5: hello may carry baseSize (0x0 = no input); malformed ones are dropped', () => {
+    const h = { t: 'hello', protocol: 5, doc: { w: 4, h: 4 }, hasInput: true, maxSendFps: 30, active: true };
+    expect(decodeTdMessage(JSON.stringify({ ...h, baseSize: { w: 1280, h: 720 } }))).toMatchObject({ baseSize: { w: 1280, h: 720 } });
+    expect(decodeTdMessage(JSON.stringify({ ...h, baseSize: { w: 0, h: 0 } }))).toMatchObject({ baseSize: { w: 0, h: 0 } });
+    expect('baseSize' in decodeTdMessage(JSON.stringify({ ...h, baseSize: { w: -1, h: 5 } }))!).toBe(false);
+    expect('baseSize' in decodeTdMessage(JSON.stringify(h))!).toBe(false);
+  });
+
   it('ignores unknown types and malformed input', () => {
     for (const s of ['{"t":"future"}', 'not json', '[]', 'null', '{"x":1}', '"hello"']) {
       expect(decodeTdMessage(s)).toBeNull();

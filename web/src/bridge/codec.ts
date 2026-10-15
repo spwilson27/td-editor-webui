@@ -143,7 +143,7 @@ export type WebMessage =
   | { t: 'log'; level: LogLevel; msg: string };
 
 export type TdMessage =
-  | { t: 'hello'; protocol: number; doc: { w: number; h: number; mode?: CanvasMode }; hasInput: boolean; maxSendFps: number; active: boolean; clientId: string; hasDocument: boolean; rev: number | null }
+  | { t: 'hello'; protocol: number; doc: { w: number; h: number; mode?: CanvasMode }; hasInput: boolean; maxSendFps: number; active: boolean; clientId: string; hasDocument: boolean; rev: number | null; baseSize?: { w: number; h: number } }
   | { t: 'docState'; rev: number; layers: LayerSpec[]; docW: number; docH: number; guides: Guides; canvas: { mode: CanvasMode } }
   | { t: 'base'; frameId: number; docW: number; docH: number; x: number; y: number; w: number; h: number }
   | { t: 'view'; frameId: number; docW: number; docH: number; w: number; h: number; appliedFrameId: number }
@@ -190,6 +190,11 @@ export function readCanvas(v: unknown): { mode: CanvasMode } {
   return { mode: isMode(c.mode) ? c.mode : 'input' };
 }
 
+function readBaseSize(v: unknown): { baseSize?: { w: number; h: number } } {
+  const b = (v && typeof v === 'object' ? v : null) as Record<string, unknown> | null;
+  return b && isNum(b.w) && isNum(b.h) && b.w >= 0 && b.h >= 0 && b.w <= U16 && b.h <= U16 ? { baseSize: { w: b.w, h: b.h } } : {};
+}
+
 const isLayers = (v: unknown): v is LayerSpec[] =>
   Array.isArray(v) && v.every((l) => l !== null && typeof l === 'object' && isStr((l as LayerSpec).id) && isStr((l as LayerSpec).kind));
 
@@ -204,6 +209,7 @@ export function decodeTdMessage(text: string): TdMessage | null {
         ? {
           t: 'hello', protocol: o.protocol, doc: isMode(doc.mode) ? { w: doc.w, h: doc.h, mode: doc.mode } : { w: doc.w, h: doc.h }, hasInput: o.hasInput, maxSendFps: o.maxSendFps, active: o.active,
           clientId: isStr(o.clientId) ? o.clientId : '', hasDocument: o.hasDocument === true, rev: isNum(o.rev) ? o.rev : null,
+          ...readBaseSize(o.baseSize),
         }
         : null;
     case 'docState':

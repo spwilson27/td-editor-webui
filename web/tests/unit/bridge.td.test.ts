@@ -1748,4 +1748,23 @@ describe('tdBridge v5 review fixes', () => {
     expect(await p).toMatch(/changed/);
     expect(engine.replaced).toHaveLength(0);
   });
+
+  it('hello.baseSize updates the base (0x0 = input removed while the page was away)', () => {
+    startR(undefined, { baseSize: { w: 0, h: 0 } });
+    expect(engine.baseSizes).toEqual([{ w: 0, h: 0 }]);
+    sock().tell(hello({ doc: { w: 64, h: 48 }, baseSize: { w: 100, h: 50 } }));
+    expect(engine.baseSizes.slice(-1)[0]).toEqual({ w: 100, h: 50 });
+  });
+
+  it('hello.baseSize is deferred while the document loads', async () => {
+    startR(undefined, { hasDocument: true, rev: 7, baseSize: { w: 100, h: 50 } });
+    expect(engine.baseSizes).toEqual([]);
+    sock().tell(docState(7));
+    await flushP();
+    for (let i = 0; i < 4; i++) {
+      for (const c of [...fm!.calls]) c.settle(okBytes(dump(Number(new URL(c.url).searchParams.get('slot')), 64, 48, 1)));
+      await flushP();
+    }
+    expect(engine.baseSizes).toEqual([{ w: 100, h: 50 }]);
+  });
 });

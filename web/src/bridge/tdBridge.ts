@@ -405,18 +405,21 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         loading = false;
         try { engine.commitSurfaces(); } catch { /* the document may be unusable; the retry reloads it */ }
         dirty.clear();
+        if (complete) { // TD changes that arrived mid-load: applied while still not authoritative, so nothing is pushed back
+          tdCanvas = { w: m.docW, h: m.docH, mode: m.canvas.mode };
+          const pend = pendingTd;
+          pendingTd = {};
+          if (pend.size) adoptCanvas(pend.size.w, pend.size.h, pend.size.mode);
+          if (pend.base) applyBaseSize(pend.base.w, pend.base.h);
+        }
+        dirty.clear();
         lastDocRev = engine.docSpec().rev;
         if (complete) {
           loadIncomplete = false;
           synced = true;
           authoritative = true;
           tdRev = m.rev;
-          tdCanvas = { w: m.docW, h: m.docH, mode: m.canvas.mode };
           endLoadState();
-          const pend = pendingTd;
-          pendingTd = {};
-          if (pend.size) adoptCanvas(pend.size.w, pend.size.h, pend.size.mode);
-          if (pend.base) applyBaseSize(pend.base.w, pend.base.h);
         } else if (loadPending && !disposed) {
           armLoadRetry(); // stay non-authoritative; ask TD again
           status.setNotice('Loading document from TouchDesigner… (retrying)');
@@ -483,6 +486,11 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         const newer = synced && m.rev !== null && tdRev !== null && m.rev > tdRev;
         const needsLoad = m.hasDocument && (!synced || loadIncomplete || newer);
         setActive(m.active);
+        if (m.baseSize) {
+          docEpoch++;
+          if (m.active && needsLoad) pendingTd.base = m.baseSize; // applied when the load completes
+          else applyBaseSize(m.baseSize.w, m.baseSize.h);
+        }
         if (m.active) {
           if (needsLoad) beginLoad();
           else pushAll();

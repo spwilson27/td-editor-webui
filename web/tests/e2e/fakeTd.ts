@@ -245,6 +245,7 @@ export class FakeTd {
   hello(): TdMessage {
     return {
       t: 'hello', protocol: 5, doc: { w: this.w, h: this.h, mode: this.mode }, hasInput: this.opts.hasInput ?? false, maxSendFps: this.opts.maxSendFps ?? 30,
+      baseSize: { w: this.baseW, h: this.baseH },
       active: this.active, clientId: this.clientId, hasDocument: this.doc !== null, rev: this.doc?.rev ?? null,
     };
   }
@@ -324,6 +325,9 @@ export class FakeTd {
   send(m: TdMessage) { this.client?.send(encodeMessage(m)); }
 
   setActive(active: boolean) { this.active = active; this.send({ t: 'active', active }); }
+
+  /** The input is disconnected while no page listens: the next hello carries baseSize 0x0. */
+  removeInput() { this.baseW = 0; this.baseH = 0; this.stored = null; }
 
   /** The input resolution changes: in Follow Input mode the document follows (docSize), always a `baseSize`. The old BASE frame is gone. */
   resize(w: number, h: number) {
