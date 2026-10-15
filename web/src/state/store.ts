@@ -13,7 +13,7 @@ import { createEffectsSlice } from './effectsSlice';
 import { createFilesSlice } from './filesSlice';
 import { createInputsSlice } from './inputsSlice';
 import { createBrushesSlice } from './brushesSlice';
-import { createLayersSlice } from './layersSlice';
+import { CLIP_MARKER, createLayersSlice } from './layersSlice';
 import { BIG_DOC_KEY } from './brushes';
 import { defaultEffect, effectLabel } from './effectDefaults';
 
@@ -649,19 +649,40 @@ export function createStore() {
     placeImageTitle(): string | undefined {
       return clientKind.peek() === 'panel' ? 'Opens a TouchDesigner file chooser. Drag-and-drop works in Open in Browser; use File ▸ Place Image here' : undefined;
     },
-    /** Edit > Paste: reads image items from the async clipboard (Ctrl+V uses the paste event instead). */
+    /** Layer copy / cut / paste / duplicate are not offered while a floating selection or the crop box is open. */
+    /** Every guard of the layer keys, for deferred work (the paste fallback timer re-checks them when it fires). */
+    layerKeysAllowed(): boolean {
+      return engine !== null && !loadingDoc.peek() && !textEdit.peek() && !topDialog.peek() && !canvasDialog.peek() && !store.fileDialog.peek() && !store.selOpDialog.peek() && !store.layerKeysBlocked();
+    },
+    layerKeysBlocked(): boolean { return store.isFloating() || !!store.cropBox.peek(); },
+    /**
+     * Edit > Paste. A system image newer than our layer marker (image present, no marker text) is imported; otherwise a non-empty layer
+     * clipboard is pasted. When the clipboard cannot be read (TouchDesigner Web Render) the layer clipboard is used, else the old notice.
+     */
     async pasteFromClipboard() {
+      if (!engine || loadingDoc.peek()) return;
+      const layersFirst = store.hasLayerClip();
       try {
-        for (const item of await navigator.clipboard.read()) {
-          const type = item.types.find((t) => t.startsWith('image/'));
-          if (type) { await store.importBlob(await item.getType(type), 'Pasted image'); return; }
+        // a clipboard read that never answers (permission prompt, TouchDesigner Web Render) must not hang the menu: after 2 s use the layer clipboard
+        const items = await Promise.race([
+          navigator.clipboard.read(),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('clipboard timeout')), 2000)),
+        ]);
+        let marker = false;
+        for (const item of items) {
+          if (!item.types.includes('text/plain')) continue;
+          try { if ((await (await item.getType('text/plain')).text()).startsWith(CLIP_MARKER)) marker = true; } catch { /* unreadable text: no marker */ }
         }
+        const image = items.map((it) => ({ it, type: it.types.find((t) => t.startsWith('image/')) })).find((x) => x.type);
+        if (image && !marker && !(layersFirst && store.markerWriteFailed())) { await store.importBlob(await image.it.getType(image.type!), 'Pasted image'); return; }
+        if (store.hasLayerClip()) { if (!store.layerKeysBlocked()) store.pasteLayerClip(); return; }
+        if (image) { await store.importBlob(await image.it.getType(image.type!), 'Pasted image'); return; }
         setNotice('No image on the clipboard');
       } catch {
+        if (store.hasLayerClip()) { if (!store.layerKeysBlocked()) store.pasteLayerClip(); return; }
         setNotice('Press Ctrl+V to paste an image');
       }
     },
-
 
     /** A forwarded key press may never send its keyup; a held Space repeats, so silence for >1 s means it is stuck. */
     releaseStaleSpace(now = performance.now()) {

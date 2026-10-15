@@ -170,6 +170,9 @@ export interface ToolContext {
   fillTolerance: number; // 0..255
 }
 
+/** v7.1: opaque layer-clipboard snapshot made by EditorEngine.copyLayers. */
+export interface LayerClip { readonly kind: 'layer-clip'; readonly count: number /* top-level layers */; readonly bytes: number /* pixel memory held */ }
+
 export interface HistoryEntry { id: number; label: string }
 
 export type EngineEvent =
@@ -311,6 +314,18 @@ export interface EditorEngine {
   replaceLayersWithPixels(ids: string[], rgba: Uint8Array | Uint8ClampedArray, w: number, h: number, name?: string): string;
   // ^ flatten / merge result from TD (doc-sized straight RGBA): removes ids, inserts one pixel layer at the topmost one's
   //   position (mergeDown: ids = [adjustment, layerBelow]); one history entry; returns the new layer id
+
+  // v7.1: layer clipboard (docs/DESIGN_V7.md section 6)
+  /** Snapshot of the layers `ids` (a selected group carries its subtree; a layer under a listed ancestor is not copied twice; TD Input layers are skipped).
+   *  Deep-copies pixels and masks, so the clip is independent of every later edit. No history. `count` 0 = nothing copyable. */
+  copyLayers(ids: string[], asCut?: boolean): LayerClip; // asCut: the clip pastes with the original names (no " copy"); on failure a notice is emitted and the clip is empty
+  /** Insert the clip's layers (new ids, new surface slots, " copy" names) as children of `parentId` (null = root) at `index` (0 = top), stack order kept.
+   *  One history entry; the topmost pasted layer becomes active. Returns the new top-level ids, topmost first ([] and a notice when it does not fit). */
+  pasteLayers(clip: LayerClip, parentId: string | null, index: number): string[];
+  /** Copy + paste above each original's block (a run of adjacent selected siblings) in one history entry; the clip clipboard is untouched. Returns the new ids, topmost first. */
+  duplicateLayers(ids: string[]): string[];
+  /** Free the pixels of a clip that is no longer needed (the clip cannot be pasted afterwards). */
+  releaseClip(clip: LayerClip): void;
 
   // v6: brushes, history persistence, below-cache, tdPreview layers (docs/DESIGN_V6.md §5)
   setBrushTip(tip: TipShape, dynamics: BrushDynamics, customTip?: { w: number; h: number; alpha: Uint8Array }): void;

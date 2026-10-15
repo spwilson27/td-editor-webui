@@ -1,12 +1,23 @@
 import { hasFiles, imageFiles } from './importImage';
 import { isTyping } from './keyboard';
+import { CLIP_MARKER } from './layersSlice';
 import type { Store } from './store';
 
-/** Ctrl/Cmd+V: image items on the clipboard become a new layer. Text fields and the text editor keep their own paste. */
+/** Ctrl/Cmd+V: image items on the clipboard become a new layer, or (v7.1) the layer clipboard is pasted. Text fields and the text editor keep their own paste. */
 export function installPaste(store: Store, win: Window = window): () => void {
   const onPaste = (e: ClipboardEvent) => {
     if (isTyping(e.target) || store.textEdit.peek() || store.loadingDoc.peek() || !store.hasEngine()) return;
+    if (store.pasteRecentlyHandled()) { e.preventDefault(); return; } // a late event after the keyboard fallback already pasted this key press
+    store.cancelPasteFallback();
     const files = imageFiles(e.clipboardData);
+    // A system image wins unless our layer marker is on the clipboard (the layers were copied after it) or the marker could not be written
+    // (then the layers win and no image is imported).
+    const marker = (e.clipboardData?.getData('text/plain') ?? '').startsWith(CLIP_MARKER);
+    const layersWin = store.hasLayerClip() && (marker || !files.length || store.markerWriteFailed());
+    if (layersWin) {
+      if (!store.layerKeysBlocked()) { e.preventDefault(); store.pasteLayerClip(); }
+      return;
+    }
     if (!files.length) return;
     e.preventDefault();
     void store.importFiles(files);

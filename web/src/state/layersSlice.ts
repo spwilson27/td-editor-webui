@@ -1,6 +1,6 @@
 // v7 layer panel state: multi-select (UI only, not in the document), batch actions, Flatten / Merge (docs/DESIGN_V7.md section 1).
 import { signal } from '@preact/signals';
-import type { LayerInfo } from '../engine/types';
+import type { LayerClip, LayerInfo } from '../engine/types';
 import { layerBelow, topLevelOf } from './layerDrop';
 import type { SliceCtx } from './slice';
 import { isIdentity } from './transform';
@@ -21,10 +21,20 @@ export const FLATTEN_TITLE = 'Flatten to pixels';
 export const MERGE_GROUP_TITLE = 'Merge group';
 export const MERGE_DOWN_TITLE = 'Merge down into layer below';
 
+/** Text marker written to the system clipboard by Copy: paste then prefers the layer clipboard over an older system image. */
+export const CLIP_MARKER = 'raster-editor-layers';
+
 export function createLayersSlice(ctx: SliceCtx) {
   /** Selected layer ids in click order; the active layer is the last clicked. Pruned when layers disappear. */
   const sel = signal<string[]>([]);
   const flattening = signal<string | null>(null);
+  /** v7.1: the one in-page layer clipboard snapshot (engine-owned pixels) and how many top-level layers it holds. */
+  let clip: LayerClip | null = null;
+  const clipCount = signal(0);
+  let markerOk = true; // the system clipboard accepted our marker text (else the layer clipboard wins over any system image)
+  let markerSeq = 0;
+  let pasteHandledAt = -1e9;
+  let pasteTimer: ReturnType<typeof setTimeout> | null = null;
   let anchor: string | null = null;
   let fromPanel = false;
 
@@ -125,6 +135,132 @@ export function createLayersSlice(ctx: SliceCtx) {
       if (e.activeLayerId() !== gid) e.setActiveLayer(gid);
       return gid;
     },
+
+    // ---- v7.1: copy / cut / paste / duplicate (docs/DESIGN_V7.md section 6) ----
+    clipCount,
+    /** True when the system clipboard could not take our marker text: then the layer clipboard wins over any system image. */
+    markerWriteFailed: (): boolean => !markerOk,
+    hasLayerClip: (): boolean => clipCount.value > 0,
+    /** The selected layers that can be copied: top-level of the selection, TD Input layers excluded. */
+    copyableIds(): string[] {
+      if (!ctx.hasEngine()) return [];
+      const layers = ctx.engine().layers();
+      const byId = new Map(layers.map((l) => [l.id, l]));
+      return topLevelOf(layers, api.selectedIds(layers)).filter((id) => byId.get(id)?.kind !== 'input');
+    },
+    canCopySelected: (): boolean => api.copyableIds().length > 0,
+    canDuplicateSelected: (): boolean => api.copyableIds().length > 0,
+    /** Cut removes what Delete would (locked layers stay) and cannot take input layers along. */
+    cuttableIds(): string[] {
+      if (!ctx.hasEngine()) return [];
+      const byId = new Map(ctx.engine().layers().map((l) => [l.id, l]));
+      return api.copyableIds().filter((id) => !byId.get(id)?.locked);
+    },
+    canCutSelected: (): boolean => api.cuttableIds().length > 0,
+    /** Replace the layer clipboard (the previous snapshot's pixels are freed). */
+    setLayerClip(next: LayerClip | null) {
+      if (clip && ctx.hasEngine()) ctx.engine().releaseClip(clip);
+      clip = next && next.count > 0 ? next : null;
+      clipCount.value = clip ? clip.count : 0;
+    },
+    /** Snapshot `ids` into the layer clipboard and leave a marker on the system clipboard. Returns false when nothing was copyable. */
+    copyIds(ids: string[], asCut = false): boolean {
+      if (!ctx.hasEngine()) return false;
+      // The old snapshot is freed BEFORE the new one is built, so the peak is one clip, not two. If the new copy then fails
+      // (allocation), the layer clipboard is left empty.
+      api.setLayerClip(null);
+      const next = ctx.engine().copyLayers(ids, asCut);
+      if (next.count === 0) { ctx.engine().releaseClip(next); return false; }
+      api.setLayerClip(next);
+      markerOk = false;
+      try {
+        const w = navigator.clipboard?.writeText(`${CLIP_MARKER}:${++markerSeq}`);
+        if (w) w.then(() => { markerOk = true; }, () => { markerOk = false; });
+      } catch { markerOk = false; }
+      return true;
+    },
+    /** Edit > Copy (Cmd/Ctrl+C). */
+    copySelected(): boolean {
+      if (!ctx.hasEngine()) return false;
+      if (api.copyableIds().length === 0) { if (api.selectedIds().length) ctx.setNotice('Input layers cannot be copied'); return false; }
+      return api.copyIds(api.copyableIds());
+    },
+    /** Edit > Cut (Cmd/Ctrl+X): copy + delete in one undo step; locked layers and input layers stay. */
+    cutSelected(): boolean {
+      if (!ctx.hasEngine()) return false;
+      const ids = api.cuttableIds();
+      if (!ids.length) {
+        const all = api.selectedIds();
+        if (all.length) ctx.setNotice(api.copyableIds().length ? (all.length > 1 ? 'The selected layers are locked' : 'The layer is locked') : 'Input layers cannot be cut');
+        return false;
+      }
+      if (!api.copyIds(ids, true)) return false;
+      ctx.engine().deleteLayers(ids);
+      return true;
+    },
+    /** Where Paste lands: into the active group (top), else directly below the active layer in its parent, else the top of the document. */
+    pasteTarget(): { parentId: string | null; index: number } {
+      const e = ctx.engine(), active = e.activeLayerId();
+      if (!active) return { parentId: null, index: 0 };
+      const spec = e.docSpec().layers, me = spec.find((l) => l.id === active);
+      if (!me) return { parentId: null, index: 0 };
+      if (me.kind === 'group') return { parentId: me.id, index: 0 };
+      const sibs = spec.filter((l) => l.parentId === me.parentId).reverse(); // top first
+      return { parentId: me.parentId, index: sibs.findIndex((l) => l.id === me.id) + 1 };
+    },
+    /** Paste the layer clipboard. Returns the new top-level ids (topmost first), [] when empty or refused. */
+    pasteLayerClip(): string[] {
+      if (!ctx.hasEngine() || !clip) return [];
+      const e = ctx.engine(), at = api.pasteTarget();
+      if (at.parentId) e.setLayerProps(at.parentId, { expanded: true });
+      return api.selectNew(e.pasteLayers(clip, at.parentId, at.index));
+    },
+    /** Make freshly created layers (topmost first) the selection; the topmost is active. */
+    selectNew(ids: string[]): string[] {
+      if (!ids.length) return ids;
+      sel.value = ids.slice().reverse();
+      anchor = ids[0];
+      const e = ctx.engine();
+      if (e.activeLayerId() !== ids[0]) { fromPanel = true; try { e.setActiveLayer(ids[0]); } finally { fromPanel = false; } }
+      return ids;
+    },
+    /** Layer > Duplicate (Cmd/Ctrl+J): copies land above their originals; the layer clipboard is untouched. */
+    duplicateSelected(): string[] {
+      if (!ctx.hasEngine()) return [];
+      const ids = api.copyableIds();
+      if (!ids.length) { if (api.selectedIds().length) ctx.setNotice('Input layers cannot be duplicated'); return []; }
+      return api.selectNew(ctx.engine().duplicateLayers(ids));
+    },
+    /** Cmd/Ctrl+drag in the layers panel: copies `ids` to the drop position (the layer clipboard is untouched). */
+    copyLayersTo(ids: string[], parentId: string | null, index: number): string[] {
+      if (!ctx.hasEngine()) return [];
+      const e = ctx.engine(), c = e.copyLayers(ids);
+      try {
+        if (c.count === 0) { ctx.setNotice('Input layers cannot be copied'); return []; }
+        if (parentId) e.setLayerProps(parentId, { expanded: true });
+        return api.selectNew(e.pasteLayers(c, parentId, index));
+      } finally { e.releaseClip(c); }
+    },
+    /**
+     * The keyboard fallback stamps its paste here; a paste event arriving within 500 ms after it (a late event for the same key press) must
+     * do nothing. The paste event itself cancels the pending fallback, so only fallback-then-event needs deduplicating; two real pastes in a
+     * row are never merged.
+     */
+    claimPaste(): boolean { pasteHandledAt = Date.now(); return true; },
+    pasteRecentlyHandled: (): boolean => Date.now() - pasteHandledAt < 500,
+    /**
+     * Keyboard paste fallback: the paste event normally handles Cmd/Ctrl+V and runs before this 0 ms timer; forwarded keys (TouchDesigner) never fire
+     * one, so the layers are pasted when the timer fires. `allowed` re-checks every guard at that moment (state may have changed since keydown).
+     */
+    armPasteFallback(allowed: () => boolean) {
+      if (!clip) return;
+      if (pasteTimer) clearTimeout(pasteTimer);
+      pasteTimer = setTimeout(() => {
+        pasteTimer = null;
+        try { if (clip && allowed() && api.claimPaste()) api.pasteLayerClip(); } catch (err) { ctx.setNotice(`Paste failed: ${err instanceof Error ? err.message : String(err)}`); }
+      }, 0);
+    },
+    cancelPasteFallback() { if (pasteTimer) { clearTimeout(pasteTimer); pasteTimer = null; } },
     /** Move the dragged row (or the whole selection when the row belongs to a multi-selection). */
     dragIds(dragId: string): string[] {
       const ids = api.selectedIds();

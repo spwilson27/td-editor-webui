@@ -233,6 +233,9 @@ export class Document {
     return ++this.slotSeq;
   }
 
+  /** How many more slots can be allocated. */
+  slotsLeft(): number { return 65535 - this.slotSeq; }
+
   /** After loading a document: continue numbering after the given ids and slots. */
   reseed(maxIdNumber: number, maxSlot: number): void {
     this.seq = Math.max(this.seq, maxIdNumber);

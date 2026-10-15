@@ -25,7 +25,7 @@ function isActivatable(target: unknown): boolean {
 }
 
 /** Delete removes layers only when the key was not meant for something else: page, canvas or the layer list. */
-function deleteKeyTarget(target: unknown): boolean {
+export function deleteKeyTarget(target: unknown): boolean {
   const t = target as { tagName?: string; closest?: (s: string) => unknown } | null;
   if (!t || !t.tagName) return true;
   const tag = t.tagName.toUpperCase();
@@ -46,6 +46,23 @@ export function onKeyDown(store: Store, e: KeyLike): void {
   const mod = e.ctrlKey || e.metaKey;
   if (e.repeat && !mod && key !== '[' && key !== ']' && key !== ' ') return; // toggles must not retrigger
 
+  if (mod && !e.altKey && !e.shiftKey && (key === 'c' || key === 'x' || key === 'v' || key === 'j')) {
+    // layer clipboard. Copy / cut / duplicate use the Delete guards (not typing, not aimed at another control, no floating selection / crop box);
+    // paste works from any non-typing target (a focused toolbar button must not block it).
+    if (!store.hasEngine() || e.defaultPrevented || store.layerKeysBlocked()) return;
+    if (key !== 'v' && !deleteKeyTarget(e.target)) return;
+    if (e.repeat) { e.preventDefault(); return; } // a held key acts once (and a held V must not fire a paste event per repeat)
+    if (key === 'v') {
+      // the paste event (system images, layer marker) normally pastes first; this covers forwarded keys that never fire one
+      store.armPasteFallback(() => store.layerKeysAllowed() && !isTyping(typeof document === 'undefined' ? null : document.activeElement));
+      return;
+    }
+    if (key === 'c') store.copySelected();
+    else if (key === 'x') store.cutSelected();
+    else store.duplicateSelected();
+    e.preventDefault();
+    return;
+  }
   if (mod) {
     if (key === 'z') { e.shiftKey ? store.redo() : store.undo(); }
     else if (key === 'y') store.redo();

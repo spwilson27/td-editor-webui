@@ -1,7 +1,7 @@
 import { remapShape, remapText, transformFor } from '../../src/state/transform';
 import type {
   BrushDynamics, BrushPreset, CloneOptions, DodgeBurnRange, Effect, TipShape,
-  AdjustmentSpec, AdjustmentType, Anchor, BlendMode, CanvasMode, DocSpec, EditorEngine, EngineEvent, Guides, HistoryEntry, LayerInfo, LayerSpec, LayerTransform,
+  AdjustmentSpec, AdjustmentType, Anchor, BlendMode, CanvasMode, DocSpec, EditorEngine, EngineEvent, Guides, HistoryEntry, LayerClip, LayerInfo, LayerSpec, LayerTransform,
   PaintTarget, Rect, SelectionOptions, ShapeSpec, ShapeType, SnapOptions, TextSpec, ToolContext, ToolId, ToolPointer,
 } from '../../src/engine/types';
 
@@ -732,5 +732,94 @@ export class FakeEngine implements EditorEngine {
     this.replacedMany.push({ ids: [...ids], id, w, h, len: rgba.length });
     return id;
   }
+
+  // ---- v7.1: layer clipboard ----
+  /** Every copyLayers / pasteLayers / duplicateLayers / releaseClip call; pasted ids are the ones returned. */
+  clipLog: Array<{ op: 'copy' | 'paste' | 'duplicate' | 'release'; asCut?: boolean; ids?: string[]; parent?: string | null; index?: number }> = [];
+  /** Set to make pasteLayers refuse (as when the document has no free slots). */
+  refusePaste = false;
+  private cloneLayers(src: FakeLayer[], idMap: Map<string, string>, copyName: Set<string>, pixels: Map<number, Uint8ClampedArray>): FakeLayer[] {
+    return src.map((l) => {
+      const slot = l.slot !== null ? this.nextSlot++ : null;
+      if (slot !== null && l.slot !== null) this.surfaces.set(slot, new Uint8ClampedArray(pixels.get(l.slot) ?? new Uint8ClampedArray(0)));
+      const mask = l.mask ? { slot: this.nextSlot++, enabled: l.mask.enabled } : null;
+      if (mask && l.mask) this.surfaces.set(mask.slot, new Uint8ClampedArray(pixels.get(l.mask.slot) ?? new Uint8ClampedArray(0)));
+      return {
+        ...l, id: idMap.get(l.id) as string, name: copyName.has(l.id) ? `${l.name} copy` : l.name, slot, mask,
+        parent: l.parent && idMap.has(l.parent) ? idMap.get(l.parent) as string : l.parent,
+        effects: l.effects.map((e) => remapFakeAux(JSON.parse(JSON.stringify(e)) as Effect, idMap)),
+      };
+    });
+  }
+  copyLayers(ids: string[], asCut = false): LayerClip {
+    this.clipLog.push({ op: 'copy', ids: [...ids], asCut });
+    this.calls.push(`copyLayers:${ids.join(',')}`);
+    const tops = this.store.filter((l) => ids.includes(l.id) && l.kind !== 'input' && !this.ancestors(l).some((a) => ids.includes(a)));
+    const keep = this.subtree(tops.map((l) => l.id));
+    const layers = this.store.filter((l) => keep.has(l.id) && l.kind !== 'input').map((l) => ({ ...l, effects: l.effects.map((e) => JSON.parse(JSON.stringify(e)) as Effect), mask: l.mask ? { ...l.mask } : null }));
+    const pixels = new Map<number, Uint8ClampedArray>();
+    for (const l of layers) {
+      for (const sl of [l.slot, l.mask?.slot ?? null]) if (sl !== null && this.surfaces.has(sl)) pixels.set(sl, new Uint8ClampedArray(this.surfaces.get(sl) as Uint8ClampedArray));
+    }
+    return { kind: 'layer-clip', count: tops.length, bytes: [...pixels.values()].reduce((n, a) => n + a.length, 0), fake: { layers, pixels, tops: tops.map((t) => t.id), asCut } } as unknown as LayerClip;
+  }
+  private ancestors(l: FakeLayer): string[] {
+    const out: string[] = [];
+    for (let p = l.parent; p; p = this.store.find((x) => x.id === p)?.parent ?? null) out.push(p);
+    return out;
+  }
+  private insertClipLayers(layers: FakeLayer[], tops: string[], parent: string | null, index: number, pixels: Map<number, Uint8ClampedArray>, keepNames = false): string[] {
+    const idMap = new Map(layers.map((l) => [l.id, `L${this.nextId++}`]));
+    const made = this.cloneLayers(layers, idMap, new Set(keepNames ? [] : tops), pixels);
+    const topSet = new Set(tops.map((t) => idMap.get(t) as string));
+    const block = made.filter((l) => topSet.has(l.id));
+    for (const l of block) l.parent = parent;
+    const rest = made.filter((l) => !topSet.has(l.id));
+    const sibs = this.store.filter((x) => x.parent === parent);
+    const below = [...sibs].reverse()[index];
+    const at = below ? this.store.indexOf(below) + 1 : sibs.length ? this.store.indexOf(sibs[0]) : this.store.length;
+    this.store.splice(at, 0, ...block);
+    this.store.push(...rest);
+    this.active = block[block.length - 1]?.id ?? this.active;
+    return block.map((l) => l.id).reverse();
+  }
+  pasteLayers(clip: LayerClip, parentId: string | null, index: number): string[] {
+    this.clipLog.push({ op: 'paste', parent: parentId, index });
+    this.calls.push(`pasteLayers:${parentId}:${index}`);
+    const f = (clip as unknown as { fake?: { layers: FakeLayer[]; pixels: Map<number, Uint8ClampedArray>; tops: string[]; asCut?: boolean } }).fake;
+    if (!f || !f.tops.length || this.refusePaste) { if (this.refusePaste) this.emit({ type: 'notice', message: 'Cannot paste: the document has no free surface slots left' }); return []; }
+    let out: string[] = [];
+    this.structural(f.tops.length === 1 ? 'Paste layer' : 'Paste layers', () => {
+      out = this.insertClipLayers(f.layers, f.tops, parentId, index, f.pixels, !!f.asCut); // the snapshot's pixels, whatever happened to the source since
+    });
+    return out;
+  }
+  duplicateLayers(ids: string[]): string[] {
+    this.clipLog.push({ op: 'duplicate', ids: [...ids] });
+    this.calls.push(`duplicateLayers:${ids.join(',')}`);
+    const clip = (this.copyLayers(ids) as unknown as { fake: { layers: FakeLayer[]; tops: string[]; pixels: Map<number, Uint8ClampedArray> } }).fake;
+    this.clipLog.pop();
+    this.calls.pop();
+    if (!clip.tops.length) return [];
+    let out: string[] = [];
+    this.structural(clip.tops.length === 1 ? 'Duplicate layer' : 'Duplicate layers', () => {
+      for (const t of [...clip.tops].reverse()) {
+        const src = this.store.find((l) => l.id === t) as FakeLayer;
+        const sub = this.subtree([t]);
+        const layers = clip.layers.filter((l) => sub.has(l.id));
+        const got = this.insertClipLayers(layers, [t], src.parent, [...this.store.filter((x) => x.parent === src.parent)].reverse().indexOf(src), clip.pixels);
+        out = [...got, ...out];
+      }
+      this.active = out[0];
+    });
+    return out;
+  }
+  releaseClip(_clip: LayerClip) { this.clipLog.push({ op: 'release' }); }
   dispose() { this.listeners.clear(); }
+}
+
+function remapFakeAux(e: Effect, idMap: Map<string, string>): Effect {
+  const o = e as unknown as { auxSource?: unknown };
+  if (typeof o.auxSource === 'string' && o.auxSource.startsWith('layer:')) { const to = idMap.get(o.auxSource.slice(6)); if (to) o.auxSource = `layer:${to}`; }
+  return e;
 }

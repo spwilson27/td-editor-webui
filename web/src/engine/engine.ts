@@ -1,6 +1,6 @@
 import type {
   AdjustmentSpec, AdjustmentType, Anchor, BlendMode, BrushDynamics, BrushPreset, BrushSettings, TipShape, CanvasMode, CloneOptions, DocSpec, Effect, EditorEngine, EngineEvent,
-  Guides, HistoryEntry, LayerInfo, LayerTransform, PaintTarget, Rect, RGBA, SelectionOptions, ShapeSpec, ShapeType, SnapOptions, TextSpec,
+  Guides, HistoryEntry, LayerClip, LayerInfo, LayerTransform, PaintTarget, Rect, RGBA, SelectionOptions, ShapeSpec, ShapeType, SnapOptions, TextSpec,
   ToolContext, ToolId, ToolPointer,
 } from './types';
 import { ADJUSTMENT_NAMES, clampAdjustment, defaultAdjustmentEffect, effectFromAdjustment, effectLabel, migrateAdjustmentEffects, stackIsIdentity } from './adjustments';
@@ -11,7 +11,7 @@ import { tdPreviewFlag } from './effectsAdapter';
 export { sanitizeEffect } from './effectsSanitize';
 import { History, type HistoryItem } from './history';
 import {
-  BASE_ID, Document, floatingBounds, isPixel, isVector, layerBox, layerExtent, layerXf, MAX_INPUTS, snapshotSurfaces, specBounds,
+  BASE_ID, cloneEffect, Document, floatingBounds, isPixel, isVector, layerBox, layerExtent, layerXf, MAX_INPUTS, snapshotSurfaces, specBounds,
   specSame, surfaceDocBounds,
   type AdjustmentLayer, type EditTarget, type GroupLayer, type InputState, type Layer, type Mask, type PixelLayer,
   type ShapeLayer, type StructureSnapshot, type TextLayer, type VectorLayer,
@@ -28,6 +28,7 @@ import type { Patch } from './tiles';
 import { hashString, readBlob, surfaceHash, writeBlob, type CanvasState, type Ser, type SerEntry } from './historyBlob';
 import { clipToSize, equal, intersect, isEmpty, union } from './rect';
 import { createSurface, releaseSurface, resampled, type Surface } from './surface';
+import { cloneShape, cloneText } from './textShape';
 
 const copyXfLayer = (l: Xf): Xf => ({ x: l.x, y: l.y, sx: l.sx, sy: l.sy, rot: l.rot, kx: l.kx, ky: l.ky });
 import {
@@ -88,6 +89,56 @@ function shiftedMask(old: Surface, w: number, h: number, dx: number, dy: number)
   return s;
 }
 
+/** v7.1: one copied layer (pixel data deep-copied) of a layer clip. */
+interface ClipNode {
+  src: string; kind: Layer['kind']; name: string; visible: boolean; locked: boolean; opacity: number; blend: BlendMode; effects: Effect[]; expanded: boolean;
+  tf: { x: number; y: number; sx: number; sy: number; rot: number; kx: number; ky: number } | null;
+  surface: Surface | null; mask: { surface: Surface; enabled: boolean } | null; spec: TextSpec | ShapeSpec | null; children: ClipNode[] | null;
+}
+
+class LayerClipImpl implements LayerClip {
+  readonly kind = 'layer-clip' as const;
+  released = false;
+  /** `epoch`: which loaded document the snapshot came from (aux layer references mean nothing in another one); `asCut`: pasted without " copy". */
+  constructor(readonly nodes: ClipNode[], readonly epoch: number, readonly asCut: boolean) {}
+  get count(): number { return this.released ? 0 : this.nodes.length; }
+  get bytes(): number {
+    let n = 0;
+    const walk = (ns: ClipNode[]): void => { for (const c of ns) { if (c.surface) n += c.surface.width * c.surface.height * 4; if (c.mask) n += c.mask.surface.width * c.mask.surface.height * 4; if (c.children) walk(c.children); } };
+    if (!this.released) walk(this.nodes);
+    return n;
+  }
+  release(): void {
+    if (this.released) return;
+    this.released = true;
+    const walk = (ns: ClipNode[]): void => { for (const c of ns) { if (c.surface) releaseSurface(c.surface); if (c.mask) releaseSurface(c.mask.surface); if (c.children) walk(c.children); } };
+    walk(this.nodes);
+  }
+}
+
+/** Exact pixel copy of a surface (a source-over draw onto transparent keeps the stored values). */
+function copySurface(s: Surface): Surface {
+  const c = createSurface(s.width, s.height);
+  c.ctx.drawImage(s.canvas as CanvasImageSource, 0, 0);
+  return c;
+}
+
+/** Effects cloned with `layer:<id>` aux references to copied layers pointed at their copies (references to layers that were not copied stay). */
+function remapAux(effects: Effect[], idMap: Map<string, string>, foreign: boolean): Effect[] {
+  return effects.map((e) => {
+    const c = structuredClone(e) as unknown as Record<string, unknown>;
+    const s = c.auxSource;
+    // foreign = pasted into another document: layer ids there mean other layers, so a reference to a layer that was not copied is dropped
+    // (an aux filter without a source renders with no displacement)
+    if (typeof s === 'string' && s.startsWith('layer:')) { const to = idMap.get(s.slice(6)); if (to) c.auxSource = `layer:${to}`; else if (foreign) delete c.auxSource; }
+    else if (s && typeof s === 'object') {
+      const t = s as { kind?: unknown; id?: unknown };
+      if (t.kind === 'layer' && typeof t.id === 'string') { const to = idMap.get(t.id); if (to) c.auxSource = { ...t, id: to }; else if (foreign) delete c.auxSource; }
+    }
+    return c as unknown as Effect;
+  });
+}
+
 /** A pixel layer with every v5 field at its default. */
 function newPixelLayer(id: string, name: string, surface: Surface, over: Partial<PixelLayer> = {}): PixelLayer {
   return {
@@ -143,6 +194,7 @@ export class Engine implements EditorEngine, Host {
   private thumbs = new Map<string, { version: number; canvas: HTMLCanvasElement }>();
   private rev = 0;
   private liveSpec = false; // a move drag already announced its offsets
+  private docEpoch = 0; // bumped by loadDocument: layer clips remember the document they came from
   private knownSlots = new Map<number, Surface>(); // slot -> surface last announced
   private freshSlots = new Set<number>(); // slots of just-created empty layers: no 'surface' event needed
   private maskTargetLayer: string | null = null; // layer whose mask is the paint target
@@ -1089,6 +1141,155 @@ export class Engine implements EditorEngine, Host {
     return group.id;
   }
 
+  // ---- v7.1: layer clipboard (docs/DESIGN_V7.md section 6) ----
+
+  private snapNode(l: Layer, deep: boolean, made: Surface[] = []): ClipNode | null {
+    if (l.kind === 'input') return null; // one layer per TD input
+    const copy = (s: Surface): Surface => { if (!deep) return s; const c = copySurface(s); made.push(c); return c; };
+    const n: ClipNode = {
+      src: l.id, kind: l.kind, name: l.name, visible: l.visible, locked: l.locked, opacity: l.opacity, blend: l.blend,
+      effects: l.effects.map(cloneEffect), expanded: l.kind === 'group' ? l.expanded : true,
+      tf: isPixel(l) ? { x: l.x, y: l.y, sx: l.sx, sy: l.sy, rot: l.rot, kx: l.kx, ky: l.ky } : null,
+      surface: l.kind === 'pixel' ? copy(l.surface) : null,
+      mask: l.kind !== 'group' && l.mask ? { surface: copy(l.mask.surface), enabled: l.mask.enabled } : null,
+      spec: l.kind === 'text' ? cloneText(l.spec) : l.kind === 'shape' ? cloneShape(l.spec) : null,
+      children: l.kind === 'group' ? l.children.map((c) => this.snapNode(c, deep, made)).filter((c): c is ClipNode => !!c) : null,
+    };
+    return n;
+  }
+
+  copyLayers(ids: string[], asCut = false): LayerClip {
+    this.finishStroke(false);
+    const made: Surface[] = [];
+    try {
+      const nodes = this.pickLayers(ids).map((l) => this.snapNode(l, true, made)).filter((n): n is ClipNode => !!n);
+      return new LayerClipImpl(nodes, this.docEpoch, asCut);
+    } catch (err) {
+      made.forEach(releaseSurface); // no partial snapshot is left behind; nothing else was touched
+      this.emit({ type: 'notice', message: `Cannot copy: ${err instanceof Error ? err.message : String(err)}` });
+      return new LayerClipImpl([], this.docEpoch, asCut);
+    }
+  }
+
+  /** A paste / duplicate that pushed a history entry: tell the user when its size (pasted pixels) evicted older steps. */
+  private noteEviction(expected: number): void {
+    if (this.hist.entries().length < expected) this.emit({ type: 'notice', message: 'Large paste: older undo steps dropped' });
+  }
+
+  releaseClip(clip: LayerClip): void {
+    if (clip instanceof LayerClipImpl) clip.release();
+  }
+
+  /** Fresh layers (new ids, slots, deep-copied pixels) from clip nodes, or null (after a notice) when they do not fit. Touches no document state. */
+  private instantiate(nodes: ClipNode[], foreign = false, keepNames = false): { layers: Layer[]; idMap: Map<string, string> } | null {
+    let need = 0;
+    const count = (ns: ClipNode[]): void => {
+      for (const n of ns) {
+        if (n.surface) need++;
+        if (n.mask) need++;
+        if (n.children) count(n.children);
+      }
+    };
+    count(nodes);
+    if (need > this.doc.slotsLeft()) {
+      this.emit({ type: 'notice', message: 'Cannot paste: the document has no free surface slots left' });
+      return null;
+    }
+    const idMap = new Map<string, string>();
+    const assign = (ns: ClipNode[]): void => { for (const n of ns) { idMap.set(n.src, this.doc.newId()); if (n.children) assign(n.children); } };
+    assign(nodes);
+    const made: Surface[] = [];
+    const mk = (s: Surface): Surface => { const c = copySurface(s); made.push(c); return c; };
+    const dw = this.doc.width;
+    const dh = this.doc.height;
+    const build = (n: ClipNode, top: boolean): Layer => {
+      const common = {
+        id: idMap.get(n.src) as string, name: top && !keepNames ? `${n.name} copy` : n.name, visible: n.visible, locked: n.locked, opacity: n.opacity, blend: n.blend,
+        effects: remapAux(n.effects, idMap, foreign),
+      };
+      const docSpace = n.kind !== 'pixel' && n.kind !== 'group';
+      let mask: Mask | null = null;
+      if (n.mask) {
+        let surface: Surface;
+        if (docSpace && (n.mask.surface.width !== dw || n.mask.surface.height !== dh)) { surface = shiftedMask(n.mask.surface, dw, dh, 0, 0); made.push(surface); } // the canvas was resized since
+        else surface = mk(n.mask.surface);
+        mask = { slot: this.doc.newSlot(), surface, enabled: n.mask.enabled };
+      }
+      switch (n.kind) {
+        case 'group':
+          return { ...common, kind: 'group', children: (n.children as ClipNode[]).map((c) => build(c, false)), expanded: n.expanded };
+        case 'pixel':
+          return newPixelLayer(common.id, common.name, mk(n.surface as Surface), { ...common, ...(n.tf as NonNullable<ClipNode['tf']>), slot: this.doc.newSlot(), mask });
+        case 'text':
+          return { ...common, kind: 'text', spec: cloneText(n.spec as TextSpec), mask };
+        case 'shape':
+          return { ...common, kind: 'shape', spec: cloneShape(n.spec as ShapeSpec), mask };
+        default:
+          return { ...common, kind: 'adjustment', adjustment: null, mask };
+      }
+    };
+    try {
+      return { layers: nodes.map((n) => build(n, true)), idMap };
+    } catch (err) {
+      made.forEach(releaseSurface);
+      this.emit({ type: 'notice', message: `Cannot paste: ${err instanceof Error ? err.message : String(err)}` });
+      return null;
+    }
+  }
+
+  /** Document area the new layers repaint (null = everything, false = nothing visible). */
+  private pasteDirty(layers: Layer[]): Rect | null | false {
+    let area: Rect | null = null;
+    for (const l of layers) if (l.visible) area = union(area, layerExtent(l, this.docRect()));
+    return area ? intersect(area, this.docRect()) ?? false : false;
+  }
+
+  pasteLayers(clip: LayerClip, parentId: string | null, index: number): string[] {
+    this.finishStroke();
+    if (!(clip instanceof LayerClipImpl) || clip.released || !clip.nodes.length) return [];
+    const parent = parentId === null ? this.doc.root : this.doc.find(parentId);
+    if (!parent || parent.kind !== 'group') return [];
+    const made = this.instantiate(clip.nodes, clip.epoch !== this.docEpoch, clip.asCut);
+    if (!made) return [];
+    const at = Math.max(0, Math.min(Math.trunc(index) || 0, parent.children.length));
+    const n = made.layers.length;
+    const expected = this.hist.index + 2;
+    this.structural(n === 1 ? 'Paste layer' : 'Paste layers', () => {
+      parent.children.splice(at, 0, ...made.layers);
+      this.doc.activeId = made.layers[0].id;
+    }, this.pasteDirty(made.layers));
+    this.noteEviction(expected);
+    return made.layers.map((l) => l.id);
+  }
+
+  duplicateLayers(ids: string[]): string[] {
+    this.finishStroke();
+    const sel = this.pickLayers(ids).filter((l) => l.kind !== 'input');
+    if (!sel.length) return [];
+    const nodes = sel.map((l) => this.snapNode(l, false) as ClipNode); // live surfaces: instantiate() copies them
+    const made = this.instantiate(nodes);
+    if (!made) return [];
+    // runs of adjacent selected siblings keep their block together; each copy block lands above its run
+    const runs: Array<{ first: Layer; copies: Layer[] }> = [];
+    let prev: { parent: GroupLayer; index: number } | null = null;
+    sel.forEach((l, i) => {
+      const loc = this.doc.locate(l.id) as { parent: GroupLayer; index: number };
+      if (prev && loc.parent === prev.parent && loc.index === prev.index + 1) runs[runs.length - 1].copies.push(made.layers[i]);
+      else runs.push({ first: l, copies: [made.layers[i]] });
+      prev = loc;
+    });
+    const expected = this.hist.index + 2;
+    this.structural(sel.length === 1 ? 'Duplicate layer' : 'Duplicate layers', () => {
+      for (const r of runs) {
+        const loc = this.doc.locate(r.first.id) as { parent: GroupLayer; index: number };
+        loc.parent.children.splice(loc.index, 0, ...r.copies);
+      }
+      this.doc.activeId = made.layers[0].id;
+    }, this.pasteDirty(made.layers));
+    this.noteEviction(expected);
+    return made.layers.map((l) => l.id);
+  }
+
   flattenToNewLayer(): string {
     this.compositor.ensure(null);
     const layer = newPixelLayer(this.doc.newId(), 'Flattened', createSurface(this.doc.width, this.doc.height), { slot: this.doc.newSlot() });
@@ -1281,6 +1482,7 @@ export class Engine implements EditorEngine, Host {
    * live frames) are kept when their size matches.
    */
   loadDocument(spec: DocSpec): void {
+    this.docEpoch++;
     const plan = this.validateSpec(spec);
     // v7: history blobs written for a v2-v7 document carry the layout hash of its legacy-shaped spec (`adjustment: {...}`); remember it
     // (before the migration into effects[]) so restoreHistory still accepts them.

@@ -119,6 +119,13 @@ export function installTestHook(store: Store, win: Window = window): void {
     deleteSelected: () => store.deleteSelected(),
     groupSelected: () => store.groupSelected(),
     mergeSelected: () => store.mergeSelected(),
+    // v7.1: layer clipboard
+    copySelected: () => store.copySelected(),
+    cutSelected: () => store.cutSelected(),
+    pasteLayers: () => store.pasteLayerClip(),
+    duplicateSelected: () => store.duplicateSelected(),
+    /** Cmd-drag copy of the given layers to a drop position (parent null = root, index 0 = top). */
+    copyLayersTo: (ids: string[], parent: string | null, index: number) => store.copyLayersTo(ids, parent, index),
     setBrushTip: (tip: TipShape, dynamics: Partial<BrushDynamics> = {}) => {
       if (tip === 'custom') store.useTipFromSelection(); else store.setTip(tip);
       store.setDynamics(dynamics);

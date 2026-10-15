@@ -6,17 +6,19 @@ export interface Drop { parentId: string | null; index: number }
 /**
  * Where dragged layer(s) land when dropped on `targetId`. `index` counts siblings excluding every dragged layer (0 = top).
  * Null when the drop is meaningless: onto a dragged layer or into one of its descendants.
+ * `copy` (v7.1, Cmd/Ctrl-drag): the originals stay where they are, so every sibling counts and any target is legal (a copy may land
+ * inside its own source group).
  */
-export function computeDrop(layers: LayerInfo[], dragIds: string | string[], targetId: string, zone: DropZone): Drop | null {
+export function computeDrop(layers: LayerInfo[], dragIds: string | string[], targetId: string, zone: DropZone, copy = false): Drop | null {
   const drags = new Set(typeof dragIds === 'string' ? [dragIds] : dragIds);
   const byId = new Map(layers.map((l) => [l.id, l]));
   const target = byId.get(targetId);
   if (!drags.size || !target || [...drags].some((d) => !byId.has(d))) return null;
-  for (let p: LayerInfo | undefined = target; p; p = p.parentId ? byId.get(p.parentId) : undefined) {
+  if (!copy) for (let p: LayerInfo | undefined = target; p; p = p.parentId ? byId.get(p.parentId) : undefined) {
     if (drags.has(p.id)) return null;
   }
   if (zone === 'into' && target.kind === 'group') return { parentId: target.id, index: 0 };
-  const sibs = layers.filter((l) => l.parentId === target.parentId && !drags.has(l.id));
+  const sibs = layers.filter((l) => l.parentId === target.parentId && (copy || !drags.has(l.id)));
   const at = sibs.findIndex((l) => l.id === targetId);
   return { parentId: target.parentId, index: zone === 'before' ? at : at + 1 };
 }

@@ -2672,6 +2672,135 @@ def s50_ui_flatten_merge_multiselect(args):
     return ok_all, "\n        ".join(notes)
 
 
+def td_surface_sigs():
+    """{slot: md5 of the surface buffer} of TD's stored surfaces (what the copies' pixels were uploaded as)."""
+    return td_json("import hashlib\nx = comp.ext.RasterEditorExt\n"
+                   "print(json.dumps({str(s): hashlib.md5(b.tobytes()).hexdigest() for s, b in sorted(x.surfaces.items())}))")
+
+
+def s51_ui_copy_paste(args):
+    """Real UI: copy / paste a pixel layer with effects + a group (with two painted children) through the page test hook -- the page's layers
+    equal TD's, the new slots' surfaces equal the sources', the composite matches after paste / duplicate, a paste after painting the source
+    still gives the pre-paint snapshot, and undo removes the copies in TD too."""
+    W, H = 320, 200
+    err = ui_doc(args, W, H)
+    if err:
+        return None, err
+    miss = hook_missing("selectLayers", "copySelected", "pasteLayers", "duplicateSelected", "addGroup", "moveLayer", "setEffects", "undo")
+    if miss:
+        return None, f"copy/paste hooks not available: {miss}"
+    notes, ok_all = [], True
+
+    def chk(label, cond, extra=""):
+        nonlocal ok_all
+        ok_all &= bool(cond)
+        notes.append(f"{label}: {'ok' if cond else 'FAIL'} {extra}".rstrip())
+
+    def page_ids():
+        return [l["id"] for l in (hook_call("layers()") or [])]
+
+    def same_layers():
+        page = page_ids()
+        return page, wait_for(lambda: sorted(l["id"] for l in td_layers()) == sorted(page), 8)
+
+    def parity(label):
+        time.sleep(0.8)
+        ok, n = compare_page_td([(label, (0, 0, W, H), 3, 2.0, 0.02)])
+        chk(f"{label}: page composite equals TD", ok, " ".join(n))
+
+    def slot_of(lid):
+        t = td_layer(lid)
+        return None if not t or t.get("slot") is None else str(t["slot"])
+
+    def sig_of(lid):
+        s = slot_of(lid)
+        return (td_surface_sigs() or {}).get(s) if s else None
+
+    def sigs_match(pairs, timeout=8):
+        return wait_for(lambda: all(sig_of(a) is not None and sig_of(a) == sig_of(b) for a, b in pairs), timeout)
+
+    # scene: a painted pixel layer with two effects, and a group with two painted children
+    px = hook_call("addLayer()")
+    paint_all(W, H, "#3060c0")
+    hook_call(f"setEffects({px!r}, [{{type:'colorOverlay', color:[255,128,0,255], opacity:0.3}}, {{type:'dropShadow', dx:6, dy:6, blur:4, color:[0,0,0,255], opacity:0.6}}])")
+    g = hook_call("addGroup()")
+    kids = []
+    for color in ("#c04020", "#20c060"):
+        kids.append(hook_call("addLayer()"))
+        paint_all(W, H, color)
+    for k in kids:
+        hook_call(f"moveLayer({k!r}, {g!r}, 0)")
+    page, same = same_layers()
+    chk("scene: TD has the same layers", same and len(page) == 5, str(page))
+    parity("scene (pixel layer with effects + group)")
+    chk("source surfaces present in TD", all(slot_of(i) for i in [px] + kids), str([slot_of(i) for i in [px] + kids]))
+    before = set(page_ids())
+
+    # copy + paste
+    hook_call(f"selectLayers({[g, px]!r})")
+    chk("copySelected", hook_call("copySelected()") is True)
+    new = hook_call("pasteLayers()") or []
+    now = page_ids()
+    chk("paste added 4 layers with new ids", len(now) == len(before) + 4 and all(i not in before for i in new) and len(new) >= 2, f"{len(before)} -> {len(now)} new={new}")
+    page, same = same_layers()
+    chk("TD has the same layers after paste (incl. new slots)", same, str(page))
+    fresh = [l for l in hook_call("layers()") if l["id"] not in before]
+    npx = next((l for l in fresh if l["kind"] == "pixel" and l.get("parentId") is None), None)
+    ng = next((l for l in fresh if l["kind"] == "group"), None)
+    nkids = [l["id"] for l in fresh if ng and l.get("parentId") == ng["id"]]
+    chk("pasted pixel layer + group with 2 children", bool(npx and ng and len(nkids) == 2), str([(l["id"], l["kind"], l.get("parentId")) for l in fresh]))
+    if npx and ng and len(nkids) == 2:
+        tdl = {l["id"]: l for l in td_layers()}
+        chk("TD parent links of the copies", all(tdl.get(k) is not None for k in nkids + [npx["id"]]))
+        slots = [t["slot"] for t in td_layers() if t.get("slot") is not None]
+        chk("every copy owns a distinct TD slot", len(set(slots)) == len(slots) and all(slot_of(i) for i in [npx["id"]] + nkids), str(slots))
+        # the copies' surfaces (kids in order) equal the sources'
+        chk("copied pixel layer's TD surface equals the source's", sigs_match([(px, npx["id"])]))
+        order = [k for k in page_ids() if k in kids]
+        norder = [k for k in page_ids() if k in nkids]
+        chk("copied children's TD surfaces equal their sources' (same order)", sigs_match(list(zip(order, norder))), f"{order} -> {norder}")
+        fx_ok = (hook_call(f"layers().find(l => l.id === {npx['id']!r}).effects.length") or 0) == 2
+        chk("pasted layer keeps its effects", fx_ok)
+        snap = sig_of(px)
+        parity("after paste")
+
+        # paint the source AFTER copying; the second paste is still the pre-paint snapshot
+        hook_call(f"selectLayers({[px]!r})")
+        hook_call(f"stroke('brush', [[10, 10], [300, 190]])")
+        chk("source surface changed in TD after painting", wait_for(lambda: sig_of(px) != snap, 6))
+        hook_call(f"selectLayers({[g, px]!r})")
+        again = hook_call("pasteLayers()") or []
+        page, same = same_layers()
+        chk("second paste reaches TD", same and len(again) >= 2, str(page))
+        again_px = next((l["id"] for l in hook_call("layers()") if l["id"] in again and l["kind"] == "pixel" and l.get("parentId") is None), None)
+        chk("second paste equals the pre-paint snapshot (not the new stroke)",
+            again_px is not None and wait_for(lambda: sig_of(again_px) == snap, 8) and sig_of(px) != snap)
+        parity("after second paste")
+
+        # undo the two pastes
+        n_before_undo = len(page_ids())
+        hook_call("undo()")
+        page, same = same_layers()
+        chk("undo removes the last paste in TD too", same and len(page) < n_before_undo and all(i not in page for i in again), str(page))
+        parity("after undo of the second paste")
+
+    # duplicate
+    hook_call(f"selectLayers({[px]!r})")
+    n0 = len(page_ids())
+    dup = hook_call("duplicateSelected()") or []
+    chk("duplicateSelected adds a layer", len(page_ids()) == n0 + 1 and len(dup) == 1, str(dup))
+    page, same = same_layers()
+    chk("TD has the duplicate", same, str(page))
+    if dup:
+        chk("duplicate's TD surface equals the source's", sigs_match([(px, dup[0])]))
+    parity("after duplicate")
+    hook_call("undo()")
+    page, same = same_layers()
+    chk("undo removes the duplicate in TD", same and not any(d in page for d in dup), str(page))
+    parity("after undo of the duplicate")
+    return ok_all, "\n        ".join(notes)
+
+
 def s29_export(args):
     """Exportpath / Exportdoc: round trip through a real file (temp + rename, no .part left), the result in Status, guides +
     canvas mode persisted and restored by loadTox into a temp COMP; errors for a missing folder; help + file filter."""
@@ -4040,6 +4169,7 @@ STEPS = [
     (48, "v6 documents with every adjustment type migrate (adjustment -> effects) and render like v6", "migrate", False),
     (49, "renderLayer flatten / mergeDown + renderLayers equal TD's composite of those layers; temporary nodes cleaned up", "renderreq", False),
     (50, "real UI: merge down, merge selected, flatten group, group / delete selected via the hook -- page equals TD, same layers", "uimulti", True),
+    (51, "real UI: copy/paste a pixel layer with effects + a group via the page test hook -- page equals TD, new surfaces present", "uicopy", True),
     (99, "deleting the COMP with clients connected does not freeze TD; undo of the delete restores the pixels (run last)", "delete", False),
 ]
 FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinput": "s4_no_input", "scene": "s5_scene",
@@ -4055,7 +4185,7 @@ FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinp
          "uifilters": "s39_ui_filters_parity", "uigroupfx": "s40_ui_filter_adjust_group_fx", "uiselectadj": "s41_ui_selection_adjustment",
          "uibrush": "s42_ui_brush_tips_presets", "layerpreview": "s43_layer_preview", "uihistory": "s44_ui_history_reload",
          "uiredoc": "s45_ui_redoc_history", "ttc": "s46_ttc_fonts", "active": "s47_active_layer_hint",
-         "migrate": "s48_migration_v6_docs", "renderreq": "s49_render_requests", "uimulti": "s50_ui_flatten_merge_multiselect"}
+         "migrate": "s48_migration_v6_docs", "renderreq": "s49_render_requests", "uimulti": "s50_ui_flatten_merge_multiselect", "uicopy": "s51_ui_copy_paste"}
 
 
 def main():

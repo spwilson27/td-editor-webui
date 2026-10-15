@@ -90,14 +90,14 @@ function NameField({ layer, onDone }: { layer: LayerInfo; onDone: () => void }) 
   );
 }
 
-interface DragState { id: string; target: string | null; zone: DropZone }
+interface DragState { id: string; target: string | null; zone: DropZone; copy: boolean }
 
 interface AncestorRef { id: string; depth: number }
 interface FlatState { enabled: boolean; title: string; tooltip: string; reason: string | null }
 /** Everything a row draws from, as plain values: a row re-renders only when one of them changes. */
 interface RowProps {
   layer: LayerInfo; selected: boolean; active: boolean; maskTarget: boolean; editing: boolean; onEdit: (id: string | null) => void;
-  dropZone: DropZone | null; tdPreview: boolean; hiddenByParent: boolean; ancestors: AncestorRef[]; ends: string[]; childCount: number; flat: FlatState; busy: boolean;
+  dropZone: DropZone | null; dropCopy: boolean; tdPreview: boolean; hiddenByParent: boolean; ancestors: AncestorRef[]; ends: string[]; childCount: number; flat: FlatState; busy: boolean;
 }
 
 const sameJson = (a: unknown, b: unknown) => a === b || JSON.stringify(a) === JSON.stringify(b);
@@ -110,7 +110,7 @@ function sameLayer(a: LayerInfo, b: LayerInfo): boolean {
 }
 function sameRow(a: RowProps, b: RowProps): boolean {
   return a.selected === b.selected && a.active === b.active && a.maskTarget === b.maskTarget && a.editing === b.editing && a.onEdit === b.onEdit
-    && a.dropZone === b.dropZone && a.tdPreview === b.tdPreview && a.hiddenByParent === b.hiddenByParent && a.childCount === b.childCount && a.busy === b.busy
+    && a.dropZone === b.dropZone && a.dropCopy === b.dropCopy && a.tdPreview === b.tdPreview && a.hiddenByParent === b.hiddenByParent && a.childCount === b.childCount && a.busy === b.busy
     && a.ends.join() === b.ends.join() && a.ancestors.map((x) => x.id + x.depth).join() === b.ancestors.map((x) => x.id + x.depth).join()
     && a.flat.enabled === b.flat.enabled && a.flat.title === b.flat.title && a.flat.tooltip === b.flat.tooltip && a.flat.reason === b.flat.reason
     && sameLayer(a.layer, b.layer);
@@ -120,7 +120,7 @@ class MemoRow extends Component<RowProps> {
   render() { return <LayerRow {...this.props} />; }
 }
 
-function LayerRow({ layer, selected, active, maskTarget, editing, onEdit, dropZone: zone, tdPreview, hiddenByParent, ancestors, ends, childCount, flat, busy }: RowProps) {
+function LayerRow({ layer, selected, active, maskTarget, editing, onEdit, dropZone: zone, dropCopy, tdPreview, hiddenByParent, ancestors, ends, childCount, flat, busy }: RowProps) {
   const e = store.engine;
   const group = layer.kind === 'group';
   const dim = !layer.visible || hiddenByParent;
@@ -154,9 +154,10 @@ function LayerRow({ layer, selected, active, maskTarget, editing, onEdit, dropZo
         return <span key={a.id} data-group-end={a.id} aria-hidden="true" style={`position:absolute;left:${guideX(a.depth)}px;right:6px;bottom:0;height:2px;background:${c};opacity:0.6;border-radius:0 0 0 2px;pointer-events:none`} />;
       })}
       {dropHere && (
-        <span data-drop-indicator data-drop-zone={zone} data-drop-depth={indDepth} aria-hidden="true"
+        <span data-drop-indicator data-drop-zone={zone} data-drop-depth={indDepth} data-drop-copy={dropCopy || undefined} aria-hidden="true"
           style={`position:absolute;left:${PAD + indDepth * IND}px;right:4px;${zone === 'before' ? 'top:-1px' : 'bottom:-1px'};height:2px;background:#7fb2f0;border-radius:1px;pointer-events:none;z-index:3`}>
           <span style="position:absolute;left:-3px;top:-2px;width:6px;height:6px;border-radius:3px;background:#7fb2f0" />
+          {dropCopy && <span data-drop-copy-badge style="position:absolute;right:0;top:-9px;font-size:10px;font-weight:700;line-height:14px;padding:0 5px;border-radius:7px;background:#7fb2f0;color:#10202f">+ copy</span>}
         </span>
       )}
       <button class="ib" data-nodrag data-act="vis" aria-label={`${layer.visible ? 'Hide' : 'Show'} ${layer.name}`} aria-pressed={layer.visible}
@@ -286,7 +287,7 @@ export function LayersPanel() {
     const info = store.flattenInfo(l, layers, childCount);
     return {
       layer: l, selected: selectedSet.has(l.id), active: l.id === activeId, maskTarget: paint.layerId === l.id && paint.target === 'mask', editing: editing === l.id, onEdit: setEditing,
-      dropZone: drag && drag.target === l.id ? drag.zone : null, tdPreview: tdLayers.has(l.id), hiddenByParent: hiddenBy(l), ancestors, ends, childCount,
+      dropZone: drag && drag.target === l.id ? drag.zone : null, dropCopy: !!drag?.copy, tdPreview: tdLayers.has(l.id), hiddenByParent: hiddenBy(l), ancestors, ends, childCount,
       flat: { enabled: info.enabled, title: info.title, reason: info.reason, tooltip: info.reason && store.flattenTooltip(l, info) === info.title ? `${info.title} (${info.reason})` : store.flattenTooltip(l, info) },
       busy: busyId === l.id,
     };
@@ -296,12 +297,12 @@ export function LayersPanel() {
   dragRef.current = drag;
 
   const rects = useRef<{ id: string; top: number; bottom: number }[] | null>(null); // row rects, measured once when a drag starts
-  const targetAt = (y: number): DragState | null => {
+  const targetAt = (y: number, copy: boolean): DragState | null => {
     if (!rects.current) rects.current = [...list.current!.querySelectorAll<HTMLElement>('[data-layer]')].map((row) => { const r = row.getBoundingClientRect(); return { id: row.dataset.layer!, top: r.top, bottom: r.bottom }; });
     for (const r of rects.current) {
       if (y < r.top || y >= r.bottom) continue;
       const target = byId.get(r.id)!;
-      return { id: press.current!.id, target: r.id, zone: dropZone(target, (y - r.top) / (r.bottom - r.top)) };
+      return { id: press.current!.id, target: r.id, zone: dropZone(target, (y - r.top) / (r.bottom - r.top)), copy };
     }
     return null;
   };
@@ -319,11 +320,35 @@ export function LayersPanel() {
     if (!p.started && Math.hypot(ev.clientX - p.x, ev.clientY - p.y) < 4) return;
     p.started = true;
     capture(list.current!, ev.pointerId);
-    const next = targetAt(ev.clientY) || { id: p.id, target: null, zone: 'after' as DropZone };
+    const copy = ev.metaKey || ev.ctrlKey;
+    const next = targetAt(ev.clientY, copy) || { id: p.id, target: null, zone: 'after' as DropZone, copy };
     const cur = dragRef.current;
-    if (!cur || cur.target !== next.target || cur.zone !== next.zone) { dragRef.current = next; setDrag(next); }
+    if (!cur || cur.target !== next.target || cur.zone !== next.zone || cur.copy !== next.copy) { dragRef.current = next; setDrag(next); }
   };
-  const onUp = () => {
+  // Cmd/Ctrl pressed or released mid-drag flips the indicator between move and copy without a pointer move
+  useEffect(() => {
+    if (!drag) return;
+    const onKey = (ev: KeyboardEvent) => {
+      const cur = dragRef.current;
+      const copy = ev.metaKey || ev.ctrlKey;
+      if (!cur || cur.copy === copy) return;
+      const next = { ...cur, copy };
+      dragRef.current = next;
+      setDrag(next);
+    };
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('keyup', onKey);
+    return () => { window.removeEventListener('keydown', onKey); window.removeEventListener('keyup', onKey); };
+  }, [!!drag]);
+  const onCancel = () => { // a cancelled pointer (the browser took over, the pointer left) ends the drag without moving or copying anything
+    const started = press.current?.started;
+    press.current = null;
+    dragRef.current = null;
+    rects.current = null;
+    setDrag(null);
+    if (started) { suppressClick = true; setTimeout(() => { suppressClick = false; }, 0); }
+  };
+  const onUp = (ev?: PointerEvent) => {
     const p = press.current, d = dragRef.current;
     press.current = null;
     dragRef.current = null;
@@ -334,9 +359,11 @@ export function LayersPanel() {
     setTimeout(() => { suppressClick = false; }, 0);
     const multi = selectedIds.length > 1 && selectedIds.includes(d.id);
     const ids = store.dragIds(d.id);
-    const drop = computeDrop(layers, ids, d.target, d.zone);
+    const copy = ev ? ev.metaKey || ev.ctrlKey : d.copy; // Cmd/Ctrl held at drop time
+    const drop = computeDrop(layers, ids, d.target, d.zone, copy);
     if (!drop) return;
-    if (multi) e.moveLayers(ids, drop.parentId, drop.index);
+    if (copy) store.copyLayersTo(ids, drop.parentId, drop.index);
+    else if (multi) e.moveLayers(ids, drop.parentId, drop.index);
     else e.moveLayer(d.id, drop.parentId, drop.index);
   };
 
@@ -345,7 +372,7 @@ export function LayersPanel() {
   return (
     <div style="flex:1 1 auto;min-height:0;display:flex;flex-direction:column">
       <LayerSettings layer={active} />
-      <div ref={list} data-layer-list onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp}
+      <div ref={list} data-layer-list data-drag-copy={drag?.copy || undefined} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onCancel}
         style="flex:1 1 auto;min-height:0;overflow-y:auto;padding:4px 0;user-select:none">
         {layers.map((l, i) => <MemoRow key={l.id} {...rowProps(l, i)} />)}
       </div>

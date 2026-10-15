@@ -40,4 +40,36 @@ describe('layer drop targets', () => {
     expect(dropZone(layers[3], 0.5)).toBe('after');
     expect(dropZone(layers[3], 0.49)).toBe('before');
   });
+
+  describe('copy (v7.1 Cmd/Ctrl-drag)', () => {
+    it('counts every sibling, the dragged layers included', () => {
+      // moving c below base excludes c itself (index 1); copying counts it (index 2)
+      expect(computeDrop(layers, 'c', 'base', 'before')).toEqual({ parentId: null, index: 1 });
+      expect(computeDrop(layers, 'c', 'base', 'before', true)).toEqual({ parentId: null, index: 2 });
+      expect(computeDrop(layers, 'a', 'b', 'after', true)).toEqual({ parentId: 'G', index: 2 });
+      expect(computeDrop(layers, ['a', 'b'], 'c', 'before', true)).toEqual({ parentId: null, index: 1 });
+      expect(computeDrop(layers, ['a', 'b'], 'c', 'before')).toEqual({ parentId: null, index: 1 });
+      expect(computeDrop(layers, 'c', 'a', 'before', true)).toEqual({ parentId: 'G', index: 0 });
+    });
+
+    it('allows dropping onto the dragged layer itself', () => {
+      expect(computeDrop(layers, 'c', 'c', 'before')).toBeNull();
+      expect(computeDrop(layers, 'c', 'c', 'before', true)).toEqual({ parentId: null, index: 1 });
+      expect(computeDrop(layers, 'c', 'c', 'after', true)).toEqual({ parentId: null, index: 2 });
+    });
+
+    it('allows dropping a group into itself or onto its descendants', () => {
+      expect(computeDrop(layers, 'G', 'a', 'before')).toBeNull();
+      expect(computeDrop(layers, 'G', 'a', 'before', true)).toEqual({ parentId: 'G', index: 0 });
+      expect(computeDrop(layers, 'G', 'G', 'into')).toBeNull();
+      expect(computeDrop(layers, 'G', 'G', 'into', true)).toEqual({ parentId: 'G', index: 0 });
+      expect(computeDrop(layers, 'G', 'b', 'after', true)).toEqual({ parentId: 'G', index: 2 });
+    });
+
+    it('still rejects unknown layers and an empty drag', () => {
+      expect(computeDrop(layers, 'nope', 'c', 'before', true)).toBeNull();
+      expect(computeDrop(layers, [], 'c', 'before', true)).toBeNull();
+      expect(computeDrop(layers, 'c', 'nope', 'before', true)).toBeNull();
+    });
+  });
 });

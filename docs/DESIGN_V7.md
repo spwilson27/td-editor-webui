@@ -54,3 +54,15 @@ hide/lock/move/group round trips; group visuals (UI tests + screenshot).
   up to ~32 straight-channel levels at alpha 8/255, which is about 1 premultiplied unit (test: v7.engine.test.ts, <= 1.5 incl. readout
   rounding). Opaque pixels agree within 1/255.
 - `groupLayers` skips recompositing only for a contiguous run of normal-blend layers without adjustment layers; otherwise it redraws.
+
+## 6. v7.1 — layer copy / paste / duplicate
+
+| Topic | Decision |
+| --- | --- |
+| Copy (Cmd/Ctrl+C, Edit ▸ Copy) | Copies the **selected layers** (multi-select aware; a selected group copies its subtree; a child whose ancestor is selected is not copied twice) into an in-page layer clipboard as a **snapshot** (pixels, masks, effects, text/shape specs, blend/opacity/visibility/lock/transform), so paste works after the source is edited or deleted. TD Input layers are skipped (one layer per input); copying only inputs shows a notice. Also writes a small text marker to the system clipboard when the Clipboard API allows, so a later system image copy can win. Not undoable (no document change). |
+| Cut (Cmd/Ctrl+X) | Copy + `deleteLayers` (one undo step), same lock rules as Delete. |
+| Paste (Cmd/Ctrl+V, Edit ▸ Paste) | If the system clipboard holds an image newer than our marker (i.e. no marker text, image present) → existing image import. Otherwise, with a non-empty layer clipboard → paste the layers: **into the active group (at its top) when the active layer is a group, else directly below the active layer** in its parent; no active layer → top of the document. Pasted layers keep stack order, get new ids/slots and " copy" names, and become the selection (active = topmost). One undo step. Clipboard read failure (e.g. TD Web Render) → layer clipboard if non-empty, else the old notice. |
+| Duplicate (Cmd/Ctrl+J, Layer ▸ Duplicate) | Copy + paste **above** each original's block in one undo step, without touching the layer clipboard. |
+| Cmd/Ctrl+drag in the layers panel | Dragging selected rows with Cmd/Ctrl held at drop time **copies** them to the drop position instead of moving (cursor/indicator shows "+ copy"); a Cmd/Ctrl+click without movement still toggles selection. Dropping into a group/ at depth uses the same drop rules as move; illegal targets (into a copied group's own subtree) are fine for copies — the copy lands there, the original is untouched. |
+| Keyboard guards | Same as Delete: ignored while typing, in curve editors, during floating selection/crop. Cmd+C/V with a pixel selection still act on layers (pixel copy is not implemented). |
+| Engine | `copyLayers(ids): LayerClip` (opaque snapshot) and `pasteLayers(clip, parentId, index): string[]` (one history entry; returns new ids top-first); `duplicateLayers(ids): string[]`. TD sees ordinary new layers/surfaces through the existing doc/surface sync (no protocol change). |
