@@ -1,5 +1,6 @@
 import type { Rect } from '../engine/types';
 import type { View } from '../state/view';
+import { HANDLES, handlePoint, centreOf } from '../state/transform';
 
 let checker: HTMLCanvasElement | null = null;
 
@@ -97,6 +98,80 @@ export interface OverlayExtra {
   paths?: Pt[][] | null;
   /** In-progress lasso / shape outline (document px). */
   preview?: { paths: Pt[][]; closed: boolean } | null;
+  /** v4: document guides (doc px); `skip` hides the guide being dragged, `drag` draws it at its dragged position. */
+  guides?: { h: number[]; v: number[]; skip?: { axis: 'h' | 'v'; index: number } | null; drag?: { axis: 'h' | 'v'; pos: number } | null } | null;
+  /** v4: the Move tool's transform box (doc px). */
+  box?: Rect | null;
+  /** v4: snap feedback lines (doc px) while dragging. */
+  snap?: { x: number | null; y: number | null } | null;
+}
+
+export const GUIDE_COLOR = '#18c8e0';
+export const SNAP_COLOR = '#ff4fb0';
+export const BOX_COLOR = '#4a8fe0';
+export const HANDLE_SIZE = 8;
+
+const px = (n: number) => Math.round(n) + 0.5;
+
+function drawGuides(ctx: CanvasRenderingContext2D, vw: number, vh: number, view: View, g: NonNullable<OverlayExtra['guides']>): void {
+  ctx.save();
+  ctx.lineWidth = 1;
+  ctx.setLineDash([]);
+  ctx.strokeStyle = GUIDE_COLOR;
+  ctx.beginPath();
+  g.h.forEach((pos, i) => {
+    if (g.skip?.axis === 'h' && g.skip.index === i) return;
+    const y = px(view.y + pos * view.zoom);
+    ctx.moveTo(0, y); ctx.lineTo(vw, y);
+  });
+  g.v.forEach((pos, i) => {
+    if (g.skip?.axis === 'v' && g.skip.index === i) return;
+    const x = px(view.x + pos * view.zoom);
+    ctx.moveTo(x, 0); ctx.lineTo(x, vh);
+  });
+  if (g.drag) {
+    if (g.drag.axis === 'h') { const y = px(view.y + g.drag.pos * view.zoom); ctx.moveTo(0, y); ctx.lineTo(vw, y); }
+    else { const x = px(view.x + g.drag.pos * view.zoom); ctx.moveTo(x, 0); ctx.lineTo(x, vh); }
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawBox(ctx: CanvasRenderingContext2D, view: View, r: Rect): void {
+  const x = view.x + r.x * view.zoom, y = view.y + r.y * view.zoom, w = r.w * view.zoom, h = r.h * view.zoom;
+  ctx.save();
+  ctx.lineWidth = 1;
+  ctx.setLineDash([]);
+  ctx.strokeStyle = BOX_COLOR;
+  ctx.strokeRect(Math.round(x) + 0.5, Math.round(y) + 0.5, Math.round(w), Math.round(h));
+  const s = { x: view.x, y: view.y, z: view.zoom };
+  for (const hd of HANDLES) {
+    const p = handlePoint(r, hd);
+    const cx = s.x + p.x * s.z, cy = s.y + p.y * s.z;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(Math.round(cx - HANDLE_SIZE / 2) + 0.5, Math.round(cy - HANDLE_SIZE / 2) + 0.5, HANDLE_SIZE, HANDLE_SIZE);
+    ctx.strokeRect(Math.round(cx - HANDLE_SIZE / 2) + 0.5, Math.round(cy - HANDLE_SIZE / 2) + 0.5, HANDLE_SIZE, HANDLE_SIZE);
+  }
+  const c = centreOf(r), ccx = s.x + c.x * s.z, ccy = s.y + c.y * s.z;
+  ctx.beginPath();
+  ctx.moveTo(ccx - 5, ccy); ctx.lineTo(ccx + 5, ccy); ctx.moveTo(ccx, ccy - 5); ctx.lineTo(ccx, ccy + 5);
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 3; ctx.stroke();
+  ctx.strokeStyle = BOX_COLOR;
+  ctx.lineWidth = 1; ctx.stroke();
+  ctx.restore();
+}
+
+function drawSnap(ctx: CanvasRenderingContext2D, vw: number, vh: number, view: View, s: { x: number | null; y: number | null }): void {
+  ctx.save();
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = SNAP_COLOR;
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath();
+  if (s.x !== null) { const x = px(view.x + s.x * view.zoom); ctx.moveTo(x, 0); ctx.lineTo(x, vh); }
+  if (s.y !== null) { const y = px(view.y + s.y * view.zoom); ctx.moveTo(0, y); ctx.lineTo(vw, y); }
+  ctx.stroke();
+  ctx.restore();
 }
 
 function antPath(ctx: CanvasRenderingContext2D, view: View, paths: Pt[][], closed: boolean, dashOffset: number): void {
@@ -140,6 +215,9 @@ export function drawOverlay(ctx: CanvasRenderingContext2D, vw: number, vh: numbe
     ctx.strokeRect(x, y, w, h);
     ctx.setLineDash([]);
   }
+  if (extra.guides) drawGuides(ctx, vw, vh, view, extra.guides);
+  if (extra.box) drawBox(ctx, view, extra.box);
+  if (extra.snap && (extra.snap.x !== null || extra.snap.y !== null)) drawSnap(ctx, vw, vh, view, extra.snap);
   if (extra.preview) antPath(ctx, view, extra.preview.paths, extra.preview.closed, dashOffset);
   if (cursor) {
     const r = Math.max(2, cursor.diameter / 2);

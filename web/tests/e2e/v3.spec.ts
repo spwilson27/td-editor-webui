@@ -96,7 +96,7 @@ test('Import from TouchDesigner: dialog lists TOPs, the chosen one appears as a 
   const spec = specs().find((l) => l.id === imported.id)!;
   expect(spec.kind).toBe('pixel');
   await td.waitFor(() => near(td.surfacePixel(spec.slot!, 80, 45), [220, 20, 30, 255], 0));
-  expect(td.surfacePixel(spec.slot!, 2, 2)[3]).toBe(0);
+  expect([spec.surfaceW, spec.surfaceH]).toEqual([100, 50]); // v5: imported images keep their native resolution
 });
 
 test('Import from TouchDesigner: a TOP larger than the document is scaled to fit; a TD error shows a notice', async ({ page }) => {
@@ -190,7 +190,7 @@ test('lasso and wand selections clip painting; the clipped pixels are what TD st
   expect(await hook(page, 'selectionMask')).toBeNull(); // inverting everything leaves nothing
 });
 
-test('text tool: create, type (shortcuts suppressed), commit, re-edit, rasterize toggle sends the doc and slot tiles', async ({ page }) => {
+test('text tool: create, type (shortcuts suppressed), commit, re-edit, TD renders it (no slot, no tiles)', async ({ page }) => {
   await open(page);
   await page.keyboard.press('t');
   await clickDoc(page, 10, 10);
@@ -201,7 +201,8 @@ test('text tool: create, type (shortcuts suppressed), commit, re-edit, rasterize
   expect((await hook<any>(page, 'state')).tool).toBe('text');
   await td.waitFor(() => kindLayers('text').length === 1 && kindLayers('text')[0].text?.text === 'Hi bge');
   const t = kindLayers('text')[0];
-  expect(t).toMatchObject({ rasterize: false, slot: null });
+  expect(t).toMatchObject({ slot: null });
+  expect('rasterize' in t).toBe(false); // v5: gone from the spec
   expect(t.text).toMatchObject({ x: 10, y: 10 });
   await page.keyboard.press('Escape');
   await expect(editor).toBeHidden();
@@ -227,19 +228,12 @@ test('text tool: create, type (shortcuts suppressed), commit, re-edit, rasterize
   await page.locator('#ts').fill('30');
   await page.locator('#ts').blur();
   await td.waitFor(() => kindLayers('text')[0].text?.size === 30);
-  // rasterize on: the layer gets a slot and the browser's pixels arrive as tiles
-  await page.locator('[data-layer-props] [data-rasterize]').check();
-  await td.waitFor(() => kindLayers('text')[0].rasterize === true && kindLayers('text')[0].slot !== null);
-  const slot = kindLayers('text')[0].slot!;
-  await td.waitFor(() => td.frames.some((f) => f.slot === slot));
-  await td.waitFor(() => { const s = td.surfaces.get(slot)!; for (let i = 3; i < s.length; i += 4) if (s[i] > 0) return true; return false; });
-  // and back off: slot released
-  await page.locator('[data-layer-props] [data-rasterize]').uncheck();
-  await td.waitFor(() => kindLayers('text')[0].rasterize === false && kindLayers('text')[0].slot === null);
-  expect(td.surfaces.has(slot)).toBe(false);
+  // text layers never own a surface: no SURFACE tiles for them, ever
+  expect(kindLayers('text')[0].slot).toBeNull();
+  expect(td.frames.every((f) => f.slot !== kindLayers('text')[0].slot)).toBe(true);
 });
 
-test('shape tool: flyout, drag draws a layer, rasterize on sends pixels, undo removes it', async ({ page }) => {
+test('shape tool: flyout, drag draws a layer (rendered by TD, no slot), undo removes it', async ({ page }) => {
   await open(page);
   await hook(page, 'setPrimary', '#2060e0');
   await page.locator('[data-flyout-toggle]').click();
@@ -250,13 +244,8 @@ test('shape tool: flyout, drag draws a layer, rasterize on sends pixels, undo re
   const s = kindLayers('shape')[0];
   expect(s.shape).toMatchObject({ type: 'ellipse', x: 40, y: 20, w: 80, h: 50 });
   expect((s.shape as any).fill).toMatchObject({ enabled: true, color: { r: 32, g: 96, b: 224 } });
-  expect(s.rasterize).toBe(false);
+  expect(s.slot).toBeNull();
   expect(await hook<number[]>(page, 'readPixel', 80, 45)).toEqual([32, 96, 224, 255]);
-  await page.locator('[data-layer-props] [data-rasterize]').check();
-  await td.waitFor(() => kindLayers('shape')[0].slot !== null);
-  const slot = kindLayers('shape')[0].slot!;
-  await td.waitFor(() => near(td.surfacePixel(slot, 80, 45), [32, 96, 224, 255], 1));
-  expect(td.surfacePixel(slot, 42, 22)[3]).toBe(0); // outside the ellipse (inside its bounding box)
   // a polygon/star through the flyout
   await page.locator('[data-flyout-toggle]').click();
   await page.locator('[data-shape=polygon]').click();
@@ -268,17 +257,19 @@ test('shape tool: flyout, drag draws a layer, rasterize on sends pixels, undo re
   await td.waitFor(() => kindLayers('shape').length === 1);
 });
 
-test('Flatten Layer turns a rasterized text layer into a pixel layer in TD\'s document', async ({ page }) => {
+test('Flatten Layer: TD renders the text layer, the page replaces it with a pixel layer in TD\'s document', async ({ page }) => {
   await open(page);
   const id = await hook<string>(page, 'addTextLayer', { text: 'AB', size: 40, x: 20, y: 20, color: { r: 0, g: 0, b: 0, a: 255 } });
   await td.waitFor(() => kindLayers('text').length === 1);
-  await hook(page, 'setRasterize', id, true);
+  td.renderColors.set(id, [11, 22, 33, 255]);
   await page.getByRole('button', { name: 'Layer', exact: true }).click();
   await page.getByRole('menuitem', { name: 'Flatten Layer' }).click();
   await td.waitFor(() => specs().some((l) => l.id === id && l.kind === 'pixel'));
+  expect(td.renderCalls).toEqual([id]);
   const spec = specs().find((l) => l.id === id)!;
-  expect(spec).toMatchObject({ text: null, shape: null, rasterize: false });
+  expect(spec).toMatchObject({ text: null, shape: null });
   expect(spec.slot).not.toBeNull();
+  await td.waitFor(() => near(td.surfacePixel(spec.slot!, 80, 45), [11, 22, 33, 255], 1));
 });
 
 for (const [w, h] of [[1600, 960], [1280, 800]] as const) {
@@ -306,19 +297,19 @@ for (const [w, h] of [[1600, 960], [1280, 800]] as const) {
   });
 }
 
-test('a fresh page loading TD\'s document does not take rasterized text pixels from TD; its render is pushed after the load', async ({ page }) => {
+test('a fresh page loading TD\'s document: text layers own no slot, nothing is fetched or pushed for them', async ({ page }) => {
   td = await FakeTd.start({ w: 160, h: 90 });
   const text = { text: 'AB', font: 'Arial', size: 40, color: { r: 0, g: 0, b: 0, a: 255 }, align: 'left', bold: false, italic: false, lineHeight: 1.2, x: 20, y: 20, boxWidth: null };
-  const base = { parentId: null, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, mask: null, adjustment: null, shape: null } as const;
+  const base = { parentId: null, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, sx: 1, sy: 1, surfaceW: null, surfaceH: null, mask: null, adjustment: null, shape: null } as const;
   td.seedDocument([
-    { ...base, id: 'base', kind: 'base', name: 'TD Input', slot: null, text: null, rasterize: false },
-    { ...base, id: 'tx', kind: 'text', name: 'AB', slot: 4, text: text as never, rasterize: true },
-  ], 5, { 4: [255, 0, 255, 255] }); // stale magenta in TD that must not win
+    { ...base, id: 'base', kind: 'base', name: 'TD Input', slot: null, text: null },
+    { ...base, id: 'tx', kind: 'text', name: 'AB', slot: null, text: text as never },
+  ], 5);
   page.on('pageerror', (e) => { throw e; });
   await page.goto(`/?test=1&client=panel&ws=${encodeURIComponent(td.url)}&token=${td.token}`);
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   await expect(page.locator('[data-layer] [data-name]')).toHaveText(['AB', 'TD Input']);
-  await td.waitFor(() => td.frames.some((f) => f.slot === 4));
-  expect(td.surfaceFetches).not.toContain(4);
-  expect(td.surfacePixel(4, 150, 80)).toEqual([0, 0, 0, 0]); // the engine's render replaced the stale pixels
+  await page.waitForTimeout(300);
+  expect(td.surfaceFetches).toEqual([]);
+  expect(td.frames).toHaveLength(0);
 });

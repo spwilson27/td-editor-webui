@@ -56,6 +56,9 @@ export function StatusBar() {
       <span data-status="hint" style="flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{toolInfo(store.tool.value).hint}</span>
       {fatal && <span data-status="fatal" style="color:#f07a6a;font-weight:600">{fatal}</span>}
       {notice && <span data-status="notice" style="color:#f0b45a">{notice}</span>}
+      <span data-status="canvas" title={store.canvasMode.value === 'input' ? 'Document size follows the TouchDesigner Input' : 'Fixed document size (Document ▸ Canvas Size…)'}>
+        {store.docSize.value.w} × {store.docSize.value.h} · {store.canvasMode.value === 'input' ? 'Follow input' : 'Fixed'}
+      </span>
       <span>Layer: <b data-status="layer" style="color:#e3e3e3;font-weight:500">{layer ? layer.name : '—'}</b></span>
       <ViewToggle />
       <LatencyReadout />

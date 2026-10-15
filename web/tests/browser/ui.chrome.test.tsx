@@ -131,6 +131,9 @@ describe('ContextBar', () => {
     expect([...document.querySelectorAll('[aria-label="Selection mode"] button')].map((b) => b.getAttribute('aria-pressed'))).toEqual(['true', 'false', 'false', 'false']);
     store.setTool('move');
     await settle();
+    expect(q<HTMLInputElement>('#mw').value).toBe('64'); // the move tool edits the active layer's bounds
+    store.setTool('picker');
+    await settle();
     expect(document.body.textContent).toContain('W 64 px');
     engine.setSelection({ x: 3, y: 4, w: 10, h: 20 });
     await settle();

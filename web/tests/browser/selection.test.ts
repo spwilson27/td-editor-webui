@@ -580,10 +580,12 @@ describe('review regressions', () => {
     stroke(e, 'brush', [[40, 30], [60, 30]]);
     expect(layerPx(e, id, 50, 30)[3]).toBe(255);
     e.resize(100, 200);
+    const id2 = e.addPixelLayer(); // surfaces keep their size on resize: paint on a layer made after it
     stroke(e, 'lasso', [[10, 110], [90, 110], [50, 190]]);
     stroke(e, 'brush', [[5, 180], [95, 180]]);
-    expect(layerPx(e, id, 10, 180)[3]).toBe(0);
-    expect(layerPx(e, id, 50, 180)[3]).toBe(255);
+    expect(layerPx(e, id2, 10, 180)[3]).toBe(0);
+    expect(layerPx(e, id2, 50, 180)[3]).toBe(255);
+    expect(id).not.toBe(id2);
   });
 
   it('marquee drags preview the plain rect and feather once on release', () => {

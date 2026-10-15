@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Engine } from '../../src/engine';
-import type { EngineEvent, Rect, ShapeSpec, TextSpec } from '../../src/engine/types';
+import type { Rect, ShapeSpec, TextSpec } from '../../src/engine/types';
 import { brushCtx, collect, maskAt, newEngine, ptr, px, rgba, setBase, slotPx, stroke } from './engineTestUtils';
 
 let e: Engine;
@@ -32,14 +32,14 @@ describe('shape rendering', () => {
   it('rect fill: exact interior and edges, spec in layers() and docSpec()', () => {
     e = newEngine(100, 80);
     const id = e.addShapeLayer(rect());
-    expect(layer(id)).toMatchObject({ kind: 'shape', rasterize: false, slot: null, text: null });
+    expect(layer(id)).toMatchObject({ kind: 'shape', slot: null, text: null, surfaceW: null, surfaceH: null });
     expect(layer(id).shape).toMatchObject({ type: 'rect', w: 40 });
     expect(px(e, 30, 30)).toEqual([255, 0, 0, 255]);
     expect(px(e, 19, 30)[3]).toBe(0);
     expect(px(e, 60, 30)[3]).toBe(0);
     expect(inkBox()).toEqual({ x: 20, y: 20, w: 40, h: 30 });
     const spec = e.docSpec().layers.find((l) => l.id === id)!;
-    expect(spec).toMatchObject({ kind: 'shape', slot: null, rasterize: false, x: 0, y: 0, text: null });
+    expect(spec).toMatchObject({ kind: 'shape', slot: null, x: 0, y: 0, sx: 1, sy: 1, surfaceW: null, surfaceH: null, text: null });
     expect(spec.shape).toEqual(layer(id).shape);
     expect(last()).toBe('Add shape');
   });
@@ -251,7 +251,7 @@ describe('text rendering', () => {
     expect(b.y + b.h).toBeLessThanOrEqual(60);
     expect(b.h).toBeGreaterThan(20);
     expect(b.w).toBeGreaterThan(60);
-    expect(layer(id)).toMatchObject({ kind: 'text', name: 'HHHH', rasterize: false });
+    expect(layer(id)).toMatchObject({ kind: 'text', name: 'HHHH', slot: null });
     const one = b.h;
     e.setText(id, text({ text: 'HHHH\nHHHH', size: 40, x: 10, y: 20 }));
     const two = inkBox()!;
@@ -341,109 +341,70 @@ describe('text rendering', () => {
   });
 });
 
-describe('rasterize on / off', () => {
-  it('on: allocates a slot, renders a surface identical to the preview, announces bbox; off releases the slot', () => {
+describe('text and shape layers never own a surface (v4)', () => {
+  it('no slot, no surface size, nothing to read or write', () => {
     e = newEngine(100, 80);
     const id = e.addShapeLayer(rect());
-    const before = inkBox();
-    const ev = collect(e);
-    e.setRasterize(id, true);
-    const info = layer(id);
-    expect(info.rasterize).toBe(true);
-    expect(info.slot).toBeGreaterThan(0);
-    expect(e.surfaceSlots()).toContain(info.slot);
-    expect(e.docSpec().layers.find((l) => l.id === id)).toMatchObject({ slot: info.slot, rasterize: true, kind: 'shape' });
-    const surf = ev.filter((x): x is Extract<EngineEvent, { type: 'surface' }> => x.type === 'surface');
-    expect(surf).toHaveLength(1);
-    expect(surf[0].slot).toBe(info.slot);
-    expect(surf[0].rect.x).toBeLessThanOrEqual(20);
-    expect(surf[0].rect.w).toBeLessThan(100);
-    expect(slotPx(e, info.slot!, 30, 30)).toEqual([255, 0, 0, 255]);
-    expect(slotPx(e, info.slot!, 5, 5)[3]).toBe(0);
-    expect(inkBox()).toEqual(before);
-    ev.length = 0;
-    e.setShape(id, rect({ x: 60, y: 40, w: 20, h: 20 }));
-    expect(slotPx(e, info.slot!, 30, 30)[3]).toBe(0);
-    expect(slotPx(e, info.slot!, 70, 50)).toEqual([255, 0, 0, 255]);
-    const s2 = ev.filter((x) => x.type === 'surface') as Array<Extract<EngineEvent, { type: 'surface' }>>;
-    expect(s2).toHaveLength(1);
-    expect(s2[0].rect.x).toBeLessThanOrEqual(20);
-    expect(s2[0].rect.x + s2[0].rect.w).toBeGreaterThanOrEqual(80);
-    expect(s2[0].rect.y + s2[0].rect.h).toBeGreaterThanOrEqual(60);
-    const slot = info.slot!;
-    e.setRasterize(id, false);
-    expect(layer(id)).toMatchObject({ rasterize: false, slot: null });
-    expect(e.surfaceSlots()).not.toContain(slot);
-    expect(e.docSpec().layers.find((l) => l.id === id)).toMatchObject({ slot: null, rasterize: false });
-    expect(inkBox()!.x).toBe(60);
-    e.setRasterize(id, true);
-    expect(layer(id).slot).not.toBe(slot);
+    const t = e.addTextLayer(text({ text: 'Hi', size: 30 }));
+    for (const x of [id, t]) {
+      expect(layer(x)).toMatchObject({ slot: null, surfaceW: null, surfaceH: null, transform: { x: 0, y: 0, sx: 1, sy: 1 } });
+      expect(e.docSpec().layers.find((l) => l.id === x)).toMatchObject({ slot: null, surfaceW: null, surfaceH: null, sx: 1, sy: 1 });
+    }
+    expect(e.surfaceSlots()).toEqual([]);
+    expect((e as unknown as Record<string, unknown>).setRasterize).toBeUndefined();
+    expect(Object.keys(layer(id))).not.toContain('rasterize');
   });
 
-  it('undo / redo of the toggle and of spec edits keep the surface and slots consistent', () => {
-    e = newEngine(100, 80);
-    const id = e.addShapeLayer(rect());
-    e.setRasterize(id, true);
-    const slot = layer(id).slot!;
-    e.setShape(id, rect({ x: 60, y: 40, w: 20, h: 20 }));
-    const ev = collect(e);
-    e.undo();
-    expect(slotPx(e, slot, 30, 30)).toEqual([255, 0, 0, 255]);
-    expect(slotPx(e, slot, 70, 50)[3]).toBe(0);
-    expect(ev.some((x) => x.type === 'surface' && x.slot === slot)).toBe(true);
-    e.undo();
-    expect(layer(id)).toMatchObject({ rasterize: false, slot: null });
-    expect(e.surfaceSlots()).not.toContain(slot);
-    e.redo();
-    expect(layer(id).slot).toBe(slot);
-    expect(slotPx(e, slot, 30, 30)).toEqual([255, 0, 0, 255]);
-    e.redo();
-    expect(slotPx(e, slot, 70, 50)).toEqual([255, 0, 0, 255]);
-    expect(slotPx(e, slot, 30, 30)[3]).toBe(0);
-  });
-
-  it('rasterized text matches the unrasterized preview pixel for pixel', () => {
-    e = newEngine(240, 100);
-    const id = e.addTextLayer(text({ text: 'Hi there', size: 36 }));
-    const a = Array.from(e.readComposite({ x: 0, y: 0, w: 240, h: 100 }));
-    e.setRasterize(id, true);
-    expect(Array.from(e.readComposite({ x: 0, y: 0, w: 240, h: 100 }))).toEqual(a);
-    expect(Array.from(e.readSurface(layer(id).slot!, { x: 0, y: 0, w: 240, h: 100 }))).toEqual(a);
-    expect(last()).toBe('Rasterize on');
-  });
-
-  it('rasterized layers accept writeSurface (TD upload path) and draw thumbnails either way', () => {
+  it('canvas and sdf renderers both draw a preview; thumbnails draw either way', () => {
     e = newEngine(40, 40);
     const id = e.addShapeLayer(rect({ x: 0, y: 0, w: 10, h: 10 }));
-    e.setRasterize(id, true);
-    e.writeSurface(layer(id).slot!, { x: 0, y: 0, w: 1, h: 1 }, new Uint8Array([1, 2, 3, 255]));
-    e.commitSurfaces();
-    expect(px(e, 0, 0)).toEqual([1, 2, 3, 255]);
     const c = document.createElement('canvas');
     c.width = c.height = 16;
     e.drawThumbnail(id, c);
     expect(c.getContext('2d')!.getImageData(1, 1, 1, 1).data[3]).toBe(255);
-    e.setRasterize(id, false);
+    e.setShapeRenderer('canvas');
     e.drawThumbnail(id, c);
     expect(c.getContext('2d')!.getImageData(1, 1, 1, 1).data[3]).toBe(255);
+    expect(px(e, 5, 5)).toEqual([255, 0, 0, 255]);
+  });
+
+  it('painting on them gives a notice and changes nothing (their masks stay paintable)', () => {
+    e = newEngine(40, 40);
+    e.addShapeLayer(rect({ x: 0, y: 0, w: 40, h: 40 }));
+    const notices: string[] = [];
+    e.on((ev) => ev.type === 'notice' && notices.push(ev.message));
+    e.setToolContext(brushCtx({ size: 6, hardness: 1 }, { primary: rgba(0, 255, 0) }));
+    stroke(e, 'brush', [[10, 10], [20, 10]]);
+    expect(notices).toHaveLength(1);
+    expect(px(e, 15, 10)).toEqual([255, 0, 0, 255]);
   });
 });
 
-describe('flatten', () => {
-  it('turns a shape into a pixel layer keeping id, name, mask, opacity, blend, visibility', () => {
+describe('replaceWithPixels (Flatten)', () => {
+  const solidRed = (w: number, h: number): Uint8ClampedArray => {
+    const a = new Uint8ClampedArray(w * h * 4);
+    for (let i = 0; i < w * h; i++) a.set([255, 0, 0, 255], i * 4);
+    return a;
+  };
+
+  it('turns a shape into a pixel layer keeping id, name, opacity, blend, visibility and mask; history entry', () => {
     e = newEngine(80, 60);
     setBase(e, [255, 255, 255, 255]);
     const id = e.addShapeLayer(rect({ x: 10, y: 10, w: 40, h: 30 }));
     e.setLayerProps(id, { name: 'Box', opacity: 0.5, blend: 'multiply' });
     const m = e.addMask(id);
     const before = Array.from(e.readComposite({ x: 0, y: 0, w: 80, h: 60 }));
-    e.flattenLayer(id);
+    // what TD would deliver: the layer rendered alone at document size
+    const tdPixels = new Uint8ClampedArray(80 * 60 * 4);
+    for (let y = 10; y < 40; y++) for (let x = 10; x < 50; x++) tdPixels.set([255, 0, 0, 255], (y * 80 + x) * 4);
+    e.replaceWithPixels(id, tdPixels, 80, 60);
     const info = layer(id);
-    expect(info).toMatchObject({ kind: 'pixel', name: 'Box', opacity: 0.5, blend: 'multiply', visible: true, rasterize: false, text: null, shape: null });
+    expect(info).toMatchObject({ kind: 'pixel', name: 'Box', opacity: 0.5, blend: 'multiply', visible: true, text: null, shape: null, surfaceW: 80, surfaceH: 60, transform: { x: 0, y: 0, sx: 1, sy: 1 } });
     expect(info.mask).toEqual({ slot: m, enabled: true });
     expect(info.slot).toBeGreaterThan(0);
     expect(Array.from(e.readComposite({ x: 0, y: 0, w: 80, h: 60 }))).toEqual(before);
     expect(slotPx(e, info.slot!, 20, 20)).toEqual([255, 0, 0, 255]);
+    expect(e.docSpec().layers.find((l) => l.id === id)).toMatchObject({ kind: 'pixel', slot: info.slot, surfaceW: 80, surfaceH: 60 });
     expect(last()).toBe('Flatten layer');
     e.setToolContext(brushCtx({ size: 6, hardness: 1 }, { primary: rgba(0, 255, 0) }));
     e.setPaintTarget(id, 'pixels');
@@ -451,34 +412,52 @@ describe('flatten', () => {
     expect(slotPx(e, info.slot!, 20, 20)[1]).toBe(255);
     e.undo();
     e.undo();
-    expect(layer(id)).toMatchObject({ kind: 'shape' });
+    expect(layer(id)).toMatchObject({ kind: 'shape', slot: null });
     expect(Array.from(e.readComposite({ x: 0, y: 0, w: 80, h: 60 }))).toEqual(before);
     e.redo();
     expect(layer(id).kind).toBe('pixel');
+    expect(slotPx(e, layer(id).slot!, 20, 20)).toEqual([255, 0, 0, 255]);
   });
 
-  it('flattening a rasterized layer keeps its slot; ignores pixel layers and unknown ids', () => {
+  it('announces the new surface, accepts only text / shape layers and bad input throws', () => {
     e = newEngine(50, 50);
     const id = e.addTextLayer(text({ text: 'H', size: 30 }));
-    e.setRasterize(id, true);
-    const slot = layer(id).slot;
+    const px1 = e.addPixelLayer();
     const n = e.history().entries.length;
-    e.flattenLayer(id);
-    expect(layer(id)).toMatchObject({ kind: 'pixel', slot });
-    e.flattenLayer(id);
-    e.flattenLayer('nope');
-    e.flattenLayer('base');
+    const ev = collect(e);
+    e.replaceWithPixels(id, solidRed(50, 50), 50, 50);
+    const slot = layer(id).slot!;
+    expect(ev.some((x) => x.type === 'surface' && x.slot === slot && x.rect.w === 50 && x.rect.h === 50)).toBe(true);
+    e.replaceWithPixels(id, solidRed(50, 50), 50, 50); // already a pixel layer: ignored
+    e.replaceWithPixels(px1, solidRed(50, 50), 50, 50);
+    e.replaceWithPixels('nope', solidRed(50, 50), 50, 50);
+    e.replaceWithPixels('base', solidRed(50, 50), 50, 50);
     expect(e.history().entries.length).toBe(n + 1);
+    const t2 = e.addTextLayer(text());
+    expect(() => e.replaceWithPixels(t2, new Uint8Array(3), 50, 50)).toThrow(RangeError);
+    expect(() => e.replaceWithPixels(t2, new Uint8Array(16), 0, 4)).toThrow(RangeError);
+    expect(layer(t2).kind).toBe('text');
+  });
+
+  it('a pixel size other than the document is kept as is (identity transform at the origin); the mask is cropped / extended', () => {
+    e = newEngine(50, 50);
+    const id = e.addShapeLayer(rect());
+    e.addMask(id);
+    e.replaceWithPixels(id, solidRed(20, 10), 20, 10);
+    expect(layer(id)).toMatchObject({ surfaceW: 20, surfaceH: 10 });
+    expect(px(e, 5, 5)).toEqual([255, 0, 0, 255]);
+    expect(px(e, 25, 5)[3]).toBe(0);
+    expect(e.readSurface(layer(id).mask!.slot, { x: 0, y: 0, w: 20, h: 10 }).length).toBe(20 * 10 * 4);
+    expect(maskAt(e, layer(id).mask!.slot, 19, 9)).toBe(255);
   });
 });
 
 describe('docSpec / loadDocument round trip', () => {
-  it('text and shape layers (raster or not) survive a round trip; raster surfaces are re-rendered locally', () => {
+  it('text and shape layers survive a round trip (with a document-space mask)', () => {
     e = newEngine(120, 90);
     const s = e.addShapeLayer(rect());
     const t = e.addTextLayer(text({ text: 'Hi', size: 30 }));
-    const r = e.addShapeLayer({ type: 'ellipse', x: 5, y: 5, w: 30, h: 30, fill: { enabled: true, color: BLUE }, stroke: NOSTROKE, rotation: 0 });
-    e.setRasterize(r, true);
+    e.addShapeLayer({ type: 'ellipse', x: 5, y: 5, w: 30, h: 30, fill: { enabled: true, color: BLUE }, stroke: NOSTROKE, rotation: 0 });
     const g = e.addGroup();
     e.moveLayer(t, g, 0);
     const m = e.addMask(s);
@@ -487,7 +466,7 @@ describe('docSpec / loadDocument round trip', () => {
     const e2 = newEngine(10, 10);
     e2.loadDocument(spec);
     expect(e2.docSpec().layers).toEqual(spec.layers);
-    expect(e2.layers().map((l) => [l.id, l.kind, l.rasterize, l.slot])).toEqual(e.layers().map((l) => [l.id, l.kind, l.rasterize, l.slot]));
+    expect(e2.layers().map((l) => [l.id, l.kind, l.slot])).toEqual(e.layers().map((l) => [l.id, l.kind, l.slot]));
     expect(e2.surfaceSlots().sort()).toEqual(e.surfaceSlots().sort());
     e2.writeSurface(m, { x: 0, y: 0, w: 120, h: 90 }, new Uint8Array(120 * 90 * 4).fill(255));
     e2.commitSurfaces();
@@ -495,7 +474,7 @@ describe('docSpec / loadDocument round trip', () => {
     e2.dispose();
   });
 
-  it('rejects malformed text / shape specs and duplicate raster slots', () => {
+  it('rejects malformed text / shape specs and surfaces on them', () => {
     e = newEngine(30, 30);
     e.addShapeLayer(rect());
     e.addTextLayer(text());
@@ -508,8 +487,8 @@ describe('docSpec / loadDocument round trip', () => {
     bad((s) => { s.layers[1].shape = null; });
     bad((s) => { s.layers[2].text = null; });
     bad((s) => { s.layers[1].shape = { type: 'blob' }; });
-    bad((s) => { s.layers[1].rasterize = true; s.layers[1].slot = 5; s.layers[2].rasterize = true; s.layers[2].slot = 5; });
-    bad((s) => { s.layers[1].rasterize = true; s.layers[1].slot = null; });
+    bad((s) => { s.layers[1].slot = 5; });
+    bad((s) => { s.layers[2].slot = 5; });
     expect(e.layers().length).toBe(3);
   });
 });
@@ -535,7 +514,8 @@ describe('importImage', () => {
     expect(px(e, 39, 35)[3]).toBe(0);
     expect(px(e, 60, 35)[3]).toBe(0);
     expect(px(e, 40, 34)[3]).toBe(0);
-    expect(slotPx(e, l[0].slot!, 40, 35)).toEqual([10, 200, 30, 255]);
+    expect(slotPx(e, l[0].slot!, 0, 0)).toEqual([10, 200, 30, 255]);
+    expect(l[0]).toMatchObject({ surfaceW: 20, surfaceH: 10, transform: { x: 40, y: 35, sx: 1, sy: 1 } });
     expect(last()).toBe('Import image');
     e.undo();
     expect(e.layers().some((x) => x.id === id)).toBe(false);
@@ -580,40 +560,4 @@ describe('importImage', () => {
     expect(e.layers().length).toBe(n + 1);
     expect(e.layers()[0].name).toBe('Image');
   });
-});
-
-describe('rasterize on / off render identically for every shape type', () => {
-  const F = { enabled: true, color: { r: 200, g: 40, b: 90, a: 220 } };
-  const S = { enabled: true, color: { r: 10, g: 120, b: 250, a: 200 }, width: 5 };
-  const cases: Record<string, ShapeSpec> = {
-    rect: { type: 'rect', x: 13.5, y: 17, w: 70, h: 50, radius: 0, fill: F, stroke: S, rotation: 0 },
-    'rounded rect': { type: 'rect', x: 13, y: 17, w: 70, h: 50, radius: 18, fill: F, stroke: S, rotation: 0 },
-    'rounded rect, fill only': { type: 'rect', x: 20, y: 20, w: 60, h: 60, radius: 12, fill: F, stroke: { ...S, enabled: false }, rotation: 0 },
-    'rotated rounded rect': { type: 'rect', x: 20, y: 30, w: 60, h: 30, radius: 10, fill: F, stroke: S, rotation: 33 },
-    'huge radius': { type: 'rect', x: 20, y: 30, w: 60, h: 30, radius: 400, fill: F, stroke: S, rotation: 0 },
-    ellipse: { type: 'ellipse', x: 12, y: 22, w: 76, h: 44, fill: F, stroke: S, rotation: 0 },
-    'rotated ellipse': { type: 'ellipse', x: 12, y: 22, w: 76, h: 44, fill: F, stroke: S, rotation: 40 },
-    line: { type: 'line', x1: 10, y1: 12, x2: 90, y2: 70, stroke: S, arrowStart: false, arrowEnd: false },
-    'line with arrows': { type: 'line', x1: 10, y1: 12, x2: 90, y2: 70, stroke: S, arrowStart: true, arrowEnd: true },
-    polygon: { type: 'polygon', cx: 50, cy: 45, radius: 38, sides: 7, innerRatio: 1, fill: F, stroke: S, rotation: 0 },
-    star: { type: 'polygon', cx: 50, cy: 45, radius: 38, sides: 5, innerRatio: 0.45, fill: F, stroke: S, rotation: 17 },
-  };
-  for (const [name, spec] of Object.entries(cases)) {
-    it(name, () => {
-      e = newEngine(100, 90);
-      const id = e.addShapeLayer(spec);
-      const off = e.readComposite({ x: 0, y: 0, w: 100, h: 90 });
-      e.setRasterize(id, true);
-      const on = e.readComposite({ x: 0, y: 0, w: 100, h: 90 });
-      const surf = e.readSurface(layer(id).slot!, { x: 0, y: 0, w: 100, h: 90 });
-      let worst = 0;
-      let worstS = 0;
-      for (let i = 0; i < off.length; i++) {
-        worst = Math.max(worst, Math.abs(off[i] - on[i]));
-        worstS = Math.max(worstS, Math.abs(off[i] - surf[i]));
-      }
-      expect(worst).toBeLessThanOrEqual(1);
-      expect(worstS).toBeLessThanOrEqual(1);
-    });
-  }
 });

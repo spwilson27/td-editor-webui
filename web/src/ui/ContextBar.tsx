@@ -3,6 +3,7 @@ import { store } from '../state/store';
 import type { RGBA, SelectionMode } from '../engine/types';
 import { toHex } from '../state/colour';
 import { PAINT_TOOLS, BRUSHES, SHAPE_KINDS, toolInfo } from '../state/tools';
+import { editBounds, type BoundsField } from '../state/transform';
 import { Icon, NOT_IN_VERSION } from './Icon';
 
 const BOX = 'padding:3px 6px;background:#1f1f1f;border:1px solid #474747;border-radius:4px;text-align:right';
@@ -192,6 +193,63 @@ function FillOptions() {
   );
 }
 
+const round = (n: number) => Math.round(n * 100) / 100;
+
+/** A numeric field that commits on change / Enter and re-reads the engine value afterwards. */
+function NumField({ id, label, value, unit, disabled, onCommit, min }: { id: string; label: string; value: number | null; unit?: string; disabled?: boolean; onCommit: (v: number) => void; min?: number }) {
+  const shown = value === null ? '' : String(round(value));
+  return (
+    <div style="display:flex;align-items:center;gap:5px">
+      <label for={id} style="color:#a8a8a8">{label}</label>
+      <input id={id} data-field={id} type="number" step="any" min={min} value={shown} disabled={disabled || value === null} aria-label={`${label}${unit ? ` (${unit})` : ''}`}
+        onChange={(e) => { const input = e.target as HTMLInputElement; const n = parseFloat(input.value); if (Number.isFinite(n)) onCommit(n); else input.value = shown; }}
+        onKeyDown={(e) => { e.stopPropagation(); if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+        style={`width:62px;${BOX};color:#e3e3e3`} />
+      {unit && <span style="color:#8f8f8f">{unit}</span>}
+    </div>
+  );
+}
+
+const LINK = 'M10 14a4 4 0 005.7 0l3-3a4 4 0 00-5.7-5.7l-1 1M14 10a4 4 0 00-5.7 0l-3 3a4 4 0 005.7 5.7l1-1';
+
+/** Move tool: the active layer's bounds (X Y W H), scale %, aspect lock, Apply / Reset Transform. */
+function MoveOptions() {
+  store.docVersion.value; store.docspecVersion.value;
+  const l = store.hasEngine() ? store.activeLayer() : undefined;
+  const e = store.hasEngine() ? store.engine : null;
+  const b = l && e ? e.layerBounds(l.id) : null;
+  const ok = !!l && !!b && store.canEditTransform(l);
+  const lock = store.aspectLock.value;
+  const pixel = !!l && (l.kind === 'pixel' || l.kind === 'base');
+  const edit = (field: BoundsField, v: number) => { if (l && b) store.setLayerBounds(l, b, editBounds(b, field, v, lock)); };
+  const setScale = (pct: number) => {
+    if (!l || !b || !pixel || !(pct > 0)) return;
+    const k = pct / 100;
+    const sx = k / (l.transform.sx || 1), sy = lock ? sx : 1;
+    store.setLayerBounds(l, b, { x: b.x, y: b.y, w: b.w * sx, h: b.h * sy });
+  };
+  return (
+    <div class="opts" data-move-options>
+      <NumField id="mx" label="X" unit="px" value={ok ? b!.x : null} onCommit={(v) => edit('x', v)} />
+      <NumField id="my" label="Y" unit="px" value={ok ? b!.y : null} onCommit={(v) => edit('y', v)} />
+      <NumField id="mw" label="W" unit="px" min={1} value={ok ? b!.w : null} onCommit={(v) => edit('w', v)} />
+      <button aria-label="Keep aspect ratio" data-aspect-lock title="Keep aspect ratio" aria-pressed={lock} onClick={() => { store.aspectLock.value = !lock; }}
+        style={`${segBtn(lock)};display:inline-flex;align-items:center;justify-content:center;width:26px;padding:0;border:1px solid #474747`}><Icon d={LINK} size={14} sw={1.8} /></button>
+      <NumField id="mh" label="H" unit="px" min={1} value={ok ? b!.h : null} onCommit={(v) => edit('h', v)} />
+      <NumField id="ms" label="Scale" unit="%" min={0.01} value={ok && pixel ? l!.transform.sx * 100 : null} onCommit={setScale} />
+      <button data-act="apply-transform" aria-disabled={!store.canApplyTransform(l)} title="Bake the transform into the layer's pixels" onClick={() => store.applyTransform()}
+        style={`height:24px;padding:0 10px;border:1px solid #474747;border-radius:4px;background:#262626;opacity:${store.canApplyTransform(l) ? 1 : 0.45}`}>Apply Transform</button>
+      <button data-act="reset-transform" aria-disabled={!store.canResetTransform(l)} title="Back to position 0, 0 at 100%" onClick={() => store.resetTransform()}
+        style={`height:24px;padding:0 10px;border:1px solid #474747;border-radius:4px;background:#262626;opacity:${store.canResetTransform(l) ? 1 : 0.45}`}>Reset Transform</button>
+      <SnapCheck />
+    </div>
+  );
+}
+
+function SnapCheck() {
+  return <Check id="snapc" label="Snap" checked={store.snapOn.value} onChange={(v) => store.setSnapOn(v)} />;
+}
+
 function Readout() {
   store.selectionVersion.value;
   const { w: dw, h: dh } = store.docSize.value;
@@ -201,7 +259,7 @@ function Readout() {
   return (
     <div class="opts" style="color:#a8a8a8">
       <span>X {v(r.x)}</span><span>Y {v(r.y)}</span><span>W {v(r.w)}</span><span>H {v(r.h)}</span>
-      <Disabled><input type="checkbox" disabled style={CHK} />Snap</Disabled>
+      <SnapCheck />
     </div>
   );
 }
@@ -222,6 +280,7 @@ export function ContextBar() {
         : id === 'text' ? <TextOptions />
         : id === 'shape' ? <ShapeOptions />
         : id === 'fill' ? <FillOptions />
+        : id === 'move' ? <MoveOptions />
         : id === 'gradient' ? <span style="color:#a8a8a8">Linear · primary to secondary colour</span>
         : <Readout />}
     </div>

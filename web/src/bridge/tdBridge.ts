@@ -1,4 +1,4 @@
-import type { EditorEngine, Rect } from '../engine/types';
+import type { CanvasMode, EditorEngine, LayerSpec, Rect } from '../engine/types';
 import {
   FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, FRAME_VIEW, MAX_BAND_PAYLOAD, PROTOCOL_VERSION,
   decodeFrame, decodeTdMessage, encodeBands, encodeMessage, isStale, type TdMessage, type TopItem, type ViewMode, type ViewRect, type WebMessage,
@@ -37,6 +37,10 @@ export interface Bridge {
   listTops(): Promise<TopItem[]>;
   /** v4: snapshot a TOP once and add it as a pixel layer (engine.importImage). Resolves with the new layer id. */
   importTop(path: string): Promise<string>;
+  /** v5 Flatten: TD renders the text/shape layer alone at document size, the pixels replace the layer (engine.replaceWithPixels). */
+  renderLayer(layerId: string): Promise<void>;
+  /** v5: tell TD the canvas size / mode (active, loaded page only). Returns false when nothing was sent. */
+  setCanvas(w: number, h: number, mode: CanvasMode): boolean;
 }
 
 export interface TdBridgeOptions {
@@ -57,6 +61,7 @@ const FETCH_TIMEOUT_MS = 10000, FETCH_RETRY_MS = 500, REQUEST_BASE_MS = 2000;
 const BACKOFF_MIN = 500, BACKOFF_MAX = 5000, DEFAULT_FPS = 30;
 const LOAD_RETRY_MIN = 2000, LOAD_RETRY_MAX = 10000, NO_DOC_FALLBACK_MS = 10000;
 const LATENCY_WINDOW = 60, SENT_KEEP = 512;
+export const RENDER_LAYER_TIMEOUT_MS = 30000;
 export const LIST_TOPS_TIMEOUT_MS = 10000, IMPORT_TOP_TIMEOUT_MS = 30000;
 
 export function resolveWsUrl(search: string, loc: { protocol: string; host: string }): string {
@@ -79,6 +84,17 @@ export function httpOrigin(wsUrl: string): string {
 
 export function resolveClient(search: string): 'panel' | 'external' {
   return new URLSearchParams(search).get('client') === 'panel' ? 'panel' : 'external';
+}
+
+/** slot → surface size from a spec: a pixel layer's surface; a mask has the size of its layer's surface (document size when the layer has none). */
+export function slotSizesOf(layers: LayerSpec[], docW: number, docH: number): Map<number, { w: number; h: number }> {
+  const out = new Map<number, { w: number; h: number }>();
+  for (const l of layers) {
+    const sz = { w: l.surfaceW ?? docW, h: l.surfaceH ?? docH };
+    if (l.slot !== null && l.slot !== undefined) out.set(l.slot, sz);
+    if (l.mask) out.set(l.mask.slot, sz);
+  }
+  return out;
 }
 
 const unionRect = (a: Rect | null | undefined, b: Rect): Rect => {
@@ -145,6 +161,10 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let scratch = new Uint8ClampedArray(0);
 
+  // canvas as TD knows it (last received from / sent to TD): engine changes of any other origin (undo, redo, jumpTo) are sent
+  let tdCanvas: { w: number; h: number; mode: CanvasMode } | null = null;
+  let adopting = false;
+  let pendingTd: { size?: Extract<TdMessage, { t: 'docSize' }>; base?: { w: number; h: number } } = {};
   // doc stack
   let docPending = false, docQueued = false, lastDocRev = -1;
   // view
@@ -168,8 +188,27 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   const canSend = () => active && authoritative && !loading && !loadPending;
   const sendJson = (m: WebMessage) => { if (isOpen()) ws!.send(encodeMessage(m)); };
 
+  /** Per-slot surface sizes (v5): a layer's surface, a mask has its layer's size. Cached per spec rev. */
+  let sizesRev = -2;
+  let sizesCache = new Map<number, { w: number; h: number }>();
+  const slotSizes = (): Map<number, { w: number; h: number }> => {
+    const known = (engine as EditorEngine & { docRev?(): number }).docRev?.();
+    if (known !== undefined && known === sizesRev) return sizesCache; // no docSpec() build per flush
+    const spec = engine.docSpec();
+    if (spec.rev !== sizesRev) { sizesRev = spec.rev; sizesCache = slotSizesOf(spec.layers, spec.width, spec.height); }
+    return sizesCache;
+  };
+  const baseSize = (): { w: number; h: number } => {
+    const b = engine.layers().find((l) => l.kind === 'base');
+    return { w: b?.surfaceW ?? engine.width, h: b?.surfaceH ?? engine.height };
+  };
+
   const markFull = (slots: number[] = engine.surfaceSlots()) => {
-    for (const slot of slots) if (!unsafe.has(slot)) dirty.set(slot, { x: 0, y: 0, w: engine.width, h: engine.height });
+    const sizes = slotSizes();
+    for (const slot of slots) {
+      const sz = sizes.get(slot);
+      if (sz && !unsafe.has(slot)) dirty.set(slot, { x: 0, y: 0, w: sz.w, h: sz.h });
+    }
     schedule();
   };
 
@@ -180,7 +219,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     if (spec.rev === lastDocRev) return;
     lastDocRev = spec.rev;
     tdRev = spec.rev;
-    sendJson({ t: 'doc', rev: spec.rev, layers: spec.layers });
+    sendJson({ t: 'doc', rev: spec.rev, layers: spec.layers, guides: spec.guides, canvas: spec.canvas });
   }
 
   function queueDoc() {
@@ -210,7 +249,9 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       if (ws!.bufferedAmount > BACKPRESSURE_BYTES) break;
       dirty.delete(slot);
       const x0 = Math.max(0, Math.floor(r.x)), y0 = Math.max(0, Math.floor(r.y));
-      const x1 = Math.min(engine.width, Math.ceil(r.x + r.w)), y1 = Math.min(engine.height, Math.ceil(r.y + r.h));
+      const sz = slotSizes().get(slot);
+      if (!sz) continue;
+      const x1 = Math.min(sz.w, Math.ceil(r.x + r.w)), y1 = Math.min(sz.h, Math.ceil(r.y + r.h));
       if (x1 <= x0 || y1 <= y0) continue;
       const rect = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
       const n = rect.w * rect.h * 4;
@@ -220,7 +261,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       frameId = (frameId + 1) >>> 0;
       sentAt.set(id, now());
       if (sentAt.size > SENT_KEEP) sentAt.delete(sentAt.keys().next().value!);
-      for (const band of encodeBands({ type: FRAME_SURFACE, slot, frameId: id, docW: engine.width, docH: engine.height, rect, pixels, maxPayload: MAX_BAND_PAYLOAD })) {
+      for (const band of encodeBands({ type: FRAME_SURFACE, slot, frameId: id, docW: sz.w, docH: sz.h, rect, pixels, maxPayload: MAX_BAND_PAYLOAD })) {
         ws!.send(band as BufferSource);
       }
     }
@@ -233,11 +274,22 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       case 'surface':
         if (canSend() && !unsafe.has(e.slot)) { dirty.set(e.slot, unionRect(dirty.get(e.slot), e.rect)); schedule(); }
         break;
-      case 'docspec': if (canSend()) queueDoc(); break;
-      case 'resize': if (canSend()) { queueDoc(); markFull(); } break;
+      case 'docspec': if (canSend()) { queueDoc(); syncCanvas(); } break;
+      case 'resize': if (canSend()) { queueDoc(); syncCanvas(); } break; // v5: the canvas size never reallocates surfaces
       default: break;
     }
   });
+
+  /** Tell TD about a canvas size / mode change that did not come from TD (undo / redo / jumpTo, the dialog). */
+  function syncCanvas() {
+    if (adopting || loading || !isOpen()) return;
+    const mode = engine.canvasMode(), w = engine.width, h = engine.height;
+    const t = tdCanvas;
+    if (t && t.mode === mode && (mode === 'input' || (t.w === w && t.h === h))) return;
+    if (!t && mode === 'input') { tdCanvas = { w, h, mode }; return; }
+    tdCanvas = { w, h, mode };
+    sendJson({ t: 'setCanvas', w: mode === 'input' ? 0 : w, h: mode === 'input' ? 0 : h, mode });
+  }
 
   function endLoadState() {
     loadPending = false;
@@ -325,15 +377,12 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     unsafe.clear();
     const sock = ws;
     let complete = false;
-    const derivedSlots: number[] = [];
     try {
-      engine.loadDocument({ rev: m.rev, width: m.docW, height: m.docH, layers: m.layers });
+      engine.loadDocument({ rev: m.rev, width: m.docW, height: m.docH, layers: m.layers, guides: m.guides, canvas: m.canvas });
       const slots: number[] = [];
+      const sizes = slotSizesOf(m.layers, m.docW, m.docH);
       for (const l of m.layers) {
-        // Rasterized text / shape pixels are derived data: the engine renders them from the spec on load and they are pushed afterwards.
-        const derived = (l.kind === 'text' || l.kind === 'shape') && l.rasterize === true;
-        if (derived && l.slot !== null && l.slot !== undefined) derivedSlots.push(l.slot);
-        else if (l.slot !== null && l.slot !== undefined) slots.push(l.slot);
+        if (l.slot !== null && l.slot !== undefined) slots.push(l.slot);
         if (l.mask) slots.push(l.mask.slot);
       }
       let next = 0;
@@ -341,7 +390,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       const worker = async () => {
         while (next < slots.length && my === loadToken && !disposed) {
           const slot = slots[next++];
-          if (!(await fetchSurface(slot, sock, my)) && my === loadToken) failed.push(slot);
+          if (!(await fetchSurface(slot, sock, my, sizes.get(slot))) && my === loadToken) failed.push(slot);
         }
       };
       await Promise.all(Array.from({ length: Math.min(SURFACE_FETCH_CONCURRENCY, slots.length) }, worker));
@@ -362,8 +411,12 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
           synced = true;
           authoritative = true;
           tdRev = m.rev;
+          tdCanvas = { w: m.docW, h: m.docH, mode: m.canvas.mode };
           endLoadState();
-          if (derivedSlots.length) markFull(derivedSlots.filter((x) => engine.surfaceSlots().includes(x)));
+          const pend = pendingTd;
+          pendingTd = {};
+          if (pend.size) adoptCanvas(pend.size.w, pend.size.h, pend.size.mode);
+          if (pend.base) applyBaseSize(pend.base.w, pend.base.h);
         } else if (loadPending && !disposed) {
           armLoadRetry(); // stay non-authoritative; ask TD again
           status.setNotice('Loading document from TouchDesigner… (retrying)');
@@ -374,7 +427,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   }
 
   /** True when the slot is settled: loaded, or TD has no pixels for it (404 = loaded-empty). False = failed. */
-  async function fetchSurface(slot: number, sock: WebSocket | null, my: number): Promise<boolean> {
+  async function fetchSurface(slot: number, sock: WebSocket | null, my: number, size: { w: number; h: number } | undefined): Promise<boolean> {
     for (let attempt = 0; attempt < 2; attempt++) {
       const ctrl = new AbortController();
       aborts.add(ctrl);
@@ -387,7 +440,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         const buf = await res.arrayBuffer();
         if (disposed || ws !== sock || my !== loadToken || !loading) return true; // superseded; the newer load owns the result
         const r = decodeFrame(buf);
-        if (!r.ok || r.frame.type !== FRAME_SURFACE_DUMP || isStale(r.frame, engine.width, engine.height)) return false;
+        if (!r.ok || r.frame.type !== FRAME_SURFACE_DUMP || !size || isStale(r.frame, size.w, size.h)) return false;
         engine.writeSurface(slot, { x: r.frame.x, y: r.frame.y, w: r.frame.w, h: r.frame.h }, r.frame.payload);
         return true;
       } catch {
@@ -425,7 +478,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         active = false;
         authoritative = false;
         tdHasDocument = m.hasDocument;
-        if (m.doc.w !== engine.width || m.doc.h !== engine.height) engine.resize(m.doc.w, m.doc.h);
+        adoptCanvas(m.doc.w, m.doc.h, m.doc.mode ?? engine.canvasMode());
         // Another client edited TD's document while this page was away: reload instead of overwriting.
         const newer = synced && m.rev !== null && tdRev !== null && m.rev > tdRev;
         const needsLoad = m.hasDocument && (!synced || loadIncomplete || newer);
@@ -442,7 +495,13 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         break;
       case 'docSize':
         docEpoch++;
-        if (m.w !== engine.width || m.h !== engine.height) engine.resize(m.w, m.h);
+        if (loading || loadPending) { pendingTd.size = m; break; } // never adopt mid-load: applied when the load completes
+        adoptCanvas(m.w, m.h, m.mode);
+        break;
+      case 'baseSize':
+        docEpoch++;
+        if (loading || loadPending) { pendingTd.base = { w: m.w, h: m.h }; break; }
+        applyBaseSize(m.w, m.h);
         break;
       case 'base':
         noticeId = m.frameId;
@@ -500,6 +559,30 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     }
   }
 
+  /** TD's document size + mode become the engine's, without history (engine.adoptCanvas; older engines: setCanvasMode + resize). */
+  function adoptCanvas(w: number, h: number, mode: CanvasMode) {
+    adopting = true;
+    try {
+      if (engine.adoptCanvas) {
+        if (w !== engine.width || h !== engine.height || mode !== engine.canvasMode()) engine.adoptCanvas(w, h, mode);
+      } else {
+        if (engine.canvasMode() !== mode) engine.setCanvasMode(mode);
+        if (w !== engine.width || h !== engine.height) engine.resize(w, h);
+      }
+    } finally {
+      adopting = false;
+    }
+    tdCanvas = { w: engine.width, h: engine.height, mode: engine.canvasMode() };
+  }
+
+  /** v5: the TD Input resolution changed; the base surface follows (no history). 0x0 = no input (the engine keeps an empty placeholder). */
+  function applyBaseSize(w: number, h: number) {
+    if (w < 0 || h < 0) return;
+    const cur = baseSize();
+    if (cur.w === w && cur.h === h) return;
+    engine.setBaseSize?.(w, h);
+  }
+
   function listTops(): Promise<TopItem[]> {
     if (!isOpen() || !clientId) return Promise.reject(new Error('Not connected to TouchDesigner'));
     const requestId = `t${++requestSeq}`;
@@ -523,6 +606,38 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     if (disposed || epoch !== docEpoch) throw new Error('The document changed during the import');
     const name = path.split('/').filter(Boolean).pop() ?? 'TOP';
     return engine.importImage(frame.payload, frame.w, frame.h, name);
+  }
+
+  /** v5 Flatten: renderLayer → topReady → GET /top (document-sized) → engine.replaceWithPixels. */
+  async function renderLayer(layerId: string): Promise<void> {
+    if (!isOpen() || !clientId) throw new Error('Not connected to TouchDesigner');
+    const requestId = `r${++requestSeq}`;
+    const sock = ws;
+    const fingerprint = () => {
+      const l = engine.layers().find((x) => x.id === layerId);
+      return l ? JSON.stringify([l.kind, l.text, l.shape, engine.width, engine.height]) : null;
+    };
+    const before = fingerprint();
+    if (canSend() && lastDocRev !== engine.docSpec().rev) sendDocNow(); // TD must render the layer as the page has it now
+    await new Promise<{ w: number; h: number }>((resolve, reject) => {
+      const timer = setTimeout(() => { pendingImports.delete(requestId); reject(new Error('TouchDesigner did not answer')); }, RENDER_LAYER_TIMEOUT_MS);
+      pendingImports.set(requestId, { resolve: (w, h) => resolve({ w, h }), reject, timer });
+      sendJson({ t: 'renderLayer', requestId, layerId });
+    });
+    const frame = await fetchTop(requestId, sock);
+    if (disposed) throw new Error('Bridge closed');
+    const l = engine.layers().find((x) => x.id === layerId);
+    if (!l || (l.kind !== 'text' && l.kind !== 'shape') || fingerprint() !== before) throw new Error('The layer changed during Flatten');
+    engine.replaceWithPixels(layerId, frame.payload, frame.w, frame.h);
+  }
+
+  function setCanvas(w: number, h: number, mode: CanvasMode): boolean {
+    if (!isOpen() || !active || !authoritative || loadPending) return false;
+    const t = tdCanvas;
+    if (t && t.mode === mode && (mode === 'input' || (t.w === w && t.h === h))) return true; // already sent for this very change
+    tdCanvas = { w: mode === 'input' ? engine.width : w, h: mode === 'input' ? engine.height : h, mode };
+    sendJson({ t: 'setCanvas', w: mode === 'input' ? 0 : w, h: mode === 'input' ? 0 : h, mode });
+    return true;
   }
 
   /** GET /top: same auth, abort and timeout rules as /surface; one retry. */
@@ -551,7 +666,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         aborts.delete(ctrl);
       }
     }
-    status.setNotice(`TOP import failed: ${lastErr}`);
+    status.setNotice(`TOP fetch failed: ${lastErr}`);
     throw new Error(lastErr);
   }
 
@@ -585,7 +700,8 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       if (epoch !== docEpoch) { refetch = true; return; } // TD counted this frame as fetched and will not re-announce it
 
       const r = decodeFrame(buf);
-      if (!r.ok || r.frame.type !== FRAME_BASE || isStale(r.frame, engine.width, engine.height)) return;
+      if (!r.ok || r.frame.type !== FRAME_BASE) return;
+      applyBaseSize(r.frame.docW, r.frame.docH); // v5: BASE docW/docH = the input's size, not the document's
       engine.writeBase({ x: r.frame.x, y: r.frame.y, w: r.frame.w, h: r.frame.h }, r.frame.payload);
       if (r.frame.frameEnd) engine.commitBase();
     } catch {
@@ -677,6 +793,8 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       loading = false;
       authoritative = false;
       loadToken++;
+      pendingTd = {};
+      tdCanvas = null;
       endLoadState();
       docEpoch++;
       for (const c of aborts) c.abort();
@@ -711,6 +829,8 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     },
     listTops,
     importTop,
+    renderLayer,
+    setCanvas,
     dispose() {
       disposed = true;
       failPending('Bridge closed');

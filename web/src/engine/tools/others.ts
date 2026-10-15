@@ -1,10 +1,12 @@
 import type { Rect, RGBA, ToolPointer } from '../types';
 import { intersect, translate, union } from '../rect';
 import { cropData, floodFill } from '../floodFill';
-import { isVector, type EditTarget, type PixelLayer, type StructureSnapshot, type VectorLayer } from '../model';
+import { isVector, layerBox, type EditTarget, type PixelLayer, type StructureSnapshot, type VectorLayer } from '../model';
 import { translateShape, translateText } from '../textShape';
 import { luminance } from '../adjustments';
-import { commitPatches, editableRegion, restoreAndDraw } from './paint';
+import { innerLayerRect, layerRectToDoc, outerRect } from '../xform';
+import type { Surface } from '../surface';
+import { commitPatches, drawCoverage, editableRegion, restoreAndDraw } from './paint';
 import { cancelRaf, raf } from '../compositor';
 import { TileBackup } from '../tiles';
 import type { Host, Tool } from './host';
@@ -21,6 +23,11 @@ export class PickerTool implements Tool {
   up(): void {}
 }
 
+/**
+ * Drags the active layer: pixel / base layers change their transform position (whole-pixel steps from where they were
+ * picked up), text / shape layers edit their geometry. Snapping (Host.snapMove) adjusts the dragged bounds.
+ * Scaling is done through EditorEngine.setTransform / setLayerBox (the UI draws the transform box and its handles).
+ */
 export class MoveTool implements Tool {
   private layer: PixelLayer | VectorLayer | null = null;
   private before: StructureSnapshot | null = null;
@@ -28,6 +35,7 @@ export class MoveTool implements Tool {
   private sy = 0;
   private ox = 0;
   private oy = 0;
+  private box: Rect | null = null; // document bounds at pointer down
   private spec: VectorLayer['spec'] | null = null; // text / shape: the spec at pointer down
   private moved = false;
 
@@ -40,6 +48,7 @@ export class MoveTool implements Tool {
     this.sx = p.x;
     this.sy = p.y;
     this.moved = false;
+    this.box = layerBox(this.layer);
     if (isVector(this.layer)) {
       this.spec = this.layer.spec;
       this.ox = this.oy = 0;
@@ -52,8 +61,13 @@ export class MoveTool implements Tool {
   move(p: ToolPointer): void {
     const l = this.layer;
     if (!l) return;
-    const dx = Math.round(p.x - this.sx);
-    const dy = Math.round(p.y - this.sy);
+    let dx = Math.round(p.x - this.sx);
+    let dy = Math.round(p.y - this.sy);
+    if (this.box && (dx !== 0 || dy !== 0)) {
+      const sn = this.host.snapMove(translate(this.box, dx, dy), l.id);
+      dx = Math.round(dx + sn.dx); // whole pixels
+      dy = Math.round(dy + sn.dy);
+    }
     if (isVector(l)) {
       // Text and shapes move by editing the spec position (TouchDesigner renders from it), never by an offset.
       if (!this.moved && dx === 0 && dy === 0) return;
@@ -67,10 +81,11 @@ export class MoveTool implements Tool {
     const nx = this.ox + dx;
     const ny = this.oy + dy;
     if (nx === l.x && ny === l.y) return;
-    const old: Rect = { x: l.x, y: l.y, w: l.surface.width, h: l.surface.height };
+    const old = outerRect(layerRectToDoc(l, { x: 0, y: 0, w: l.surface.width, h: l.surface.height }));
     l.x = nx;
     l.y = ny;
-    this.host.changed(union(old, translate(old, nx - old.x, ny - old.y)) as Rect);
+    const now = outerRect(layerRectToDoc(l, { x: 0, y: 0, w: l.surface.width, h: l.surface.height }));
+    this.host.changed(union(old, now) as Rect);
     this.host.docMoved();
   }
 
@@ -89,32 +104,50 @@ export class MoveTool implements Tool {
 export class FillTool implements Tool {
   constructor(private host: Host) {}
 
+  /**
+   * Flood fill in the layer's own pixels: the clicked layer pixel is the one under the cursor (inverse transform),
+   * tolerance is measured on layer pixels, and the fill is limited to the part of the layer visible in the document
+   * (and the selection; partial coverage is sampled at layer pixel centres).
+   */
   down(p: ToolPointer): void {
     const layer = this.host.editableLayer();
     if (!layer) return;
-    const area = editableRegion(this.host, layer, { x: Math.floor(p.x), y: Math.floor(p.y), w: 1, h: 1 });
-    if (!area) return;
-    const docW = this.host.doc.width;
+    const tf = layer.tf;
+    const { width: docW, height: docH } = this.host.doc;
+    const dxp = Math.floor(p.x);
+    const dyp = Math.floor(p.y);
+    if (!(dxp >= 0 && dyp >= 0 && dxp < docW && dyp < docH)) return;
     const cov = this.host.selectionAlpha();
-    if (cov && cov[Math.floor(p.y) * docW + Math.floor(p.x)] === 0) return; // clicked on an unselected pixel
-    // Flood only inside the selection (or the whole layer): read just that region.
-    const lay = intersect({ x: 0, y: 0, w: layer.surface.width, h: layer.surface.height }, translate(this.host.doc.selection ?? { x: 0, y: 0, w: this.host.doc.width, h: this.host.doc.height }, -layer.x, -layer.y)) as Rect;
+    if (cov && cov[dyp * docW + dxp] === 0) return; // clicked on an unselected pixel
+    const cu = Math.floor((p.x - tf.x) / tf.sx);
+    const cv = Math.floor((p.y - tf.y) / tf.sy);
+    const lay = intersect(
+      { x: 0, y: 0, w: layer.surface.width, h: layer.surface.height },
+      innerLayerRect(tf, this.host.doc.selection ?? { x: 0, y: 0, w: docW, h: docH }),
+    );
+    if (!lay || cu < lay.x || cv < lay.y || cu >= lay.x + lay.w || cv >= lay.y + lay.h) return;
     const ctx = this.host.context();
     const img = layer.surface.ctx.getImageData(lay.x, lay.y, lay.w, lay.h);
     // Masks flood on their value (alpha) only; the colour channels of the alpha-stored mask are meaningless.
     const probe = layer.isMask ? maskProbe(img.data) : img.data;
-    const res = floodFill(probe, lay.w, lay.h, Math.floor(p.x) - layer.x - lay.x, Math.floor(p.y) - layer.y - lay.y, ctx.fillTolerance);
+    const res = floodFill(probe, lay.w, lay.h, cu - lay.x, cv - lay.y, ctx.fillTolerance);
     if (!res) return;
     const before = cropData(img.data, lay.w, res.rect);
     const after = before.slice();
-    // coverage of the selection at crop pixel (x, y) of res.rect, in document space
-    const covAt = cov ? (x: number, y: number): number => cov[(lay.y + res.rect.y + y + layer.y) * docW + lay.x + res.rect.x + x + layer.x] : null;
+    // selection coverage at crop pixel (x, y) of res.rect: sampled at the layer pixel's centre in document space
+    const covAt = cov
+      ? (x: number, y: number): number => {
+        const dx = Math.floor(tf.x + tf.sx * (lay.x + res.rect.x + x + 0.5));
+        const dy = Math.floor(tf.y + tf.sy * (lay.y + res.rect.y + y + 0.5));
+        return dx >= 0 && dy >= 0 && dx < docW && dy < docH ? cov[dy * docW + dx] : 0;
+      }
+      : null;
     if (layer.isMask) paintMaskValue(after, lay.w, res.rect, res.mask, luminance(ctx.primary.r, ctx.primary.g, ctx.primary.b), ctx.primary.a / 255, covAt);
     else paintCovered(after, lay.w, res.rect, res.mask, ctx.primary, covAt);
     const r = { x: lay.x + res.rect.x, y: lay.y + res.rect.y, w: res.rect.w, h: res.rect.h };
     const afterImg = new ImageData(after, r.w, r.h);
     layer.surface.ctx.putImageData(afterImg, r.x, r.y);
-    this.host.paintChanged(layer, translate(r, layer.x, layer.y));
+    this.host.paintChanged(layer, r);
     this.host.pushPatch('Fill', layer, [{ rect: r, before: new ImageData(before, r.w, r.h), after: afterImg }]);
   }
   move(): void {}
@@ -182,7 +215,7 @@ export class GradientTool implements Tool {
   down(p: ToolPointer): void {
     this.layer = this.host.editableLayer();
     if (!this.layer) return;
-    this.tb = new TileBackup(this.layer, this.host.scratch.backup);
+    this.tb = new TileBackup(this.layer);
     this.sx = p.x;
     this.sy = p.y;
     this.drew = false;
@@ -213,69 +246,77 @@ export class GradientTool implements Tool {
     if (this.drew && !(p.x === this.sx && p.y === this.sy)) commitPatches(this.host, layer, tb, 'Gradient');
   }
 
+  /**
+   * The gradient is defined in document space (start / end are pointer positions) and drawn under the layer's
+   * doc -> layer transform, so its iso-lines stay perpendicular to the drag on screen even for non-uniform scales.
+   */
   private draw(): void {
     const layer = this.layer;
     const p = this.pending;
     this.pending = null;
     if (!layer || !p) return;
-    const area = editableRegion(this.host, layer, { x: 0, y: 0, w: this.host.doc.width, h: this.host.doc.height });
+    const area = editableRegion(this.host, layer, { x: 0, y: 0, w: layer.surface.width, h: layer.surface.height });
     if (!area) return;
-    const lr = translate(area, -layer.x, -layer.y);
+    const tf = layer.tf;
     const { primary: a, secondary: b } = this.host.context();
-    restoreAndDraw(this.host, layer, this.tb as TileBackup, lr, () => {
+    restoreAndDraw(this.host, layer, this.tb as TileBackup, area, () => {
       if (p.x === this.sx && p.y === this.sy) return; // zero-length drag paints nothing
       const c = layer.surface.ctx;
       const sel = this.host.selectionCanvas();
       if (sel) {
-        this.drawCovered(layer, sel.canvas as CanvasImageSource, area, lr, p);
+        this.drawCovered(layer, sel, area, p);
         return;
       }
-      const g = c.createLinearGradient(this.sx - layer.x, this.sy - layer.y, p.x - layer.x, p.y - layer.y);
-      if (layer.isMask) {
-        // Mask value from colour luminance, replacing the old mask under the gradient (stored as white with alpha).
-        g.addColorStop(0, `rgba(255,255,255,${luminance(a.r, a.g, a.b) / 255})`);
-        g.addColorStop(1, `rgba(255,255,255,${luminance(b.r, b.g, b.b) / 255})`);
-        c.clearRect(lr.x, lr.y, lr.w, lr.h);
-      } else {
-        g.addColorStop(0, `rgba(${a.r},${a.g},${a.b},${a.a / 255})`);
-        g.addColorStop(1, `rgba(${b.r},${b.g},${b.b},${b.a / 255})`);
-      }
+      if (layer.isMask) c.clearRect(area.x, area.y, area.w, area.h); // the gradient replaces the old mask
+      const d = layerRectToDoc(tf, area);
+      c.save();
+      c.setTransform(1 / tf.sx, 0, 0, 1 / tf.sy, -tf.x / tf.sx, -tf.y / tf.sy);
+      const g = c.createLinearGradient(this.sx, this.sy, p.x, p.y);
+      this.stops(g, layer.isMask, a, b);
       c.fillStyle = g;
-      c.fillRect(lr.x, lr.y, lr.w, lr.h);
+      c.fillRect(d.x, d.y, d.w, d.h);
+      c.restore();
     });
     this.drew = true;
     this.host.paintChanged(layer, area);
   }
 
-  /** Gradient under a non-rect selection: render it in a window, multiply by the coverage, then merge into the layer. */
-  private drawCovered(layer: EditTarget, sel: CanvasImageSource, area: Rect, lr: Rect, p: { x: number; y: number }): void {
-    const { primary: a, secondary: b } = this.host.context();
-    const t = this.host.tempWindow(area.w, area.h);
-    const tc = t.ctx;
-    tc.globalCompositeOperation = 'source-over';
-    tc.setTransform(1, 0, 0, 1, -area.x, -area.y);
-    tc.clearRect(area.x, area.y, area.w, area.h);
-    const g = tc.createLinearGradient(this.sx, this.sy, p.x, p.y);
-    if (layer.isMask) {
+  private stops(g: CanvasGradient, isMask: boolean, a: RGBA, b: RGBA): void {
+    if (isMask) {
+      // Mask value from colour luminance (stored as white with alpha).
       g.addColorStop(0, `rgba(255,255,255,${luminance(a.r, a.g, a.b) / 255})`);
       g.addColorStop(1, `rgba(255,255,255,${luminance(b.r, b.g, b.b) / 255})`);
     } else {
       g.addColorStop(0, `rgba(${a.r},${a.g},${a.b},${a.a / 255})`);
       g.addColorStop(1, `rgba(${b.r},${b.g},${b.b},${b.a / 255})`);
     }
+  }
+
+  /** Gradient under a non-rect selection: render it in a window, multiply by the coverage, then merge into the layer. */
+  private drawCovered(layer: EditTarget, sel: Surface, area: Rect, p: { x: number; y: number }): void {
+    const { primary: a, secondary: b } = this.host.context();
+    const tf = layer.tf;
+    const t = this.host.tempWindow(area.w, area.h);
+    const tc = t.ctx;
+    tc.globalCompositeOperation = 'source-over';
+    tc.clearRect(0, 0, area.w, area.h);
+    drawCoverage(this.host, tc, sel, area, tf, 0, 0);
+    tc.globalCompositeOperation = 'source-in';
+    tc.setTransform(1 / tf.sx, 0, 0, 1 / tf.sy, -tf.x / tf.sx - area.x, -tf.y / tf.sy - area.y); // document -> window
+    const g = tc.createLinearGradient(this.sx, this.sy, p.x, p.y);
+    this.stops(g, layer.isMask, a, b);
     tc.fillStyle = g;
-    tc.fillRect(area.x, area.y, area.w, area.h);
+    const d = layerRectToDoc(tf, area);
+    tc.fillRect(d.x, d.y, d.w, d.h);
     tc.setTransform(1, 0, 0, 1, 0, 0);
-    tc.globalCompositeOperation = 'destination-in';
-    tc.drawImage(sel, area.x, area.y, area.w, area.h, 0, 0, area.w, area.h);
     tc.globalCompositeOperation = 'source-over';
     const c = layer.surface.ctx;
     if (layer.isMask) {
       // mask = old * (1 - coverage) + gradient * coverage
       c.globalCompositeOperation = 'destination-out';
-      c.drawImage(sel, area.x, area.y, area.w, area.h, lr.x, lr.y, lr.w, lr.h);
+      drawCoverage(this.host, c, sel, area, tf, area.x, area.y);
       c.globalCompositeOperation = 'lighter';
     }
-    c.drawImage(t.canvas as CanvasImageSource, 0, 0, area.w, area.h, lr.x, lr.y, lr.w, lr.h);
+    c.drawImage(t.canvas as CanvasImageSource, 0, 0, area.w, area.h, area.x, area.y, area.w, area.h);
   }
 }

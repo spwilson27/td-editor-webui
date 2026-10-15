@@ -3,7 +3,7 @@ import type { Engine } from '../../src/engine';
 import type { EngineEvent, ShapeSpec } from '../../src/engine/types';
 import { FoldedPolygon, polyVertices, renderShapeBytes, sdPolygonFull, setShapeCacheBudget, shapeCacheStats, shapeUniforms } from '../../src/engine/shapeSdf';
 import shapeGlsl from '../../../td/raster_editor/shape.glsl?raw';
-import { newEngine, perfEnabled, ptr, px, slotPx } from './engineTestUtils';
+import { newEngine, perfEnabled, ptr, px } from './engineTestUtils';
 
 let e: Engine;
 afterEach(() => e?.dispose());
@@ -158,19 +158,18 @@ describe('SDF renderer maths', () => {
   });
 });
 
-describe('rasterize on / off are identical in both renderers', () => {
+describe('flattening what the preview shows is lossless in both renderers', () => {
   for (const mode of ['sdf', 'canvas'] as const) {
     for (const [name, spec] of Object.entries(cases)) {
       it(`${mode}: ${name}`, () => {
         e = newEngine(W, H);
         e.setShapeRenderer(mode);
         const id = e.addShapeLayer(spec);
-        const off = e.readComposite({ x: 0, y: 0, w: W, h: H });
-        e.setRasterize(id, true);
-        const on = e.readComposite({ x: 0, y: 0, w: W, h: H });
-        const surf = e.readSurface(e.layers().find((l) => l.id === id)!.slot!, { x: 0, y: 0, w: W, h: H });
+        const before = e.readComposite({ x: 0, y: 0, w: W, h: H });
+        e.replaceWithPixels(id, before, W, H); // what TD would deliver for a layer alone at document size
+        const after = e.readComposite({ x: 0, y: 0, w: W, h: H });
         let worst = 0;
-        for (let i = 0; i < off.length; i++) worst = Math.max(worst, Math.abs(off[i] - on[i]), Math.abs(off[i] - surf[i]));
+        for (let i = 0; i < before.length; i++) worst = Math.max(worst, Math.abs(before[i] - after[i]));
         expect(worst).toBeLessThanOrEqual(1);
       });
     }
@@ -178,15 +177,12 @@ describe('rasterize on / off are identical in both renderers', () => {
 });
 
 describe('renderer switch', () => {
-  it("defaults to 'sdf'; switching re-renders every shape layer and announces rasterized surfaces", () => {
+  it("defaults to 'sdf'; switching re-renders every shape layer without touching the document", () => {
     e = newEngine(W, H);
     expect(e.shapeRenderer()).toBe('sdf');
     const a = e.addShapeLayer(cases['rounded rect']);
     const b = e.addShapeLayer(cases.star);
-    e.setRasterize(b, true);
-    const slot = e.layers().find((l) => l.id === b)!.slot!;
     const sdfComp = Array.from(e.readComposite({ x: 0, y: 0, w: W, h: H }));
-    const sdfSurf = Array.from(e.readSurface(slot, { x: 0, y: 0, w: W, h: H }));
     const ev: EngineEvent[] = [];
     e.on((x) => ev.push(x));
     const hist = e.history().entries.length;
@@ -195,10 +191,7 @@ describe('renderer switch', () => {
     expect(e.shapeRenderer()).toBe('canvas');
     const canvasComp = Array.from(e.readComposite({ x: 0, y: 0, w: W, h: H }));
     expect(canvasComp).not.toEqual(sdfComp); // the two renderers differ at edges
-    expect(Array.from(e.readSurface(slot, { x: 0, y: 0, w: W, h: H }))).not.toEqual(sdfSurf);
-    const surf = ev.filter((x) => x.type === 'surface') as Array<Extract<EngineEvent, { type: 'surface' }>>;
-    expect(surf.map((x) => x.slot)).toEqual([slot]);
-    expect(surf[0].rect).toEqual({ x: 0, y: 0, w: W, h: H });
+    expect(ev.some((x) => x.type === 'surface')).toBe(false);
     expect(ev.some((x) => x.type === 'pixels')).toBe(true);
     expect(e.history().entries.length).toBe(hist); // not a document edit
     expect(JSON.stringify(e.docSpec())).toBe(spec);
@@ -208,9 +201,8 @@ describe('renderer switch', () => {
     expect(big).toBeLessThan(80);
     e.setShapeRenderer('sdf');
     expect(Array.from(e.readComposite({ x: 0, y: 0, w: W, h: H }))).toEqual(sdfComp);
-    expect(Array.from(e.readSurface(slot, { x: 0, y: 0, w: W, h: H }))).toEqual(sdfSurf);
-    expect(slotPx(e, slot, 50, 20)).toEqual(slotPx(e, slot, 50, 20));
     expect(a).toBeTruthy();
+    expect(b).toBeTruthy();
   });
 
   it('switching to the current mode does nothing', () => {
@@ -327,24 +319,6 @@ describe('review regressions: shortcut vs exact, folded polygons, move cache, bu
     const r = shapeCacheStats().renders;
     for (let i = 0; i < 8; i++) { e.changed({ x: 0, y: 0, w: 300, h: 200 }); e.flush(); }
     expect(shapeCacheStats().renders).toBe(r); // working set fits: no cyclic misses
-  });
-
-  it('undo that restores a surface drawn by the other renderer re-renders it', () => {
-    e = newEngine(100, 90);
-    const id = e.addShapeLayer(cases.star);
-    e.setRasterize(id, true); // surface drawn by sdf
-    e.setRasterize(id, false);
-    e.setShapeRenderer('canvas');
-    e.undo(); // restores the sdf-drawn surface
-    const slot = e.layers().find((l) => l.id === id)!.slot!;
-    const got = e.readSurface(slot, { x: 0, y: 0, w: 100, h: 90 });
-    const ref = newEngine(100, 90);
-    ref.setShapeRenderer('canvas');
-    const rid = ref.addShapeLayer(cases.star);
-    ref.setRasterize(rid, true);
-    const want = ref.readSurface(ref.layers().find((l) => l.id === rid)!.slot!, { x: 0, y: 0, w: 100, h: 90 });
-    ref.dispose();
-    expect(premultDiff(got, want)).toBeLessThanOrEqual(1);
   });
 });
 

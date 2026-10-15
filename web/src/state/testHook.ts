@@ -1,5 +1,5 @@
 import type { Store } from './store';
-import type { AdjustmentSpec, AdjustmentType, PaintTarget, SelectionOptions, ShapeSpec, ShapeType, TextSpec, ToolId, ToolPointer } from '../engine/types';
+import type { Anchor, AdjustmentSpec, AdjustmentType, CanvasMode, LayerTransform, PaintTarget, SnapOptions, SelectionOptions, ShapeSpec, ShapeType, TextSpec, ToolId, ToolPointer } from '../engine/types';
 import { completeShapeSpec, completeTextSpec } from './specs';
 
 /** `window.__editorTest`, installed only with ?test=1; used by automated TouchDesigner validation. */
@@ -56,8 +56,27 @@ export function installTestHook(store: Store, win: Window = window): void {
       const cur = store.engine.layers().find((l) => l.id === id)?.shape;
       if (cur) store.engine.setShape(id, { ...cur, ...spec } as ShapeSpec);
     },
-    setRasterize: (id: string, on: boolean) => store.engine.setRasterize(id, on),
-    flatten: (id: string) => store.engine.flattenLayer(id),
+    // v4: transforms, canvas, guides, snapping, Flatten (via TouchDesigner)
+    setTransform: (id: string, t: Partial<LayerTransform>) => {
+      const cur = store.engine.layers().find((l) => l.id === id)?.transform;
+      if (cur) store.engine.setTransform(id, { ...cur, ...t });
+    },
+    applyTransform: (id: string) => store.engine.applyTransform(id),
+    layerBounds: (id: string) => store.engine.layerBounds(id),
+    setCanvasSize: (w: number, h: number, anchor: Anchor = 'c') => store.setCanvasSize(w, h, anchor),
+    setCanvasMode: (mode: CanvasMode) => { if (mode === 'input') store.followInput(); else store.setCanvasSize(store.docSize.peek().w, store.docSize.peek().h, 'c'); return store.engine.canvasMode(); },
+    canvasMode: () => store.engine.canvasMode(),
+    addGuide: (axis: 'h' | 'v', pos: number) => store.engine.addGuide(axis, pos),
+    moveGuide: (axis: 'h' | 'v', index: number, pos: number) => store.engine.moveGuide(axis, index, pos),
+    removeGuide: (axis: 'h' | 'v', index: number) => store.engine.removeGuide(axis, index),
+    guides: () => store.engine.guides(),
+    setSnap: (o: Partial<SnapOptions>) => {
+      if (o.enabled !== undefined) store.setSnapOn(o.enabled);
+      store.engine.setSnap({ ...store.snapOptions(), ...o });
+      return store.snapOptions();
+    },
+    /** Flatten a text / shape layer: TD renders it, the pixels replace the layer. Resolves true when done. */
+    flatten: (id: string) => store.flattenLayer(id),
     fonts: () => store.fonts.peek(),
     setShapeRenderer: (m: 'sdf' | 'canvas') => { store.setShapeRenderer(m); return store.engine.shapeRenderer(); },
     listTops: () => (store.bridge ? store.bridge.listTops() : Promise.reject(new Error('standalone'))),

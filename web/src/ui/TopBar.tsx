@@ -4,7 +4,7 @@ import { MODES } from '../state/tools';
 import { formatZoom } from '../state/view';
 import { Icon, NOT_IN_VERSION } from './Icon';
 
-type Item = 'sep' | { label: string; hint?: string; run?: (s: Store) => void; checked?: (s: Store) => boolean; enabled?: (s: Store) => boolean };
+type Item = 'sep' | { label: string; hint?: string; run?: (s: Store) => void; checked?: (s: Store) => boolean; enabled?: (s: Store) => boolean; title?: (s: Store) => string | undefined };
 interface MenuDef { label: string; items: Item[] }
 
 const off = (label: string, hint?: string): Item => ({ label, hint });
@@ -17,21 +17,29 @@ const MENUS: MenuDef[] = [
     { label: 'New layer', run: (s) => s.addLayer() }, { label: 'Flatten to new layer', run: (s) => s.flatten() }] },
   { label: 'Edit', items: [{ label: 'Undo', hint: 'Ctrl+Z', run: (s) => s.undo() }, { label: 'Redo', hint: 'Ctrl+Shift+Z', run: (s) => s.redo() },
     'sep', off('Cut', 'Ctrl+X'), off('Copy', 'Ctrl+C'), { label: 'Paste', hint: 'Ctrl+V', run: (s) => void s.pasteFromClipboard() }] },
-  { label: 'Document', items: [off('Resize document…'), off('Resize canvas…'), off('Rotate…')] },
+  { label: 'Document', items: [off('Resize document…'),
+    { label: 'Canvas Size…', run: (s) => { s.canvasDialog.value = true; } },
+    { label: 'Follow Input Size', run: (s) => s.followInput(), checked: (s) => s.canvasMode.value === 'input', title: () => 'The document size tracks the TouchDesigner Input resolution' }, off('Rotate…')] },
   { label: 'Layer', items: [off('Duplicate'), off('Merge down'), off('Layer properties…'), 'sep',
-    { label: 'Flatten Layer', run: (s) => { const l = s.activeLayer(); if (l) s.flattenLayer(l.id); }, enabled: (s) => isEditable(s.activeLayer()?.kind) },
-    { label: 'Rasterize', checked: (s) => !!s.activeLayer()?.rasterize, enabled: (s) => isEditable(s.activeLayer()?.kind), run: (s) => { const l = s.activeLayer(); if (l) s.setRasterize(l.id, !l.rasterize); } }, 'sep', { label: 'Add mask', run: (s) => s.addMask(), enabled: (s) => s.canAddMask() }, { label: 'Delete mask', run: (s) => s.deleteMask(), enabled: (s) => !!s.activeLayer()?.mask }] },
+    { label: 'Flatten Layer', run: (s) => { const l = s.activeLayer(); if (l) void s.flattenLayer(l.id); }, enabled: (s) => s.canFlatten(s.activeLayer()),
+      title: (s) => (isEditable(s.activeLayer()?.kind) && s.connection.value !== 'linked' ? 'Flatten needs TouchDesigner' : undefined) },
+    { label: 'Apply Transform', run: (s) => s.applyTransform(), enabled: (s) => s.canApplyTransform(s.activeLayer()) },
+    { label: 'Reset Transform', run: (s) => s.resetTransform(), enabled: (s) => s.canResetTransform(s.activeLayer()) }, 'sep', { label: 'Add mask', run: (s) => s.addMask(), enabled: (s) => s.canAddMask() }, { label: 'Delete mask', run: (s) => s.deleteMask(), enabled: (s) => !!s.activeLayer()?.mask }] },
   { label: 'Select', items: [{ label: 'Select All', hint: 'Ctrl+A', run: (s) => s.selectAll() }, { label: 'Deselect', hint: 'Ctrl+D', run: (s) => s.deselect() },
     { label: 'Invert Selection', hint: 'Shift+Ctrl+I', run: (s) => s.invertSelection() }, 'sep',
     { label: 'Mask from Selection', run: (s) => s.maskFromSelection(), enabled: (s) => s.canMaskFromSelection() }] },
   { label: 'Filters', items: [off('Blur…'), off('Sharpen…'), off('Noise…')] },
   { label: 'View', items: [{ label: 'Zoom in', hint: '+', run: (s) => s.zoomStep(1) }, { label: 'Zoom out', hint: '-', run: (s) => s.zoomStep(-1) },
     { label: 'Fit', hint: '0', run: (s) => s.fit() }, { label: '100%', hint: '1', run: (s) => s.zoomTo(1) }, 'sep',
+    { label: 'Show Rulers', run: (s) => s.setShowRulers(!s.showRulers.value), checked: (s) => s.showRulers.value },
+    { label: 'Show Guides', run: (s) => s.setShowGuides(!s.showGuides.value), checked: (s) => s.showGuides.value },
+    { label: 'Snap', run: (s) => s.setSnapOn(!s.snapOn.value), checked: (s) => s.snapOn.value },
+    { label: 'Clear Guides', run: (s) => s.clearGuides(), enabled: (s) => s.hasGuides() }, 'sep',
     { label: 'Local view', run: (s) => s.setViewMode('local'), checked: (s) => s.viewMode.value === 'local' },
     { label: 'TouchDesigner view', run: (s) => s.setViewMode('td'), checked: (s) => s.viewMode.value === 'td', enabled: (s) => s.tdAvailable.value }, 'sep',
     { label: 'Shape antialiasing: Exact (matches TouchDesigner)', run: (s) => s.setShapeRenderer('sdf'), checked: (s) => s.shapeRenderer.value === 'sdf' },
     { label: 'Shape antialiasing: Browser canvas', run: (s) => s.setShapeRenderer('canvas'), checked: (s) => s.shapeRenderer.value === 'canvas' }] },
-  { label: 'Window', items: [off('Reset layout'), off('Show rulers')] },
+  { label: 'Window', items: [off('Reset layout')] },
 ];
 
 function MenuBar() {
@@ -63,7 +71,7 @@ function MenuBar() {
                 const usable = !!it.run && (!it.enabled || it.enabled(store));
                 const check = it.checked?.(store);
                 return (
-                  <button key={it.label} role="menuitem" class="mi" aria-disabled={!usable} aria-checked={check} title={it.run ? undefined : NOT_IN_VERSION}
+                  <button key={it.label} role="menuitem" class="mi" aria-disabled={!usable} aria-checked={check} title={it.run ? it.title?.(store) : NOT_IN_VERSION}
                     onClick={() => { if (!usable) return; setOpen(-1); it.run!(store); }}
                     style={`display:flex;width:100%;box-sizing:border-box;align-items:center;gap:24px;height:26px;padding:0 10px;border-radius:4px;text-align:left;color:${usable ? '#e3e3e3' : '#707070'}`}>
                     <span style="flex:1 1 auto">{check ? '✓ ' : ''}{it.label}</span>

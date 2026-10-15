@@ -1,13 +1,15 @@
+import { remapShape, remapText, transformFor } from '../../src/state/transform';
 import type {
-  AdjustmentSpec, AdjustmentType, BlendMode, DocSpec, EditorEngine, EngineEvent, HistoryEntry, LayerInfo, LayerSpec, PaintTarget, Rect,
-  SelectionOptions, ShapeSpec, ShapeType, TextSpec, ToolContext, ToolId, ToolPointer,
+  AdjustmentSpec, AdjustmentType, Anchor, BlendMode, CanvasMode, DocSpec, EditorEngine, EngineEvent, Guides, HistoryEntry, LayerInfo, LayerSpec, LayerTransform,
+  PaintTarget, Rect, SelectionOptions, ShapeSpec, ShapeType, SnapOptions, TextSpec, ToolContext, ToolId, ToolPointer,
 } from '../../src/engine/types';
 
 interface FakeLayer {
   id: string; name: string; kind: 'pixel' | 'group' | 'base' | 'adjustment' | 'text' | 'shape'; visible: boolean; locked: boolean;
   opacity: number; blend: BlendMode; expanded: boolean; parent: string | null; colour: string;
   slot: number | null; mask: { slot: number; enabled: boolean } | null; adjustment: AdjustmentSpec | null;
-  text?: TextSpec | null; shape?: ShapeSpec | null; rasterize?: boolean;
+  text?: TextSpec | null; shape?: ShapeSpec | null;
+  x: number; y: number; sx: number; sy: number; surfaceW: number | null; surfaceH: number | null;
 }
 
 export const DEFAULT_ADJUSTMENTS: Record<AdjustmentType, AdjustmentSpec> = {
@@ -49,11 +51,18 @@ export class FakeEngine implements EditorEngine {
   shapeTool: ShapeType = 'rect';
   imported: { w: number; h: number; name: string; len: number }[] = [];
   private canvas: HTMLCanvasElement | null = null;
+  // v4
+  guideLists: Guides = { h: [], v: [] };
+  mode: CanvasMode = 'input';
+  snapOpts: SnapOptions = { enabled: true, guides: true, canvas: true, layers: false, threshold: 6 };
+  replaced: { id: string; w: number; h: number; len: number }[] = [];
+  baseSizes: { w: number; h: number }[] = [];
+  canvasCalls: { w: number; h: number; anchor: Anchor }[] = [];
 
   constructor(width = 64, height = 48) {
     this.width = width;
     this.height = height;
-    this.store = [{ id: 'base', name: 'TD Input', kind: 'base', visible: true, locked: true, opacity: 1, blend: 'normal', expanded: false, parent: null, colour: '#9cc3e4', slot: null, mask: null, adjustment: null }];
+    this.store = [{ id: 'base', name: 'TD Input', kind: 'base', visible: true, locked: true, opacity: 1, blend: 'normal', expanded: false, parent: null, colour: '#9cc3e4', slot: null, mask: null, adjustment: null, x: 0, y: 0, sx: 1, sy: 1, surfaceW: width, surfaceH: height }];
     this.active = 'base';
   }
 
@@ -80,7 +89,8 @@ export class FakeEngine implements EditorEngine {
       id: l.id, name: l.name, kind: l.kind, visible: l.visible, locked: l.locked, opacity: l.opacity, blend: l.blend,
       depth: this.depth(l), expanded: l.kind === 'group' ? l.expanded : undefined, parentId: l.parent,
       slot: l.slot, mask: l.mask ? { ...l.mask } : null, adjustment: l.adjustment,
-      text: l.text ?? null, shape: l.shape ?? null, rasterize: l.rasterize ?? false,
+      text: l.text ?? null, shape: l.shape ?? null,
+      transform: { x: l.x, y: l.y, sx: l.sx, sy: l.sy }, surfaceW: l.surfaceW, surfaceH: l.surfaceH,
     }));
   }
   activeLayerId() { return this.active; }
@@ -91,7 +101,7 @@ export class FakeEngine implements EditorEngine {
     const above = this.store.find((l) => l.id === this.active)!;
     const idx = this.store.indexOf(above) + 1;
     const slot = kind === 'pixel' ? this.nextSlot++ : null;
-    this.store.splice(idx, 0, { id, name, kind, visible: true, locked: false, opacity: 1, blend: 'normal', expanded: true, parent: above.parent, colour: '#' + ((this.nextId * 5000011) & 0xffffff).toString(16).padStart(6, '0'), slot, mask: null, adjustment, ...extra });
+    this.store.splice(idx, 0, { id, name, kind, visible: true, locked: false, opacity: 1, blend: 'normal', expanded: true, parent: above.parent, colour: '#' + ((this.nextId * 5000011) & 0xffffff).toString(16).padStart(6, '0'), slot, mask: null, adjustment, x: 0, y: 0, sx: 1, sy: 1, surfaceW: kind === 'pixel' ? this.width : null, surfaceH: kind === 'pixel' ? this.height : null, ...extra });
     this.active = id;
     this.push(kind === 'group' ? 'New group' : kind === 'adjustment' ? 'New adjustment' : 'New pixel layer');
     const prevActive = above.id;
@@ -149,39 +159,47 @@ export class FakeEngine implements EditorEngine {
       for (const l of this.store.filter((x) => x.parent === parent)) {
         layers.push({
           id: l.id, kind: l.kind, parentId: l.parent, name: l.name, visible: l.visible, opacity: l.opacity, blend: l.blend,
-          x: 0, y: 0, slot: l.slot, mask: l.mask ? { ...l.mask } : null, adjustment: l.adjustment,
-          text: l.text ?? null, shape: l.shape ?? null, rasterize: l.rasterize ?? false,
+          x: l.x, y: l.y, sx: l.sx, sy: l.sy, slot: l.slot, mask: l.mask ? { ...l.mask } : null, adjustment: l.adjustment,
+          text: l.text ?? null, shape: l.shape ?? null, surfaceW: l.surfaceW, surfaceH: l.surfaceH,
         });
         if (l.kind === 'group') walk(l.id);
       }
     };
     walk(null);
-    return { rev: this.rev, width: this.width, height: this.height, layers };
+    return { rev: this.rev, width: this.width, height: this.height, layers, guides: { h: [...this.guideLists.h], v: [...this.guideLists.v] }, canvas: { mode: this.mode } };
   }
   surfaceSlots() { return this.store.flatMap((l) => [...(l.slot !== null ? [l.slot] : []), ...(l.mask ? [l.mask.slot] : [])]); }
+  /** Surface size of a slot: its layer's surface; a mask has its layer's surface size; document size otherwise. */
+  slotSize(slot: number): { w: number; h: number } {
+    const l = this.store.find((x) => x.slot === slot || x.mask?.slot === slot);
+    return { w: l?.surfaceW ?? this.width, h: l?.surfaceH ?? this.height };
+  }
   /** Fills a slot with a deterministic pattern so tests can compare the bytes sent. */
   fillSurface(slot: number, rect: Rect, rgba: [number, number, number, number]) {
-    const buf = this.surfaceBuf(slot);
-    for (let y = rect.y; y < rect.y + rect.h; y++) for (let x = rect.x; x < rect.x + rect.w; x++) buf.set(rgba, (y * this.width + x) * 4);
+    const buf = this.surfaceBuf(slot), sw = this.slotSize(slot).w;
+    for (let y = rect.y; y < rect.y + rect.h; y++) for (let x = rect.x; x < rect.x + rect.w; x++) buf.set(rgba, (y * sw + x) * 4);
     this.emit({ type: 'surface', slot, rect });
   }
   private surfaceBuf(slot: number) {
+    const { w, h } = this.slotSize(slot);
     let b = this.surfaces.get(slot);
-    if (!b || b.length !== this.width * this.height * 4) { b = new Uint8ClampedArray(this.width * this.height * 4); this.surfaces.set(slot, b); }
+    if (!b || b.length !== w * h * 4) { b = new Uint8ClampedArray(w * h * 4); this.surfaces.set(slot, b); }
     return b;
   }
   readSurface(slot: number, rect: Rect, out?: Uint8ClampedArray) {
-    const n = rect.w * rect.h * 4, buf = out ?? new Uint8ClampedArray(n), src = this.surfaceBuf(slot);
-    for (let row = 0; row < rect.h; row++) buf.set(src.subarray(((rect.y + row) * this.width + rect.x) * 4, ((rect.y + row) * this.width + rect.x + rect.w) * 4), row * rect.w * 4);
+    const n = rect.w * rect.h * 4, buf = out ?? new Uint8ClampedArray(n), src = this.surfaceBuf(slot), sw = this.slotSize(slot).w;
+    for (let row = 0; row < rect.h; row++) buf.set(src.subarray(((rect.y + row) * sw + rect.x) * 4, ((rect.y + row) * sw + rect.x + rect.w) * 4), row * rect.w * 4);
     return buf;
   }
   loadDocument(spec: DocSpec) {
     this.loaded.push(spec);
     this.width = spec.width; this.height = spec.height; this.canvas = null;
+    this.guideLists = { h: [...spec.guides.h], v: [...spec.guides.v] };
+    this.mode = spec.canvas.mode;
     this.surfaces.clear();
     const kids = new Map<string, FakeLayer>();
     this.store = spec.layers.map((l) => {
-      const f: FakeLayer = { id: l.id, name: l.name, kind: l.kind as FakeLayer['kind'], visible: l.visible, locked: l.kind === 'base', opacity: l.opacity, blend: l.blend, expanded: true, parent: l.parentId, colour: '#778899', slot: l.slot, mask: l.mask ? { ...l.mask } : null, adjustment: l.adjustment, text: l.text, shape: l.shape, rasterize: l.rasterize };
+      const f: FakeLayer = { id: l.id, name: l.name, kind: l.kind as FakeLayer['kind'], visible: l.visible, locked: l.kind === 'base', opacity: l.opacity, blend: l.blend, expanded: true, parent: l.parentId, colour: '#778899', slot: l.slot, mask: l.mask ? { ...l.mask } : null, adjustment: l.adjustment, text: l.text, shape: l.shape, x: l.x, y: l.y, sx: l.sx, sy: l.sy, surfaceW: l.surfaceW, surfaceH: l.surfaceH };
       kids.set(l.id, f);
       return f;
     });
@@ -194,8 +212,8 @@ export class FakeEngine implements EditorEngine {
   }
   writeSurface(slot: number, rect: Rect, rgba: Uint8Array | Uint8ClampedArray) {
     this.surfaceWrites.push({ slot, rect, len: rgba.length });
-    const buf = this.surfaceBuf(slot);
-    for (let row = 0; row < rect.h; row++) buf.set(rgba.subarray(row * rect.w * 4, (row + 1) * rect.w * 4), ((rect.y + row) * this.width + rect.x) * 4);
+    const buf = this.surfaceBuf(slot), sw = this.slotSize(slot).w;
+    for (let row = 0; row < rect.h; row++) buf.set(rgba.subarray(row * rect.w * 4, (row + 1) * rect.w * 4), ((rect.y + row) * sw + rect.x) * 4);
     this.emit({ type: 'surface', slot, rect });
   }
   commitSurfaces() { this.surfaceCommits++; }
@@ -239,6 +257,13 @@ export class FakeEngine implements EditorEngine {
   }
 
   writeBase(rect: Rect, rgba: Uint8Array | Uint8ClampedArray) { this.baseWrites.push({ rect, len: rgba.length }); }
+  /** Not in the v4 contract (needs report): resize the base (TD Input) surface when the input resolution changes. */
+  setBaseSize(w: number, h: number) {
+    this.baseSizes.push({ w, h });
+    const b = this.store.find((x) => x.kind === 'base')!;
+    b.surfaceW = w; b.surfaceH = h;
+    this.changed();
+  }
   commitBase() { this.commits++; }
   readComposite(rect: Rect, out?: Uint8ClampedArray) {
     const n = rect.w * rect.h * 4;
@@ -279,7 +304,7 @@ export class FakeEngine implements EditorEngine {
   invertSelection() { this.calls.push('invertSelection'); this.emit({ type: 'selection' }); }
   maskFromSelection(layerId: string) { this.calls.push(`maskFromSelection:${layerId}`); if (!this.store.find((x) => x.id === layerId)?.mask) this.addMask(layerId); }
   private addSpecLayer(kind: 'text' | 'shape', name: string, text: TextSpec | null, shape: ShapeSpec | null): string {
-    return this.add(kind, name, null, { text, shape, rasterize: false });
+    return this.add(kind, name, null, { text, shape });
   }
   addTextLayer(spec: TextSpec) { this.calls.push(`addText:${JSON.stringify(spec)}`); return this.addSpecLayer('text', spec.text || 'Text', spec, null); }
   addShapeLayer(spec: ShapeSpec) { this.calls.push(`addShape:${JSON.stringify(spec)}`); return this.addSpecLayer('shape', spec.type, null, spec); }
@@ -291,18 +316,14 @@ export class FakeEngine implements EditorEngine {
     this.changed();
   }
   setShape(id: string, spec: ShapeSpec) { this.store.find((x) => x.id === id)!.shape = spec; this.calls.push(`setShape:${id}:${JSON.stringify(spec)}`); this.changed(); }
-  setRasterize(id: string, rasterize: boolean) {
+  /** v4: text/shape → pixel layer from TD's pixels (doc-space at 0,0). */
+  replaceWithPixels(id: string, rgba: Uint8Array | Uint8ClampedArray, w: number, h: number) {
     const l = this.store.find((x) => x.id === id)!;
-    l.rasterize = rasterize;
-    l.slot = rasterize ? this.nextSlot++ : null;
-    this.calls.push(`rasterize:${id}:${rasterize}`);
-    this.changed();
-  }
-  flattenLayer(id: string) {
-    const l = this.store.find((x) => x.id === id)!;
-    l.kind = 'pixel'; l.text = null; l.shape = null; l.rasterize = false;
-    if (l.slot === null) l.slot = this.nextSlot++;
-    this.calls.push(`flattenLayer:${id}`);
+    l.kind = 'pixel'; l.text = null; l.shape = null; l.slot = this.nextSlot++;
+    l.surfaceW = w; l.surfaceH = h; l.x = 0; l.y = 0; l.sx = 1; l.sy = 1;
+    this.surfaces.set(l.slot, new Uint8ClampedArray(rgba));
+    this.replaced.push({ id, w, h, len: rgba.length });
+    this.calls.push(`replaceWithPixels:${id}:${w}x${h}`);
     this.push('Flatten layer');
     this.changed();
   }
@@ -324,7 +345,7 @@ export class FakeEngine implements EditorEngine {
   importImage(rgba: Uint8Array | Uint8ClampedArray, w: number, h: number, name: string) {
     this.imported.push({ w, h, name, len: rgba.length });
     this.calls.push(`importImage:${name}:${w}x${h}`);
-    return this.add('pixel', name);
+    return this.add('pixel', name, null, { surfaceW: w, surfaceH: h });
   }
 
   setTool(id: ToolId) { this.tool = id; this.calls.push(`tool:${id}`); }
@@ -356,7 +377,127 @@ export class FakeEngine implements EditorEngine {
 
   resize(w: number, h: number) {
     this.width = w; this.height = h; this.canvas = null;
+    this.calls.push(`resize:${w}x${h}`);
     this.emit({ type: 'resize', width: w, height: h });
+    this.rev++; this.emit({ type: 'docspec' });
+  }
+
+  // ---- v4: transforms, canvas, guides, snapping ----
+  setTransform(id: string, t: LayerTransform) {
+    const l = this.store.find((x) => x.id === id)!;
+    l.x = t.x; l.y = t.y; l.sx = t.sx; l.sy = t.sy;
+    this.calls.push(`setTransform:${id}:${JSON.stringify(t)}`);
+    this.push('Transform');
+    this.changed();
+  }
+  applyTransform(id: string) {
+    const l = this.store.find((x) => x.id === id)!;
+    l.surfaceW = Math.round((l.surfaceW ?? 0) * l.sx); l.surfaceH = Math.round((l.surfaceH ?? 0) * l.sy);
+    l.sx = 1; l.sy = 1;
+    this.calls.push(`applyTransform:${id}`);
+    this.push('Apply transform');
+    this.changed();
+  }
+  layerBounds(id: string): Rect | null {
+    const l = this.store.find((x) => x.id === id);
+    if (!l) return null;
+    if (l.kind === 'pixel' || l.kind === 'base') return { x: l.x, y: l.y, w: (l.surfaceW ?? this.width) * l.sx, h: (l.surfaceH ?? this.height) * l.sy };
+    if (l.kind === 'text' && l.text) {
+      const t = l.text, lines = t.text.split('\n');
+      return { x: t.x, y: t.y, w: Math.max(...lines.map((q) => q.length), 1) * t.size * 0.6, h: lines.length * t.size * t.lineHeight };
+    }
+    const sp = l.shape;
+    if (l.kind === 'shape' && sp) {
+      if (sp.type === 'rect' || sp.type === 'ellipse') return { x: sp.x, y: sp.y, w: sp.w, h: sp.h };
+      if (sp.type === 'line') return { x: Math.min(sp.x1, sp.x2), y: Math.min(sp.y1, sp.y2), w: Math.abs(sp.x2 - sp.x1), h: Math.abs(sp.y2 - sp.y1) };
+      return { x: sp.cx - sp.radius, y: sp.cy - sp.radius, w: sp.radius * 2, h: sp.radius * 2 };
+    }
+    return null;
+  }
+  setCanvasSize(w: number, h: number, anchor: Anchor) {
+    this.canvasCalls.push({ w, h, anchor });
+    const ax = anchor.includes('l') ? 0 : anchor.includes('r') ? 1 : 0.5, ay = anchor.startsWith('t') ? 0 : anchor.startsWith('b') ? 1 : 0.5;
+    const dx = (w - this.width) * ax, dy = (h - this.height) * ay;
+    const prev = { w: this.width, h: this.height, mode: this.mode };
+    this.canvasUndo(prev, dx, dy);
+    for (const l of this.store) if (l.kind === 'pixel' || l.kind === 'base') { l.x += dx; l.y += dy; }
+    this.width = w; this.height = h; this.canvas = null; this.mode = 'fixed';
+    this.calls.push(`setCanvasSize:${w}x${h}:${anchor}`);
+    this.push('Canvas size');
+    this.registerCanvasUndo();
+    this.emit({ type: 'resize', width: w, height: h });
+    this.changed();
+  }
+  private pendingCanvasUndo: (() => void) | null = null;
+  private canvasUndo(prev: { w: number; h: number; mode: CanvasMode }, dx: number, dy: number) {
+    this.pendingCanvasUndo = () => {
+      for (const l of this.store) if (l.kind === 'pixel' || l.kind === 'base') { l.x -= dx; l.y -= dy; }
+      this.width = prev.w; this.height = prev.h; this.mode = prev.mode; this.canvas = null;
+      this.emit({ type: 'resize', width: prev.w, height: prev.h });
+    };
+  }
+  private registerCanvasUndo() { if (this.pendingCanvasUndo) this.undoers.set(this.entries[this.index].id, this.pendingCanvasUndo); this.pendingCanvasUndo = null; }
+  /** v4 optional engine API: fit the layer's box to `box` (pixel/base → transform, text/shape → geometry). Set to undefined to test the UI's fallback. */
+  setLayerBox: ((id: string, box: Rect) => void) | undefined = (id, box) => {
+    const l = this.store.find((x) => x.id === id)!, from = this.layerBounds(id);
+    if (!from) return;
+    this.calls.push(`setLayerBox:${id}:${JSON.stringify(box)}`);
+    if (l.kind === 'text' && l.text) this.setText(id, remapText(l.text, from, box));
+    else if (l.kind === 'shape' && l.shape) this.setShape(id, remapShape(l.shape, from, box));
+    else this.setTransform(id, transformFor({ x: l.x, y: l.y, sx: l.sx, sy: l.sy }, from, box));
+  };
+  adoptCanvas(w: number, h: number, mode: CanvasMode) {
+    this.width = w; this.height = h; this.canvas = null; this.mode = mode;
+    this.calls.push(`adoptCanvas:${w}x${h}:${mode}`);
+    this.emit({ type: 'resize', width: w, height: h });
+    this.changed();
+  }
+  viewZoom = 1;
+  setViewZoom(z: number) { this.viewZoom = z; }
+  setCanvasMode(mode: CanvasMode) {
+    const prev = this.mode;
+    this.mode = mode;
+    this.calls.push(`setCanvasMode:${mode}`);
+    this.push('Canvas mode');
+    this.undoers.set(this.entries[this.index].id, () => { this.mode = prev; });
+    this.changed();
+  }
+  canvasMode() { return this.mode; }
+  guides(): Guides { return { h: [...this.guideLists.h], v: [...this.guideLists.v] }; }
+  addGuide(axis: 'h' | 'v', pos: number) { this.guideLists[axis].push(pos); this.calls.push(`addGuide:${axis}:${pos}`); this.push('Add guide'); this.changed(); }
+  moveGuide(axis: 'h' | 'v', index: number, pos: number) { this.guideLists[axis][index] = pos; this.calls.push(`moveGuide:${axis}:${index}:${pos}`); this.push('Move guide'); this.changed(); }
+  removeGuide(axis: 'h' | 'v', index: number) { this.guideLists[axis].splice(index, 1); this.calls.push(`removeGuide:${axis}:${index}`); this.push('Remove guide'); this.changed(); }
+  setSnap(opts: SnapOptions) { this.snapOpts = opts; this.calls.push(`setSnap:${JSON.stringify(opts)}`); }
+  /** Snap lines (doc px) in one axis: guides, canvas edges / centre, other layers' edges when enabled. */
+  private snapLines(axis: 'x' | 'y'): number[] {
+    const o = this.snapOpts, out: number[] = [];
+    if (o.guides) out.push(...(axis === 'x' ? this.guideLists.v : this.guideLists.h));
+    if (o.canvas) { const n = axis === 'x' ? this.width : this.height; out.push(0, n / 2, n); }
+    return out;
+  }
+  private nearest(v: number, lines: number[], tol: number): number | null {
+    let best: number | null = null;
+    for (const l of lines) if (Math.abs(l - v) <= tol && (best === null || Math.abs(l - v) < Math.abs(best - v))) best = l;
+    return best;
+  }
+  snapPoint(x: number, y: number, zoom: number) {
+    this.calls.push('snapPoint');
+    if (!this.snapOpts.enabled) return { x, y, guideX: null, guideY: null };
+    const tol = this.snapOpts.threshold / zoom;
+    const gx = this.nearest(x, this.snapLines('x'), tol), gy = this.nearest(y, this.snapLines('y'), tol);
+    return { x: gx ?? x, y: gy ?? y, guideX: gx, guideY: gy };
+  }
+  snapRect(r: Rect, zoom: number) {
+    this.calls.push('snapRect');
+    if (!this.snapOpts.enabled) return { dx: 0, dy: 0, guideX: null, guideY: null };
+    const tol = this.snapOpts.threshold / zoom;
+    const best = (vals: number[], lines: number[]) => {
+      let d: number | null = null, g: number | null = null;
+      for (const v of vals) for (const l of lines) if (Math.abs(l - v) <= tol && (d === null || Math.abs(l - v) < Math.abs(d))) { d = l - v; g = l; }
+      return { d: d ?? 0, g };
+    };
+    const bx = best([r.x, r.x + r.w / 2, r.x + r.w], this.snapLines('x')), by = best([r.y, r.y + r.h / 2, r.y + r.h], this.snapLines('y'));
+    return { dx: bx.d, dy: by.d, guideX: bx.g, guideY: by.g };
   }
   dispose() { this.listeners.clear(); }
 }

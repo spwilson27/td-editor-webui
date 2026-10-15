@@ -151,12 +151,18 @@ export function selectAllState(w: number, h: number): SelState {
 
 /** Keep the old content top-left in a new w2 x h2 document. */
 export function resizeSel(s: SelState, w: number, w2: number, h2: number): SelState {
+  return reframeSel(s, w, w2, h2, 0, 0);
+}
+
+/** Move the selection by (dx, dy) into a new w2 x h2 document (the old one was w wide); whatever falls outside is dropped. */
+export function reframeSel(s: SelState, w: number, w2: number, h2: number, dx: number, dy: number): SelState {
   if (!s.rect) return s;
-  const win = interRect(s.rect, { x: 0, y: 0, w: w2, h: h2 });
+  const moved = { x: s.rect.x + dx, y: s.rect.y + dy, w: s.rect.w, h: s.rect.h };
+  const win = interRect(moved, { x: 0, y: 0, w: w2, h: h2 });
   if (!win) return NO_SEL;
   if (!s.alpha) return { rect: win, alpha: null };
   const out = new Uint8Array(w2 * h2);
-  for (let y = win.y; y < win.y + win.h; y++) out.set(s.alpha.subarray(y * w + win.x, y * w + win.x + win.w), y * w2 + win.x);
+  for (let y = win.y; y < win.y + win.h; y++) out.set(s.alpha.subarray((y - dy) * w + win.x - dx, (y - dy) * w + win.x - dx + win.w), y * w2 + win.x);
   const rect = boundsOfAlpha(out, w2, win);
   return rect ? { rect, alpha: out } : NO_SEL;
 }

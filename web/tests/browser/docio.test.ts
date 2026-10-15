@@ -30,9 +30,9 @@ describe('docSpec', () => {
     expect(spec.layers.map((l) => l.parentId)).toEqual([null, null, null, g, g, null]);
     expect(spec.layers[0]).toEqual({
       id: 'base', kind: 'base', parentId: null, name: 'TD Input', visible: true, opacity: 1, blend: 'normal',
-      x: 0, y: 0, slot: null, mask: null, adjustment: null, text: null, shape: null, rasterize: false,
+      x: 0, y: 0, sx: 1, sy: 1, slot: null, mask: null, adjustment: null, text: null, shape: null, surfaceW: 30, surfaceH: 20,
     });
-    expect(spec.layers[1]).toMatchObject({ kind: 'pixel', name: 'A', slot: slotOf(e, a), mask: { slot: m, enabled: true }, adjustment: null });
+    expect(spec.layers[1]).toMatchObject({ kind: 'pixel', name: 'A', surfaceW: 30, surfaceH: 20, sx: 1, sy: 1, slot: slotOf(e, a), mask: { slot: m, enabled: true }, adjustment: null });
     expect(spec.layers[2]).toMatchObject({ kind: 'group', slot: null, mask: null, adjustment: null });
     expect(spec.layers[3]).toMatchObject({ kind: 'pixel', visible: false, opacity: 0.4, blend: 'screen' });
     expect(spec.layers[4]).toMatchObject({ kind: 'adjustment', slot: null, blend: 'normal', adjustment: { type: 'levels', inLow: 0, inHigh: 1, gamma: 1, outLow: 0, outHigh: 1 } });
@@ -211,7 +211,7 @@ describe('surface I/O', () => {
     e.writeSurface(s, { x: 0, y: 0, w: 0, h: 0 }, new Uint8Array(0));
   });
 
-  it('writeSurface on a layer with an offset marks the shifted document area dirty', () => {
+  it('writeSurface on a layer with an offset marks the shifted document area dirty (whole-pixel offsets map 1:1)', () => {
     e = newEngine(20, 20);
     const l = e.addPixelLayer();
     e.setTool('move');
@@ -368,15 +368,16 @@ describe('loadDocument', () => {
     const spec: DocSpec = {
       rev: 5, width: 12, height: 8,
       layers: [
-        { id: 'whatever', kind: 'base', parentId: null, name: 'In', visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot: null, mask: null, adjustment: null, text: null, shape: null, rasterize: false },
-        { id: 'L7', kind: 'pixel', parentId: null, name: 'P', visible: true, opacity: 3, blend: 'bogus' as never, x: 2.4, y: -1, slot: 40, mask: null, adjustment: null, text: null, shape: null, rasterize: false },
-        { id: 'A', kind: 'adjustment', parentId: null, name: 'Adj', visible: true, opacity: 1, blend: 'multiply', x: 0, y: 0, slot: null, mask: { slot: 41, enabled: false }, adjustment: { type: 'threshold', level: 5 }, text: null, shape: null, rasterize: false },
+        { id: 'whatever', kind: 'base', parentId: null, name: 'In', visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, sx: 1, sy: 1, slot: null, mask: null, adjustment: null, text: null, shape: null, surfaceW: 12, surfaceH: 8 },
+        { id: 'L7', kind: 'pixel', parentId: null, name: 'P', visible: true, opacity: 3, blend: 'bogus' as never, x: 2.4, y: -1, sx: 1.5, sy: 0.5, slot: 40, mask: null, adjustment: null, text: null, shape: null, surfaceW: 7, surfaceH: 5 },
+        { id: 'A', kind: 'adjustment', parentId: null, name: 'Adj', visible: true, opacity: 1, blend: 'multiply', x: 0, y: 0, sx: 1, sy: 1, slot: null, mask: { slot: 41, enabled: false }, adjustment: { type: 'threshold', level: 5 }, text: null, shape: null, surfaceW: null, surfaceH: null },
       ],
+      guides: { h: [], v: [] }, canvas: { mode: 'input' },
     };
     e.loadDocument(spec);
     const out = e.docSpec();
     expect(out.layers[0].id).toBe('base');
-    expect(out.layers[1]).toMatchObject({ opacity: 1, blend: 'normal', x: 2, y: -1, slot: 40 });
+    expect(out.layers[1]).toMatchObject({ opacity: 1, blend: 'normal', x: 2, y: -1, sx: 1.5, sy: 0.5, surfaceW: 7, surfaceH: 5, slot: 40 });
     expect(out.layers[2]).toMatchObject({ blend: 'normal', mask: { slot: 41, enabled: false }, adjustment: { type: 'threshold', level: 1 } });
     const n = e.addPixelLayer();
     expect(n).toBe('L8');

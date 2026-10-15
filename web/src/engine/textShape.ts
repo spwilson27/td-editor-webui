@@ -367,3 +367,49 @@ export function shapeBounds(s: ShapeSpec): Rect {
   const y = Math.floor(Math.min(...ys) - pad);
   return { x, y, w: Math.ceil(Math.max(...xs) + pad) - x, h: Math.ceil(Math.max(...ys) + pad) - y };
 }
+
+/** Tight geometric box of a shape (ignores stroke width and rotation): what the transform box of the layer surrounds. */
+export function shapeBox(s: ShapeSpec): Rect {
+  switch (s.type) {
+    case 'rect':
+    case 'ellipse':
+      return { x: s.x, y: s.y, w: s.w, h: s.h };
+    case 'line': {
+      const x = Math.min(s.x1, s.x2);
+      const y = Math.min(s.y1, s.y2);
+      return { x, y, w: Math.abs(s.x2 - s.x1), h: Math.abs(s.y2 - s.y1) };
+    }
+    case 'polygon':
+      return { x: s.cx - s.radius, y: s.cy - s.radius, w: 2 * s.radius, h: 2 * s.radius };
+  }
+}
+
+/**
+ * Scale a text / shape spec so that its box (textBox / shapeBox) goes from `from` to `to`.
+ * Text: the position follows the box, the font size scales by the vertical factor (rounded to 0.01) and a wrap width by the
+ * horizontal factor. Shapes: all coordinates map linearly; radius, polygon radius and stroke width scale by the geometric
+ * mean of the two factors (a stroke has one width); ellipse / rect corner radius likewise. Degenerate source boxes (zero
+ * width or height) keep their size on that axis and only move.
+ */
+export function scaleSpec<T extends TextSpec | ShapeSpec>(spec: T, from: Rect, to: Rect): T {
+  const fx = from.w > 1e-9 ? to.w / from.w : 1;
+  const fy = from.h > 1e-9 ? to.h / from.h : 1;
+  const g = Math.sqrt(Math.abs(fx * fy));
+  const mx = (x: number): number => to.x + (x - from.x) * fx;
+  const my = (y: number): number => to.y + (y - from.y) * fy;
+  if (!('type' in spec)) {
+    const t = spec as TextSpec;
+    return { ...t, color: { ...t.color }, x: mx(t.x), y: my(t.y), size: Math.min(4000, Math.max(1, Math.round(t.size * fy * 100) / 100)), boxWidth: t.boxWidth === null ? null : Math.max(1, t.boxWidth * fx) } as T;
+  }
+  const c = cloneShape(spec as ShapeSpec);
+  if (c.type === 'rect' || c.type === 'ellipse') {
+    c.x = mx(c.x); c.y = my(c.y); c.w *= fx; c.h *= fy;
+    if (c.type === 'rect') c.radius *= g;
+  } else if (c.type === 'line') {
+    c.x1 = mx(c.x1); c.x2 = mx(c.x2); c.y1 = my(c.y1); c.y2 = my(c.y2);
+  } else {
+    c.cx = mx(c.cx); c.cy = my(c.cy); c.radius *= g;
+  }
+  c.stroke.width *= g;
+  return c as T;
+}

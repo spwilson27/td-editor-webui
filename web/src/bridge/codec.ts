@@ -1,10 +1,10 @@
-// Pure encode/decode of docs/PROTOCOL.md (version 4). No sockets here.
-import type { LayerSpec } from '../engine/types';
+// Pure encode/decode of docs/PROTOCOL.md (version 5). No sockets here.
+import type { CanvasMode, Guides, LayerSpec } from '../engine/types';
 
 export const MAGIC = [0x52, 0x45, 0x46, 0x31]; // "REF1"
 export const HEADER_BYTES = 24;
 export const MAX_BAND_PAYLOAD = 2 * 1024 * 1024;
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 export const FRAME_BASE = 1;
 export const FRAME_SURFACE = 3;
 export const FRAME_SURFACE_DUMP = 4;
@@ -116,7 +116,7 @@ export function decodeFrame(data: ArrayBuffer | ArrayBufferView): DecodedFrame {
   return { ok: true, frame };
 }
 
-/** Frames from before a resize carry a different document size and are dropped silently. */
+/** v5: `docW/docH` are the SURFACE size of the slot (BASE: the input size). Frames from before a surface resize carry another size and are dropped silently. */
 export function isStale(f: FrameHeader, docW: number, docH: number): boolean {
   return f.docW !== docW || f.docH !== docH;
 }
@@ -131,22 +131,25 @@ export interface ViewRect { x: number; y: number; w: number; h: number }
 
 export type WebMessage =
   | { t: 'ready'; protocol: number; client: ClientKind; version: string; token: string; fresh: boolean }
-  | { t: 'doc'; rev: number; layers: LayerSpec[] }
+  | { t: 'doc'; rev: number; layers: LayerSpec[]; guides: Guides; canvas: { mode: CanvasMode } }
   | { t: 'requestDoc' }
   | { t: 'view'; mode: ViewMode; zoom: number; panX: number; panY: number; rect: ViewRect }
   | { t: 'takeover' }
   | { t: 'requestBase' }
   | { t: 'listTops'; requestId: string }
   | { t: 'importTop'; requestId: string; path: string }
+  | { t: 'setCanvas'; w: number; h: number; mode: CanvasMode } // v5
+  | { t: 'renderLayer'; requestId: string; layerId: string } // v5: Flatten
   | { t: 'log'; level: LogLevel; msg: string };
 
 export type TdMessage =
-  | { t: 'hello'; protocol: number; doc: { w: number; h: number }; hasInput: boolean; maxSendFps: number; active: boolean; clientId: string; hasDocument: boolean; rev: number | null }
-  | { t: 'docState'; rev: number; layers: LayerSpec[]; docW: number; docH: number }
+  | { t: 'hello'; protocol: number; doc: { w: number; h: number; mode?: CanvasMode }; hasInput: boolean; maxSendFps: number; active: boolean; clientId: string; hasDocument: boolean; rev: number | null }
+  | { t: 'docState'; rev: number; layers: LayerSpec[]; docW: number; docH: number; guides: Guides; canvas: { mode: CanvasMode } }
   | { t: 'base'; frameId: number; docW: number; docH: number; x: number; y: number; w: number; h: number }
   | { t: 'view'; frameId: number; docW: number; docH: number; w: number; h: number; appliedFrameId: number }
   | { t: 'applied'; frameId: number; tdFrame: number }
-  | { t: 'docSize'; w: number; h: number; hasInput: boolean }
+  | { t: 'docSize'; w: number; h: number; hasInput: boolean; mode: CanvasMode }
+  | { t: 'baseSize'; w: number; h: number } // v5: TD Input resolution (0x0 = no input)
   | { t: 'active'; active: boolean }
   | { t: 'error'; msg: string }
   | { t: 'fonts'; families: string[] }
@@ -174,6 +177,19 @@ function parseObject(text: string): Record<string, unknown> | null {
   }
 }
 
+const isMode = (v: unknown): v is CanvasMode => v === 'input' || v === 'fixed';
+const num = (a: unknown): number[] => (Array.isArray(a) ? a.filter(isNum) : []);
+
+/** Guides and canvas default to "none" / "input" when absent (a pre-v5 peer). */
+export function readGuides(v: unknown): Guides {
+  const g = (v && typeof v === 'object' ? v : {}) as Record<string, unknown>;
+  return { h: num(g.h), v: num(g.v) };
+}
+export function readCanvas(v: unknown): { mode: CanvasMode } {
+  const c = (v && typeof v === 'object' ? v : {}) as Record<string, unknown>;
+  return { mode: isMode(c.mode) ? c.mode : 'input' };
+}
+
 const isLayers = (v: unknown): v is LayerSpec[] =>
   Array.isArray(v) && v.every((l) => l !== null && typeof l === 'object' && isStr((l as LayerSpec).id) && isStr((l as LayerSpec).kind));
 
@@ -186,13 +202,13 @@ export function decodeTdMessage(text: string): TdMessage | null {
     case 'hello':
       return isNum(o.protocol) && doc && isSize(doc.w) && isSize(doc.h) && isBool(o.hasInput) && isNum(o.maxSendFps) && isBool(o.active)
         ? {
-          t: 'hello', protocol: o.protocol, doc: { w: doc.w, h: doc.h }, hasInput: o.hasInput, maxSendFps: o.maxSendFps, active: o.active,
+          t: 'hello', protocol: o.protocol, doc: isMode(doc.mode) ? { w: doc.w, h: doc.h, mode: doc.mode } : { w: doc.w, h: doc.h }, hasInput: o.hasInput, maxSendFps: o.maxSendFps, active: o.active,
           clientId: isStr(o.clientId) ? o.clientId : '', hasDocument: o.hasDocument === true, rev: isNum(o.rev) ? o.rev : null,
         }
         : null;
     case 'docState':
       return isNum(o.rev) && isLayers(o.layers) && isSize(o.docW) && isSize(o.docH)
-        ? { t: 'docState', rev: o.rev, layers: o.layers, docW: o.docW, docH: o.docH }
+        ? { t: 'docState', rev: o.rev, layers: o.layers, docW: o.docW, docH: o.docH, guides: readGuides(o.guides), canvas: readCanvas(o.canvas) }
         : null;
     case 'base':
       return isNum(o.frameId) && isSize(o.docW) && isSize(o.docH) && isNum(o.x) && isNum(o.y) && isSize(o.w) && isSize(o.h)
@@ -205,7 +221,9 @@ export function decodeTdMessage(text: string): TdMessage | null {
     case 'applied':
       return isNum(o.frameId) ? { t: 'applied', frameId: o.frameId, tdFrame: isNum(o.tdFrame) ? o.tdFrame : 0 } : null;
     case 'docSize':
-      return isSize(o.w) && isSize(o.h) && isBool(o.hasInput) ? { t: 'docSize', w: o.w, h: o.h, hasInput: o.hasInput } : null;
+      return isSize(o.w) && isSize(o.h) && isBool(o.hasInput) ? { t: 'docSize', w: o.w, h: o.h, hasInput: o.hasInput, mode: isMode(o.mode) ? o.mode : 'input' } : null;
+    case 'baseSize':
+      return isNum(o.w) && isNum(o.h) && o.w >= 0 && o.h >= 0 && o.w <= U16 && o.h <= U16 ? { t: 'baseSize', w: o.w, h: o.h } : null;
     case 'active':
       return isBool(o.active) ? { t: 'active', active: o.active } : null;
     case 'error':
@@ -239,7 +257,7 @@ export function decodeWebMessage(text: string): WebMessage | null {
         ? { t: 'ready', protocol: o.protocol, client: o.client, version: o.version, token: isStr(o.token) ? o.token : '', fresh: o.fresh === true }
         : null;
     case 'doc':
-      return isNum(o.rev) && isLayers(o.layers) ? { t: 'doc', rev: o.rev, layers: o.layers } : null;
+      return isNum(o.rev) && isLayers(o.layers) ? { t: 'doc', rev: o.rev, layers: o.layers, guides: readGuides(o.guides), canvas: readCanvas(o.canvas) } : null;
     case 'requestDoc':
       return { t: 'requestDoc' };
     case 'view': {
@@ -256,6 +274,10 @@ export function decodeWebMessage(text: string): WebMessage | null {
       return isStr(o.requestId) ? { t: 'listTops', requestId: o.requestId } : null;
     case 'importTop':
       return isStr(o.requestId) && isStr(o.path) ? { t: 'importTop', requestId: o.requestId, path: o.path } : null;
+    case 'setCanvas':
+      return isMode(o.mode) && (o.mode === 'input' || (isSize(o.w) && isSize(o.h))) ? { t: 'setCanvas', w: isNum(o.w) ? o.w : 0, h: isNum(o.h) ? o.h : 0, mode: o.mode } : null;
+    case 'renderLayer':
+      return isStr(o.requestId) && isStr(o.layerId) ? { t: 'renderLayer', requestId: o.requestId, layerId: o.layerId } : null;
     case 'log':
       return (o.level === 'info' || o.level === 'warn' || o.level === 'error') && isStr(o.msg) ? { t: 'log', level: o.level, msg: o.msg } : null;
     default:

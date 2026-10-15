@@ -2,13 +2,14 @@ import { useEffect, useRef } from 'preact/hooks';
 import { store } from '../state/store';
 import { ContextBar } from './ContextBar';
 import { DocTabs } from './DocTabs';
+import { CanvasSizeDialog } from './CanvasSizeDialog';
 import { ImportTopDialog } from './ImportTopDialog';
 import { LoadingOverlay, StandbyOverlay } from './StandbyOverlay';
 import { Studio } from './Studio';
 import { StatusBar } from './StatusBar';
 import { ToolRail } from './ToolRail';
 import { TopBar } from './TopBar';
-import { Viewport } from './Viewport';
+import { ViewportFrame } from './Rulers';
 
 export function App() {
   const clear = store.tdPanel.value;
@@ -25,7 +26,7 @@ export function App() {
         <ToolRail />
         <div style={`flex:999 1 480px;min-width:0;display:flex;flex-direction:column;background:${clear ? 'transparent' : '#1c1c1c'}`}>
           <DocTabs />
-          <Viewport />
+          <ViewportFrame />
         </div>
         <Studio />
       </div>
@@ -33,6 +34,7 @@ export function App() {
       <input ref={place} type="file" accept="image/*" multiple hidden data-place-input aria-hidden="true" tabIndex={-1}
         onChange={(e) => { const i = e.target as HTMLInputElement; const files = [...(i.files ?? [])]; i.value = ''; void store.importFiles(files); }} />
       <ImportTopDialog />
+      <CanvasSizeDialog />
       <LoadingOverlay />
       <StandbyOverlay />
     </div>

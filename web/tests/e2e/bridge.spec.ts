@@ -16,7 +16,7 @@ const hook = <T,>(page: Page, fn: string, ...args: unknown[]) =>
 test('connects, says ready as the panel client and shows the linked state', async ({ page }) => {
   await open(page);
   await td.waitFor(() => td.messages.length > 0);
-  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 4, client: 'panel', token: td.token, fresh: true });
+  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 5, client: 'panel', token: td.token, fresh: true });
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   expect((await hook<any>(page, 'state')).doc).toEqual({ w: 160, h: 90 });
 });
@@ -135,7 +135,7 @@ test('docSize from TD resizes the document', async ({ page }) => {
 });
 
 const pxLayer = (id: string, slot: number, extra: Partial<LayerSpec> = {}): LayerSpec => ({
-  id, kind: 'pixel', parentId: null, name: id, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot, mask: null, adjustment: null, text: null, shape: null, rasterize: false, ...extra,
+  id, kind: 'pixel', parentId: null, name: id, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot, mask: null, adjustment: null, text: null, shape: null, sx: 1, sy: 1, surfaceW: null, surfaceH: null, ...extra,
 });
 const baseLayer = (): LayerSpec => ({ ...pxLayer('base', 0), kind: 'base', slot: null, name: 'TD Input' });
 
@@ -171,7 +171,10 @@ test('reconnects after the socket drops and re-pushes doc and full surfaces', as
   expect(td.connections).toBe(2);
   expect(td.messages.filter((m) => m.t === 'ready').map((m) => (m as { fresh: boolean }).fresh)).toEqual([true, false]);
   await td.waitFor(() => td.frameEnds > ends && td.docMessages > docs);
-  expect(td.frames[td.frames.length - 1]).toMatchObject({ x: 0, y: 0, w: 160, h: 90 });
+  // v5: surfaces keep their own size (the default Layer 1 was created at the boot size), frames carry the SURFACE size
+  const last = td.frames[td.frames.length - 1];
+  expect(last.x).toBe(0);
+  expect(last.w).toBe(last.docW);
 });
 
 test('forwards page errors to TD as log messages', async ({ page }) => {

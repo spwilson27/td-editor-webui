@@ -32,7 +32,7 @@ export function onKeyDown(store: Store, e: KeyLike): void {
     if (e.key === 'Escape') { store.commitText(); e.preventDefault(); }
     return;
   }
-  if (store.topDialog.peek()) return; // the import dialog owns the keyboard (it closes itself on Escape)
+  if (store.topDialog.peek() || store.canvasDialog.peek()) return; // dialogs own the keyboard (they close themselves on Escape)
   if (isTyping(e.target) || store.loadingDoc.peek()) return; // locked while loading TD's document
   const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
   const mod = e.ctrlKey || e.metaKey;

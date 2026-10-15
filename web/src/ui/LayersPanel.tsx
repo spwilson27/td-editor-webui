@@ -9,6 +9,7 @@ import { Icon, NOT_IN_VERSION } from './Icon';
 const EYE = 'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12zM12 9a3 3 0 100 6 3 3 0 000-6z';
 const EYE_OFF = 'M3 3l18 18M10.6 5.1A10 10 0 0112 5c6 0 10 7 10 7a17 17 0 01-3 3.7M6.6 6.6C3.9 8.4 2 12 2 12s4 7 10 7a9.6 9.6 0 005.4-1.6';
 const LOCK = 'M6 11h12v10H6zM8 11V7a4 4 0 018 0v4';
+const FLATTEN = 'M4 8l8-4 8 4-8 4-8-4zM4 12l8 4 8-4M4 16l8 4 8-4';
 const FOLDER = 'M3 6h7l2 2h9v11H3z';
 
 const ADJUST_ICON = 'M12 3a9 9 0 100 18V3z M12 3a9 9 0 010 18';
@@ -124,6 +125,15 @@ function LayerRow({ layer, layers, selected, maskTarget, editing, onEdit, drag }
           : <span data-name style="flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{layer.name}</span>}
         <span style={`flex:none;font-size:11px;color:${selected ? '#e6eefa' : '#a8a8a8'}`}>{meta}</span>
       </div>
+      {(layer.kind === 'text' || layer.kind === 'shape') && (() => {
+        const can = store.canFlatten(layer), busy = store.flattening.value === layer.id;
+        return (
+          <button class="ib flattenbtn" data-nodrag data-act="flatten" aria-label="Flatten to pixels" aria-disabled={!can} data-busy={busy || undefined} title={store.flattenTitle()}
+            onClick={() => { if (can) void store.flattenLayer(layer.id); }} style={`width:22px;height:26px;flex:none;opacity:${can ? 0.8 : 0.35}`}>
+            <Icon d={FLATTEN} size={14} sw={1.8} />
+          </button>
+        );
+      })()}
       <button class={'ib lockbtn' + (layer.locked ? ' on' : '')} data-nodrag data-act="lock" aria-label={`${layer.locked ? 'Unlock' : 'Lock'} ${layer.name}`} aria-pressed={layer.locked}
         onClick={() => e.setLayerProps(layer.id, { locked: !layer.locked })} style="width:20px;height:26px;flex:none">
         <Icon d={LOCK} size={13} sw={2} />
@@ -155,17 +165,6 @@ function LayerSettings({ layer }: { layer: LayerInfo | undefined }) {
           style="width:26px;padding:0;text-align:right;color:#e3e3e3;background:none;border:0;outline:0" />%
       </span>
     </div>
-    {layer && (layer.kind === 'text' || layer.kind === 'shape') && (
-      <div data-layer-props style="display:flex;align-items:center;gap:10px;padding:6px 10px;border-bottom:1px solid #1f1f1f">
-        <label for="lras" title="On: the browser renders this layer into pixels. Off: TouchDesigner renders it live." style="display:flex;align-items:center;gap:6px;color:#e3e3e3">
-          <input id="lras" data-rasterize type="checkbox" aria-label="Rasterize" checked={layer.rasterize} style="accent-color:#4a8fe0;margin:0"
-            onChange={(ev) => store.setRasterize(layer.id, (ev.target as HTMLInputElement).checked)} />Rasterize
-        </label>
-        <span style="flex:1 1 auto;color:#8f8f8f;font-size:11px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{layer.rasterize ? 'Browser-rendered pixels' : 'Rendered live by TouchDesigner'}</span>
-        <button data-flatten onClick={() => store.flattenLayer(layer.id)} title="Convert to a plain pixel layer"
-          style="height:22px;padding:0 10px;border:1px solid #474747;border-radius:4px;background:#262626;color:#e3e3e3">Flatten</button>
-      </div>
-    )}
     </>
   );
 }

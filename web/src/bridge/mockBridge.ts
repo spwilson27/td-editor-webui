@@ -48,5 +48,5 @@ export function startMockBridge(engine: EditorEngine, status: BridgeStatus & { d
   status.setConnection('standalone');
   status.setActive(true);
   const offline = () => Promise.reject(new Error('Not connected to TouchDesigner'));
-  return { takeover() {}, dispose() {}, setView() {}, listTops: offline, importTop: offline };
+  return { takeover() {}, dispose() {}, setView() {}, listTops: offline, importTop: offline, renderLayer: offline, setCanvas: () => false };
 }

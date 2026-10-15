@@ -1,4 +1,4 @@
-# TD ⇄ Web protocol (version 3)
+# TD ⇄ Web protocol (version 5; see §6–7 for the v4/v5 additions)
 
 One WebSocket per browser client, served by the COMP's Web Server DAT at
 `ws://127.0.0.1:<Port>/ws`. Text messages are JSON; binary WebSocket messages are SURFACE tiles
@@ -191,3 +191,17 @@ that has not fetched for 10 s is stalled (no further notices of that kind until 
 | web → TD | `setCanvas` | `w`, `h`, `mode` | active client sets the canvas size / mode (`mode:"input"` = follow input; `w,h` ignored) |
 | TD → web | `baseSize` | `w`, `h` | TD Input resolution changed (or input (dis)connected: 0×0 = no input) |
 | web → TD | `renderLayer` | `requestId`, `layerId` | Flatten: render that text/shape layer alone at doc size; reply `topReady` / `topError` and `GET /top` as §6 (frame type 6, `docW/docH` = doc size) |
+
+Further v5 details (TD implementation):
+
+- **`hello`** carries the canvas state: `doc: {w, h, mode}` (`mode` = `"input"` | `"fixed"`, the `Docsizemode` parameter) and
+  `baseSize: {w, h}` (the input resolution, 0x0 = no input). `docState` also carries `guides` and `canvas: {mode}`.
+- **`docSize`** is sent to every client when the document size, mode or `hasInput` changes (parameter edit, input change,
+  `setCanvas`); the *sender* of a `setCanvas` only gets it when the result differs from its request (clamped, or the input's size for
+  `mode:"input"`). It never reallocates surfaces. `baseSize` is sent whenever the input resolution changes or the input is
+  (dis)connected, together with a fresh `base` notice whose `docW/docH` are the input size.
+- **`renderLayer`** is answered with `topError` for: a non-active client, a restore in progress, a layer that is not a text / shape
+  layer of TD's document, a document > 32 Mpx, a document resize during the render, and `"layer changed"` when the layer's
+  operator was replaced or a newer `doc` was applied before the readback finished (the client may simply retry).
+- A surface without `surfaceW/H` in the spec (adjustment / group masks, v4 documents) keeps the size of its existing buffer, else the
+  document size; the engine should send `surfaceW/H` for pixel layers (masks follow their layer) to be exact.

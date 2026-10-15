@@ -16,7 +16,8 @@ const open = async (page: Page, client: 'panel' | 'external' = 'panel') => {
 const hook = <T,>(page: Page, fn: string, ...args: unknown[]) =>
   page.evaluate(([f, a]) => (window as any).__editorTest[f as string](...(a as unknown[])), [fn, args] as const) as Promise<T>;
 const layer = (id: string, over: Partial<LayerSpec>): LayerSpec => ({
-  id, kind: 'pixel', parentId: null, name: id, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot: null, mask: null, adjustment: null, text: null, shape: null, rasterize: false, ...over,
+  id, kind: 'pixel', parentId: null, name: id, visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot: null, mask: null, adjustment: null, text: null, shape: null, sx: 1, sy: 1,
+  surfaceW: !over.kind || over.kind === 'pixel' || over.kind === 'base' ? 160 : null, surfaceH: !over.kind || over.kind === 'pixel' || over.kind === 'base' ? 90 : null, ...over,
 });
 const baseLayer = () => layer('base', { kind: 'base', name: 'TD Input' });
 const mainPixel = (page: Page, fx: number, fy: number) => page.locator('[data-viewport] canvas').first().evaluate((c: HTMLCanvasElement, [x, y]) => {
@@ -222,7 +223,7 @@ test('/surface 500: the page stays locked, retries the load, and never pushes; r
   await expect(page.locator('[data-loading-doc]')).toBeVisible();
   // docSize during a failed load must not push empty surfaces over TD's pixels
   td.resize(80, 60);
-  td.surfaces.set(4, new Uint8ClampedArray(80 * 60 * 4).fill(7));
+  td.surfaces.set(4, new Uint8ClampedArray(160 * 90 * 4).fill(7)); // surfaces keep their own size when the document resizes
   await page.waitForTimeout(800);
   expect(td.docMessages).toBe(0);
   expect(td.frames.length).toBe(0);

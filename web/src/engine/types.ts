@@ -240,6 +240,17 @@ export interface EditorEngine {
   setSnap(opts: SnapOptions): void;
   snapPoint(x: number, y: number, zoom: number): { x: number; y: number; guideX: number | null; guideY: number | null };
   snapRect(r: Rect, zoom: number): { dx: number; dy: number; guideX: number | null; guideY: number | null };
+  // v4 engine additions (optional so fakes keep compiling; the real engine implements all of them)
+  /** Fit a layer's box (doc px) to `box`: pixel/base layers get the mapping transform, text/shape layers scale their geometry (one drag = one history entry). */
+  setLayerBox?(id: string, box: Rect): void;
+  /** TD Input resolution changed (0x0 = no input): reallocates the base surface, no history. */
+  setBaseSize?(w: number, h: number): void;
+  /** Size + mode from TD's docSize message without history entries. */
+  adoptCanvas?(w: number, h: number, mode: CanvasMode): void;
+  /** Viewport zoom for the move tool's snapping threshold. */
+  setViewZoom?(zoom: number): void;
+  /** Cheap change counter equal to docSpec().rev (no spec is built). */
+  docRev?(): number;
 
   dispose(): void;
 }

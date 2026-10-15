@@ -5,7 +5,7 @@ export interface ToolInfo {
 }
 
 export const TOOLS: ToolInfo[] = [
-  { id: 'move', name: 'Move Tool', key: 'V', enabled: true, hint: 'Drag to move the selected layer. Shift constrains to axis.', d: 'M12 3v18M3 12h18M12 3l-3 3M12 3l3 3M12 21l-3-3M12 21l3-3M3 12l3-3M3 12l3 3M21 12l-3-3M21 12l-3 3' },
+  { id: 'move', name: 'Move Tool', key: 'V', enabled: true, hint: 'Drag inside the box to move the layer; drag a handle to scale (Shift keeps the aspect, Alt scales from the centre).', d: 'M12 3v18M3 12h18M12 3l-3 3M12 3l3 3M12 21l-3-3M12 21l3-3M3 12l3-3M3 12l3 3M21 12l-3-3M21 12l-3 3' },
   { id: 'marquee', name: 'Rectangular Marquee', key: 'M', sep: true, enabled: true, hint: 'Drag to select. Ctrl+D deselects.', d: 'M4 4h3M10 4h4M17 4h3v3M20 10v4M20 17v3h-3M14 20h-4M7 20H4v-3M4 14v-4M4 7V4' },
   { id: 'lasso', name: 'Freehand Selection', key: 'L', enabled: true, hint: 'Drag to draw a freehand selection. Release to close. Shift adds, Alt subtracts.', d: 'M12 4c5 0 8 2.5 8 5.5S16.5 15 12 15 4 12.5 4 9.5 7 4 12 4zM7 14c-1 2 0 4 2 4s2 2 1 3' },
   { id: 'wand', name: 'Flood Select', key: 'W', enabled: true, hint: 'Click to select similar colours. Shift adds, Alt subtracts, Shift+Alt intersects.', d: 'M4 20L15 9M14 3v2M20 9h-2M18.5 4.5L17 6M9.5 4.5l1 1M18.5 13.5l-1-1' },

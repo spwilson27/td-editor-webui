@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { decodeFrame, encodeFrame, isStale, type FrameHeader } from '../../src/bridge/codec';
+import { slotSizesOf } from '../../src/bridge/tdBridge';
 
 const dir = new URL('../../../docs/fixtures/', import.meta.url);
 const manifest = JSON.parse(readFileSync(new URL('fixtures.json', dir), 'utf8')) as {
@@ -24,6 +25,31 @@ describe('shared fixtures (docs/fixtures)', () => {
     }
     expect(manifest.messages.find((m) => m.name === 'invalid_type_2')?.valid).toBe(false);
     expect(manifest.messages.some((m) => m.valid && m.header!.slot > 0)).toBe(true);
+  });
+
+  it('v5: SURFACE / SURFACE_DUMP docW/docH are the slot\'s surface size (stale check per slot), BASE docW/docH the input size', () => {
+    for (const m of manifest.messages.filter((x) => x.valid && (x.header!.type === 3 || x.header!.type === 4))) {
+      const h = m.header!;
+      const layers = [{ id: 'p', kind: 'pixel', slot: h.slot, mask: null, surfaceW: h.docW, surfaceH: h.docH }] as never;
+      const sz = slotSizesOf(layers, 9999, 9999).get(h.slot)!;
+      expect(isStale(h, sz.w, sz.h)).toBe(false);
+      expect(isStale(h, h.docW + 1, h.docH)).toBe(true);
+      expect(h.x + h.w).toBeLessThanOrEqual(h.docW); // rects lie inside the surface
+      expect(h.y + h.h).toBeLessThanOrEqual(h.docH);
+    }
+    for (const m of manifest.messages.filter((x) => x.valid && x.header!.type === 1)) {
+      expect(m.header!.x + m.header!.w).toBeLessThanOrEqual(m.header!.docW);
+    }
+  });
+
+  it('slotSizesOf: a mask has its layer\'s surface size; layers without a surface fall back to the document size', () => {
+    const sizes = slotSizesOf([
+      { id: 'a', kind: 'pixel', slot: 1, mask: { slot: 2, enabled: true }, surfaceW: 20, surfaceH: 10 },
+      { id: 'b', kind: 'adjustment', slot: null, mask: { slot: 3, enabled: true }, surfaceW: null, surfaceH: null },
+    ] as never, 64, 48);
+    expect(sizes.get(1)).toEqual({ w: 20, h: 10 });
+    expect(sizes.get(2)).toEqual({ w: 20, h: 10 });
+    expect(sizes.get(3)).toEqual({ w: 64, h: 48 });
   });
 
   it('manifest is non-empty and covers valid and invalid messages', () => {

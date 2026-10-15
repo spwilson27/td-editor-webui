@@ -300,11 +300,12 @@ describe('thumbnails, offset layers and resize', () => {
     e.setToolContext(brushCtx({ size: 10 }, { primary: rgba(0, 255, 0) }));
     stroke(e, 'brush', [[50, 50]]);
     e.resize(300, 300);
+    const id2 = e.addPixelLayer(); // layers made after the resize are document sized; older surfaces keep their size
     stroke(e, 'brush', [[250, 250], [260, 250]]);
-    expect(layerPx(e, id, 255, 250)).toEqual([0, 255, 0, 255]);
+    expect(layerPx(e, id2, 255, 250)).toEqual([0, 255, 0, 255]);
     expect(layerPx(e, id, 50, 50)).toEqual([0, 255, 0, 255]);
     e.undo();
-    expect(layerPx(e, id, 255, 250)[3]).toBe(0);
+    expect(layerPx(e, id2, 255, 250)[3]).toBe(0);
     expect(layerPx(e, id, 50, 50)[3]).toBe(255);
   });
 });

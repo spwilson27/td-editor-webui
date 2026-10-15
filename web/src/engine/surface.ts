@@ -45,3 +45,27 @@ export function releaseSurface(s: Surface): void {
 export function clearRect(s: Surface, r: { x: number; y: number; w: number; h: number }): void {
   s.ctx.clearRect(r.x, r.y, r.w, r.h);
 }
+
+/**
+ * New surface of w x h holding `src` resampled to that size. Downscales halve step by step (a single big jump skips most
+ * source pixels); every step uses high quality smoothing. `src` is not modified.
+ */
+export function resampled(src: Surface, w: number, h: number, readback = false): Surface {
+  let cur = src;
+  let owned = false;
+  while (cur.width >= w * 2 && cur.height >= h * 2) {
+    const next = createSurface(Math.max(w, Math.floor(cur.width / 2)), Math.max(h, Math.floor(cur.height / 2)));
+    next.ctx.imageSmoothingEnabled = true;
+    next.ctx.imageSmoothingQuality = 'high';
+    next.ctx.drawImage(cur.canvas as CanvasImageSource, 0, 0, next.width, next.height);
+    if (owned) releaseSurface(cur);
+    cur = next;
+    owned = true;
+  }
+  const out = createSurface(w, h, readback);
+  out.ctx.imageSmoothingEnabled = true;
+  out.ctx.imageSmoothingQuality = 'high';
+  out.ctx.drawImage(cur.canvas as CanvasImageSource, 0, 0, cur.width, cur.height, 0, 0, w, h);
+  if (owned) releaseSurface(cur);
+  return out;
+}

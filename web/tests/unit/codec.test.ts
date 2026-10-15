@@ -155,7 +155,7 @@ describe('frame types', () => {
 });
 
 describe('protocol v3 messages', () => {
-  it('is protocol version 4', () => { expect(PROTOCOL_VERSION).toBe(4); });
+  it('is protocol version 5', () => { expect(PROTOCOL_VERSION).toBe(5); });
 
   it('decodes a base notice and rejects incomplete ones', () => {
     const n = { t: 'base', frameId: 4000000000, docW: 1920, docH: 1080, x: 0, y: 0, w: 1920, h: 1080 } as const;
@@ -173,7 +173,9 @@ describe('protocol v3 messages', () => {
 
   it('docState, view notice and applied', () => {
     const layers = [{ id: 'base', kind: 'base' }];
-    expect(decodeTdMessage(JSON.stringify({ t: 'docState', rev: 3, layers, docW: 8, docH: 4 }))).toEqual({ t: 'docState', rev: 3, layers, docW: 8, docH: 4 });
+    expect(decodeTdMessage(JSON.stringify({ t: 'docState', rev: 3, layers, docW: 8, docH: 4 }))).toEqual({ t: 'docState', rev: 3, layers, docW: 8, docH: 4, guides: { h: [], v: [] }, canvas: { mode: 'input' } });
+    expect(decodeTdMessage(JSON.stringify({ t: 'docState', rev: 3, layers, docW: 8, docH: 4, guides: { h: [1, 'x', 2.5], v: 'no' }, canvas: { mode: 'fixed' } })))
+      .toEqual({ t: 'docState', rev: 3, layers, docW: 8, docH: 4, guides: { h: [1, 2.5], v: [] }, canvas: { mode: 'fixed' } });
     expect(decodeTdMessage(JSON.stringify({ t: 'docState', rev: 3, layers: 'x', docW: 8, docH: 4 }))).toBeNull();
     expect(decodeTdMessage(JSON.stringify({ t: 'docState', rev: 3, layers, docW: 0, docH: 4 }))).toBeNull();
     const v = { t: 'view', frameId: 9, docW: 8, docH: 4, w: 8, h: 4, appliedFrameId: 77 } as const;
@@ -188,8 +190,11 @@ describe('json messages', () => {
   it('web messages round trip', () => {
     const spec = { id: 'a', kind: 'adjustment', parentId: null, name: 'Levels', visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, slot: null, mask: { slot: 4, enabled: true }, adjustment: { type: 'invert' } };
     const msgs = [
-      { t: 'ready', protocol: 4, client: 'panel', version: '0.1.0', token: 'abc', fresh: true },
-      { t: 'doc', rev: 5, layers: [spec] },
+      { t: 'ready', protocol: 5, client: 'panel', version: '0.1.0', token: 'abc', fresh: true },
+      { t: 'doc', rev: 5, layers: [spec], guides: { h: [10], v: [] }, canvas: { mode: 'fixed' } },
+      { t: 'setCanvas', w: 800, h: 600, mode: 'fixed' },
+      { t: 'setCanvas', w: 0, h: 0, mode: 'input' },
+      { t: 'renderLayer', requestId: 'r1', layerId: 'L3' },
       { t: 'requestDoc' },
       { t: 'view', mode: 'td', zoom: 0.5, panX: 12, panY: -3, rect: { x: 100, y: 80, w: 900, h: 700 } },
       { t: 'takeover' },
@@ -223,6 +228,9 @@ describe('json messages', () => {
     for (const m of [{ t: 'listTops', requestId: 'a' }, { t: 'importTop', requestId: 'b', path: '/p1/x' }] as const) expect(decodeWebMessage(encodeMessage(m))).toEqual(m);
     expect(decodeWebMessage('{"t":"importTop","requestId":"b"}')).toBeNull();
     expect(decodeWebMessage('{"t":"listTops"}')).toBeNull();
+    expect(decodeWebMessage('{"t":"setCanvas","w":0,"h":10,"mode":"fixed"}')).toBeNull();
+    expect(decodeWebMessage('{"t":"setCanvas","w":0,"h":0,"mode":"input"}')).toEqual({ t: 'setCanvas', w: 0, h: 0, mode: 'input' });
+    expect(decodeWebMessage('{"t":"renderLayer","requestId":"r"}')).toBeNull();
   });
 
   it('rejects malformed v3 web messages', () => {
@@ -236,7 +244,13 @@ describe('json messages', () => {
     const hello = { t: 'hello', protocol: 4, doc: { w: 1920, h: 1080 }, hasInput: true, maxSendFps: 30, active: false, clientId: 'c1', hasDocument: false, rev: null } as const;
     expect(decodeTdMessage(encodeMessage(hello))).toEqual(hello);
     expect(decodeTdMessage(JSON.stringify({ ...hello, extra: 1 }))).toEqual(hello);
-    expect(decodeTdMessage('{"t":"docSize","w":4,"h":5,"hasInput":false}')).toEqual({ t: 'docSize', w: 4, h: 5, hasInput: false });
+    expect(decodeTdMessage('{"t":"docSize","w":4,"h":5,"hasInput":false}')).toEqual({ t: 'docSize', w: 4, h: 5, hasInput: false, mode: 'input' });
+    expect(decodeTdMessage('{"t":"docSize","w":4,"h":5,"hasInput":false,"mode":"fixed"}')).toEqual({ t: 'docSize', w: 4, h: 5, hasInput: false, mode: 'fixed' });
+    expect(decodeTdMessage('{"t":"baseSize","w":1280,"h":720}')).toEqual({ t: 'baseSize', w: 1280, h: 720 });
+    expect(decodeTdMessage('{"t":"baseSize","w":0,"h":0}')).toEqual({ t: 'baseSize', w: 0, h: 0 }); // no input
+    expect(decodeTdMessage('{"t":"baseSize","w":-1,"h":4}')).toBeNull();
+    expect(decodeTdMessage('{"t":"hello","protocol":5,"doc":{"w":4,"h":4,"mode":"fixed"},"hasInput":true,"maxSendFps":30,"active":true}'))
+      .toMatchObject({ doc: { w: 4, h: 4, mode: 'fixed' } });
     expect(decodeTdMessage('{"t":"active","active":true}')).toEqual({ t: 'active', active: true });
     expect(decodeTdMessage('{"t":"error","msg":"nope"}')).toEqual({ t: 'error', msg: 'nope' });
   });

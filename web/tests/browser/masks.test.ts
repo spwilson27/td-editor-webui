@@ -325,16 +325,25 @@ describe('masks: compositing', () => {
 });
 
 describe('masks: resize', () => {
-  it('keeps the old mask content top-left and makes the new area visible', () => {
-    const { slot } = setup();
+  it('a pixel layer mask keeps its size when the document grows; adjustment masks follow the document', () => {
+    const { id, slot } = setup();
     e.setToolContext(brushCtx({ size: 40 }));
     stroke(e, 'brush', [[20, 20]]);
     const ev = collect(e);
     e.resize(60, 60);
+    expect(e.docSpec().layers.find((l) => l.id === id)).toMatchObject({ surfaceW: 40, surfaceH: 40 });
     expect(maskAt(e, slot, 20, 20)).toBe(0);
-    expect(maskAt(e, slot, 50, 50)).toBe(255);
-    expect(ev.some((x) => x.type === 'surface' && x.slot === slot)).toBe(true);
-    e.resize(10, 10);
-    expect(slotPx(e, slot, 9, 9)).toEqual([0, 0, 0, 255]);
+    expect(e.readSurface(slot, { x: 0, y: 0, w: 60, h: 60 }).length).toBe(60 * 60 * 4);
+    const adj = e.addAdjustment('invert');
+    const aslot = e.addMask(adj);
+    e.setPaintTarget(adj, 'mask');
+    stroke(e, 'brush', [[20, 20]]);
+    expect(maskAt(e, aslot, 20, 20)).toBe(0);
+    e.setCanvasSize(80, 80, 'tl');
+    expect(maskAt(e, aslot, 20, 20)).toBe(0); // old content stays top-left
+    expect(maskAt(e, aslot, 70, 70)).toBe(255); // the new area is fully visible
+    expect(ev.some((x) => x.type === 'surface' && x.slot === aslot)).toBe(true);
+    e.undo();
+    expect(slotPx(e, aslot, 59, 59)).toEqual([255, 255, 255, 255]);
   });
 });
