@@ -1,7 +1,7 @@
 import type { Store } from './store';
-import type { BrushDynamics, CloneOptions, DodgeBurnRange, Effect, TipShape, Rect, Anchor, AdjustmentSpec, AdjustmentType, CanvasMode, LayerTransform, PaintTarget, SnapOptions, SelectionOptions, ShapeSpec, ShapeType, TextSpec, ToolId, ToolPointer } from '../engine/types';
+import type { BrushDynamics, CloneOptions, DodgeBurnRange, Effect, TipShape, Rect, Anchor, CanvasMode, LayerTransform, PaintTarget, SnapOptions, SelectionOptions, ShapeSpec, ShapeType, TextSpec, ToolId, ToolPointer } from '../engine/types';
 import { completeShapeSpec, completeTextSpec } from './specs';
-import { defaultEffect } from './effectDefaults';
+import { defaultEffect, effectLabel } from './effectDefaults';
 
 /** `window.__editorTest`, installed only with ?test=1; used by automated TouchDesigner validation. */
 export function installTestHook(store: Store, win: Window = window): void {
@@ -20,16 +20,12 @@ export function installTestHook(store: Store, win: Window = window): void {
     setPrimary: (hex: string) => store.setPrimaryHex(hex),
     setTool: (id: ToolId) => store.setTool(id),
     addLayer: () => store.addLayer(),
+    addGroup: () => store.addGroup(),
+    moveLayer: (id: string, parent: string | null, index: number) => store.engine.moveLayer(id, parent, index),
     setLayerVisible: (id: string, visible: boolean) => store.engine.setLayerProps(id, { visible }),
     layers: () => store.engine.layers(),
-    addAdjustment: (type: AdjustmentType, params?: Partial<AdjustmentSpec>) => {
-      const id = store.engine.addAdjustment(type);
-      if (params && Object.keys(params).length) {
-        const cur = store.engine.layers().find((l) => l.id === id)?.adjustment;
-        if (cur) store.engine.setAdjustment(id, { ...cur, ...params } as AdjustmentSpec);
-      }
-      return id;
-    },
+    addAdjustment: (type: string, params: Record<string, unknown> = {}) =>
+      store.engine.addAdjustmentLayer([{ ...defaultEffect(type), ...params } as Effect], effectLabel(type)),
     addMask: (layerId: string) => store.engine.addMask(layerId),
     setPaintTarget: (layerId: string, target: PaintTarget) => store.engine.setPaintTarget(layerId, target),
     setViewMode: (m: 'local' | 'td') => { store.setViewMode(m); return store.viewMode.peek(); },
@@ -115,11 +111,14 @@ export function installTestHook(store: Store, win: Window = window): void {
       return cur.length;
     },
     /** New filter adjustment layer (spec defaults + `params`); returns its id. */
-    addFilterAdjustment: (type: string, params: Record<string, unknown> = {}) => {
-      const id = store.addFilterAdjustment(type);
-      if (Object.keys(params).length) store.engine.setAdjustment(id, { type: 'filter', effect: { ...defaultEffect(type), ...params } as Effect });
-      return id;
-    },
+    addFilterAdjustment: (type: string, params: Record<string, unknown> = {}) =>
+      store.engine.addAdjustmentLayer([{ ...defaultEffect(type), ...params } as Effect], effectLabel(type)),
+    // v8: multi-select, batch ops, merge
+    selectLayers: (ids: string[]) => store.selectLayers(ids),
+    selectedLayers: () => store.selectedIds(),
+    deleteSelected: () => store.deleteSelected(),
+    groupSelected: () => store.groupSelected(),
+    mergeSelected: () => store.mergeSelected(),
     setBrushTip: (tip: TipShape, dynamics: Partial<BrushDynamics> = {}) => {
       if (tip === 'custom') store.useTipFromSelection(); else store.setTip(tip);
       store.setDynamics(dynamics);

@@ -110,17 +110,17 @@ describe('layer masks UI', () => {
 });
 
 describe('adjustment menu', () => {
-  it('opens from the footer, lists the six adjustments (filters have their own entries) and adds one above the active layer', async () => {
+  it('opens from the footer, lists the classic adjustments first (one catalogue) and adds one above the active layer', async () => {
     store.addLayer();
     await settle();
     expect(document.querySelector('[role=menu][aria-label="New adjustment"]')).toBeNull();
     q('[aria-label="New adjustment"]').click();
     await settle();
-    const items = [...document.querySelectorAll('[role=menu][aria-label="New adjustment"] [data-adjustment]')].map((e) => e.textContent);
-    expect(items).toEqual(['Levels', 'Brightness/Contrast', 'Hue/Saturation', 'Blur', 'Invert', 'Threshold']);
-    q('[data-adjustment=hueSaturation]').click();
+    const items = [...document.querySelectorAll('[role=menu][aria-label="New adjustment"] [data-new-adjustment]')].map((e) => e.textContent);
+    expect(items.slice(0, 6)).toEqual(['Levels', 'Brightness/Contrast', 'Hue/Saturation', 'Gaussian blur', 'Invert', 'Threshold']);
+    q('[data-new-adjustment=hueSaturation]').click();
     await settle();
-    expect(last('addAdjustment')).toBe('addAdjustment:hueSaturation');
+    expect(last('addAdjustmentLayer')).toBe('addAdjustmentLayer:hueSaturation');
     expect(document.querySelector('[role=menu][aria-label="New adjustment"]')).toBeNull();
     expect(engine.layers()[0].kind).toBe('adjustment');
   });
@@ -143,9 +143,9 @@ describe('adjustment menu', () => {
     for (const t of ['levels', 'brightnessContrast', 'hueSaturation', 'blur', 'invert', 'threshold']) {
       q('[aria-label="New adjustment"]').click();
       await settle();
-      q(`[data-adjustment=${t}]`).click();
+      q(`[data-new-adjustment=${t}]`).click();
       await settle();
-      expect(last('addAdjustment')).toBe(`addAdjustment:${t}`);
+      expect(last('addAdjustmentLayer')).toBe(`addAdjustmentLayer:${t}`);
     }
   });
 });

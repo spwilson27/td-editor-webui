@@ -220,7 +220,8 @@ def test_doc_with_filters_filter_adjustment_and_group_adjustment_effects_is_appl
     e, a = make(doc=layers)
     assert not e.s.messages(a, "error")
     assert [l["id"] for l in e.o.net.applies[-1][0]] == ["p1", "g", "adj"]
-    assert json.loads(e.o.doc_state.text)["layers"][2]["adjustment"] == FILTER_ADJ    # survives the stored copy
+    assert json.loads(e.o.doc_state.text)["layers"][2]["adjustment"] is None    # v8: migrated into effects[] (the stored copy)
+    assert json.loads(e.o.doc_state.text)["layers"][2]["effects"] == [FILTER_ADJ["effect"], dict(BLUR, radius=9)]
 
 
 # --------------------------------------------------------------------------- activeLayer + content bounds

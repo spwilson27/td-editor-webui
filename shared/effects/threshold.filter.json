@@ -1,0 +1,14 @@
+{
+  "type": "threshold",
+  "group": "color",
+  "doc": "Threshold (the v2 adjustment): Rec.709 luma 0.2126 R + 0.7152 G + 0.0722 B of the straight colour >= level -> white, else black. Alpha unchanged.",
+  "reads": "point",
+  "preservesTransparent": true,
+  "params": {
+    "level": {"kind": "num", "default": 0.5, "min": 0, "max": 1}
+  },
+  "passes": [{"pass": 0, "u": ["level"]}],
+  "extent": ["0", "0", "0", "0"],
+  "samples": [{"level": 0.5}, {"level": 0.2}, {"level": 0.85}, {"level": 0}, {"level": 1}],
+  "degenerate": [{}, {"level": 1e9}, {"level": -1e9}, {"level": "x"}, {"level": null}]
+}

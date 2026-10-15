@@ -1,8 +1,8 @@
-import { Fragment } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import type { Effect, EffectType, LayerInfo, RGBA } from '../engine/types';
-import { EFFECT_FIELDS, EFFECT_ORDER, EXPERIMENTAL, defaultEffect, effectLabel } from '../state/effectDefaults';
-import { filterDoc, filterGroups, isFilterType } from '../state/filterSchema';
+import { EXPERIMENTAL, defaultEffect, effectLabel, fieldsOf } from '../state/effectDefaults';
+import { isFilterType } from '../state/filterSchema';
+import { EffectCatalogue } from './EffectCatalogue';
 import { store } from '../state/store';
 import { ColorField, EnumField, NumField } from './fields';
 import { FilterParams, applyPatch, type Patch } from './FilterEditors';
@@ -15,7 +15,7 @@ function EffectRow({ fx, index, count, open, onToggleOpen, edit, onMove, onRemov
   onMove: (index: number, d: number) => void; onRemove: (index: number) => void;
 }) {
   const label = effectLabel(fx.type);
-  const library = !(fx.type in EFFECT_FIELDS) && isFilterType(fx.type);
+  const library = !fieldsOf(fx.type) && isFilterType(fx.type);
   const set = (patch: Patch) => edit((l) => l.map((e, i) => (i === index ? applyPatch(e, patch) : e)));
   // colour edits merge into the latest draft so two edits in one frame never drop each other
   const setColor = (key: string, part: Partial<RGBA>) => edit((l) => l.map((e, i) => (i === index ? ({ ...e, [key]: { ...(e as unknown as Record<string, RGBA>)[key], ...part } } as Effect) : e)));
@@ -37,7 +37,7 @@ function EffectRow({ fx, index, count, open, onToggleOpen, edit, onMove, onRemov
         <div data-fx-params style="display:flex;flex-direction:column;gap:8px;padding:4px 10px 10px 28px">
           {library
             ? <FilterParams fx={fx} onSet={set} selfId={layerId} />
-            : (EFFECT_FIELDS[fx.type as EffectType] ?? []).map((f) => f.kind === 'num'
+            : (fieldsOf(fx.type) ?? []).map((f) => f.kind === 'num'
               ? <NumField key={f.key} f={f} value={vals[f.key] as number} onChange={(v) => set({ [f.key]: v })} />
               : f.kind === 'enum'
                 ? <EnumField key={f.key} f={f} value={vals[f.key] as string} onChange={(v) => set({ [f.key]: v })} />
@@ -63,31 +63,8 @@ function AddMenu({ onAdd }: { onAdd: (t: string) => void }) {
     <div ref={ref} style="position:relative;flex:none;padding:6px 10px;border-top:1px solid #1f1f1f;background:#282828">
       <button data-fx-add aria-haspopup="menu" aria-expanded={menu} onClick={() => setMenu(!menu)}
         style="width:100%;height:26px;border:1px solid #474747;border-radius:5px;background:#262626;color:#e3e3e3">Add effect ▾</button>
-      {menu && (
-        <div role="menu" aria-label="Add effect" style="position:absolute;left:10px;right:10px;bottom:100%;z-index:50;max-height:min(420px,70vh);overflow-y:auto;padding:4px;background:#2f2f2f;border:1px solid #161616;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,0.55)">
-          {EFFECT_ORDER.map((t, i) => (
-            <Fragment key={t}>
-              {i > 0 && EXPERIMENTAL.has(t) && !EXPERIMENTAL.has(EFFECT_ORDER[i - 1]) && <div role="separator" style="height:1px;margin:4px 6px;background:#161616" />}
-              <button role="menuitem" class="mi" data-add-effect={t} onClick={() => { setMenu(false); onAdd(t); }}
-                style="display:flex;width:100%;box-sizing:border-box;align-items:center;justify-content:space-between;height:26px;padding:0 10px;border-radius:4px;text-align:left;color:#e3e3e3">
-                <span>{effectLabel(t)}</span>{EXPERIMENTAL.has(t) && <span style="font-size:10px;color:#d9a441">Experimental</span>}
-              </button>
-            </Fragment>
-          ))}
-          {filterGroups().map((g) => (
-            <div key={g.id} role="group" aria-label={g.label} data-filter-group={g.id}>
-              <div role="separator" style="height:1px;margin:4px 6px;background:#161616" />
-              <div data-filter-group-label style="padding:3px 10px 2px;font-size:10px;letter-spacing:0.04em;text-transform:uppercase;color:#8f8f8f">{g.label}</div>
-              {g.types.map((t) => (
-                <button key={t} role="menuitem" class="mi" data-add-filter={t} title={filterDoc(t)} onClick={() => { setMenu(false); onAdd(t); }}
-                  style="display:flex;width:100%;box-sizing:border-box;align-items:center;height:26px;padding:0 10px;border-radius:4px;text-align:left;color:#e3e3e3">
-                  <span>{effectLabel(t)}</span>
-                </button>
-              ))}
-            </div>
-          ))}
-        </div>
-      )}
+      {menu && <EffectCatalogue label="Add effect" attr="data-add-effect" onPick={(t) => { setMenu(false); onAdd(t); }}
+        style="position:absolute;left:10px;right:10px;bottom:100%;z-index:50;max-height:min(420px,70vh);overflow-y:auto;padding:4px;background:#2f2f2f;border:1px solid #161616;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,0.55)" />}
     </div>
   );
 }
@@ -122,9 +99,9 @@ export function EffectsPanel({ layer }: { layer: LayerInfo | undefined }) {
   const onRemove = (i: number) => { list.splice(i, 1); edit((l) => l.filter((_, k) => k !== i)); };
   return (
     <div data-effects-panel data-layer-id={layer.id} style="flex:1 1 auto;min-height:0;display:flex;flex-direction:column">
-      <div style="flex:none;padding:6px 10px;color:#a8a8a8;border-bottom:1px solid #1f1f1f;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Effects on <b style="color:#e3e3e3;font-weight:500">{layer.name}</b></div>
+      <div style="flex:none;padding:6px 10px;color:#a8a8a8;border-bottom:1px solid #1f1f1f;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{layer.kind === 'adjustment' ? 'Adjustment stack of' : 'Effects on'} <b style="color:#e3e3e3;font-weight:500">{layer.name}</b></div>
       <div style="flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden">
-        {effects.length === 0 && <div data-effects-empty style="padding:12px;color:#8f8f8f">No effects. Use Add effect.</div>}
+        {effects.length === 0 && <div data-effects-empty style="padding:12px;color:#8f8f8f">{layer.kind === 'adjustment' ? 'Empty stack. Use Add effect.' : 'No effects. Use Add effect.'}</div>}
         {effects.map((fx, i) => (
           <EffectRow key={`${layer.id}-${list[i]}`} layerId={layer.id} fx={fx} index={i} count={effects.length} open={!!openSet[list[i]]}
             onToggleOpen={() => { const rid = list[i]; setOpenSet((o) => ({ ...o, [rid]: !o[rid] })); }} edit={edit} onMove={onMove} onRemove={onRemove} />

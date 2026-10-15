@@ -1,0 +1,16 @@
+{
+  "type": "brightnessContrast",
+  "group": "color",
+  "doc": "Brightness / contrast (the v2 adjustment, bit for bit) on straight colour: c1 = clamp(c * (1 + brightness)) (brightness MULTIPLIES), out = clamp((c1 - 0.5) * (1 + contrast) + 0.5) (contrast pivots at 0.5). Alpha unchanged.",
+  "reads": "point",
+  "preservesTransparent": true,
+  "params": {
+    "brightness": {"kind": "num", "default": 0, "min": -1, "max": 1},
+    "contrast": {"kind": "num", "default": 0, "min": -1, "max": 1}
+  },
+  "noop": "brightness == 0 && contrast == 0",
+  "passes": [{"pass": 0, "u": ["brightness", "contrast"]}],
+  "extent": ["0", "0", "0", "0"],
+  "samples": [{"brightness": 0.4}, {"contrast": 0.5}, {"brightness": -0.3, "contrast": -0.4}, {"brightness": 1, "contrast": 1}, {"brightness": -1, "contrast": -1}],
+  "degenerate": [{}, {"brightness": 1e9, "contrast": -1e9}, {"brightness": "x"}, {"contrast": null}]
+}

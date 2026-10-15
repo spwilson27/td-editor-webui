@@ -24,15 +24,15 @@ test('the selection also stays when the adjustment is added from the menus', asy
   await expect(page.locator('[data-tool]').first()).toBeVisible();
   await hook(page, 'selectRect', 20, 20, 60, 40);
   await page.getByRole('button', { name: 'New adjustment' }).click();
-  await page.locator('[data-adjustment=invert]').click();
+  await page.locator('[data-new-adjustment=invert]').click();
   expect(await hook<any>(page, 'selectionMask')).not.toBeNull();
   await page.getByRole('tab', { name: 'Layers' }).click();
   await page.getByRole('button', { name: 'New adjustment' }).click();
-  await page.locator('[data-adjustment-filter=posterize]').click();
+  await page.locator('[data-new-adjustment=posterize]').click();
   expect(await hook<any>(page, 'selectionMask')).not.toBeNull();
   await page.getByRole('button', { name: 'Layer', exact: true }).click();
-  await page.locator('[data-flyout=filters]').click();
-  await page.locator('[data-new-filter-adjustment=twirl]').click();
+  await page.locator('[data-flyout=adjustments]').click();
+  await page.locator('[data-new-adjustment=twirl]').click();
   expect(await hook<any>(page, 'selectionMask')).not.toBeNull();
   // painting on the new mask does not clear it either
   await page.waitForTimeout(300);

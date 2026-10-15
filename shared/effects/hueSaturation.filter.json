@@ -1,0 +1,17 @@
+{
+  "type": "hueSaturation",
+  "group": "color",
+  "doc": "Hue / saturation / value (the v2 adjustment): a true HSV edit of the straight colour. V = max(R,G,B), S = (V - min) / V (0 when V = 0), H in degrees (grey: 0). H' = H + hue (positive = CSS hue-rotate direction, red -> green -> blue), S' = min(1, S * saturation), V' = V * value, back to RGB (HSV hexcone), each channel clamped to 0..1 (value > 1 saturates channels). Alpha unchanged.",
+  "reads": "point",
+  "preservesTransparent": true,
+  "params": {
+    "hue": {"kind": "num", "default": 0, "min": -180, "max": 180, "unit": "deg"},
+    "saturation": {"kind": "num", "default": 1, "min": 0, "max": 2, "doc": "multiplier"},
+    "value": {"kind": "num", "default": 1, "min": 0, "max": 2, "doc": "multiplier"}
+  },
+  "noop": "hue == 0 && saturation == 1 && value == 1",
+  "passes": [{"pass": 0, "u": ["hue", "saturation", "value"]}],
+  "extent": ["0", "0", "0", "0"],
+  "samples": [{"hue": 90}, {"saturation": 0}, {"saturation": 1.6, "value": 0.7}, {"hue": -140, "saturation": 0.5, "value": 1.5}, {"value": 2}],
+  "degenerate": [{}, {"hue": 1e9, "saturation": -1e9, "value": 1e9}, {"hue": "x"}, {"saturation": null}, {"hue": 180}, {"hue": -180}]
+}

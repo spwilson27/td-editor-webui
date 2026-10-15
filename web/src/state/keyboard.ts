@@ -4,7 +4,7 @@ import { TOOLS, toolInfo } from './tools';
 
 export interface KeyLike {
   key: string; repeat?: boolean; ctrlKey: boolean; metaKey: boolean; shiftKey: boolean; altKey: boolean;
-  target: unknown; preventDefault(): void;
+  target: unknown; preventDefault(): void; defaultPrevented?: boolean;
 }
 
 const TEXT_INPUT = /^(text|search|number|email|url|tel|password)$/i;
@@ -22,6 +22,14 @@ function isActivatable(target: unknown): boolean {
   const t = target as { tagName?: string; getAttribute?: (n: string) => string | null } | null;
   const tag = t?.tagName?.toUpperCase();
   return tag === 'BUTTON' || tag === 'A' || t?.getAttribute?.('role') === 'button';
+}
+
+/** Delete removes layers only when the key was not meant for something else: page, canvas or the layer list. */
+function deleteKeyTarget(target: unknown): boolean {
+  const t = target as { tagName?: string; closest?: (s: string) => unknown } | null;
+  if (!t || !t.tagName) return true;
+  const tag = t.tagName.toUpperCase();
+  return tag === 'BODY' || tag === 'HTML' || tag === 'CANVAS' || !!t.closest?.('[data-layer-list]');
 }
 
 const toolKeys = new Map<string, ToolId[]>();
@@ -43,6 +51,7 @@ export function onKeyDown(store: Store, e: KeyLike): void {
     else if (key === 'y') store.redo();
     else if (key === 'd') store.deselect();
     else if (key === 'a') store.selectAll();
+    else if (key === 'g' && !e.shiftKey) { if (store.hasEngine()) store.groupSelected(); }
     else if (key === 'i' && e.shiftKey) store.invertSelection();
     else if (key === 't' && !e.shiftKey) {
       if (!store.hasEngine() || !store.canTransformSelection()) return;
@@ -70,6 +79,12 @@ export function onKeyDown(store: Store, e: KeyLike): void {
     case 'Escape':
       if (store.isFloating()) { store.cancelFloating(); e.preventDefault(); }
       else if (store.cropBox.peek()) { store.cancelCrop(); e.preventDefault(); }
+      return;
+    case 'Delete': // Backspace is left alone
+      if (e.defaultPrevented || !deleteKeyTarget(e.target)) return;
+      if (store.isFloating() || store.cropBox.peek() || store.engine.selection()) return; // a pixel selection: the engine has no clear op, so layers stay
+      store.deleteSelected();
+      e.preventDefault();
       return;
     case 'q': store.toggleQuickMask(); return;
     case '[': store.nudgeSize(-1); return;

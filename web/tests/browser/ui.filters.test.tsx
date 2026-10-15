@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Effect } from '../../src/engine/types';
-import { EFFECT_ORDER, defaultEffect } from '../../src/state/effectDefaults';
+import { CLASSIC_ORDER, EFFECT_ORDER, defaultEffect, isClassicType } from '../../src/state/effectDefaults';
 import { filterGroups, filterFields, type NumField } from '../../src/state/filterSchema';
 import { store } from '../../src/state/store';
 import { Studio } from '../../src/ui/Studio';
@@ -11,7 +11,6 @@ import { frame, freshEngine, mount, ptr, q, settle, unmount } from './uiHelpers'
 let engine: FakeEngine;
 const setFx = () => engine.calls.filter((c) => c.startsWith('setEffects'));
 const lastFx = (): Array<Record<string, any>> => JSON.parse(setFx()[setFx().length - 1].replace(/^setEffects:[^:]+:/, ''));
-const lastAdj = (): any => JSON.parse(engine.calls.filter((c) => c.startsWith('setAdjustment')).at(-1)!.replace(/^setAdjustment:[^:]+:/, ''));
 const tabsEl = () => q('[aria-label="Layer panels"]');
 const range = (el: HTMLInputElement, v: number) => { el.value = String(v); el.dispatchEvent(new Event('input', { bubbles: true })); };
 const select = (el: HTMLSelectElement, v: string) => { el.value = v; el.dispatchEvent(new Event('change', { bubbles: true })); };
@@ -37,11 +36,13 @@ describe('Add effect menu: the filter library grouped', () => {
   it('lists the v5 effects unchanged, then five groups with every filter', async () => {
     q('[data-fx-add]').click();
     await settle();
-    expect([...document.querySelectorAll('[data-add-effect]')].map((b) => b.getAttribute('data-add-effect'))).toEqual(EFFECT_ORDER);
+    const offered = [...document.querySelectorAll('[data-add-effect]')].map((b) => b.getAttribute('data-add-effect')!);
+    expect(offered.filter((t) => (EFFECT_ORDER as string[]).includes(t))).toEqual(EFFECT_ORDER);
+    expect(offered.slice(0, 6)).toEqual(CLASSIC_ORDER);
     const groups = [...document.querySelectorAll('[data-filter-group]')];
     expect(groups.map((g) => g.querySelector('[data-filter-group-label]')!.textContent)).toEqual(['Blur & sharpen', 'Colour', 'Stylise', 'Distort', 'Static animated']);
-    expect(groups.map((g) => g.querySelectorAll('[data-add-filter]').length)).toEqual([7, 9, 8, 7, 4]);
-    expect([...document.querySelectorAll('[data-add-filter]')].map((b) => b.getAttribute('data-add-filter'))).toEqual(filterGroups().flatMap((g) => g.types));
+    expect(groups.map((g) => g.querySelectorAll('[data-add-filter]').length)).toEqual([6, 9, 8, 7, 4]); // the classic adjustments are listed once, in their own group
+    expect([...document.querySelectorAll('[data-add-filter]')].map((b) => b.getAttribute('data-add-filter')).sort()).toEqual(filterGroups().flatMap((g) => g.types).sort());
     expect(q('[data-add-filter=motionBlur]').textContent).toBe('Motion blur');
     expect(q('[data-add-filter=lut]').textContent).toBe('Colour LUT (.cube)');
     expect(q('[role=menu][aria-label="Add effect"]').scrollHeight).toBeGreaterThan(0);
@@ -57,6 +58,7 @@ describe('Add effect menu: the filter library grouped', () => {
     }
     const names = [...document.querySelectorAll('[data-effect]')].map((r) => r.getAttribute('data-effect'));
     expect(names).toEqual(filterGroups().flatMap((g) => g.types));
+    expect(CLASSIC_ORDER.every((t) => names.includes(t) && isClassicType(t))).toBe(true);
     // every one opened with its parameter panel
     expect(document.querySelectorAll('[data-fx-params]').length).toBe(names.length);
   });
@@ -146,6 +148,22 @@ describe('number, enum, bool, seed and colour editors', () => {
     q('[data-fx-remove]', q('[data-effect-index="0"]')).click();
     await flush();
     expect(lastFx().map((e) => e.type)).toEqual(['blur']);
+  });
+});
+
+describe('blur editor: sigma and edge', () => {
+  it('shows Radius while sigma is 0, Sigma (0..200 px) instead of Radius when sigma > 0, and the Edge choice', async () => {
+    await addFilter('blur');
+    expect(document.querySelector('input[aria-label="Radius"]')).toBeTruthy();
+    expect(q<HTMLInputElement>('input[aria-label="Sigma"]').max).toBe('200');
+    expect([...q<HTMLSelectElement>('select[aria-label="Edge"]').options].map((o) => o.value)).toEqual(['transparent', 'hold']);
+    engine.setEffects('L1', [{ ...defaultEffect('blur'), sigma: 6 } as never]); // a migrated legacy blur
+    await flush();
+    expect(document.querySelector('input[aria-label="Radius"]')).toBeNull(); // sigma overrides the radius: the slider would do nothing
+    expect(q<HTMLInputElement>('input[aria-label="Sigma"]').value).toBe('6');
+    select(q<HTMLSelectElement>('select[aria-label="Edge"]'), 'hold');
+    await flush();
+    expect(lastFx()[0]).toMatchObject({ type: 'blur', sigma: 6, edge: 'hold' });
   });
 });
 
@@ -550,7 +568,7 @@ describe('effects on groups and adjustment layers', () => {
   });
 });
 
-describe('Layer ▸ New Filter Adjustment and the adjustment editor', () => {
+describe('Layer ▸ New Adjustment and the unified catalogue', () => {
   beforeEach(async () => {
     unmount();
     await mount(<><TopBar /><Studio /></>, 'width:900px;height:900px;display:flex;flex-direction:column');
@@ -561,76 +579,87 @@ describe('Layer ▸ New Filter Adjustment and the adjustment editor', () => {
     const btn = [...document.querySelectorAll<HTMLElement>('button.menu')].find((b) => b.textContent === 'Layer')!;
     btn.click();
     await settle();
-    q('[data-flyout=filters]').click();
+    q('[data-flyout=adjustments]').click();
     await settle();
   };
 
-  it('the Layer menu has a flyout with the five groups and all filters', async () => {
+  it('the Layer menu has a flyout with the same catalogue as Add effect', async () => {
     await openLayerMenu();
-    const fly = q('[role=menu][aria-label="New Filter Adjustment"]');
-    expect([...fly.querySelectorAll('[role=group]')].map((g) => g.getAttribute('aria-label'))).toEqual(['Blur & sharpen', 'Colour', 'Stylise', 'Distort', 'Static animated']);
-    expect(fly.querySelectorAll('[data-new-filter-adjustment]').length).toBe(35);
+    const fly = q('[role=menu][aria-label="New Adjustment"]');
+    expect([...fly.querySelectorAll('[role=group]')].map((g) => g.getAttribute('aria-label'))).toEqual(['Adjustments', 'Layer styles', 'Blur & sharpen', 'Colour', 'Stylise', 'Distort', 'Static animated']);
+    const types = [...fly.querySelectorAll('[data-new-adjustment]')].map((b) => b.getAttribute('data-new-adjustment')!);
+    expect(types.slice(0, 6)).toEqual(CLASSIC_ORDER);
+    expect(new Set(types).size).toBe(types.length);
+    expect(types.length).toBe(6 + EFFECT_ORDER.length + 35 - 1 + 0); // 35 filters incl. blur: the four classic filters are in the first group
   });
 
-  it('picking a filter adds an adjustment layer {type:"filter"} with defaults, named after it, and opens its editor', async () => {
+  it('picking an entry adds an adjustment layer whose FX stack is that effect with defaults, named after it, and opens the Effects tab', async () => {
     await openLayerMenu();
-    q('[data-new-filter-adjustment=twirl]').click();
+    q('[data-new-adjustment=twirl]').click();
     await flush();
-    expect(engine.calls).toContain('addFilterAdjustment:twirl');
+    expect(engine.calls).toContain('addAdjustmentLayer:twirl');
     const l = engine.layers().find((x) => x.id === engine.activeLayerId())!;
     expect(l.kind).toBe('adjustment');
     expect(l.name).toBe('Twirl');
-    expect(l.adjustment).toEqual({ type: 'filter', effect: defaultEffect('twirl') });
-    expect(document.querySelector('[role=menu][aria-label="New Filter Adjustment"]')).toBeNull();
-    // the Adjustment tab was selected and shows the filter's editor
-    const editor = q('[data-adjust-panel][data-adjust-type=filter]');
-    expect(editor.getAttribute('data-filter-type')).toBe('twirl');
-    expect(editor.textContent).toContain('Twirl');
+    expect(l.adjustment).toBeNull();
+    expect(l.effects).toEqual([defaultEffect('twirl')]);
+    expect(document.querySelector('[role=menu][aria-label="New Adjustment"]')).toBeNull();
+    expect(q('[data-effects-panel]').getAttribute('data-layer-id')).toBe(l.id);
+    expect(q('[data-effect=twirl]')).toBeTruthy();
   });
 
-  it('editing the adjustment writes {type:"filter", effect} through setAdjustment, once per frame', async () => {
-    store.addFilterAdjustment('motionBlur');
+  it('a classic adjustment (Levels) comes from the same catalogue', async () => {
+    await openLayerMenu();
+    q('[data-new-adjustment=levels]').click();
     await flush();
-    const n = engine.calls.filter((c) => c.startsWith('setAdjustment')).length;
-    const len = q<HTMLInputElement>('[data-adjust-type=filter] input[aria-label="Length"]');
+    const l = engine.layers().find((x) => x.id === engine.activeLayerId())!;
+    expect(l).toMatchObject({ kind: 'adjustment', name: 'Levels' });
+    expect(l.effects).toEqual([{ type: 'levels', enabled: true, inLow: 0, inHigh: 1, gamma: 1, outLow: 0, outHigh: 1 }]);
+  });
+
+  it('editing the stack writes setEffects once per frame', async () => {
+    store.addAdjustment('motionBlur');
+    await flush();
+    q('[data-fx-open]').click();
+    await settle();
+    const n = setFx().length;
+    const len = q<HTMLInputElement>('[data-fx-params] input[aria-label="Length"]');
     for (const v of [10, 20, 30]) range(len, v);
-    const ang = q<HTMLInputElement>('[data-adjust-type=filter] input[aria-label="Angle"]');
-    range(ang, 45);
+    range(q<HTMLInputElement>('[data-fx-params] input[aria-label="Angle"]'), 45);
     await flush();
-    expect(engine.calls.filter((c) => c.startsWith('setAdjustment')).length - n).toBe(1);
-    expect(lastAdj()).toEqual({ type: 'filter', effect: { ...defaultEffect('motionBlur'), length: 30, angle: 45 } });
-    const en = q<HTMLInputElement>('[data-adjust-type=filter] input[data-fx-enable]');
-    en.checked = false;
-    en.dispatchEvent(new Event('change', { bubbles: true }));
-    await flush();
-    expect(lastAdj().effect.enabled).toBe(false);
+    expect(setFx().length - n).toBe(1);
+    expect(lastFx()).toEqual([{ ...defaultEffect('motionBlur'), length: 30, angle: 45 }]);
   });
 
   it('special editors work inside an adjustment too (curves)', async () => {
-    store.addFilterAdjustment('curves');
+    store.addAdjustment('curves');
     await flush();
-    const svg = q<SVGSVGElement>('[data-adjust-type=filter] [data-curve-editor]');
+    q('[data-fx-open]').click();
+    await settle();
+    const svg = q<SVGSVGElement>('[data-curve-editor]');
     const r = svg.getBoundingClientRect();
     svg.dispatchEvent(ptr('pointerdown', { clientX: r.left + r.width / 2, clientY: r.top + r.height * 0.2, buttons: 1 }));
     svg.dispatchEvent(ptr('pointerup', { clientX: r.left + r.width / 2, clientY: r.top + r.height * 0.2 }));
     await flush();
-    expect(lastAdj().effect.master.length).toBe(3);
+    expect(lastFx()[0].master.length).toBe(3);
   });
 
-  it('the layers panel footer menu lists the filters too', async () => {
+  it('the layers panel footer menu offers the same catalogue', async () => {
     q('[role=tab]:nth-child(1)', tabsEl()).click();
     await settle();
     q('[aria-label="New adjustment"]').click();
     await settle();
-    expect(document.querySelectorAll('[data-adjustment-filter]').length).toBe(35);
-    q('[data-adjustment-filter=posterize]').click();
+    const types = [...document.querySelectorAll('[role=menu][aria-label="New adjustment"] [data-new-adjustment]')].map((b) => b.getAttribute('data-new-adjustment')!);
+    expect(types.slice(0, 6)).toEqual(CLASSIC_ORDER);
+    expect(types).toContain('posterize');
+    q('[data-new-adjustment=posterize]').click();
     await flush();
-    expect(engine.layers().find((l) => l.id === engine.activeLayerId())!.adjustment).toMatchObject({ type: 'filter', effect: { type: 'posterize' } });
-    expect(document.querySelectorAll('[data-adjustment]').length).toBe(0); // menu closed
+    expect(engine.layers().find((l) => l.id === engine.activeLayerId())!.effects).toMatchObject([{ type: 'posterize' }]);
+    expect(document.querySelectorAll('[data-new-adjustment]').length).toBe(0); // menu closed
   });
 });
 
-describe('New Filter Adjustment without a document', () => {
+describe('New Adjustment without a document', () => {
   it('the Layer menu entry is disabled when no engine is attached', async () => {
     unmount();
     await mount(<TopBar />, 'width:900px');
@@ -638,11 +667,11 @@ describe('New Filter Adjustment without a document', () => {
     const btn = [...document.querySelectorAll<HTMLElement>('button.menu')].find((b) => b.textContent === 'Layer')!;
     btn.click();
     await settle();
-    const item = q('[data-flyout=filters]');
+    const item = q('[data-flyout=adjustments]');
     expect(item.getAttribute('aria-disabled')).toBe('true');
     item.click();
     await settle();
-    expect(document.querySelector('[data-new-filter-adjustment]')).toBeNull();
+    expect(document.querySelector('[data-new-adjustment]')).toBeNull();
     store.attach(engine);
   });
 });

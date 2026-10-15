@@ -1,0 +1,12 @@
+{
+  "type": "invert",
+  "group": "color",
+  "doc": "Invert (the v2 adjustment): straight colour c -> 1 - c, alpha unchanged. No parameters.",
+  "reads": "point",
+  "preservesTransparent": true,
+  "params": {},
+  "passes": [{"pass": 0, "u": []}],
+  "extent": ["0", "0", "0", "0"],
+  "samples": [{}],
+  "degenerate": [{}, {"x": 5}]
+}

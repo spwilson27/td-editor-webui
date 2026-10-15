@@ -12,9 +12,9 @@ const specs = readdirSync(dir).filter((f) => f.endsWith('.filter.json')).map((f)
 
 describe('filter schema (generated from shared/effects/*.filter.json)', () => {
   it('knows every filter of the library, in the five menu groups', () => {
-    expect(specs.length).toBe(35);
+    expect(specs.length).toBe(40); // 35 filters + the five classic adjustments
     expect(filterGroups().map((g) => g.label)).toEqual(['Blur & sharpen', 'Colour', 'Stylise', 'Distort', 'Static animated']);
-    expect(filterGroups().map((g) => g.types.length)).toEqual([7, 9, 8, 7, 4]);
+    expect(filterGroups().map((g) => g.types.length)).toEqual([7, 14, 8, 7, 4]);
     expect([...ALL_FILTER_TYPES()].sort()).toEqual(specs.map((s) => s.type).sort());
     for (const g of filterGroups()) for (const t of g.types) expect(specs.find((s) => s.type === t)!.group).toBe(g.id);
   });
@@ -25,7 +25,7 @@ describe('filter schema (generated from shared/effects/*.filter.json)', () => {
       expect(fx.type).toBe(s.type);
       expect(fx.enabled).toBe(true);
       const fields = filterFields(s.type);
-      expect(fields.length, s.type).toBeGreaterThan(0);
+      if (s.type !== 'invert') expect(fields.length, s.type).toBeGreaterThan(0); // invert has no parameters
       for (const [key, p] of Object.entries(s.params)) {
         if (p.kind === 'num') {
           const f = fields.find((x) => x.kind === 'num' && x.key === key) as NumField;
@@ -117,21 +117,15 @@ describe('store: filter adjustments and effect panel rules', () => {
   beforeEach(() => { vi.useFakeTimers(); vi.stubGlobal('requestAnimationFrame', (cb: () => void) => setTimeout(cb, 16)); store = createStore(); engine = new FakeEngine(64, 48); store.attach(engine); });
   afterEach(() => { store.detach(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
-  it('addFilterAdjustment creates an adjustment layer {type:filter, effect: defaults} named after the filter', () => {
-    const id = store.addFilterAdjustment('motionBlur');
+  it('addAdjustment creates an adjustment layer whose FX stack is the catalogue entry with defaults, named after it', () => {
+    const id = store.addAdjustment('motionBlur');
     const l = engine.layers().find((x) => x.id === id)!;
     expect(l.kind).toBe('adjustment');
     expect(l.name).toBe('Motion blur');
-    expect(l.adjustment).toEqual({ type: 'filter', effect: defaultEffect('motionBlur') });
-    expect(engine.calls.filter((c) => c.startsWith('add'))).toEqual(['addFilterAdjustment:motionBlur']); // one engine call, one history entry
-    expect(engine.calls.some((c) => c.startsWith('setAdjustment'))).toBe(false);
-  });
-
-  it('engines without addFilterAdjustment fall back to add + set + rename', () => {
-    (engine as unknown as { addFilterAdjustment?: unknown }).addFilterAdjustment = undefined;
-    const id = store.addFilterAdjustment('twirl');
-    expect(engine.calls.filter((c) => c.startsWith('addAdjustment'))).toEqual(['addAdjustment:filter']);
-    expect(engine.layers().find((x) => x.id === id)).toMatchObject({ name: 'Twirl', adjustment: { type: 'filter', effect: defaultEffect('twirl') } });
+    expect(l.adjustment).toBeNull();
+    expect(l.effects).toEqual([defaultEffect('motionBlur')]);
+    expect(engine.calls.filter((c) => c.startsWith('add'))).toEqual(['addAdjustmentLayer:motionBlur']); // one engine call, one history entry
+    expect(store.addFilterAdjustment('twirl')).toBeTruthy(); // alias
   });
 
   it('effects are allowed on pixel, text, shape, input, group and adjustment layers', () => {

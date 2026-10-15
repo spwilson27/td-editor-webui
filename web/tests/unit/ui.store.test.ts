@@ -169,10 +169,11 @@ describe('store: layers', () => {
     const a = store.addLayer();
     expect(engine.activeLayerId()).toBe(a);
     store.addGroup();
-    store.deleteActive();
+    store.deleteSelected();
     expect(engine.layers().some((l) => l.kind === 'group')).toBe(false);
+    expect(engine.calls.filter((c) => c.startsWith('deleteLayers'))).toHaveLength(1);
     engine.setActiveLayer('base');
-    store.deleteActive(); // v5: input layers can be deleted
+    store.deleteSelected(); // v5: input layers can be deleted
     expect(engine.layers().some((l) => l.kind === 'input')).toBe(false);
   });
 });
@@ -208,15 +209,19 @@ describe('store: v2 view mode, masks, adjustments', () => {
     expect(store.tdPanel.value).toBe(false);
   });
 
-  it('selects the Adjustment tab when an adjustment layer becomes active and leaves it otherwise', () => {
+  it('opens the Effects tab only when an adjustment layer is created; not on selection, undo or delete', () => {
     const adj = store.addAdjustment('blur');
-    expect(store.layerTab.value).toBe('adjust');
+    expect(store.layerTab.value).toBe('fx'); // an adjustment is an FX stack
     engine.setActiveLayer('base');
-    expect(store.layerTab.value).toBe('layers');
+    expect(store.layerTab.value).toBe('layers'); // leaving it returns to Layers
     engine.setActiveLayer(adj);
-    expect(store.layerTab.value).toBe('adjust');
+    expect(store.layerTab.value).toBe('layers'); // selecting an existing adjustment does not switch
     store.layerTab.value = 'history';
     engine.emit({ type: 'structure' }); // same active layer: the user's tab choice stays
+    expect(store.layerTab.value).toBe('history');
+    store.deleteSelected();
+    expect(store.layerTab.value).toBe('history');
+    engine.undo(); // the adjustment is back and active again: no switch
     expect(store.layerTab.value).toBe('history');
   });
 
@@ -233,15 +238,12 @@ describe('store: v2 view mode, masks, adjustments', () => {
     expect(store.canAddMask()).toBe(false);
   });
 
-  it('coalesces live adjustment edits to the newest value per animation frame', () => {
-    vi.stubGlobal('requestAnimationFrame', (cb: () => void) => setTimeout(cb, 16) as unknown as number);
-    const id = store.addAdjustment('threshold');
-    for (const level of [0.1, 0.2, 0.3]) store.editAdjustment(id, { type: 'threshold', level });
-    expect(store.adjDraft.value).toEqual({ id, spec: { type: 'threshold', level: 0.3 } });
-    expect(engine.calls.filter((c) => c.startsWith('setAdjustment'))).toHaveLength(0);
-    vi.advanceTimersByTime(16);
-    expect(engine.calls.filter((c) => c.startsWith('setAdjustment'))).toEqual([`setAdjustment:${id}:{"type":"threshold","level":0.3}`]);
-    expect(store.adjDraft.value).toBeNull();
-    vi.unstubAllGlobals();
+  it('a click on an adjustment row does not steal the Layers panel', () => {
+    const adj = store.addAdjustment('threshold');
+    engine.setActiveLayer('base');
+    store.layerTab.value = 'layers';
+    store.clickLayer(adj);
+    expect(store.layerTab.value).toBe('layers');
+    expect(engine.layers().find((l) => l.id === adj)!.effects[0]).toMatchObject({ type: 'threshold', level: 0.5 });
   });
 });

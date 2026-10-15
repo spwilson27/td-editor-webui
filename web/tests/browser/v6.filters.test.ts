@@ -160,7 +160,8 @@ describe('filter adjustment layers', () => {
     e.setAdjustment(id, { type: 'filter', effect });
     e.flush();
     const fl = e.layers().find((l) => l.id === id)!;
-    expect(fl.adjustment?.type).toBe('filter');
+    expect(fl.adjustment).toBeNull();
+    expect(fl.effects[0].type).toBe('blur');
     const filtered = ref(below, e.width, e.height, [effect]);
     expect(maxDiff(comp(e), filtered)).toBeLessThanOrEqual(2);
     // half opacity = the premultiplied mix
@@ -204,17 +205,18 @@ describe('filter adjustment layers', () => {
     e.setAdjustment(id, spec);
     const ds = e.docSpec();
     const sp = ds.layers.find((l) => l.id === id)!;
-    expect(sp.adjustment).toMatchObject({ type: 'filter', effect: { type: 'duotone', amount: 80, enabled: true } });
+    expect(sp.adjustment).toBeNull();
+    expect(sp.effects[0]).toMatchObject({ type: 'duotone', amount: 80, enabled: true });
     const e2 = mk();
     e2.loadDocument(ds);
-    expect(e2.layers().find((l) => l.id === id)?.adjustment).toMatchObject({ type: 'filter', effect: { type: 'duotone', amount: 80 } });
+    expect(e2.layers().find((l) => l.id === id)?.effects[0]).toMatchObject({ type: 'duotone', amount: 80 });
     // setAdjustment coalesces like other adjustments
     const n = e.history().entries.length;
     e.setAdjustment(id, { type: 'filter', effect: fx('duotone', { amount: 60 }) });
     e.setAdjustment(id, { type: 'filter', effect: fx('duotone', { amount: 40 }) });
     expect(e.history().entries.length).toBe(n); // coalesced into the previous 'Adjustment' step
     e.undo();
-    expect((e.layers().find((l) => l.id === id)?.adjustment as { effect: { type: string } }).effect.type).toBe('blur'); // the default filter
+    expect(e.layers().find((l) => l.id === id)?.effects[0].type).toBe('blur'); // the default filter
   });
 
   it('a global filter adjustment stays exact when a layer below changes', () => {
@@ -302,7 +304,7 @@ describe('effects on groups and adjustment layers', () => {
     const id = e.addAdjustment('invert');
     e.flush();
     const inverted = comp(e);
-    e.setEffects(id, [effect]);
+    e.setEffects(id, [...e.layers().find((l) => l.id === id)!.effects, effect]); // stack: invert, then the overlay
     e.setLayerProps(id, { opacity: 0.6 });
     e.flush();
     const adjusted = ref(inverted, e.width, e.height, [effect]);
@@ -628,7 +630,7 @@ describe('aux rules aligned with TD, addFilterAdjustment', () => {
     expect(e.history().entries.length).toBe(n + 1);
     const info = e.layers().find((l) => l.id === id)!;
     expect(info.name).toBe('Poster');
-    expect(info.adjustment).toMatchObject({ type: 'filter', effect: { type: 'posterize', levels: 3 } });
+    expect(info.effects[0]).toMatchObject({ type: 'posterize', levels: 3 });
     e.undo();
     expect(e.layers().some((l) => l.id === id)).toBe(false);
   });

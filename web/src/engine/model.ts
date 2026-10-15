@@ -53,7 +53,7 @@ export type SurfaceLayer = PixelLayer;
 
 export interface AdjustmentLayer extends LayerCommon {
   kind: 'adjustment';
-  adjustment: AdjustmentSpec; // replaced wholesale, never mutated
+  adjustment: null; // v7: legacy slot, always null (migrated into effects[], the FX stack applied to everything below)
   mask: Mask | null;
 }
 
@@ -96,11 +96,6 @@ export interface Floating {
 
 export function cloneEffect(e: Effect): Effect {
   return structuredClone(e);
-}
-
-/** Copy of an adjustment spec (a filter adjustment holds a nested effect). */
-export function cloneAdjustment(a: AdjustmentSpec): AdjustmentSpec {
-  return a.type === 'filter' ? { type: 'filter', effect: cloneEffect(a.effect) } : { ...a };
 }
 
 export const BASE_ID = 'base'; // id of the default TD Input 1 layer (v5 migrates a 'base' layer to input 1 and keeps this id)
@@ -327,7 +322,7 @@ export class Document {
           effects: c.effects.map(cloneEffect),
           slot: c.kind === 'pixel' ? c.slot : null,
           mask: c.kind !== 'group' && c.mask ? { slot: c.mask.slot, enabled: c.mask.enabled } : null,
-          adjustment: c.kind === 'adjustment' ? cloneAdjustment(c.adjustment) : null,
+          adjustment: null,
           text: c.kind === 'text' ? cloneText(c.spec) : null,
           shape: c.kind === 'shape' ? cloneShape(c.spec) : null,
           surfaceW: px ? px.surface.width : null, surfaceH: px ? px.surface.height : null,
@@ -359,7 +354,7 @@ export class Document {
           opacity: c.opacity, blend: c.blend, depth, parentId: g === this.root ? null : g.id,
           slot: c.kind === 'pixel' ? c.slot : null,
           mask: c.kind !== 'group' && c.mask ? { slot: c.mask.slot, enabled: c.mask.enabled } : null,
-          adjustment: c.kind === 'adjustment' ? cloneAdjustment(c.adjustment) : null,
+          adjustment: null,
           text: c.kind === 'text' ? cloneText(c.spec) : null,
           shape: c.kind === 'shape' ? cloneShape(c.spec) : null,
           transform: px ? { x: px.x, y: px.y, sx: px.sx, sy: px.sy, rot: px.rot, kx: px.kx, ky: px.ky } : { x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0 },
@@ -387,7 +382,7 @@ export class Document {
       sw: isPixel(l) ? l.surface.width : 0, sh: isPixel(l) ? l.surface.height : 0,
       surface: l.kind === 'pixel' ? l.surface : null, // an input surface is TouchDesigner's: never part of history
       mask: l.kind === 'group' ? null : l.mask, maskEnabled: l.kind !== 'group' && l.mask ? l.mask.enabled : true,
-      adjustment: l.kind === 'adjustment' ? l.adjustment : null,
+      adjustment: null,
       children: l.kind === 'group' ? l.children.map(snap) : null,
       spec: isVector(l) ? l.spec : null,
     });
@@ -405,9 +400,8 @@ export class Document {
       } else if (l.kind !== 'group') {
         l.mask = n.mask;
         if (l.mask) l.mask.enabled = n.maskEnabled;
-        if (l.kind === 'adjustment' && n.adjustment) l.adjustment = n.adjustment;
-        else if (isVector(l)) (l as { spec: unknown }).spec = n.spec;
-        else if (l.kind !== 'adjustment') {
+        if (isVector(l)) (l as { spec: unknown }).spec = n.spec;
+        else if (l.kind !== 'adjustment') { // adjustment layers: effects[] (restored above) is everything
           l.x = n.x;
           l.y = n.y;
           l.sx = n.sx;

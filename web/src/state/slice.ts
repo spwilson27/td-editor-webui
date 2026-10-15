@@ -9,5 +9,5 @@ export interface SliceCtx {
   bridge(): StoreBridge | null;
   activeLayer(): LayerInfo | undefined;
   linked(): boolean;
-  setLayerTab(t: 'layers' | 'history' | 'adjust' | 'fx'): void;
+  setLayerTab(t: 'layers' | 'history' | 'fx'): void;
 }

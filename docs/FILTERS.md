@@ -31,14 +31,19 @@ WebGL2 runner in headless Chromium).  Sources: `shared/effects/<type>.filter.jso
 | `radialBlur` | blur | global | 1 | whole document | no | no |
 | `unsharp` | blur | neighbourhood | 3 | 3 x 3 px | yes | no |
 | `zoomBlur` | blur | global | 1 | whole document | no | no |
+| `brightnessContrast` | color | point | 1 | 0 x 0 px | yes | no |
 | `channelMixer` | color | point | 1 | 0 x 0 px | yes | no |
 | `colorBalance` | color | point | 1 | 0 x 0 px | yes | no |
 | `curves` | color | point | 1 | 0 x 0 px | yes | no |
 | `duotone` | color | point | 1 | 0 x 0 px | yes | no |
 | `gradientMap` | color | point | 1 | 0 x 0 px | yes | no |
+| `hueSaturation` | color | point | 1 | 0 x 0 px | yes | no |
+| `invert` | color | point | 1 | 0 x 0 px | yes | no |
+| `levels` | color | point | 1 | 0 x 0 px | yes | no |
 | `lut` | color | point | 1 | 0 x 0 px | yes | no |
 | `posterize` | color | point | 1 | 0 x 0 px | yes | no |
 | `selectiveColor` | color | point | 1 | 0 x 0 px | yes | no |
+| `threshold` | color | point | 1 | 0 x 0 px | yes | no |
 | `vibrance` | color | point | 1 | 0 x 0 px | yes | no |
 | `displace` | distort | neighbourhood | 1 | 16 x 16 px | no | no |
 | `kaleidoscope` | distort | global | 1 | whole document | no | no |
@@ -58,6 +63,58 @@ WebGL2 runner in headless Chromium).  Sources: `shared/effects/<type>.filter.jso
 
 v5 effects (`dropShadow outerGlow innerGlow stroke bevel colorOverlay pixelSort glitch chromaticAberration halftone`) are unchanged except that their blur passes use the
 pyramid above 16 px; `pixelSort` is flagged `tdPreview` (see below).
+
+## Classic adjustments as filters (v7)
+
+`levels`, `brightnessContrast`, `hueSaturation`, `invert`, `threshold` are the v2 adjustment layers as ordinary filters (point ops, `reads: point`, alpha preserved,
+straight sRGB colour; params, units, ranges and defaults are exactly the `AdjustmentSpec` variants of `web/src/engine/types.ts`).  Identity settings (`levels`,
+`brightnessContrast`, `hueSaturation` at their defaults) plan no passes; `invert` and `threshold` always run.  Spec notes: `levels` keeps `inHigh >= inLow + 1e-4`
+(`hi = max(inHigh, inLow + 1e-4)`, as TD did), `hueSaturation` is the true HSV edit of `blend.glsl` uAdjust 6 (hue in degrees, positive = red -> green -> blue).
+
+Parity vs the **old adjustment outputs** (numpy reference of the v2 formulas on the 8-bit premultiplied test image, `scripts/effects_dev.py old_adjust_ref`; max over the
+samples, /255, tolerance 1.0): TD levels 0.50, brightnessContrast 0.50, hueSaturation 0.50, invert 0.00, threshold 0.00 (0 pixels > 1); WebGL2 (Metal) levels 0.92,
+brightnessContrast 0.86, hueSaturation 0.96, invert 0.46, threshold 0.00 (SwiftShader the same within 0.01).  The browser values are slightly larger than TD's because the
+web result is 8-bit premultiplied; TD vs WebGL2 itself is in the table below (max 0.47 Metal, 1.44 SwiftShader).  `web/tests/browser/effects.filters.adjust.test.ts`
+checks the same against `adjustments.ts` (`levelsLut`, `brightnessContrastLut`, `hsvAdjust`, `luminance`).  Threshold and hue are discontinuous, so a pixel whose luma / hue
+lands exactly on a step could flip; none did in the samples.
+
+### Blur: the v6 Blur adjustment as the `blur` filter (edge hold + sigma)
+
+The adjustment blur has sigma = `radius` px (0..200) and repeats the document's edge pixels outside the document; the plain `blur` filter has sigma = `radius / 3` and reads
+transparent outside.  v7 adds two optional blur params (defaults leave all existing output unchanged, vectors of every other case are identical):
+
+- `sigma` (px, 0..200, default 0 = radius / 3): > 0 overrides `radius`; the kernel half width is then 4 sigma while that is <= 16 px (exact separable path, no truncation error),
+  else 3 sigma, capped at 600 px (pyramid level up to 6, the plain `radius` cap stays 200).
+- `edge` (`transparent` | `hold`, default `transparent`): `hold` clamps every read (full-resolution taps, the pyramid down-sample box, the low-res taps and the bilinear
+  up-sample margins) to the document, so it works in the pyramid and in partial-region renders (`effects.filters.test.ts` partial == full covers the hold samples at borders and corners).
+
+**Canonical migration** (one place; `legacyBlurToFilter(r)` in `web/src/engine/effects/filters.ts`, re-exported from `engine/effects`, mirrored by `legacy_blur_to_filter(r)` in
+`td/raster_editor/effects.py`): `{type:'blur', radius: r}` -> `{enabled:true, type:'blur', radius: k, sigma: r, edge:'hold'}`, `r` clamped 0..200, `k = min(200, 4r)` if `4r <= 16`
+else `min(200, 3r)` (`radius` is informational once `sigma > 0`), and `r < 0.05` (the old identity) -> `radius: 0, sigma: 0` (plans no passes).
+
+Parity vs the old adjustment blur (numpy gaussian, sigma = r, premultiplied 8 bit source, edge hold; `scripts/effects_dev.py old_blur_ref`; /255; border band = within 4 sigma
+of the document edge, whole image for r = 200; max over the band / the interior):
+
+| adjustment radius | planned as | TD border | WebGL border | TD interior | WebGL interior |
+|---|---|---|---|---|---|
+| 2 | exact, kernel 8 | 0.52 | 0.75 | 0.61 | 1.01 |
+| 4 | exact, kernel 16 | 0.58 | 0.92 | 0.59 | 1.03 |
+| 10 | pyramid L1, kernel 30 | 1.38 | 1.43 | 1.04 | 1.13 |
+| 16 | pyramid L2, kernel 48 | 1.77 | 1.77 | 0.87 | 1.14 |
+| 200 (old max) | pyramid L6, kernel 600 | 0.74 | 0.74 | 0.54 | 0.54 |
+
+SwiftShader: the same within 0.2 (worst 1.89 at r = 16).  The exact path (r <= 4) is within the 8-bit rounding (<= ~1/255, WebGL's u8 intermediate costs the extra 0.4);
+the pyramid cases (r >= 5) carry the pyramid's documented error (1.1 .. 2.4 /255) and are NOT within 1/255 - the border is no worse than the interior.  TD vs WebGL for the hold
+samples is in the parity table (`blur` rows: Metal max 0.50, SwiftShader 1.50; rows `blur as adjustment`).  `web/tests/browser/effects.filters.adjust.test.ts` checks
+`legacyBlurToFilter` against a hold gaussian over the whole image for r = 2 .. 200 (<= 2/255) and `td/tests/test_effects_color.py` the mapping and the plan.
+
+Live TD check of the migrated adjustment (`scripts/network_dev.py adjust`, blur of a structured image touching the document border, numpy gaussian reference with edge hold, /255):
+r = 3: max 0.62 / mean 0.11; r = 8: 1.17 / 0.18; r = 20: 1.27 / 0.21 (256 px); r = 40: 1.38 / 0.22 (512 px); r = 100: 2.95 / 0.32; r = 200: 1.78 / 0.31 (512 px).  Against the
+real v0.6.0 network (`network_dev.py v7` / `v6` ref) the new blur differs by max ~4/255 (mean 0.7): both are approximations of the same gaussian with different pyramid
+plans (v6 planned the pyramid from `radius`, the filter from `sigma` with kernel `3 sigma`), each within ~1.5/255 of the exact gaussian, so a ~4/255 spread between them
+is acceptable and equals the browser-vs-v6 spread (web `effects.filters.adjust.test.ts`, <= 2/255 from the exact gaussian).  Regression (found by this check): the pyramid
+textures were sized from the effect input's reported size, which is the stale 256 x 256 default for a TOP that has not cooked yet; a 512 px document with blur 40 came out
+garbage (max 255).  The chain now takes the document size (`EffectChain.apply(..., doc_w, doc_h)`; `test_chain_pyramid_size_follows_the_document_not_a_stale_input_top`).
 
 ### Whole-document (global-extent) filters
 
@@ -84,7 +141,13 @@ Chromium's software rasteriser, used as the "different GPU implementation" worst
 | bevel (v5 effect) | 1 | 0.46 | 0.009 | 1.20 | 0.010 |  |
 | bevel pyramid 60 (v5 effect) | 1 | 0.47 | 0.011 | 1.45 | 0.019 |  |
 | bloom | 3 | 0.50 | 0.025 | 1.46 | 0.052 |  |
-| blur | 3 | 0.50 | 0.061 | 1.49 | 0.102 |  |
+| blur (incl. sigma / edge hold samples) | 7 | 0.50 | 0.040 | 1.50 | n/a |  |
+| blur as adjustment, radius 2 (legacyBlurToFilter) | 1 | 0.50 | 0.021 | 1.49 | 0.027 |  |
+| blur as adjustment, radius 4 (legacyBlurToFilter) | 1 | 0.50 | 0.031 | 1.49 | 0.040 |  |
+| blur as adjustment, radius 10 (legacyBlurToFilter) | 1 | 0.50 | 0.053 | 1.49 | 0.094 |  |
+| blur as adjustment, radius 16 (legacyBlurToFilter) | 1 | 0.49 | 0.066 | 1.49 | 0.109 |  |
+| blur as adjustment, radius 200 (legacyBlurToFilter) | 1 | 0.03 | 0.007 | 1.02 | n/a |  |
+| brightnessContrast | 5 | 0.47 | 0.009 | 1.36 | 0.009 |  |
 | channelMixer | 3 | 0.47 | 0.015 | 1.25 | 0.016 |  |
 | chromaticAberration (v5 effect) | 1 | 0.47 | 0.009 | 1.00 | 0.010 |  |
 | colorBalance | 3 | 0.47 | 0.011 | 0.47 | 0.011 |  |
@@ -109,19 +172,22 @@ Chromium's software rasteriser, used as the "different GPU implementation" worst
 | halftone dot (v5 effect) | 1 | 0.49 | 0.017 | 1.20 | 0.019 |  |
 | halftone line (v5 effect) | 1 | 0.48 | 0.016 | 1.14 | 0.018 |  |
 | highPass | 2 | 0.47 | 0.018 | 1.42 | 0.035 |  |
+| hueSaturation | 5 | 0.47 | 0.007 | 1.44 | 0.016 |  |
 | innerGlow (v5 effect) | 1 | 0.45 | 0.004 | 1.40 | 0.005 |  |
 | innerGlow pyramid 70 (v5 effect) | 1 | 0.45 | 0.004 | 1.33 | 0.016 |  |
+| invert | 1 | 0.46 | 0.009 | 0.46 | 0.009 |  |
 | kaleidoscope | 4 | 0.49 | 0.056 | 1.36 | 0.056 |  |
 | kuwahara | 3 | 0.49 | 0.013 | 1.43 | 0.057 |  |
 | lensBlur | 4 | 0.50 | 0.069 | 1.48 | 0.097 |  |
 | lensDistortion | 4 | 0.49 | 0.013 | 1.46 | 0.040 |  |
+| levels | 5 | 0.46 | 0.006 | 1.09 | 0.006 |  |
 | lut | 2 | 0.46 | 0.018 | 1.00 | 0.023 |  |
 | motionBlur | 3 | 0.50 | 0.057 | 1.47 | 0.069 |  |
 | outerGlow (v5 effect) | 1 | 0.49 | 0.024 | 1.46 | 0.028 |  |
 | outerGlow pyramid 100 (v5 effect) | 1 | 0.49 | 0.042 | 1.47 | 0.077 |  |
+| pixelate | 3 | 0.47 | 0.041 | 1.00 | 0.041 |  |
 | pixelSort h luma (v5 effect) | 1 | 0.46 | 0.009 | 0.46 | 0.009 |  |
 | pixelSort v hue (v5 effect) | 1 | 0.46 | 0.009 | 159.00 | 0.031 | tdPreview |
-| pixelate | 3 | 0.47 | 0.041 | 1.00 | 0.041 |  |
 | polar | 4 | 0.49 | 0.007 | 1.00 | 0.007 |  |
 | posterize | 3 | 0.33 | 0.012 | 1.00 | 0.058 |  |
 | radialBlur | 3 | 0.50 | 0.055 | 1.20 | 0.055 |  |
@@ -131,6 +197,7 @@ Chromium's software rasteriser, used as the "different GPU implementation" worst
 | stroke centre (v5 effect) | 1 | 0.46 | 0.007 | 1.00 | 0.008 |  |
 | stroke inside (v5 effect) | 1 | 0.47 | 0.013 | 0.47 | 0.013 |  |
 | stroke outside (v5 effect) | 1 | 0.47 | 0.010 | 0.47 | 0.010 |  |
+| threshold | 5 | 0.00 | 0.000 | 0.00 | 0.000 |  |
 | tileMirror | 4 | 0.49 | 0.011 | 1.40 | 0.052 |  |
 | twirl | 4 | 0.49 | 0.010 | 1.02 | 0.010 |  |
 | unsharp | 2 | 0.46 | 0.008 | 2.00 | 0.047 |  |

@@ -266,11 +266,17 @@ Extension (`ext.py`), all on the main thread, bounded per pump, nothing large on
   connect. `doc_state` stores `{rev, layers, guides, canvas:{mode}}`; a restore puts the stored mode back into `Docsizemode`
   (the parameter is the single source of truth while running: the `canvas` of an incoming `doc` is informational). Before a client
   sent a document the network gets a default base layer (surface = input size; Fixed mode: fitted and centred).
-- **Flatten.** `renderLayer {requestId, layerId}` (active client): `network.render_layer_source(layerId)` -> TOP, read back through
-  the same budgeted two-step pipeline as a TOP import (shrunk/stretched on the GPU only if its size differs from the document),
-  un-premultiplied per `Premultiplied`, served as a type-6 frame of the *document* size (`topReady` + `GET /top`; errors `topError`:
-  not a text/shape layer, restoring, document too large (> 32 Mpx), document resized meanwhile). It shares the import queue
-  (one job per client, newest wins).
+- **Flatten / merge (v8).** `renderLayer {requestId, layerId, mode?: flatten|mergeDown}` and `renderLayers {requestId, layerIds}` (active
+  client). The job opens a render request on the network (`network.render_open(key, ...)`: a temporary network `rqout_q<n>` planned together
+  with the document from a synthetic copy of the requested layers, sharing the surfaces; closed again when the job ends), then reads
+  `network.render_source(key)` back through the same budgeted two-step pipeline as a TOP import, un-premultiplied per `Premultiplied`,
+  and serves it as a type-6 frame of the *document* size (`topReady` + `GET /top`). `flatten` = the layer alone (opacity 1, Normal, visible;
+  mask, transform, effects kept; a group with its children); an adjustment layer flattens as `mergeDown` = the layer below it (as flatten)
+  with the adjustment's stack mixed by its opacity x mask; `renderLayers` = those layers in stack order, each with its own opacity / blend /
+  visibility (a selected group's children come with it). `network.render_token(key)` (request layers' specs, document size, node identity,
+  text layouts, cook counters of the surfaces read) is checked before and after the readback ("layer changed"). `topError`: restoring,
+  unknown layer, nothing below the adjustment, document too large (> 32 Mpx), document resized meanwhile. Shares the import queue (one job
+  per client, newest wins).
 - **Export with Document.** `Exportdoc` (pulse) -> `ExportDoc()`: refuse while a restore is pending, `Exportpath` made absolute
   (relative = project folder, `.tox` appended, folder must exist), `Freeze()` -> `comp.save(<name>.part.tox)` -> rename -> `Thaw()`
   (always). The outcome stays in `Status` for 10 s ("exported with document to ..." / "export failed: ..."); a success clears the
@@ -331,3 +337,16 @@ See `PROTOCOL.md` section 9 for the wire details. Extension behaviour:
   `network.set_active_layer` / `set_content_bounds` and re-applies the stack once when either changed.
 - **`chooseFile readText`**: file dialog + UTF-8 read (<= 12 MB) in the pump, `fileChosen.text`.
 - Tests: `td/tests/test_ext_v7.py`, `test_protocol_v7.py`; live: `scripts/validate_td.py` steps 39-47.
+
+## 11. Protocol v8 additions (DESIGN_V7): unified adjustments, render requests
+
+- **Adjustment layers = effect stacks.** `protocol.parse_doc` migrates every v2..v7 `adjustment` spec (classic `levels` / `brightnessContrast` /
+  `hueSaturation` / `invert` / `threshold` / `blur`, or `{type:"filter", effect}`) to `adjustment: null` + the spec's effect prepended to
+  `effects[]` (blur through `effects.legacy_blur_to_filter`); this also runs on `.redoc` files. In the network an adjustment layer is an
+  `EffectChain` (`fx_<id>_*`) over the accumulated image `acc`, mixed by `blend_L_<id>` (blend.glsl uAdjust 1: `mix(below, chain(acc),
+  opacity x mask)`). The old special passes (`adj_L_*` Blur TOPs, blur pyramid, `adjx_L_*`, blend.glsl uAdjust 2..6 / 9 / 10) are gone. An
+  adjustment whose stack draws nothing is skipped (`noop`) or mixes the image with itself. Adjustments still break merged runs and need
+  16 bit inputs.
+- **Render requests** (see "Flatten / merge" above): `network.render_open / render_source / render_token / render_status / render_close`.
+- Tests: `td/tests/test_v8.py`; live: `scripts/network_dev.py v8` (chain vs the v0.6.0 passes, requests vs layers composited alone),
+  `scripts/validate_td.py` steps 48-50.

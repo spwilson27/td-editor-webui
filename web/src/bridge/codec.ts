@@ -1,4 +1,4 @@
-// Pure encode/decode of docs/PROTOCOL.md (version 7). No sockets here.
+// Pure encode/decode of docs/PROTOCOL.md (version 8). No sockets here.
 import type { BrushPreset, CanvasMode, Guides, LayerSpec } from '../engine/types';
 import type { FileOp, FileResult } from '../state/filesSlice';
 import type { InputItem } from '../state/inputsSlice';
@@ -6,7 +6,8 @@ import type { InputItem } from '../state/inputsSlice';
 export const MAGIC = [0x52, 0x45, 0x46, 0x31]; // "REF1"
 export const HEADER_BYTES = 24;
 export const MAX_BAND_PAYLOAD = 2 * 1024 * 1024;
-export const PROTOCOL_VERSION = 7;
+export type RenderMode = 'flatten' | 'mergeDown';
+export const PROTOCOL_VERSION = 8;
 export const FRAME_BASE = 1;
 export const FRAME_SURFACE = 3;
 export const FRAME_SURFACE_DUMP = 4;
@@ -148,7 +149,8 @@ export type WebMessage =
   | { t: 'listTops'; requestId: string }
   | { t: 'importTop'; requestId: string; path: string }
   | { t: 'setCanvas'; w: number; h: number; mode: CanvasMode } // v5
-  | { t: 'renderLayer'; requestId: string; layerId: string } // v5: Flatten
+  | { t: 'renderLayer'; requestId: string; layerId: string; mode?: RenderMode } // v5: Flatten; v8 mode (default 'flatten')
+  | { t: 'renderLayers'; requestId: string; layerIds: string[] } // v8: isolated composite of these layers (Merge Selected)
   | { t: 'saveProject'; requestId: string; path?: string; includeHistory?: boolean } // v6; v7 includeHistory (default true): false = TD writes no history.bin
   | { t: 'openProject'; requestId: string; path?: string }
   | { t: 'exportPng'; requestId: string; path?: string }
@@ -351,7 +353,10 @@ export function decodeWebMessage(text: string): WebMessage | null {
     case 'setCanvas':
       return isMode(o.mode) && (o.mode === 'input' || (isSize(o.w) && isSize(o.h))) ? { t: 'setCanvas', w: isNum(o.w) ? o.w : 0, h: isNum(o.h) ? o.h : 0, mode: o.mode } : null;
     case 'renderLayer':
-      return isStr(o.requestId) && isStr(o.layerId) ? { t: 'renderLayer', requestId: o.requestId, layerId: o.layerId } : null;
+      if (o.mode !== undefined && o.mode !== 'flatten' && o.mode !== 'mergeDown') return null;
+      return isStr(o.requestId) && isStr(o.layerId) ? { t: 'renderLayer', requestId: o.requestId, layerId: o.layerId, ...(o.mode ? { mode: o.mode as RenderMode } : {}) } : null;
+    case 'renderLayers':
+      return isStr(o.requestId) && Array.isArray(o.layerIds) && o.layerIds.length > 0 && o.layerIds.every(isStr) ? { t: 'renderLayers', requestId: o.requestId, layerIds: o.layerIds as string[] } : null;
     case 'saveProject':
     case 'openProject':
     case 'exportPng':

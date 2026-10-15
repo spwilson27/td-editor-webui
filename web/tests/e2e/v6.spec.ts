@@ -22,7 +22,7 @@ const pixelLayer = async (page: Page) => (await layers(page)).find((l) => l.kind
 
 test('protocol 7 hello, activeLayer follows the active layer', async ({ page }) => {
   await open(page);
-  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 7 });
+  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 8 });
   const id = await hook<string>(page, 'addLayer');
   await td.waitFor(() => td.activeLayers.includes(id));
   const other = (await layers(page)).find((l) => l.id !== id)!.id;
@@ -46,23 +46,23 @@ test('filter effect round trip: TD stores it verbatim and a fresh page gets it b
   expect(((await layers(page)).find((l) => l.id === id)!.effects[0] as any).amount).toBe(180);
 });
 
-test('filter adjustment layer reaches TD as {type:"filter", effect} and survives a reload', async ({ page }) => {
+test('adjustment layer reaches TD as an FX stack (effects[]) and survives a reload', async ({ page }) => {
   await open(page);
   const id = await hook<string>(page, 'addFilterAdjustment', 'posterize', { levels: 5 });
-  await td.waitFor(() => !!td.doc?.layers.find((l) => l.id === id && l.adjustment?.type === 'filter'));
-  expect(td.doc!.layers.find((l) => l.id === id)!.adjustment).toMatchObject({ type: 'filter', effect: { type: 'posterize', enabled: true, levels: 5 } });
+  await td.waitFor(() => !!td.doc?.layers.find((l) => l.id === id && l.kind === 'adjustment' && (l.effects as any[])[0]?.type === 'posterize'));
+  expect(td.doc!.layers.find((l) => l.id === id)!.effects).toMatchObject([{ type: 'posterize', enabled: true, levels: 5 }]); // v8: the FX stack is the adjustment
   await page.goto(url(td));
-  await expect.poll(async () => (await layers(page)).find((l) => l.id === id)?.adjustment?.effect?.levels).toBe(5);
+  await expect.poll(async () => (await layers(page)).find((l) => l.id === id)?.effects?.[0]?.levels).toBe(5);
   await expect(page.locator(`[data-layer="${id}"]`)).toBeVisible();
 });
 
 test('the Layer menu creates filter adjustments in the browser UI', async ({ page }) => {
   await open(page);
   await page.getByRole('button', { name: 'Layer', exact: true }).click();
-  await page.locator('[data-flyout=filters]').click();
-  await page.locator('[data-new-filter-adjustment=vibrance]').click();
-  await td.waitFor(() => !!td.doc?.layers.some((l) => l.adjustment?.type === 'filter'));
-  await expect(page.locator('[data-adjust-type=filter]')).toBeVisible();
+  await page.locator('[data-flyout=adjustments]').click();
+  await page.locator('[data-new-adjustment=vibrance]').click();
+  await td.waitFor(() => !!td.doc?.layers.some((l) => l.kind === 'adjustment' && (l.effects as any[])[0]?.type === 'vibrance'));
+  await expect(page.locator('[data-effects-panel] [data-effect=vibrance]')).toBeVisible();
 });
 
 test('undo history is uploaded to TD (rev of the stored document) and persists across a page reload: undo works afterwards', async ({ page }) => {

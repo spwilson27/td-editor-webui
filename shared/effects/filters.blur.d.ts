@@ -1,7 +1,13 @@
 // Blur & sharpen filters (see filters.d.ts for the conventions and the blur pyramid note).
 export type BlurFilter =
   /** Gaussian blur; radius = kernel half width (sigma = radius / 3). threshold/knee: blur only the bright part (bloom building block). */
-  | { type: 'blur'; radius: number /* px 0..200 */; threshold?: number /* 0..1, 0 = all */; knee?: number /* 0..1 */ }
+  | {
+      type: 'blur'; radius: number /* px 0..200 */; threshold?: number /* 0..1, 0 = all */; knee?: number /* 0..1 */;
+      /** v7: > 0 overrides `radius`: gaussian sigma in px 0..200 (kernel half width 4 sigma while <= 16 px, else 3 sigma, up to 600 px). Default 0 = radius / 3. */
+      sigma?: number;
+      /** v7: outside the document: 'transparent' (default) or 'hold' (repeat the edge pixels; the v6 adjustment blur). Works in the pyramid and for regions. */
+      edge?: 'transparent' | 'hold';
+    }
   /** out = src + amount * (src - blur) where |src - blur| >= threshold. */
   | { type: 'unsharp'; amount: number /* % 0..500 */; radius: number /* px 0..200 */; threshold: number /* levels 0..255 */ }
   /** straight colour = 0.5 + (src - blur); alpha kept. */

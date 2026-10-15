@@ -34,8 +34,8 @@ describe('layers panel: text and shape layers', () => {
   });
 
   const bridgeStub = (calls: string[], fail?: string) => ({
-    listTops: async () => [], importTop: async () => '',
-    renderLayer: async (id: string) => { calls.push(`render:${id}`); if (fail) throw new Error(fail); engine.replaceWithPixels(id, new Uint8Array(64 * 48 * 4), 64, 48); },
+    listTops: async () => [], importTop: async () => '', renderLayers: async () => undefined,
+    renderLayer: async (id: string, _mode?: string) => { calls.push(`render:${id}`); if (fail) throw new Error(fail); engine.replaceWithPixels(id, new Uint8Array(64 * 48 * 4), 64, 48); },
   });
 
   it('there is no Rasterize checkbox or properties strip any more', async () => {
@@ -46,7 +46,7 @@ describe('layers panel: text and shape layers', () => {
     expect(document.body.textContent).not.toMatch(/Rasterize/);
   });
 
-  it('text and shape rows get a Flatten button next to the lock; pixel and base rows do not', async () => {
+  it('every row gets a Flatten button next to the lock (disabled for a plain pixel layer and input layers)', async () => {
     const t = engine.addTextLayer(completeTextSpec({ text: 'T' }));
     const s = engine.addShapeLayer(completeShapeSpec({ type: 'rect' }));
     const p = engine.addPixelLayer('Px');
@@ -59,8 +59,10 @@ describe('layers panel: text and shape layers', () => {
       const lock = q(`[data-layer="${id}"] [data-act=lock]`);
       expect(btn.nextElementSibling).toBe(lock); // directly before the lock
     }
-    expect(document.querySelector(`[data-layer="${p}"] [data-act=flatten]`)).toBeNull();
-    expect(document.querySelector('[data-layer="base"] [data-act=flatten]')).toBeNull();
+    for (const id of [p, 'base']) {
+      expect(q(`[data-layer="${id}"] [data-act=flatten]`).nextElementSibling).toBe(q(`[data-layer="${id}"] [data-act=lock]`));
+      expect(q(`[data-layer="${id}"] [data-act=flatten]`).getAttribute('aria-disabled')).toBe('true'); // plain pixel layer / input layer: nothing to bake
+    }
   });
 
   it('standalone: the Flatten button is disabled with an explanatory tooltip and does nothing', async () => {
@@ -88,7 +90,7 @@ describe('layers panel: text and shape layers', () => {
     expect(calls).toEqual([`render:${t}`]);
     expect(engine.replaced).toMatchObject([{ id: t, w: 64, h: 48 }]);
     expect(engine.layers().find((l) => l.id === t)!.kind).toBe('pixel');
-    expect(document.querySelector(`[data-layer="${t}"] [data-act=flatten]`)).toBeNull();
+    expect(q(`[data-layer="${t}"] [data-act=flatten]`).getAttribute('aria-disabled')).toBe('true'); // now a plain pixel layer
     store.bridge = null;
   });
 
@@ -119,7 +121,7 @@ describe('Layer menu', () => {
   beforeEach(async () => { await mount(<TopBar />, 'width:1200px'); });
 
   it('Flatten Layer is enabled for text / shape layers while linked; there is no Rasterize item', async () => {
-    store.bridge = { listTops: async () => [], importTop: async () => '', renderLayer: async (id: string) => { engine.replaceWithPixels(id, new Uint8Array(64 * 48 * 4), 64, 48); } };
+    store.bridge = { listTops: async () => [], importTop: async () => '', renderLayers: async () => undefined, renderLayer: async (id: string) => { engine.replaceWithPixels(id, new Uint8Array(64 * 48 * 4), 64, 48); } };
     store.connection.value = 'linked';
     await openMenu('Layer');
     expect(item('Flatten Layer').getAttribute('aria-disabled')).toBe('true');

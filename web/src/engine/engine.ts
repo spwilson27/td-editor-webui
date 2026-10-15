@@ -3,10 +3,11 @@ import type {
   Guides, HistoryEntry, LayerInfo, LayerTransform, PaintTarget, Rect, RGBA, SelectionOptions, ShapeSpec, ShapeType, SnapOptions, TextSpec,
   ToolContext, ToolId, ToolPointer,
 } from './types';
-import { ADJUSTMENT_NAMES, clampAdjustment, defaultAdjustment, isIdentity, sameAdjustment } from './adjustments';
+import { ADJUSTMENT_NAMES, clampAdjustment, defaultAdjustmentEffect, effectFromAdjustment, effectLabel, migrateAdjustmentEffects, stackIsIdentity } from './adjustments';
+import { CLASSIC_EFFECT_TYPES } from './adjustmentTypes';
 import { Compositor } from './compositor';
 import { sanitizeEffects, sameEffects } from './effectsSanitize';
-import { effectIsTdPreview, tdPreviewFlag } from './effectsAdapter';
+import { tdPreviewFlag } from './effectsAdapter';
 export { sanitizeEffect } from './effectsSanitize';
 import { History, type HistoryItem } from './history';
 import {
@@ -804,16 +805,17 @@ export class Engine implements EditorEngine, Host {
   }
 
   addAdjustment(type: AdjustmentType): string {
-    return this.addAdj(defaultAdjustment(type), ADJUSTMENT_NAMES[type]);
+    return this.addAdjustmentLayer([defaultAdjustmentEffect(type)], ADJUSTMENT_NAMES[type]);
   }
 
-  /** v6: a filter adjustment layer with its initial effect in one history entry (selection-limited like addAdjustment). Returns the layer id. */
+  /** v6 wrapper: a filter adjustment layer whose stack is [effect]. */
   addFilterAdjustment(effect: Effect, name?: string): string {
-    const spec = clampAdjustment({ type: 'filter', effect });
-    return this.addAdj(spec, name ?? ADJUSTMENT_NAMES.filter);
+    return this.addAdjustmentLayer([effect], name ?? ADJUSTMENT_NAMES.filter);
   }
 
-  private addAdj(adjustment: AdjustmentSpec, name: string): string {
+  /** v7: an adjustment layer = FX stack over everything below (selection-limited mask as before), one history entry. */
+  addAdjustmentLayer(effects: Effect[], name?: string): string {
+    const stack = sanitizeEffects(effects);
     // v6: with a selection the layer starts with a mask holding its coverage (document sized, feathered as the selection is); the selection stays
     const sel = this.sel.rect ? this.sel : null;
     let mask: Mask | null = null;
@@ -823,22 +825,26 @@ export class Engine implements EditorEngine, Host {
       mask = { slot: this.doc.newSlot(), surface, enabled: true };
     }
     const layer: AdjustmentLayer = {
-      id: this.doc.newId(), kind: 'adjustment', name, visible: true, locked: false,
-      opacity: 1, blend: 'normal', adjustment, mask, effects: [],
+      id: this.doc.newId(), kind: 'adjustment', name: name ?? (stack.length === 1 ? effectLabel(stack[0]) : 'Adjustment'), visible: true, locked: false,
+      opacity: 1, blend: 'normal', adjustment: null, mask, effects: stack,
     };
-    this.insertAboveActive('Add adjustment', layer, isIdentity(adjustment) ? false : sel ? sel.rect : null);
+    this.insertAboveActive('Add adjustment', layer, stackIsIdentity(stack) ? false : sel ? sel.rect : null);
     return layer.id;
   }
 
+  /** v7 wrapper: sets the layer's primary (first) effect from a legacy spec (prepends it when the stack is empty). */
   setAdjustment(id: string, spec: AdjustmentSpec): void {
     const l = this.doc.find(id);
     if (!l || l.kind !== 'adjustment') return;
-    const next = clampAdjustment(spec);
-    if (sameAdjustment(next, l.adjustment)) return;
-    this.finishStroke();
-    const before = this.doc.snapshot();
-    l.adjustment = next;
-    this.commitStructure('Adjustment', before, `adj:${id}`, l.visible && l.opacity > 0 ? null : false);
+    const e = effectFromAdjustment(clampAdjustment(spec));
+    if (!e) return;
+    const next = l.effects.slice();
+    const head = next[0];
+    // replace the primary effect only when it is what a legacy spec means: a classic adjustment / blur, or the same filter type; else prepend
+    const owns = head && (CLASSIC_EFFECT_TYPES.has(head.type) || (head.type as string) === 'blur' || (spec.type === 'filter' && head.type === e.type));
+    if (owns) next[0] = { ...e, enabled: head.enabled };
+    else next.unshift(e);
+    this.setEffectsAs(id, next, 'Adjustment', `adj:${id}`);
   }
 
   addMask(layerId: string): number {
@@ -953,6 +959,134 @@ export class Engine implements EditorEngine, Host {
     const visible = ext && intersect(ext, { x: 0, y: 0, w: this.doc.width, h: this.doc.height });
     const affectsPixels = keys.some((k) => k !== 'name' && k !== 'locked');
     this.commitStructure(single ? PROP_LABELS[single] : 'Layer properties', before, single === 'opacity' ? `opacity:${id}` : undefined, affectsPixels ? visible ?? false : false);
+  }
+
+  // ---- v7: batch layer operations (each is one history entry) ----
+
+  /** Existing layers of `ids` in display order (top first, depth first), without any layer whose ancestor is also listed; `all` keeps the nested ones. */
+  private pickLayers(ids: readonly string[], all = false): Layer[] {
+    const want = new Set(ids);
+    const out: Layer[] = [];
+    const walk = (g: GroupLayer, covered: boolean): void => {
+      for (const c of g.children) {
+        const hit = want.has(c.id);
+        if (hit && (all || !covered)) out.push(c);
+        if (c.kind === 'group') walk(c, covered || hit);
+      }
+    };
+    walk(this.doc.root, false);
+    return out;
+  }
+
+  /** Like structural(), but `mutate` returns false when it changed nothing: then no history entry is made. */
+  private structuralIf(label: string, mutate: () => boolean, dirty: Rect | null | false = null): boolean {
+    this.finishStroke();
+    const before = this.doc.snapshot();
+    if (!mutate()) return false;
+    this.commitStructure(label, before, undefined, dirty);
+    return true;
+  }
+
+  /** Layout signature (ids and parents in order), to detect a move that changed nothing. */
+  private layoutKey(): string {
+    const walk = (g: GroupLayer): string => `${g.id}(${g.children.map((c) => (c.kind === 'group' ? walk(c) : c.id)).join(',')})`;
+    return walk(this.doc.root);
+  }
+
+  deleteLayers(ids: string[]): void {
+    this.finishStroke(); // first: it may commit a floating selection; handles below are located afterwards
+    const sel = this.pickLayers(ids);
+    if (!sel.length) return;
+    const first = this.doc.locate(sel[0].id) as { parent: GroupLayer; index: number };
+    const gone = new Set<Layer>(sel);
+    const above = first.parent.children.slice(0, first.index).filter((c) => !gone.has(c)).length;
+    this.structuralIf(sel.length === 1 ? 'Delete layer' : 'Delete layers', () => {
+      for (const l of sel) {
+        const loc = this.doc.locate(l.id);
+        if (loc) loc.parent.children.splice(loc.index, 1);
+      }
+      if (!this.doc.find(this.doc.activeId)) {
+        const sibs = first.parent.children;
+        const next = sibs[above] ?? sibs[above - 1] ?? (first.parent === this.doc.root ? null : first.parent);
+        this.doc.activeId = (next ?? this.doc.root.children[0])?.id ?? null;
+      }
+      return true;
+    });
+    this.thumbs.forEach((_, k) => { if (!this.doc.find(k)) this.thumbs.delete(k); });
+  }
+
+  setLayersProps(ids: string[], props: Partial<Pick<LayerInfo, 'visible' | 'locked'>>): void {
+    this.finishStroke();
+    const todo: Array<[Layer, Partial<Record<'visible' | 'locked', boolean>>]> = [];
+    for (const l of this.pickLayers(ids, true)) {
+      const ch: Partial<Record<'visible' | 'locked', boolean>> = {};
+      if (props.visible !== undefined && l.visible !== !!props.visible) ch.visible = !!props.visible;
+      if (props.locked !== undefined && l.kind !== 'input' && l.locked !== !!props.locked) ch.locked = !!props.locked;
+      if (Object.keys(ch).length) todo.push([l, ch]);
+    }
+    if (!todo.length) return;
+    this.finishStroke();
+    const before = this.doc.snapshot();
+    let area: Rect | null = null;
+    let pixels = false;
+    for (const [l, ch] of todo) {
+      if (ch.visible !== undefined) {
+        pixels = true;
+        const ext = layerExtent(l, this.docRect());
+        area = area ? union(area, ext) : ext;
+        l.visible = ch.visible;
+      }
+      if (ch.locked !== undefined) l.locked = ch.locked;
+    }
+    const keys = new Set(todo.flatMap(([, ch]) => Object.keys(ch)));
+    const label = keys.size === 1 ? (keys.has('visible') ? PROP_LABELS.visible : PROP_LABELS.locked) : 'Layer properties';
+    const vis = area && intersect(area, this.docRect());
+    this.commitStructure(label, before, undefined, pixels ? vis ?? false : false);
+  }
+
+  moveLayers(ids: string[], targetParentId: string | null, index: number): void {
+    this.finishStroke();
+    const sel = this.pickLayers(ids);
+    if (!sel.length) return;
+    const target = targetParentId === null ? this.doc.root : this.doc.find(targetParentId);
+    if (!target || target.kind !== 'group') return;
+    for (const l of sel) if (l === target || (l.kind === 'group' && this.isInside(l, target))) return; // a group cannot enter itself
+    const key = this.layoutKey();
+    this.structuralIf(sel.length === 1 ? 'Move layer' : 'Move layers', () => {
+      for (const l of sel) {
+        const loc = this.doc.locate(l.id);
+        if (loc) loc.parent.children.splice(loc.index, 1);
+      }
+      const at = Math.max(0, Math.min(Math.trunc(index) || 0, target.children.length));
+      target.children.splice(at, 0, ...sel);
+      return this.layoutKey() !== key;
+    });
+  }
+
+  groupLayers(ids: string[], name?: string): string {
+    this.finishStroke();
+    const sel = this.pickLayers(ids);
+    if (!sel.length) return '';
+    const top = this.doc.locate(sel[0].id) as { parent: GroupLayer; index: number };
+    // The composite stays exactly as it is only for a contiguous run of plain blended layers; anything else (a blend mode or adjustment inside
+    // the new isolated group, a different stacking order) changes it.
+    const contiguous = sel.every((l, i) => { const lo = this.doc.locate(l.id); return !!lo && lo.parent === top.parent && lo.index === top.index + i; });
+    const plain = sel.every((l) => l.blend === 'normal' && l.kind !== 'adjustment' && (l.kind !== 'group' || (this.isPlainGroup(l))));
+    const unchanged = contiguous && plain;
+    const group: GroupLayer = {
+      id: this.doc.newId(), kind: 'group', name: name ?? `Group ${++this.groupCount}`, visible: true, locked: false,
+      opacity: 1, blend: 'normal', children: sel.slice(), expanded: true, effects: [],
+    };
+    this.structuralIf('Group layers', () => {
+      for (const l of sel) {
+        const loc = this.doc.locate(l.id);
+        if (loc) loc.parent.children.splice(loc.index, 1);
+      }
+      top.parent.children.splice(top.index, 0, group); // the topmost's index is unaffected: every other removed sibling lies below it
+      this.doc.activeId = group.id;
+      return true;
+    }, unchanged ? false : null);
+    return group.id;
   }
 
   flattenToNewLayer(): string {
@@ -1148,6 +1282,11 @@ export class Engine implements EditorEngine, Host {
    */
   loadDocument(spec: DocSpec): void {
     const plan = this.validateSpec(spec);
+    // v7: history blobs written for a v2-v7 document carry the layout hash of its legacy-shaped spec (`adjustment: {...}`); remember it
+    // (before the migration into effects[]) so restoreHistory still accepts them.
+    this.legacySig = spec.layers.some((l) => l.kind === 'adjustment' && l.adjustment != null)
+      ? hashString(JSON.stringify([spec.width, spec.height, spec.layers, spec.guides, spec.canvas]))
+      : null;
     this.finishStroke();
     this.cancelFloating();
     if (this.qm) this.setQuickMask(false);
@@ -1204,7 +1343,7 @@ export class Engine implements EditorEngine, Host {
         layer = { ...common, kind: 'group', children: [], expanded: true };
         kids.set(sp.id, []);
       } else if (sp.kind === 'adjustment') {
-        layer = { ...common, blend: 'normal', kind: 'adjustment', adjustment: clampAdjustment(sp.adjustment as AdjustmentSpec), mask: mk(sp.mask, w, h) };
+        layer = { ...common, effects: migrateAdjustmentEffects(sp.adjustment as AdjustmentSpec | null, common.effects), blend: 'normal', kind: 'adjustment', adjustment: null, mask: mk(sp.mask, w, h) };
       } else if (sp.kind === 'text' || sp.kind === 'shape') {
         const v = { ...common, mask: mk(sp.mask, w, h) };
         layer = sp.kind === 'text'
@@ -1301,7 +1440,7 @@ export class Engine implements EditorEngine, Host {
       else if (l.kind === 'input' || legacyBase) {
         const n = inputOf(l);
         if (!Number.isInteger(n) || n < 1 || n > MAX_INPUTS) bad(`bad input number of ${l.id}`);
-      } else if (l.kind === 'adjustment') { if (!l.adjustment || !(l.adjustment.type in ADJUSTMENT_NAMES)) bad(`adjustment ${l.id}`); }
+      } else if (l.kind === 'adjustment') { if (l.adjustment != null && !(l.adjustment.type in ADJUSTMENT_NAMES)) bad(`adjustment ${l.id}`); }
       else if (l.kind === 'text' || l.kind === 'shape') {
         const sp = l.kind === 'text' ? l.text : l.shape;
         if (!sp || typeof sp !== 'object') bad(`${l.kind} spec of ${l.id}`);
@@ -1706,6 +1845,36 @@ export class Engine implements EditorEngine, Host {
     const px = newPixelLayer(l.id, l.name, surface, { visible: l.visible, locked: l.locked, opacity: l.opacity, blend: l.blend, effects: l.effects, slot: this.doc.newSlot(), mask });
     const area = union(specBounds(l), { x: 0, y: 0, w, h }) as Rect;
     this.structural('Flatten layer', () => { loc.parent.children[loc.index] = px; }, l.visible && l.opacity > 0 ? area : false);
+  }
+
+  /**
+   * v7: TD rendered ids (flatten of one layer / group / adjustment-with-below, or Merge Selected): remove them and insert ONE pixel layer
+   * holding `rgba` (doc-sized straight RGBA, identity transform, no mask, no effects, normal / 100%) at the topmost removed layer's position;
+   * it becomes active. Ids nested in a listed group go with it. One history entry. Returns the new layer's id ('' if no id exists).
+   */
+  replaceLayersWithPixels(ids: string[], rgba: Uint8Array | Uint8ClampedArray, w: number, h: number, name?: string): string {
+    this.finishStroke();
+    const sel = this.pickLayers(ids);
+    if (!sel.length) return '';
+    if (!Number.isInteger(w) || !Number.isInteger(h) || w < 1 || h < 1 || w > MAX_DIM || h > MAX_DIM) throw new RangeError('replaceLayersWithPixels: bad size');
+    const need = w * h * 4;
+    if (rgba.length < need) throw new RangeError(`replaceLayersWithPixels: need ${need} bytes, got ${rgba.length}`);
+    this.finishStroke();
+    const surface = createSurface(w, h);
+    surface.ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba.buffer as ArrayBuffer, rgba.byteOffset, need), w, h), 0, 0);
+    const layer = newPixelLayer(this.doc.newId(), name ?? (sel.length === 1 ? sel[0].name : 'Merged'), surface, { slot: this.doc.newSlot() });
+    const top = this.doc.locate(sel[0].id) as { parent: GroupLayer; index: number };
+    this.structuralIf(sel.length === 1 ? 'Flatten layer' : 'Merge layers', () => {
+      for (const l of sel) {
+        const loc = this.doc.locate(l.id);
+        if (loc) loc.parent.children.splice(loc.index, 1);
+      }
+      top.parent.children.splice(top.index, 0, layer);
+      this.doc.activeId = layer.id;
+      return true;
+    }, union(this.docRect(), { x: 0, y: 0, w, h }) as Rect);
+    this.thumbs.forEach((_, k) => { if (!this.doc.find(k)) this.thumbs.delete(k); });
+    return layer.id;
   }
 
   /** Stored only: the UI creates shape layers itself (addShapeLayer); the engine's 'shape' / 'text' tools are no-ops. */
@@ -2122,6 +2291,10 @@ export class Engine implements EditorEngine, Host {
   // ---- v5: effects ----
 
   setEffects(id: string, effects: Effect[]): void {
+    this.setEffectsAs(id, effects, 'Layer effects', `fx:${id}`);
+  }
+
+  private setEffectsAs(id: string, effects: Effect[], label: string, key: string): void {
     const l = this.doc.find(id);
     if (!l) return;
     const next = sanitizeEffects(effects);
@@ -2131,7 +2304,7 @@ export class Engine implements EditorEngine, Host {
     const old = layerExtent(l, this.docRect());
     l.effects = next;
     const ext = union(old, layerExtent(l, this.docRect()));
-    this.commitStructure('Layer effects', before, `fx:${id}`, l.visible && l.opacity > 0 ? ext : false);
+    this.commitStructure(label, before, key, l.visible && l.opacity > 0 ? ext : false);
   }
 
   // ---- v6: layers shown from TouchDesigner's render (tdPreview) ----
@@ -2139,7 +2312,7 @@ export class Engine implements EditorEngine, Host {
   tdPreviewLayers(): string[] {
     const out: string[] = [];
     for (const l of this.doc.all()) {
-      if (tdPreviewFlag(l.effects) || (l.kind === 'adjustment' && l.adjustment.type === 'filter' && effectIsTdPreview(l.adjustment.effect))) out.push(l.id);
+      if (tdPreviewFlag(l.effects)) out.push(l.id);
     }
     return out;
   }
@@ -2537,6 +2710,8 @@ export class Engine implements EditorEngine, Host {
   historyVersion(): number { return this.hist.version; }
 
   /** Hash of everything docSpec() says except the revision: identifies the document a persisted history belongs to. */
+  private legacySig: string | null = null;
+
   private layoutSig(): string {
     const d = this.docSpec();
     return hashString(JSON.stringify([d.width, d.height, d.layers, d.guides, d.canvas]));
@@ -2589,7 +2764,13 @@ export class Engine implements EditorEngine, Host {
   restoreHistory(blob: Uint8Array, rev: number): boolean {
     try {
       if (this.doc.floating || this.qm || this.hist.stored().length || !(blob instanceof Uint8Array)) return false;
-      const r = readBlob(blob, this.doc, rev, this.layoutSig(), this.surfaceHashes());
+      let r: ReturnType<typeof readBlob>;
+      try {
+        r = readBlob(blob, this.doc, rev, this.layoutSig(), this.surfaceHashes());
+      } catch (err) {
+        if (!this.legacySig) throw err;
+        r = readBlob(blob, this.doc, rev, this.legacySig, this.surfaceHashes()); // blob of the pre-migration document
+      }
       let items: HistoryItem[];
       try {
         items = r.entries.map((e) => this.item(e.label, e.ser));
@@ -2693,6 +2874,11 @@ export class Engine implements EditorEngine, Host {
       (loc ? loc.parent : this.doc.root).children.splice(loc ? loc.index : 0, 0, layer);
       this.doc.activeId = layer.id;
     }, dirty);
+  }
+
+  /** A group whose subtree is all normal-blend, no adjustment layers: compositing it isolated equals compositing its children in place. */
+  private isPlainGroup(g: GroupLayer): boolean {
+    return g.effects.length === 0 && g.opacity === 1 && g.children.every((c) => c.blend === 'normal' && c.kind !== 'adjustment' && (c.kind !== 'group' || this.isPlainGroup(c)));
   }
 
   private isInside(group: GroupLayer, maybeDescendant: Layer): boolean {

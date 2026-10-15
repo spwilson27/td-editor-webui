@@ -32,7 +32,7 @@ interface FakeInput { w: number; h: number; connected: boolean; stored: { id: nu
 export interface FakeTop { path: string; w: number; h: number; rgba: Uint8Array }
 
 /**
- * A stand-in for the TouchDesigner web server DAT (protocol v7: `activeLayer` log, `POST/GET /history` (blob + `X-Doc-Rev`), `layerPreview` notices + `GET /layer` (frame type 7), `brushPresets` in the doc; protocol v6: several inputs with BASE frames per input, `inputs`, effects/transforms stored verbatim in the doc, `saveProject`/`openProject`/`exportPng` with an in-memory file map + `reload`/`files`, plus the v5 `setCanvas`/`renderLayer` features): WebSocket for JSON and SURFACE tiles (stored per
+ * A stand-in for the TouchDesigner web server DAT (protocol v8: `renderLayer {mode}` and `renderLayers` serve synthetic flatten / merge images; protocol v7: `activeLayer` log, `POST/GET /history` (blob + `X-Doc-Rev`), `layerPreview` notices + `GET /layer` (frame type 7), `brushPresets` in the doc; protocol v6: several inputs with BASE frames per input, `inputs`, effects/transforms stored verbatim in the doc, `saveProject`/`openProject`/`exportPng` with an in-memory file map + `reload`/`files`, plus the v5 `setCanvas`/`renderLayer` features): WebSocket for JSON and SURFACE tiles (stored per
  * slot with the last `doc`), HTTP `GET /base` / `/surface` / `/view` / `/top`; `fonts` after `hello`; `listTops` / `importTop` over a registry of fake TOPs; `applied` replies per finished SURFACE frame.
  */
 export class FakeTd {
@@ -88,6 +88,8 @@ export class FakeTd {
   mode: CanvasMode;
   setCanvasMessages: { w: number; h: number; mode: CanvasMode }[] = [];
   renderCalls: string[] = [];
+  /** v8: every renderLayer / renderLayers request, as received. */
+  renderRequests: { t: 'renderLayer' | 'renderLayers'; ids: string[]; mode?: string }[] = [];
   /** Colour `renderLayer` paints for a layer id (default green); `renderFails` makes it answer topError. */
   renderColors = new Map<string, [number, number, number, number]>();
   renderFails: string | null = null;
@@ -324,6 +326,7 @@ export class FakeTd {
         if (m.t === 'activeLayer' && this.active) this.activeLayers.push(m.id);
         if (m.t === 'setCanvas' && this.active) this.onSetCanvas(m);
         if (m.t === 'renderLayer') this.onRenderLayer(m);
+        if (m.t === 'renderLayers') this.onRenderLayers(m);
         if (m.t === 'requestDoc') { this.requestDocs++; this.awaitingRequestDoc = false; }
         if (m.t === 'listTops') this.send({ t: 'tops', requestId: m.requestId, items: this.tops.map(({ path, w, h }) => ({ path, w, h })) });
         if (m.t === 'importTop') {
@@ -371,7 +374,7 @@ export class FakeTd {
 
   hello(): TdMessage {
     return {
-      t: 'hello', protocol: 7, doc: { w: this.w, h: this.h, mode: this.mode }, hasInput: this.opts.hasInput ?? false, maxSendFps: this.opts.maxSendFps ?? 30,
+      t: 'hello', protocol: 8, doc: { w: this.w, h: this.h, mode: this.mode }, hasInput: this.opts.hasInput ?? false, maxSendFps: this.opts.maxSendFps ?? 30,
       inputs: this.inputList(),
       active: this.active, clientId: this.clientId, hasDocument: this.doc !== null, rev: this.doc?.rev ?? null,
     };
@@ -470,19 +473,34 @@ export class FakeTd {
     this.send({ t: 'docSize', w: this.w, h: this.h, hasInput: true, mode: this.mode });
   }
 
-  /** Flatten: TD renders the text / shape layer alone at document size and serves it like a TOP import. */
+  /** Flatten / merge down: TD renders the layer (any kind, v8) alone at document size and serves it like a TOP import. */
   private onRenderLayer(m: Extract<WebMessage, { t: 'renderLayer' }>) {
     this.renderCalls.push(m.layerId);
+    this.renderRequests.push({ t: 'renderLayer', ids: [m.layerId], mode: m.mode ?? 'flatten' });
     const layer = this.doc?.layers.find((l) => l.id === m.layerId);
-    if (this.renderFails || !layer || (layer.kind !== 'text' && layer.kind !== 'shape')) {
+    if (this.renderFails || !layer) {
       this.send({ t: 'topError', requestId: m.requestId, msg: this.renderFails ?? `Layer ${m.layerId} cannot be rendered` });
       return;
     }
+    this.serveRender(m.requestId, this.renderColors.get(m.layerId) ?? [10, 200, 30, 255]);
+  }
+
+  /** v8 Merge Selected: an isolated composite of the layers, here a synthetic flat colour. */
+  private onRenderLayers(m: Extract<WebMessage, { t: 'renderLayers' }>) {
+    this.renderRequests.push({ t: 'renderLayers', ids: [...m.layerIds] });
+    const known = m.layerIds.every((id) => this.doc?.layers.some((l) => l.id === id));
+    if (this.renderFails || !known) {
+      this.send({ t: 'topError', requestId: m.requestId, msg: this.renderFails ?? 'Layers cannot be rendered' });
+      return;
+    }
+    this.serveRender(m.requestId, this.renderColors.get(m.layerIds[0]) ?? [200, 60, 160, 255]);
+  }
+
+  private serveRender(requestId: string, c: [number, number, number, number]) {
     const rgba = new Uint8Array(this.w * this.h * 4);
-    const c = this.renderColors.get(m.layerId) ?? [10, 200, 30, 255];
     for (let i = 0; i < rgba.length; i += 4) rgba.set(c, i);
-    this.topSnapshots.set(m.requestId, encodeFrame({ type: FRAME_TOP, frameEnd: true, slot: 0, frameId: 1, docW: this.w, docH: this.h, x: 0, y: 0, w: this.w, h: this.h }, rgba));
-    setTimeout(() => this.send({ t: 'topReady', requestId: m.requestId, w: this.w, h: this.h }), this.topDelayMs);
+    this.topSnapshots.set(requestId, encodeFrame({ type: FRAME_TOP, frameEnd: true, slot: 0, frameId: 1, docW: this.w, docH: this.h, x: 0, y: 0, w: this.w, h: this.h }, rgba));
+    setTimeout(() => this.send({ t: 'topReady', requestId, w: this.w, h: this.h }), this.topDelayMs);
   }
 
   /** Pre-load a stored document as if TouchDesigner had restored it from its .toe (for the fresh-page load flow). */

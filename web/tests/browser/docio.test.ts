@@ -35,7 +35,7 @@ describe('docSpec', () => {
     expect(spec.layers[1]).toMatchObject({ kind: 'pixel', name: 'A', surfaceW: 30, surfaceH: 20, sx: 1, sy: 1, slot: slotOf(e, a), mask: { slot: m, enabled: true }, adjustment: null });
     expect(spec.layers[2]).toMatchObject({ kind: 'group', slot: null, mask: null, adjustment: null });
     expect(spec.layers[3]).toMatchObject({ kind: 'pixel', visible: false, opacity: 0.4, blend: 'screen' });
-    expect(spec.layers[4]).toMatchObject({ kind: 'adjustment', slot: null, blend: 'normal', adjustment: { type: 'levels', inLow: 0, inHigh: 1, gamma: 1, outLow: 0, outHigh: 1 } });
+    expect(spec.layers[4]).toMatchObject({ kind: 'adjustment', slot: null, blend: 'normal', adjustment: null, effects: [{ type: 'levels', enabled: true, inLow: 0, inHigh: 1, gamma: 1, outLow: 0, outHigh: 1 }] });
     expect(JSON.parse(JSON.stringify(spec))).toEqual(spec);
     expect(e.surfaceSlots().sort()).toEqual([slotOf(e, a), m, slotOf(e, b), slotOf(e, top)].sort());
   });
@@ -97,7 +97,8 @@ describe('docSpec', () => {
     const ev = collect(e);
     e.setAdjustment(a, { type: 'blur', radius: 9 });
     expect(types(ev, 'docspec')).toHaveLength(1);
-    expect(e.docSpec().layers[1].adjustment).toEqual({ type: 'blur', radius: 9 });
+    expect(e.docSpec().layers[1].adjustment).toBeNull();
+    expect(e.docSpec().layers[1].effects[0]).toMatchObject({ type: 'blur', sigma: 9, edge: 'hold' });
     const l = solidLayer(e, 'red');
     e.setTool('move');
     const p = (x: number) => ({ x, y: 5, pressure: 1, shift: false, alt: false, ctrl: false });
@@ -354,7 +355,6 @@ describe('loadDocument', () => {
     bad((s) => { s.layers[1].slot = 0; });
     bad((s) => { s.layers[1].slot = 1.5; });
     bad((s) => { s.layers.push({ ...s.layers[1], id: 'dup' }); });
-    bad((s) => { s.layers.push({ ...s.layers[1], id: 'adj', kind: 'adjustment', slot: null, adjustment: null }); });
     bad((s) => { s.layers.push({ ...s.layers[1], id: 'adj', kind: 'adjustment', slot: null, adjustment: { type: 'nope' } as never }); });
     bad((s) => { s.layers.push({ ...s.layers[1], id: 'zz', kind: 'weird' as never, slot: null }); });
     expect(JSON.stringify(e.docSpec())).toBe(before);
@@ -375,7 +375,7 @@ describe('loadDocument', () => {
     const out = e.docSpec();
     expect(out.layers[0].id).toBe('whatever'); // ids are kept
     expect(out.layers[1]).toMatchObject({ opacity: 1, blend: 'normal', x: 2, y: -1, sx: 1.5, sy: 0.5, surfaceW: 7, surfaceH: 5, slot: 40 });
-    expect(out.layers[2]).toMatchObject({ blend: 'normal', mask: { slot: 41, enabled: false }, adjustment: { type: 'threshold', level: 1 } });
+    expect(out.layers[2]).toMatchObject({ blend: 'normal', mask: { slot: 41, enabled: false }, adjustment: null, effects: [{ type: 'threshold', enabled: true, level: 1 }] });
     const n = e.addPixelLayer();
     expect(n).toBe('L8');
     expect(e.layers().find((l) => l.id === n)?.slot).toBe(42);

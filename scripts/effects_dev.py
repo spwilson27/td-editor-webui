@@ -448,8 +448,80 @@ def diff_stats(a, b):
     return float(d.max()), float(np.percentile(d, 99.9)), int((d > TOL).sum()), d
 
 
+# --------------------------------------------------------------------------- v7: classic adjustments as filters vs the v2 adjustment maths
+
+OLD_ADJ_TYPES = ("levels", "brightnessContrast", "hueSaturation", "invert", "threshold")
+# the v6 adjustment blur (sigma = radius px, edge hold) as the blur filter: effects.legacy_blur_to_filter(r) = {radius: min(200, 3r), sigma: r, edge: hold}
+ADJ_BLUR_CASES = [("adjBlur r%d" % r, [fxpy.legacy_blur_to_filter(r)]) for r in (2, 4, 10, 16, 200)]
+OLD_ROWS = []
+
+
+def _hsv_edit(c, hue, sat, val):
+    """TD blend.glsl rgb2hsv / hsv2rgb (uAdjust 6) in numpy; c (..., 3) straight 0..1."""
+    mx, mn = c.max(-1), c.min(-1)
+    d = mx - mn
+    r, g, b = c[..., 0], c[..., 1], c[..., 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        h = np.where(mx == r, np.mod((g - b) / d, 6.0), np.where(mx == g, (b - r) / d + 2.0, (r - g) / d + 4.0))
+    h = np.where(d > 0, h, 0.0) * 60.0
+    s = np.where(mx > 0, d / np.where(mx > 0, mx, 1), 0.0)
+    h = np.mod(h + hue, 360.0) / 60.0
+    s = np.minimum(1.0, s * sat)
+    v = mx * val
+    i = np.floor(h)
+    f = h - i
+    p_, q_, t_ = v * (1 - s), v * (1 - s * f), v * (1 - s * (1 - f))
+    k = i.astype(int) % 6
+    out = np.zeros_like(c)
+    for kk, (R, G, B) in enumerate([(v, t_, p_), (q_, v, p_), (p_, v, t_), (p_, q_, v), (t_, p_, v), (v, p_, q_)]):
+        m = k == kk
+        out[..., 0] = np.where(m, R, out[..., 0])
+        out[..., 1] = np.where(m, G, out[..., 1])
+        out[..., 2] = np.where(m, B, out[..., 2])
+    return np.clip(out, 0, 1)
+
+
+def old_adjust_ref(e, straight_u8):
+    """Premultiplied float 0..1 of the v2 adjustment (docs in web/src/engine/adjustments.ts, td blend.glsl uAdjust 2..6) applied to an 8 bit
+    PREMULTIPLIED image (what the layer / the composite below holds), straight colour recovered in float, alpha preserved."""
+    pm8 = np.rint(premult(straight_u8) * 255.0) / 255.0
+    a = pm8[..., 3:4]
+    c = np.clip(np.where(a > 1e-6, pm8[..., :3] / np.maximum(a, 1e-6), 0.0), 0, 1)
+    t = e["type"]
+    if t == "levels":
+        lo = e.get("inLow", 0.0)
+        hi = max(e.get("inHigh", 1.0), lo + 1e-4)
+        g = e.get("gamma", 1.0)
+        o = e.get("outLow", 0.0) + (e.get("outHigh", 1.0) - e.get("outLow", 0.0)) * np.clip((c - lo) / (hi - lo), 0, 1) ** (1.0 / g)
+    elif t == "brightnessContrast":
+        c1 = np.clip(c * (1 + e.get("brightness", 0.0)), 0, 1)
+        o = (c1 - 0.5) * (1 + e.get("contrast", 0.0)) + 0.5
+    elif t == "invert":
+        o = 1.0 - c
+    elif t == "threshold":
+        o = np.repeat((c @ np.array([0.2126, 0.7152, 0.0722]) >= e.get("level", 0.5)).astype(np.float64)[..., None], 3, -1)
+    else:
+        o = _hsv_edit(c, e.get("hue", 0.0), e.get("saturation", 1.0), e.get("value", 1.0))
+    return np.concatenate([np.clip(o, 0, 1) * a, a], -1)
+
+
+def old_blur_ref(radius_adj, straight_u8):
+    """v6 adjustment blur: gaussian sigma = radius px on the PREMULTIPLIED image, outside the document repeats the edge pixels (hold)."""
+    sg = float(radius_adj)
+    n = int(np.ceil(4 * sg))
+    k = np.exp(-0.5 * (np.arange(-n, n + 1) / sg) ** 2)
+    k /= k.sum()
+    x = np.rint(premult(straight_u8) * 255.0) / 255.0       # the layer holds 8 bit premultiplied
+    for ax in (0, 1):
+        pad = [(0, 0)] * 3
+        pad[ax] = (n, n)
+        xp = np.pad(x, pad, mode="edge")
+        x = sum(k[i] * np.take(xp, np.arange(i, i + x.shape[ax]), axis=ax) for i in range(2 * n + 1))
+    return x
+
+
 def all_cases(only):
-    return [c for c in CASES + PYRAMID_CASES if not only or c[0] in only or c[0].split()[0] in only] + filter_cases(only)
+    return [c for c in CASES + PYRAMID_CASES if not only or c[0] in only or c[0].split()[0] in only] + filter_cases(only) + [c for c in ADJ_BLUR_CASES if not only or c[0] in only or "adjBlur" in only]
 
 
 def do_parity(only, swiftshader):
@@ -485,6 +557,27 @@ def do_parity(only, swiftshader):
         if not ok and mx > TOL and name in PIXEL_SORT_NAMES:
             ok = nbad <= 0.005 * w * h        # key ties across GPUs reorder at most a handful of near-equal pixels
             detail += "  (pixel sort: allowed 0.5%% of pixels, got %.3f%%)" % (100.0 * nbad / (w * h))
+        e0 = effects[0]
+        if len(effects) == 1 and e0["type"] in OLD_ADJ_TYPES:
+            ref = old_adjust_ref(e0, img)
+            ma, mb = float(np.abs(a - ref).max() * 255), float(np.abs(b - ref).max() * 255)
+            ba, bb = int((np.abs(a - ref) * 255 > 1.0).sum()), int((np.abs(b - ref) * 255 > 1.0).sum())
+            # threshold / hue are discontinuous: a pixel whose key lands on the other side of the step differs by a lot; count those separately
+            okr = (ma <= 1.0 and mb <= 1.0) or (e0["type"] in ("threshold", "hueSaturation") and max(ba, bb) <= 0.002 * w * h)
+            check("vs v2 adjustment " + name, okr, "TD max %.2f/255 (%d px > 1)  WebGL max %.2f/255 (%d px > 1)" % (ma, ba, mb, bb))
+            OLD_ROWS.append((name, ma, ba, mb, bb))
+        elif name.startswith("adjBlur"):
+            r = e0["sigma"]
+            ref = old_blur_ref(r, img)
+            m = min(int(np.ceil(4 * r)) + 1, min(h, w) // 2 - 1)
+            edge = np.ones(a.shape[:2], bool)
+            edge[m:-m, m:-m] = False
+            dA, dB = np.abs(a - ref) * 255, np.abs(b - ref) * 255
+            ia, ib, ea, eb = float(dA[~edge].max()), float(dB[~edge].max()), float(dA[edge].max()), float(dB[edge].max())
+            tol = 1.05 if 4 * r <= 16 else 2.0         # exact path: 8 bit rounding only; pyramid: its documented error (<= 2.4)
+            check("vs v2 blur " + name, max(ea, eb, ia, ib) <= tol,
+                  "border band TD %.2f WebGL %.2f /255; interior TD %.2f WebGL %.2f (reference: gaussian sigma=%g, edge hold; band = 4 sigma, whole image when larger)" % (ea, eb, ia, ib, r))
+            OLD_ROWS.append((name, ia, 0, ib, 0, ea, eb))
         check("parity " + name, ok, detail)
         PARITY_ROWS.append((name, mx, mean, p999, nbad, changed))
         if not ok:

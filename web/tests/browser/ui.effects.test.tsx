@@ -42,9 +42,8 @@ describe('Effects tab', () => {
     expect(q('[data-effects-panel]')).toBeTruthy();
     store.addAdjustment('blur');
     await settle();
-    // adjustment layers switch to the Adjustment tab; choose Effects again
-    q('[role=tab]:nth-child(4)', q('[aria-label="Layer panels"]')).click();
-    await settle();
+    // v8: an adjustment layer's FX stack is edited in the Effects tab
+    expect(tabs()).toEqual(['Layers:false', 'History:false', 'Effects:true']);
     expect(document.querySelector('[data-effects-hint]')).toBeNull();
     expect(q('[data-effects-panel]')).toBeTruthy();
   });
@@ -53,7 +52,9 @@ describe('Effects tab', () => {
     expect(document.querySelector('[data-effects-empty]')).toBeTruthy();
     q('[data-fx-add]').click();
     await settle();
-    expect([...document.querySelectorAll('[data-add-effect]')].map((b) => b.getAttribute('data-add-effect'))).toEqual(EFFECT_ORDER);
+    const offered = [...document.querySelectorAll('[data-add-effect]')].map((b) => b.getAttribute('data-add-effect')!);
+    expect(offered.slice(0, 6)).toEqual(['levels', 'brightnessContrast', 'hueSaturation', 'blur', 'invert', 'threshold']); // the classic adjustments lead the one catalogue
+    expect(offered.filter((t) => (EFFECT_ORDER as string[]).includes(t))).toEqual(EFFECT_ORDER);
     q('[data-fx-add]').click();
     await settle();
     const expected: Effect[] = [];
@@ -169,13 +170,16 @@ describe('Effects tab', () => {
 describe('Layer row fx button and badge', () => {
   beforeEach(() => { q('[role=tab]:nth-child(1)', q('[aria-label="Layer panels"]')).click(); });
 
-  it('fx button opens the Effects tab for that layer; badge appears with effects, dimmed when all disabled', async () => {
+  it('rows have no fx button; the footer Layer Effects button opens the Effects tab; badge appears with effects, dimmed when all disabled', async () => {
     await settle();
     engine.setActiveLayer('base');
     await settle();
+    expect(document.querySelector('[data-layer] [data-act=fx]')).toBeNull();
     const l1 = q('[data-layer="L1"]');
     expect(l1.querySelector('[data-fx-badge]')).toBeNull();
-    q('[data-act=fx]', l1).click();
+    q('[data-layer="L1"] [data-act=sel]').click();
+    await settle();
+    q('[aria-label="Layer effects"]').click();
     await settle();
     expect(engine.activeLayerId()).toBe('L1');
     expect(tabs()).toEqual(['Layers:false', 'History:false', 'Effects:true']);
@@ -185,18 +189,19 @@ describe('Layer row fx button and badge', () => {
     await settle();
     const badge = q('[data-layer="L1"] [data-fx-badge]');
     expect(badge.style.opacity).toBe('1');
+    expect(badge.closest('button')).toBeNull();
     expect(document.querySelector('[data-layer="base"] [data-fx-badge]')).toBeNull();
     engine.setEffects('L1', [{ ...defaultEffect('glitch'), enabled: false }]);
     await settle();
     expect(q('[data-layer="L1"] [data-fx-badge]').style.opacity).toBe('0.4');
   });
 
-  it('groups and adjustments get an fx button (v6)', async () => {
+  it('groups and adjustments can take effects (v6) but no row has an fx button', async () => {
     store.addGroup();
     store.addAdjustment('invert');
     q('[role=tab]:nth-child(1)', q('[aria-label="Layer panels"]')).click();
     await settle();
-    expect(document.querySelectorAll('[data-layer] [data-act=fx]').length).toBe(4); // L1 + base + group + adjustment
+    expect(document.querySelectorAll('[data-layer] [data-act=fx]').length).toBe(0);
     expect(store.canHaveEffects('group')).toBe(true);
     expect(store.canHaveEffects('adjustment')).toBe(true);
   });

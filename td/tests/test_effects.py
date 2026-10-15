@@ -454,6 +454,22 @@ def _env_with_filters():
     return e
 
 
+def test_chain_pyramid_size_follows_the_document_not_a_stale_input_top():
+    """Regression (live network_dev adjust, blur 40 on 512 px): a TOP that has not cooked yet reports 256 x 256; the level textures were
+    then sized for 256 px and the blur came out garbage. The document size passed to apply() wins."""
+    e = _env_with_filters()
+    e.src.width, e.src.height = 256, 256
+    e.chain.apply([legacy_fx(40)], e.src, 512, 512)
+    n = e.chain.nodes
+    assert (n[0].par.value("resolutionw"), n[0].par.value("resolutionh")) == (67, 67)          # level 3: ceil(512/8) + 3
+    e.chain.apply([legacy_fx(40)], e.src)                                                         # no size given: the input's
+    assert (e.chain.nodes[0].par.value("resolutionw")) == 35
+
+
+def legacy_fx(r):
+    return effects.legacy_blur_to_filter(r)
+
+
 def test_chain_pyramid_levels_set_custom_resolution():
     e = _env_with_filters()
     e.chain.apply([{"type": "blur", "radius": 150}], e.src, 1000, 500)

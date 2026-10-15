@@ -5338,6 +5338,462 @@
    "effects": [
     {
      "enabled": true,
+     "type": "blur",
+     "radius": 12,
+     "sigma": 4,
+     "edge": "hold"
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 0,
+     "u": [
+      4.0,
+      16.0,
+      2.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float"
+    },
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 1,
+     "u": [
+      4.0,
+      16.0,
+      2.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 16,
+   "extent": [
+    [
+     16,
+     16,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "neighbourhood"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "blur",
+     "radius": 48,
+     "sigma": 16,
+     "edge": "hold"
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 2,
+     "u": [
+      3.968626966596886,
+      12.0,
+      2.0,
+      2.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 2
+    },
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 3,
+     "u": [
+      3.968626966596886,
+      12.0,
+      2.0,
+      2.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 2
+    },
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 4,
+     "u": [
+      3.968626966596886,
+      12.0,
+      2.0,
+      2.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 2
+    },
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 5,
+     "u": [
+      3.968626966596886,
+      12.0,
+      2.0,
+      2.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 56,
+   "extent": [
+    [
+     56,
+     56,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "neighbourhood"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "blur",
+     "radius": 40,
+     "edge": "hold"
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 2,
+     "u": [
+      3.295619988880865,
+      10.0,
+      2.0,
+      2.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 2
+    },
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 3,
+     "u": [
+      3.295619988880865,
+      10.0,
+      2.0,
+      2.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 2
+    },
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 4,
+     "u": [
+      3.295619988880865,
+      10.0,
+      2.0,
+      2.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 2
+    },
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 5,
+     "u": [
+      3.295619988880865,
+      10.0,
+      2.0,
+      2.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 48,
+   "extent": [
+    [
+     48,
+     48,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "neighbourhood"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "blur",
+     "radius": 200,
+     "sigma": 200,
+     "edge": "hold"
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 2,
+     "u": [
+      3.0847406698132667,
+      10.0,
+      2.0,
+      6.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 6
+    },
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 3,
+     "u": [
+      3.0847406698132667,
+      10.0,
+      2.0,
+      6.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 6
+    },
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 4,
+     "u": [
+      3.0847406698132667,
+      10.0,
+      2.0,
+      6.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 6
+    },
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 5,
+     "u": [
+      3.0847406698132667,
+      10.0,
+      2.0,
+      6.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 768,
+   "extent": [
+    [
+     768,
+     768,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "neighbourhood"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
      "type": "blur"
     }
    ],
@@ -6103,6 +6559,735 @@
    ],
    "reads": [
     "neighbourhood"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "blur",
+     "sigma": 1000000000.0,
+     "edge": "hold"
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 2,
+     "u": [
+      3.0847406698132667,
+      10.0,
+      2.0,
+      6.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 6
+    },
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 3,
+     "u": [
+      3.0847406698132667,
+      10.0,
+      2.0,
+      6.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 6
+    },
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 4,
+     "u": [
+      3.0847406698132667,
+      10.0,
+      2.0,
+      6.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 6
+    },
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 5,
+     "u": [
+      3.0847406698132667,
+      10.0,
+      2.0,
+      6.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 768,
+   "extent": [
+    [
+     768,
+     768,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "neighbourhood"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "blur",
+     "sigma": -3
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 0,
+     "u": [
+      3.3333333333333335,
+      10.0,
+      2.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float"
+    },
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 1,
+     "u": [
+      3.3333333333333335,
+      10.0,
+      2.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 10,
+   "extent": [
+    [
+     10,
+     10,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "neighbourhood"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "blur",
+     "sigma": "x",
+     "edge": "nope"
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 0,
+     "u": [
+      3.3333333333333335,
+      10.0,
+      2.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float"
+    },
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 1,
+     "u": [
+      3.3333333333333335,
+      10.0,
+      2.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 10,
+   "extent": [
+    [
+     10,
+     10,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "neighbourhood"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "blur",
+     "radius": 0,
+     "sigma": 0.01,
+     "edge": "hold"
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 0,
+     "u": [
+      0.01,
+      1.0,
+      2.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float"
+    },
+    {
+     "effect": 0,
+     "shader": "blur",
+     "pass": 1,
+     "u": [
+      0.01,
+      1.0,
+      2.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 1,
+   "extent": [
+    [
+     1,
+     1,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "neighbourhood"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "brightnessContrast",
+     "brightness": 0.4
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "brightnessContrast",
+     "pass": 0,
+     "u": [
+      0.4,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "brightnessContrast",
+     "contrast": 0.5
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "brightnessContrast",
+     "pass": 0,
+     "u": [
+      0.0,
+      0.5,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "brightnessContrast",
+     "brightness": -0.3,
+     "contrast": -0.4
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "brightnessContrast",
+     "pass": 0,
+     "u": [
+      -0.3,
+      -0.4,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "brightnessContrast",
+     "brightness": 1,
+     "contrast": 1
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "brightnessContrast",
+     "pass": 0,
+     "u": [
+      1.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "brightnessContrast",
+     "brightness": -1,
+     "contrast": -1
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "brightnessContrast",
+     "pass": 0,
+     "u": [
+      -1.0,
+      -1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "brightnessContrast"
+    }
+   ],
+   "chain": [],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "none"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "brightnessContrast",
+     "brightness": 1000000000.0,
+     "contrast": -1000000000.0
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "brightnessContrast",
+     "pass": 0,
+     "u": [
+      1.0,
+      -1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "brightnessContrast",
+     "brightness": "x"
+    }
+   ],
+   "chain": [],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "none"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "brightnessContrast",
+     "contrast": null
+    }
+   ],
+   "chain": [],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "none"
    ]
   },
   {
@@ -13337,6 +14522,633 @@
    "effects": [
     {
      "enabled": true,
+     "type": "hueSaturation",
+     "hue": 90
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "hueSaturation",
+     "pass": 0,
+     "u": [
+      90.0,
+      1.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "hueSaturation",
+     "saturation": 0
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "hueSaturation",
+     "pass": 0,
+     "u": [
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "hueSaturation",
+     "saturation": 1.6,
+     "value": 0.7
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "hueSaturation",
+     "pass": 0,
+     "u": [
+      0.0,
+      1.6,
+      0.7,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "hueSaturation",
+     "hue": -140,
+     "saturation": 0.5,
+     "value": 1.5
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "hueSaturation",
+     "pass": 0,
+     "u": [
+      -140.0,
+      0.5,
+      1.5,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "hueSaturation",
+     "value": 2
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "hueSaturation",
+     "pass": 0,
+     "u": [
+      0.0,
+      1.0,
+      2.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "hueSaturation"
+    }
+   ],
+   "chain": [],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "none"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "hueSaturation",
+     "hue": 1000000000.0,
+     "saturation": -1000000000.0,
+     "value": 1000000000.0
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "hueSaturation",
+     "pass": 0,
+     "u": [
+      180.0,
+      0.0,
+      2.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "hueSaturation",
+     "hue": "x"
+    }
+   ],
+   "chain": [],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "none"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "hueSaturation",
+     "saturation": null
+    }
+   ],
+   "chain": [],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "none"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "hueSaturation",
+     "hue": 180
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "hueSaturation",
+     "pass": 0,
+     "u": [
+      180.0,
+      1.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "hueSaturation",
+     "hue": -180
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "hueSaturation",
+     "pass": 0,
+     "u": [
+      -180.0,
+      1.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "invert"
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "invert",
+     "pass": 0,
+     "u": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "invert"
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "invert",
+     "pass": 0,
+     "u": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "invert",
+     "x": 5
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "invert",
+     "pass": 0,
+     "u": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
      "type": "kaleidoscope",
      "segments": 6,
      "angle": 20
@@ -15910,6 +17722,541 @@
    ],
    "reads": [
     "global"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "levels",
+     "inLow": 0.1,
+     "inHigh": 0.9
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "levels",
+     "pass": 0,
+     "u": [
+      0.1,
+      0.9,
+      1.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "levels",
+     "gamma": 2.2
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "levels",
+     "pass": 0,
+     "u": [
+      0.0,
+      1.0,
+      2.2,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "levels",
+     "inLow": 0.2,
+     "inHigh": 0.8,
+     "gamma": 0.6,
+     "outLow": 0.1,
+     "outHigh": 0.95
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "levels",
+     "pass": 0,
+     "u": [
+      0.2,
+      0.8,
+      0.6,
+      0.1,
+      0.95,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "levels",
+     "inLow": 1,
+     "inHigh": 0
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "levels",
+     "pass": 0,
+     "u": [
+      1.0,
+      1.0001,
+      1.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "levels",
+     "outLow": 1,
+     "outHigh": 0
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "levels",
+     "pass": 0,
+     "u": [
+      0.0,
+      1.0,
+      1.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "levels"
+    }
+   ],
+   "chain": [],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "none"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "levels",
+     "inLow": 0.5,
+     "inHigh": 0.5
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "levels",
+     "pass": 0,
+     "u": [
+      0.5,
+      0.5001,
+      1.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "levels",
+     "inLow": 1,
+     "inHigh": 1
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "levels",
+     "pass": 0,
+     "u": [
+      1.0,
+      1.0001,
+      1.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "levels",
+     "gamma": 0
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "levels",
+     "pass": 0,
+     "u": [
+      0.0,
+      1.0,
+      0.1,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "levels",
+     "gamma": 1000000000.0
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "levels",
+     "pass": 0,
+     "u": [
+      0.0,
+      1.0,
+      10.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "levels",
+     "inLow": "x",
+     "gamma": null
+    }
+   ],
+   "chain": [],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "none"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "levels",
+     "outLow": -5,
+     "outHigh": 5
+    }
+   ],
+   "chain": [],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "none"
    ]
   },
   {
@@ -19626,6 +21973,505 @@
    "effects": [
     {
      "enabled": true,
+     "type": "threshold",
+     "level": 0.5
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "threshold",
+     "pass": 0,
+     "u": [
+      0.5,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "threshold",
+     "level": 0.2
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "threshold",
+     "pass": 0,
+     "u": [
+      0.2,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "threshold",
+     "level": 0.85
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "threshold",
+     "pass": 0,
+     "u": [
+      0.85,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "threshold",
+     "level": 0
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "threshold",
+     "pass": 0,
+     "u": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "threshold",
+     "level": 1
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "threshold",
+     "pass": 0,
+     "u": [
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "threshold"
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "threshold",
+     "pass": 0,
+     "u": [
+      0.5,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "threshold",
+     "level": 1000000000.0
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "threshold",
+     "pass": 0,
+     "u": [
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "threshold",
+     "level": -1000000000.0
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "threshold",
+     "pass": 0,
+     "u": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "threshold",
+     "level": "x"
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "threshold",
+     "pass": 0,
+     "u": [
+      0.5,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
+     "type": "threshold",
+     "level": null
+    }
+   ],
+   "chain": [
+    {
+     "effect": 0,
+     "shader": "threshold",
+     "pass": 0,
+     "u": [
+      0.5,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba8fixed"
+    }
+   ],
+   "reach": 0,
+   "extent": [
+    [
+     0,
+     0,
+     0,
+     0
+    ]
+   ],
+   "tdPreview": [
+    false
+   ],
+   "reads": [
+    "point"
+   ]
+  },
+  {
+   "effects": [
+    {
+     "enabled": true,
      "type": "tileMirror",
      "tilesX": 2,
      "tilesY": 2,
@@ -22115,17 +24961,23 @@
     },
     {
      "enabled": true,
-     "type": "blur"
+     "type": "blur",
+     "radius": 12,
+     "sigma": 4,
+     "edge": "hold"
     },
     {
      "enabled": true,
      "type": "blur",
-     "radius": 0
+     "radius": 48,
+     "sigma": 16,
+     "edge": "hold"
     },
     {
      "enabled": true,
      "type": "blur",
-     "radius": -5
+     "radius": 40,
+     "edge": "hold"
     },
     {
      "enabled": true,
@@ -22394,13 +25246,13 @@
      "shader": "blur",
      "pass": 0,
      "u": [
-      3.3333333333333335,
-      10.0,
+      4.0,
+      16.0,
       2.0,
       0.0,
       0.0,
       0.0,
-      0.0,
+      1.0,
       0.0,
       0.0,
       0.0,
@@ -22418,13 +25270,211 @@
      "shader": "blur",
      "pass": 1,
      "u": [
-      3.3333333333333335,
-      10.0,
+      4.0,
+      16.0,
       2.0,
       0.0,
       0.0,
       0.0,
+      1.0,
       0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float"
+    },
+    {
+     "effect": 4,
+     "shader": "blur",
+     "pass": 2,
+     "u": [
+      3.968626966596886,
+      12.0,
+      2.0,
+      2.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 2
+    },
+    {
+     "effect": 4,
+     "shader": "blur",
+     "pass": 3,
+     "u": [
+      3.968626966596886,
+      12.0,
+      2.0,
+      2.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 2
+    },
+    {
+     "effect": 4,
+     "shader": "blur",
+     "pass": 4,
+     "u": [
+      3.968626966596886,
+      12.0,
+      2.0,
+      2.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 2
+    },
+    {
+     "effect": 4,
+     "shader": "blur",
+     "pass": 5,
+     "u": [
+      3.968626966596886,
+      12.0,
+      2.0,
+      2.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float"
+    },
+    {
+     "effect": 5,
+     "shader": "blur",
+     "pass": 2,
+     "u": [
+      3.295619988880865,
+      10.0,
+      2.0,
+      2.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 2
+    },
+    {
+     "effect": 5,
+     "shader": "blur",
+     "pass": 3,
+     "u": [
+      3.295619988880865,
+      10.0,
+      2.0,
+      2.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 2
+    },
+    {
+     "effect": 5,
+     "shader": "blur",
+     "pass": 4,
+     "u": [
+      3.295619988880865,
+      10.0,
+      2.0,
+      2.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "fmt": "rgba16float",
+     "level": 2
+    },
+    {
+     "effect": 5,
+     "shader": "blur",
+     "pass": 5,
+     "u": [
+      3.295619988880865,
+      10.0,
+      2.0,
+      2.0,
+      0.0,
+      0.0,
+      1.0,
       0.0,
       0.0,
       0.0,
@@ -22486,7 +25536,7 @@
      "fmt": "rgba8fixed"
     }
    ],
-   "reach": 269,
+   "reach": 379,
    "extent": [
     [
      6,
@@ -22507,20 +25557,20 @@
      0
     ],
     [
-     10,
-     10,
+     16,
+     16,
      0,
      0
     ],
     [
-     0,
-     0,
+     56,
+     56,
      0,
      0
     ],
     [
-     0,
-     0,
+     48,
+     48,
      0,
      0
     ],
@@ -22545,8 +25595,8 @@
     "neighbourhood",
     "neighbourhood",
     "neighbourhood",
-    "none",
-    "none",
+    "neighbourhood",
+    "neighbourhood",
     "neighbourhood"
    ]
   }

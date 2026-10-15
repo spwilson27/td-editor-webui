@@ -3,7 +3,7 @@
 // surface / adjusted result, premultiplied), 2 = mask (optional, .r).
 // Uniforms (GLSL TOP "Vectors" page):
 //   uParams  vec4  x = uMode (BlendMode index, web/src/engine/types.ts: normal=0 ... luminosity=15)
-//                  y = uOpacity (0..1)   z = uHasMask (0/1)   w = uAdjust (0..6)
+//                  y = uOpacity (0..1)   z = uHasMask (0/1)   w = uAdjust (0, 1, 7, 8)
 //   uXform   vec4  layer -> document mapping  doc = (x, y) + (sx, sy) * layer  (document pixels, top-left
 //                  origin, x/y fractional, sx/sy > 0).  Layer pixel (0,0) is the top-left texel of the source
 //                  (its size = textureSize of the source input).
@@ -31,29 +31,18 @@
 //   The accumulator stays in float32 registers between the layers (more exact than K chained 16-bit passes); each
 //   layer reads only the texels inside its own rect (the bounding-box skip).  Pixel-for-pixel the result equals K
 //   chained uAdjust 0 passes within the rounding of the intermediate format.
-// uAdjust = 9 / 10: BLUR PYRAMID passes (v6, adjustment blur with radius >= 7).  Texel space of the textures (origin
-//   bottom-left), premultiplied RGBA.  9 = SHRINK: input 0 = the image (w x h), output (custom resolution) = padded grid of
-//   ceil(w/s) + 2k by ceil(h/s) + 2k cells, uXform.x = s, uA.x = k.  Cell (i, j) is the mean of the s x s source block starting at
-//   ((i-k) s, (j-k) s) with the source coordinates CLAMPED to the image (edge hold, exact: the k pad cells are the edge pixels'
-//   means, not a block average of the border).  10 = ENLARGE: input 0 = the blurred padded grid, output (custom resolution = the
-//   document) = bilinear (linear input filter) at ((x + .5) / s + k) / gridSize; the same s / k.
-// uAdjust 0..6 (blend / adjust passes): inputs 0 = below, 1 = source, 2 = mask.  The source is at document
+// uAdjust 0 / 1 (blend / mix passes): inputs 0 = below, 1 = source, 2 = mask.  The source is at document
 //   size (a resample result, group result, adjustment source) or a surface placed by an INTEGER offset:
 //   source texel = document pixel - round(uXform.xy)  (outside the source, or outside the mask = transparent / 0).
 // uAdjust = 0: W3C Compositing and Blending L1 "source-over with blend mode" (== Canvas 2D
 //   globalCompositeOperation + globalAlpha), premultiplied in / out.
 // uAdjust = 1: out = mix(below, adjusted, opacity * mask)   (adjusted = premultiplied RGBA, input 1).
-// uAdjust = 2..6: colour adjustments computed here on the STRAIGHT colour of input 0 (no helper passes):
-//   adjusted rgb = clamp(f(rgb), 0, 1), alpha from below, out = mix(below, adjusted * a, opacity * mask)
-//   2 levels      uA = (inLow, inHigh, gamma, outLow), uB.x = outHigh
-//   3 bright/contr uA = (brightness, contrast)         4 invert
-//   5 threshold   uA.x = level (Rec.709 luma >= level -> white else black)
-//   6 hue/sat/val uA = (hue deg, saturation, value)   true HSV edit
+// (v8: the classic adjustments -- levels, brightness / contrast, hue / saturation, invert, threshold, blur -- are effect types
+//  (shared/effects/*.glsl) run by an effect chain; an adjustment layer's blend pass is a plain uAdjust 1 mix.)
 
 uniform vec4 uParams;
 uniform vec4 uXform;
-uniform vec4 uA;      // adjustment parameters (uAdjust 2..6)
-uniform vec4 uB;
+uniform vec4 uA;      // resample translation (uAdjust 7)
 uniform vec4 uL0;     // merged pass layer slots (uAdjust 8)
 uniform vec4 uL1;
 uniform vec4 uL2;
@@ -131,45 +120,6 @@ vec3 blendFn(int mode, vec3 cb, vec3 cs) {
     case 15: return setLum(cb, lum(cs));                             // luminosity
     }
     return cs;
-}
-
-vec3 rgb2hsv(vec3 c) {
-    float mx = max(max(c.r, c.g), c.b), mn = min(min(c.r, c.g), c.b), d = mx - mn;
-    float h = 0.0;
-    if (d > 0.0) {
-        if (mx == c.r) h = mod((c.g - c.b) / d, 6.0);
-        else if (mx == c.g) h = (c.b - c.r) / d + 2.0;
-        else h = (c.r - c.g) / d + 4.0;
-    }
-    return vec3(h * 60.0, mx > 0.0 ? d / mx : 0.0, mx);
-}
-
-vec3 hsv2rgb(vec3 c) {
-    float h6 = mod(c.x, 360.0) / 60.0;
-    float i = floor(h6), f = h6 - i;
-    float p = c.z * (1.0 - c.y), q = c.z * (1.0 - c.y * f), t = c.z * (1.0 - c.y * (1.0 - f));
-    int k = int(i) % 6;
-    if (k == 0) return vec3(c.z, t, p);
-    if (k == 1) return vec3(q, c.z, p);
-    if (k == 2) return vec3(p, c.z, t);
-    if (k == 3) return vec3(p, q, c.z);
-    if (k == 4) return vec3(t, p, c.z);
-    return vec3(c.z, p, q);
-}
-
-vec3 adjustFn(int k, vec3 c) {
-    if (k == 2) {
-        vec3 t = clamp((c - uA.x) / (uA.y - uA.x), 0.0, 1.0);
-        return uA.w + (uB.x - uA.w) * pow(t, vec3(1.0 / uA.z));
-    }
-    if (k == 3) {
-        vec3 c1 = clamp(c * (1.0 + uA.x), 0.0, 1.0);
-        return (c1 - 0.5) * (1.0 + uA.y) + 0.5;
-    }
-    if (k == 4) return 1.0 - c;
-    if (k == 5) return vec3(dot(c, vec3(0.2126, 0.7152, 0.0722)) >= uA.x ? 1.0 : 0.0);
-    vec3 h = rgb2hsv(c);
-    return hsv2rgb(vec3(h.x + uA.x, min(1.0, h.y * uA.y), h.z * uA.z));
 }
 
 // Clips the convex polygon p[0..n) to the half plane dot(v, nrm) >= d (Sutherland-Hodgman); returns the new count (<= 8).
@@ -317,38 +267,7 @@ void merged() {
     fragColor = TDOutputSwizzle(acc);
 }
 
-void shrinkPass() {
-    int s = int(uXform.x + 0.5);
-    int k = int(uA.x + 0.5);
-    ivec2 src = textureSize(sTD2DInputs[0], 0);
-    ivec2 o = (ivec2(gl_FragCoord.xy) - ivec2(k)) * s;
-    ivec2 lo = clamp(o, ivec2(0), src - 1);
-    ivec2 hi = clamp(o + (s - 1), ivec2(0), src - 1);
-    vec4 sum = vec4(0.0);
-    // taps that fall outside the image repeat the clamped edge texel: count them by clamped position
-    float n = 0.0;
-    for (int y = 0; y < s; y++) {
-        int yy = clamp(o.y + y, 0, src.y - 1);
-        for (int x = 0; x < s; x++) {
-            int xx = clamp(o.x + x, 0, src.x - 1);
-            sum += texelFetch(sTD2DInputs[0], ivec2(xx, yy), 0);
-            n += 1.0;
-        }
-    }
-    fragColor = TDOutputSwizzle(sum / n);
-}
-
-void enlargePass() {
-    float s = uXform.x;
-    float k = uA.x;
-    vec2 grid = vec2(textureSize(sTD2DInputs[0], 0));
-    vec2 q = (gl_FragCoord.xy / s) + vec2(k);
-    fragColor = TDOutputSwizzle(texture(sTD2DInputs[0], q / grid));
-}
-
 void main() {
-    if (uParams.w > 9.5) { enlargePass(); return; }
-    if (uParams.w > 8.5) { shrinkPass(); return; }
     if (uParams.w > 7.5) { merged(); return; }
     if (uParams.w > 6.5) { resample(); return; }
     ivec2 p = ivec2(gl_FragCoord.xy);
@@ -373,11 +292,7 @@ void main() {
     }
 
     vec4 res;
-    if (uParams.w > 1.5) {
-        vec3 c = below.a > 0.0 ? below.rgb / below.a : vec3(0.0);
-        vec3 o = clamp(adjustFn(int(uParams.w + 0.5), c), 0.0, 1.0);
-        res = mix(below, vec4(o * below.a, below.a), opacity * m);
-    } else if (uParams.w > 0.5) {
+    if (uParams.w > 0.5) {
         res = mix(below, src, opacity * m);
     } else {
         res = composeOver(below, src, mode, opacity, m);

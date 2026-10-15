@@ -12,7 +12,8 @@ const setSlider = (label: string, v: number) => {
   s.value = String(v);
   s.dispatchEvent(new Event('input', { bubbles: true }));
 };
-const adjustCalls = () => engine.calls.filter((c) => c.startsWith('setAdjustment'));
+const fxCalls = () => engine.calls.filter((c) => c.startsWith('setEffects'));
+const open = async () => { q('[data-fx-open]').click(); await settle(); };
 
 beforeEach(async () => {
   engine = freshEngine();
@@ -21,13 +22,16 @@ beforeEach(async () => {
 });
 afterEach(unmount);
 
-describe('Adjustment panel', () => {
-  it('has no Adjustment tab until an adjustment layer is active; it is then selected automatically', async () => {
+// v8: an adjustment layer is an FX stack; the old Adjustment tab is the Effects panel, the classic adjustments are ordinary FX.
+describe('Adjustment layers use the Effects panel', () => {
+  it('there is no Adjustment tab; a new adjustment layer opens the Effects tab with its stack', async () => {
     expect(tabs()).toEqual(['Layers:true', 'History:false', 'Effects:false']);
     store.addAdjustment('levels');
     await settle();
-    expect(tabs()).toEqual(['Layers:false', 'History:false', 'Adjustment:true', 'Effects:false']);
-    expect(document.querySelector('[data-adjust-panel][data-adjust-type=levels]')).toBeTruthy();
+    expect(tabs()).toEqual(['Layers:false', 'History:false', 'Effects:true']);
+    expect(document.querySelector('[data-adjust-panel]')).toBeNull();
+    expect(q('[data-effects-panel]').textContent).toContain('Adjustment stack of');
+    expect(document.querySelectorAll('[data-effect=levels]').length).toBe(1);
   });
 
   it('goes back to Layers when a non-adjustment layer becomes active', async () => {
@@ -36,66 +40,71 @@ describe('Adjustment panel', () => {
     engine.setActiveLayer('base');
     await settle();
     expect(tabs()).toEqual(['Layers:true', 'History:false', 'Effects:false']);
-    expect(document.querySelector('[data-adjust-panel]')).toBeNull();
   });
 
-  it('shows sliders per type with their ranges', async () => {
-    const cases: [Parameters<typeof store.addAdjustment>[0], string[]][] = [
-      ['levels', ['Input black', 'Gamma', 'Input white', 'Output black', 'Output white']],
+  it('shows sliders per classic type with the v2 ranges', async () => {
+    const cases: [string, string[]][] = [
+      ['levels', ['Input black', 'Input white', 'Gamma', 'Output black', 'Output white']],
       ['brightnessContrast', ['Brightness', 'Contrast']],
       ['hueSaturation', ['Hue', 'Saturation', 'Value']],
-      ['blur', ['Radius']],
       ['threshold', ['Level']],
     ];
     for (const [type, labels] of cases) {
       store.addAdjustment(type);
       await settle();
-      expect([...document.querySelectorAll('[data-adjust-panel] input[type=range]')].map((i) => i.getAttribute('aria-label'))).toEqual(labels);
+      await open();
+      expect([...document.querySelectorAll('[data-fx-params] input[type=range]')].map((i) => i.getAttribute('aria-label'))).toEqual(labels);
     }
     store.addAdjustment('invert');
     await settle();
-    expect(document.querySelectorAll('[data-adjust-panel] input[type=range]').length).toBe(0);
-    expect(q('[data-adjust-panel]').textContent).toContain('no parameters');
+    await open();
+    expect(document.querySelectorAll('[data-fx-params] input[type=range]').length).toBe(0);
     store.addAdjustment('levels');
     await settle();
-    expect(slider('Gamma').min).toBe('0.1');
-    expect(slider('Gamma').max).toBe('10');
+    await open();
+    expect([slider('Gamma').min, slider('Gamma').max]).toEqual(['0.1', '10']);
     store.addAdjustment('hueSaturation');
     await settle();
+    await open();
     expect([slider('Hue').min, slider('Hue').max, slider('Saturation').max]).toEqual(['-180', '180', '2']);
     store.addAdjustment('blur');
     await settle();
+    await open();
     expect(slider('Radius').max).toBe('200');
   });
 
   it('dragging a slider updates the readout at once and the engine at most once per frame with the newest value', async () => {
-    store.addAdjustment('blur');
+    store.addAdjustment('threshold');
     await settle();
-    setSlider('Radius', 10);
-    setSlider('Radius', 20);
-    setSlider('Radius', 30);
+    await open();
+    setSlider('Level', 0.1);
+    setSlider('Level', 0.2);
+    setSlider('Level', 0.3);
     await settle();
-    expect(q('[data-adjust-value=radius]').textContent).toBe('30 px');
-    expect(adjustCalls()).toHaveLength(1);
-    expect(adjustCalls()[0]).toContain('"radius":30');
-    setSlider('Radius', 40);
+    expect(q('[data-fx-value=level]').textContent).toBe('0.30');
+    expect(fxCalls()).toHaveLength(1);
+    expect(fxCalls()[0]).toContain('"level":0.3');
+    setSlider('Level', 0.4);
     await frame(); await frame();
-    expect(adjustCalls()).toHaveLength(2);
-    expect(engine.layers()[0].adjustment).toEqual({ type: 'blur', radius: 40 });
+    expect(fxCalls()).toHaveLength(2);
+    expect(engine.layers()[0].effects[0]).toMatchObject({ type: 'threshold', level: 0.4 });
   });
 
   it('editing one parameter keeps the others', async () => {
     store.addAdjustment('levels');
     await settle();
+    await open();
     setSlider('Gamma', 2.2);
     await settle();
-    expect(engine.layers()[0].adjustment).toEqual({ type: 'levels', inLow: 0, inHigh: 1, gamma: 2.2, outLow: 0, outHigh: 1 });
+    expect(engine.layers()[0].effects[0]).toEqual({ type: 'levels', enabled: true, inLow: 0, inHigh: 1, gamma: 2.2, outLow: 0, outHigh: 1 });
   });
 
   it('reflects engine-side changes (undo) in the sliders', async () => {
     store.addAdjustment('threshold');
     await settle();
-    engine.setAdjustment(engine.activeLayerId()!, { type: 'threshold', level: 0.8 });
+    await open();
+    const id = engine.activeLayerId()!;
+    engine.setEffects(id, [{ type: 'threshold', enabled: true, level: 0.8 } as never]);
     await settle();
     expect(slider('Level').value).toBe('0.8');
   });

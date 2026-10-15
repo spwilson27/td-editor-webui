@@ -92,7 +92,8 @@ describe('LayersPanel rows', () => {
     const g = engine.activeLayerId()!;
     engine.moveLayer(store.addLayer(), g, 0);
     await settle();
-    expect(row(g).style.paddingLeft).toBe('4px');
+    expect(row(g).style.paddingLeft).toBe('6px');
+    expect(row(engine.layers().find((l) => l.parentId === g)!.id).style.paddingLeft).toBe('22px'); // one indent step per depth
     expect(document.querySelectorAll('[data-layer]').length).toBe(3);
     q('[data-act=open]', row(g)).click();
     await settle();
@@ -184,7 +185,8 @@ describe('LayersPanel drag reorder', () => {
     await addTwo();
     const d = dragRow('L2', 'L1', 0.8);
     await settle();
-    expect(row('L1').style.boxShadow).toContain('0px -2px 0px');
+    const ind = q('[data-drop-indicator]', row('L1'));
+    expect([ind.getAttribute('data-drop-zone'), ind.getAttribute('data-drop-depth')]).toEqual(['after', '0']);
     d.list.dispatchEvent(ptr('pointerup', { clientX: d.x, clientY: d.y }));
     await settle();
     expect(last('move:')).toBe('move:L2:null:1');

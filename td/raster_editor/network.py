@@ -14,51 +14,28 @@ Network shape (all names inside ``doc``)::
                               2 mask; always 3 wired).  They are
                               NOT named after the layer: creating or renaming a GLSL TOP costs ~4.5 ms, so a
                               pool of spare nodes is made in tick() and handed out / taken back by apply().
-    adj_L_<id>     Blur TOP of a blur adjustment (the only native adjustment node)
+    fx_<id>_*      effect chain nodes of a layer (effects.EffectChain), also an adjustment layer's stack
     out            nullTOP    result (input = last root blend)
     blend_glsl, surface_callbacks   text DATs (shader, Script TOP callbacks)
 
 v6 performance network (``optimize=True``, docs/DESIGN_V6.md 2.1): layers that provably add nothing get no pass (hidden, opacity 0,
-empty, off canvas, no-op adjustment); runs of up to 8 plain layers are ONE ``mrg_L_<first id>`` GLSL Multi TOP (blend.glsl uAdjust
+empty, off canvas, adjustment without drawing effects); runs of up to 8 plain layers are ONE ``mrg_L_<first id>`` GLSL Multi TOP (blend.glsl uAdjust
 8, 16 inputs); transformed pixel layers (``xf_L_*``) and small shapes (``shapec_*``) render only their bounding box; pass outputs are
-8 bit when only plain Normal blends follow; blur radii >= 7 use a mipmapped downsample -> small Blur TOP -> linear upsample
-(``adj_L_<id>_dn`` / ``adj_L_<id>`` / ``adj_L_<id>_up``); spare nodes are pre-cooked.  Optional hints: ``set_content_bounds``,
+8 bit when only plain Normal blends follow; spare nodes are pre-cooked.  Optional hints: ``set_content_bounds``,
 ``set_active_layer``.  ``optimize=False`` builds the v5 network (one 16 bit pass per layer).
 
 Chain order is bottom -> top inside each parent; a group is an isolated chain that starts at ``blank``
 and whose result is the *source* of ``blend_<groupId>``.
 
-Adjustment mapping (AdjustmentSpec -> blend.glsl / TOPs)  --  KEEP IN SYNC WITH THE WEB PREVIEW
-=========================================================================================
-All formulas are on STRAIGHT (unpremultiplied) sRGB values c in [0,1].  Levels, brightness/contrast,
-invert, threshold and hue/saturation are computed INSIDE the ``blend_<id>`` pass (blend.glsl uAdjust 2..6,
-parameters in uniforms uA / uB): one full-screen pass per adjustment, no helper nodes.  The shader
-unpremultiplies the image below, applies f, clamps to [0,1], premultiplies with the alpha of the image below.
-Final result of every adjustment layer:
+Adjustment layers (v8, docs/DESIGN_V7.md 3): an adjustment layer is an effect stack over everything below it (inside its parent).
+Its ``effects[]`` (the classic Levels / Brightness-Contrast / Hue-Saturation / Invert / Threshold / Blur adjustments are ordinary
+effect types since v8; ``protocol.parse_doc`` migrates v2..v7 ``adjustment`` specs) run as an ``effects.EffectChain`` on the
+accumulated image ``acc``; the layer's blend node mixes the result in premultiplied RGBA (blend.glsl uAdjust 1):
 
-    out = mix(below, adjusted, opacity * mask)            (premultiplied RGBA, per channel)
+    out = mix(below, chain(below), opacity * mask)
 
-levels            uAdjust 2   uA = (inLow, inHigh, gamma, outLow), uB.x = outHigh
-                    t   = clamp((c - inLow) / (inHigh - inLow), 0, 1)
-                    out = outLow + (outHigh - outLow) * t ** (1 / gamma)       (gamma > 1 brightens mid-tones)
-                    inHigh is kept >= inLow + 1e-4, gamma in 0.1..10
-brightnessContrast uAdjust 3  uA = (brightness, contrast)
-                    c1  = clamp(c * (1 + brightness), 0, 1)
-                    out = clamp((c1 - 0.5) * (1 + contrast) + 0.5, 0, 1)
-hueSaturation     uAdjust 6   uA = (hue, saturation, value)
-                    true HSV edit: V = max(R,G,B), S = (V - min) / V, H in degrees;
-                    H' = H + hue (+ = CSS hue-rotate direction: red -> green -> blue), S' = min(1, S * saturation),
-                    V' = V * value, back to RGB, each channel clamped (value > 1 saturates channels).
-invert            uAdjust 4   out = 1 - c
-threshold         uAdjust 5   uA.x = level;  out = white if lum(c) >= level else black, alpha preserved,
-                    lum = Rec.709 0.2126 R + 0.7152 G + 0.0722 B
-blur              uAdjust 1   one extra node ``adj_L_<id>`` = Blur TOP (gaussian) on the premultiplied image
-                    size = round(radius * 4.698 / preshrink), preshrink = 1 (r<6), 2 (<14), 4 (<32), 8
-                    -> gaussian with standard deviation sigma = radius px (measured 100.06 for size 470 and
-                    200.4 for 940 at preshrink 1), premultiplied RGBA, pixels outside the document repeat the
-                    edge pixels (extend 'hold').  radius < 0.1 -> node bypassed.
-(Version 1 used native Level / HSV Adjust / Threshold TOPs behind an unpremultiply helper pass: 3-4 passes per
-adjustment.  Same maths, folded into the shader to cut GPU passes and cooks.)
+An adjustment whose stack draws nothing is skipped (``optimize``) or mixes the image with itself.  Adjustments break merged runs and
+need full-precision (16 bit) inputs: the chain divides by alpha / colours.
 
 Blend uniforms (GLSL TOP Vectors page): ``uParams`` vec4 = (BlendMode index, opacity, hasMask,
 uAdjust 0..7) and ``uXform`` vec4 = (x, y, sx, sy), the layer -> document mapping ``doc = (x, y) + (sx, sy) * layer``
@@ -80,7 +57,7 @@ does, and Skia's area-scale rule for rotated / skewed draws) or ``linear``; its 
 never an accumulator.  Every other glsl node is ``nearest`` / texelFetch only (TD builds mip chains for ALL inputs of a
 mipmap-filtered node, and keeps them).  Integer offsets at scale 1 without effects have no resample node: the blend pass
 places the surface itself (exact).  Text / shape layers are always TD rendered at document size (they never have a
-surface slot); see ``render_layer_source``.
+surface slot).
 
 Inputs (v6): layers of kind ``input`` (input 1..8; a legacy ``base`` layer is input 1) read ``src_in<N>``.  The ext tells
 the network which COMP inputs are connected with :meth:`DocNetwork.set_inputs` (the connectors of the COMP are also read
@@ -88,11 +65,10 @@ by apply()); a layer on a disconnected input renders transparent (no resample no
 
 Layer effects: a layer with enabled effects (pixel, input, text, shape) feeds its doc-space content (the resample node
 when it has a mask or a transform, the source node otherwise) through an effect chain (effects.EffectChain, one per
-layer, owned by the network) whose output is the *source* of the layer's blend node.  Flatten is content only
-(``render_layer_source`` ignores effects).
+layer, owned by the network) whose output is the *source* of the layer's blend node.  A render request (flatten / merge) plans its own nodes for
+the requested layers (``render_open``).
 
-v7 (docs/DESIGN_V6.md 5.1): adjustments of type ``filter`` (an effect chain on the accumulated image, mixed by opacity x mask with uAdjust 1),
-effects on groups (chain on the isolated composite, mask first) and on adjustments (``adjx_L_<id>`` adjusted image -> chain -> mix), displace
+v7 (docs/DESIGN_V6.md 5.1): effects on groups (chain on the isolated composite, mask first), displace
 aux images (``auxSource`` 'layer:<id>' / 'input:<n>'), tdPreview layers (``preview_layers`` / ``layer_preview_source`` / ``layer_preview_token``)
 and bold / italic faces of font collections (``text_face``).
 
@@ -123,14 +99,13 @@ BLEND_INDEX = {name: i for i, name in enumerate(BLEND_MODES)}
 GRACE_S = 2.0
 WIDTH_CACHE_MAX = 100000   # measured widths kept (LRU); far above one max-size (20000 char) text
 MEASURE_BUDGET = 16      # Text TOP measurement cooks per apply() / per tick()
-FLATTEN_BUDGET = 200     # Text TOP measurement cooks per render_layer_status() call
+FLATTEN_BUDGET = 200     # Text TOP measurement cooks per render_status() call
 POOL_TARGET = 6          # spare glsl TOPs kept ready (creating a GLSL TOP costs ~4.7 ms)
 POOL_MAX = 10
 GARBAGE_MAX = 12
 JUNK_MAX = 80
 PENDING_MAX = 24
 ROLE_PREFIX = "role:"
-BLUR_SIZE_PER_RADIUS = 4.698   # Blur TOP gaussian: sigma = size / 4.698 (measured)
 FMT = "rgba16float"          # adjustment internals (values may leave 0..1)
 FMT_SHAPE = "rgba8fixed"       # shape / text layer outputs (the browser surfaces are 8 bit too)
 FMT_BLEND = "rgba16fixed"     # blend outputs: 1.5e-5 steps (float16 is 2.4e-4 near 1.0 and colour-burn amplifies it)
@@ -149,9 +124,6 @@ PREWARM = False                # v6: off by default — an unexplained adjustmen
                                # only ever reproduced with pre-warm on; it saves at most a one-off ~15-20 ms compile
 WARM_IDLE_S = 1.0             # spare nodes are pre-cooked (shader compile ~15 ms) only when no apply() happened this recently
 ADJ_MERGED_CODE = 8           # blend.glsl uAdjust of a merged pass
-BLUR_RADIUS_MAX = 200.0       # web/src sanitizer clamps the blur radius here
-BLUR_NOOP_BELOW = 0.05        # ... and treats a smaller radius as no blur
-BLUR_SIGMA_MIN = 3.5          # shrunk sigma (px) the blur pyramid keeps
 
 # reserved (non layer) node names inside doc
 RESERVED = ("blend_glsl", "shape_glsl", "text_measure", "surface_callbacks", "blank", "out", "warm_in")
@@ -226,22 +198,6 @@ def view_uniforms(view, panel_w, panel_h, doc_w, doc_h):
     x0, y0 = max(0.0, rx), max(0.0, ry)
     x1, y1 = min(float(panel_w), rx + rw), min(float(panel_h), ry + rh)
     return (ox, oy, zoom, 1.0 if zoom < 1.0 else 0.0, x0, y0, max(x0, x1), max(y0, y1))
-
-
-def blur_preshrink(radius):
-    """Blur TOP pre-shrink (box downsample before the 1-D passes); the cost is linear in the filter size, so
-    large radii run on a 2x/4x/8x smaller image (sigma >= ~3.5 shrunk px; measured error vs a true gaussian
-    stays ~4/255 incl. 1 px lines)."""
-    return 1 if radius < 6 else 2 if radius < 14 else 4 if radius < 32 else 8
-
-
-def blur_shrink(radius):
-    """Blur pyramid shrink factor (power of two): the image is downsampled (mipmapped Resolution TOP) so the gaussian
-    runs with a shrunk sigma of 3.5..7 px on a (w/s, h/s) image, then enlarged bilinearly.  Cost is ~constant in the
-    radius (a Blur TOP's cost is superlinear in its filter size: 246 ms at r=400 / 4K).  1 for radius < 7."""
-    if not radius >= 2 * BLUR_SIGMA_MIN:
-        return 1
-    return 2 ** int(math.floor(math.log2(radius / BLUR_SIGMA_MIN) + 1e-9))
 
 
 IDENTITY_XF = (0.0, 0.0, 1.0, 1.0)
@@ -548,24 +504,6 @@ def text_is_empty(spec):
         return float((spec.get("color") or {}).get("a", 255)) <= 0
     except (TypeError, ValueError):
         return False
-
-
-def adjustment_is_noop(adj):
-    """An adjustment that cannot change the image: a blur below 0.05 px (the web's threshold), an unknown type."""
-    t = (adj or {}).get("type")
-    if t == "blur":
-        try:
-            return not float(adj.get("radius", 0.0)) >= BLUR_NOOP_BELOW
-        except (TypeError, ValueError):
-            return True
-    return t not in ("levels", "brightnessContrast", "invert", "threshold", "hueSaturation")
-
-
-def adjustment_filter(adj):
-    """The filter effect of a ``{type: 'filter', effect}`` adjustment (a dict), else None."""
-    if isinstance(adj, dict) and adj.get("type") == "filter" and isinstance(adj.get("effect"), dict):
-        return adj["effect"]
-    return None
 
 
 def effect_aux_ref(effects):
@@ -940,73 +878,9 @@ def text_pars(spec, doc_w, doc_h, metrics=None, face=None):
     }
 
 
-class Plan:
-    """How one adjustment layer is built.
-
-    ``nodes``: extra operators (only blur has one), ordered ``(name, optype, pars, bypass, inputs, kind)``;
-    inputs are node names or the tokens ``$acc`` (accumulated image below) / ``$prev``.  ``src`` = node
-    feeding blend input 1 (``$last`` = last node, otherwise a name such as ``blank``), ``adjust`` =
-    blend.glsl uAdjust, ``extra`` = uA / uB uniform values of the blend node."""
-
-    def __init__(self, nodes, adjust, src="$last", extra=None):
-        self.nodes, self.adjust, self.src, self.extra = nodes, adjust, src, extra or {}
-
-
-# blend.glsl uAdjust codes
-ADJ_BLEND, ADJ_PREMULT, ADJ_LEVELS, ADJ_BC, ADJ_INVERT, ADJ_THRESHOLD, ADJ_HSV, ADJ_RESAMPLE = range(8)
-ADJ_SHRINK, ADJ_ENLARGE = 9, 10          # blur pyramid passes (blend.glsl uAdjust 9 / 10; 8 = merged)
-
-
-def _ab(a=0.0, b=0.0, c=0.0, d=0.0, e=0.0):
-    return {"vec2valuex": float(a), "vec2valuey": float(b), "vec2valuez": float(c), "vec2valuew": float(d),
-            "vec3valuex": float(e)}
-
-
-def adjustment_plan(adj, sid, doc_w=0, doc_h=0, pyramid=False):
-    """AdjustmentSpec -> :class:`Plan`.  Documented at the top of this module.  ``pyramid`` (v6, needs the document
-    size): blur radii >= 7 run as  adj_L_<id>_dn (Resolution TOP, mipmap, 1/s) -> adj_L_<id> (Blur TOP on the small image)
-    -> adj_L_<id>_up (Resolution TOP, linear, document size)  with s = :func:`blur_shrink`."""
-    t = adj.get("type")
-    base = "adj_L_" + sid
-    if t == "levels":
-        lo = float(adj.get("inLow", 0.0))
-        hi = max(float(adj.get("inHigh", 1.0)), lo + 1e-4)
-        gamma = min(10.0, max(0.1, float(adj.get("gamma", 1.0))))
-        return Plan([], ADJ_LEVELS, "blank", _ab(lo, hi, gamma, float(adj.get("outLow", 0.0)), float(adj.get("outHigh", 1.0))))
-    if t == "brightnessContrast":
-        return Plan([], ADJ_BC, "blank", _ab(float(adj.get("brightness", 0.0)), float(adj.get("contrast", 0.0))))
-    if t == "invert":
-        return Plan([], ADJ_INVERT, "blank", _ab())
-    if t == "threshold":
-        return Plan([], ADJ_THRESHOLD, "blank", _ab(float(adj.get("level", 0.5))))
-    if t == "hueSaturation":
-        return Plan([], ADJ_HSV, "blank", _ab(float(adj.get("hue", 0.0)), float(adj.get("saturation", 1.0)),
-                                              float(adj.get("value", 1.0))))
-    if t == "blur":
-        r = min(BLUR_RADIUS_MAX, max(0.0, float(adj.get("radius", 0.0))))      # the web clamps at 200
-        sh = blur_shrink(r)
-        if pyramid and sh > 1 and doc_w > 0 and doc_h > 0:
-            size = max(1, int(round(r / sh * BLUR_SIZE_PER_RADIUS)))
-            k = size + 1                                  # pad cells: the blur's reach, so no extend mode is needed
-            gw, gh = -(-int(doc_w) // sh) + 2 * k, -(-int(doc_h) // sh) + 2 * k
-
-            def gl(w, h, filt, a_code):
-                return {"outputresolution": "custom", "resolutionw": w, "resolutionh": h, "pixeldat": "blend_glsl",
-                        "inputfiltertype": filt, "inputextenduv": "hold",
-                        "vec0name": "uParams", "vec0valuex": 0.0, "vec0valuey": 1.0, "vec0valuez": 0.0, "vec0valuew": float(a_code),
-                        "vec1name": "uXform", "vec1valuex": float(sh), "vec1valuey": 0.0, "vec1valuez": 0.0, "vec1valuew": 0.0,
-                        "vec2name": "uA", "vec2valuex": float(k), "vec2valuey": 0.0, "vec2valuez": 0.0, "vec2valuew": 0.0}
-            return Plan([
-                (base + "_dn", "glslTOP", gl(gw, gh, "nearest", ADJ_SHRINK), False, ["$acc", "$acc", "$acc"], "shrink"),
-                (base, "blurTOP", {"type": "gaussian", "extend": "hold", "preshrink": 1, "size": size}, False, ["$prev"], "blur"),
-                (base + "_up", "glslTOP", gl(int(doc_w), int(doc_h), "linear", ADJ_ENLARGE), False, ["$prev", "$prev", "$prev"], "grow")],
-                ADJ_PREMULT)
-        ps = blur_preshrink(r)
-        return Plan([(base, "blurTOP", {
-            "type": "gaussian", "extend": "hold", "preshrink": ps,
-            "size": max(1, int(round(r * BLUR_SIZE_PER_RADIUS / ps)))}, r < BLUR_NOOP_BELOW, ["$acc"], "blur")], ADJ_PREMULT)
-    # unknown type: identity
-    return Plan([(base, "nullTOP", {}, False, ["$acc"], "null")], ADJ_PREMULT)
+# blend.glsl uAdjust codes (2..6 were the classic adjustments, 9 / 10 the blur pyramid: gone in v8 -- they are effect types now)
+ADJ_BLEND, ADJ_PREMULT = 0, 1
+ADJ_RESAMPLE = 7
 
 
 class _OutOfBudget(Exception):
@@ -1050,8 +924,6 @@ class DocNetwork:
         self._pool_serial = 0
         self._mpool = []      # spare GLSL Multi TOPs for merged passes
         self._mpool_serial = 0
-        self._lazy = {}       # layer id -> _Node of a full-size shape_<id> that is not built unless Flatten asks
-        self._flat_want = set()    # shape layers whose full-size node was requested (kept while the layer exists)
         self._shape_cropped = set()     # shape layers cropped by the last plan (crop hysteresis)
         self._active = None   # set_active_layer(): the layer being edited (its own pass, runs split around it)
         self._hints = {}      # layer id -> content bounds hint (set_content_bounds)
@@ -1081,12 +953,13 @@ class DocNetwork:
         self._slots = {}      # slot -> node name (live surfaces)
         self._new_sizes = {}
         self._slot_sizes = {}  # slot -> (w, h) of the surface (document size when the spec has none)
-        self._source_keys = {}  # text / shape layer id -> its own spec + document size (Flatten token)
-        self._sources = {}     # text / shape layer id -> source node name
         self._slot_nodes = {}
         self._prev_layers = None
         self._prev_stack = None
         self._prev_size = None
+        self._prev_reqs = None
+        self._cur = None             # (layers, doc_w, doc_h) of the last apply(): render requests re-plan with it
+        self._reqs = {}              # render request key -> {spec, tag, sig, out, texts, slots, error}
         self._input_connected = None   # {input: bool} of the last apply()
         self._declared = {}            # set_inputs(): fallback for inputs whose COMP connector is not readable
         self._scanned = False
@@ -1119,7 +992,9 @@ class DocNetwork:
         connected = self._detect_inputs()
         key = (doc_w, doc_h)
         snap = json.dumps(layers)         # (key order follows the ext's parser: a different order only costs a re-plan)
-        if snap == self._prev_layers and key == self._prev_size and connected == self._input_connected:
+        reqs = self._reqs_key()
+        self._cur = (layers, doc_w, doc_h)
+        if snap == self._prev_layers and key == self._prev_size and connected == self._input_connected and reqs == self._prev_reqs:
             self._last = {k: 0 for k in self._counters}
             self._last_ms = (time.perf_counter() - t0) * 1e3
             return
@@ -1136,6 +1011,7 @@ class DocNetwork:
         if self._active is not None and self._active not in ids:
             self._active = None
         self._prev_size = key
+        self._prev_reqs = reqs
         self._counters["applies"] += 1
         self._last_ms = (time.perf_counter() - t0) * 1e3
         self._last = {k: self._counters[k] - counters0[k] for k in self._counters}
@@ -1187,63 +1063,8 @@ class DocNetwork:
         top = self.surface_top(slot)
         return (int(top.width), int(top.height)) if top is not None else None
 
-    # ---- Flatten (text / shape layer rendered alone) -------------------------------------------
-    # The ext re-resolves these EVERY FRAME while a renderLayer request is in flight (they are cheap dictionary
-    # lookups): the operator behind a layer can be recycled / destroyed by an apply() between two frames.
-
-    def render_layer_source(self, layer_id):
-        """The TOP that renders a text / shape layer alone: its source node (Text TOP / shape GLSL TOP) at document
-        resolution, transparent background, premultiplied RGBA, NOT affected by the layer's opacity, mask, blend
-        mode, visibility (a hidden layer still renders) or the layers below.  No cooking, no measurement (v6: the
-        full-size node of a cropped / skipped shape is built here on first use).  ``None`` when ``layer_id`` is not a text / shape layer of the last applied stack (never
-        applied, deleted, kind changed) or its operator is gone; the transparent ``blank`` TOP for a layer without a
-        spec.  Check :meth:`render_layer_ready` before reading pixels and :meth:`render_layer_token` before and after
-        the readback."""
-        name = self._sources.get(layer_id)
-        if name is None:
-            for l in self._prev_stack or ():
-                if l.get("id") == layer_id and l.get("kind") in ("text", "shape"):
-                    op = self._ops.get("blank")
-                    return op if op is not None and op.valid else None
-            return None
-        op = self._ops.get(name)
-        if op is None and layer_id in self._lazy:
-            op = self._materialize_flat(layer_id, name)
-        return op if op is not None and op.valid else None
-
-    def _materialize_flat(self, layer_id, name):
-        """v6: the document-size ``shape_<id>`` of a cropped / skipped shape layer is built the first time Flatten asks for it
-        (one pooled GLSL TOP, no cooking); it then stays while the layer exists (the next plans include it)."""
-        node = self._lazy.pop(layer_id)
-        self._flat_want.add(layer_id)
-        op = self._acquire(name, node)
-        self._set_pars(name, op, node.pars)
-        cache = self._cache[name]
-        op.nodeX, op.nodeY = node.pos
-        cache["pos"] = node.pos
-        self._wire(name, [])
-        self._desired[name] = node
-        return op
-
-    def render_layer_token(self, layer_id):
-        """Opaque value identifying the pixels ``render_layer_source`` would produce right now.  PER LAYER: it changes
-        only when this layer's own spec / kind / the document size changes, the node behind it is replaced, or its text
-        layout is refined (measurements finished).  Edits to other layers do not touch it, so a readback survives
-        continuous editing elsewhere.  ``None`` = the layer is gone.  The ext compares it before cooking and after
-        reading back and drops the result when it differs."""
-        if self.render_layer_source(layer_id) is None:
-            return None
-        name = self._sources.get(layer_id, "blank")
-        return (self._gen.get(name), self._source_keys.get(layer_id), self._text_rev.get(name, 0))
-
-    def render_layer_status(self, layer_id):
-        """``'ready'`` | ``'pending'`` (text measurements still being finished over later ticks, the layout shown is
-        the 0.5 em fallback) | ``'failed'`` (the Text TOP could not be measured: retried with back-off, the fallback
-        layout is what renders) | ``None`` (layer gone).  Does a bounded amount of measurement work itself
-        (``FLATTEN_BUDGET`` cooks per call), so polling it each frame converges."""
-        if self.render_layer_source(layer_id) is None:
-            return None
-        name = self._sources.get(layer_id)
+    def _text_status(self, name):
+        """'ready' | 'pending' | 'failed' of one Text TOP's layout; does a bounded amount of measurement work (FLATTEN_BUDGET cooks)."""
         if name is None or name not in self._text_todo:
             return "ready"
         node, op = self._text_nodes.get(name), self._ops.get(name)
@@ -1264,8 +1085,156 @@ class DocNetwork:
             return "ready"
         return "failed" if self._text_retry.get(name, (0, 0.0))[0] > 0 else "pending"
 
-    def render_layer_ready(self, layer_id):
-        return self.render_layer_status(layer_id) == "ready"
+    # ---- v8 render requests: flatten / merge down / merge selected --------------------------------------------------
+    # A request is a temporary network ``rqout_<tag>`` planned (and reconciled) with the document: the same planner turns a synthetic
+    # layer list (copies of the requested layers with their own ids ``<tag>.<id>``, sharing the surfaces) into nodes, so effects, masks,
+    # transforms, blend modes, groups and adjustments behave exactly as in the document.  The nodes are removed again by
+    # :meth:`render_close`.  The ext re-resolves :meth:`render_source` every frame and checks :meth:`render_token` before and after the
+    # readback (like the v4 text / shape flatten).
+
+    def _reqs_key(self):
+        return tuple(sorted((k, json.dumps(v["spec"], sort_keys=True)) for k, v in self._reqs.items()))
+
+    def render_open(self, key, kind, layer_id=None, layer_ids=None, mode="flatten"):
+        """Start a render request.  ``kind`` 'layer' (``layer_id``, ``mode`` 'flatten' | 'mergeDown') or 'layers' (``layer_ids``).
+        Returns None, or an error string (unknown layer, nothing below an adjustment, ...).  Plans the temporary nodes at once
+        (one apply() of the last document)."""
+        if self._cur is None:
+            return "no document"
+        if key in self._reqs:
+            self.render_close(key)
+        spec = {"kind": kind, "layerId": layer_id, "layerIds": list(layer_ids or ()), "mode": mode}
+        used = {v["tag"] for v in self._reqs.values()}
+        tag = next("q%d" % i for i in range(1 << 16) if "q%d" % i not in used)
+        try:
+            self._request_layers(self._cur[0], spec, tag)
+        except ValueError as e:
+            return str(e)
+        self._reqs[key] = {"spec": spec, "tag": tag, "sig": None, "out": None, "texts": set(), "slots": set(), "inputs": set(), "ids": frozenset(), "error": None}
+        self._replan()
+        return self._reqs[key].get("error")
+
+    def render_close(self, key):
+        """End a render request: its temporary nodes are removed (by the re-plan; destroys are deferred to tick())."""
+        if self._reqs.pop(key, None) is not None and self._cur is not None:
+            self._replan()
+
+    def _replan(self):
+        layers, w, h = self._cur
+        self.apply(layers, w, h)
+
+    def render_error(self, key):
+        rq = self._reqs.get(key)
+        return None if rq is None else rq.get("error")
+
+    def render_source(self, key):
+        """The TOP with the request's result: document size, premultiplied RGBA, transparent where nothing is drawn.  ``None``
+        when the request is gone, invalid (its layer was deleted / changed kind) or its operator is gone."""
+        rq = self._reqs.get(key)
+        if rq is None or rq.get("out") is None:
+            return None
+        op = self._ops.get(rq["out"])
+        return op if op is not None and op.valid else None
+
+    def render_token(self, key):
+        """Opaque value identifying the pixels :meth:`render_source` would produce now: the request's synthetic layers (spec, masks,
+        transforms, effects), the document size, the node's identity, its text layouts and the cook counters of the surfaces it reads.
+        Edits to other layers do not change it.  ``None`` = no source."""
+        if self.render_source(key) is None:
+            return None
+        rq = self._reqs[key]
+        cooks = tuple(getattr(self._ops.get("s%d" % sl), "totalCooks", 0) for sl in sorted(rq["slots"]))
+        ins = tuple((n, getattr(self._ops.get("src_in%d" % n), "totalCooks", 0)) for n in sorted(rq["inputs"]))
+        failed = tuple(sorted((i, self._fx_fail[i][2]) for i in rq["ids"] if i in self._fx_fail))   # a failed chain changes the picture
+        return (rq["tag"], self._gen.get(rq["out"]), rq["sig"], self._prev_size,
+                tuple(self._text_rev.get(n, 0) for n in sorted(rq["texts"])), cooks, ins, failed)
+
+    def render_status(self, key):
+        """'ready' | 'pending' | 'failed' (text layouts still being measured / unmeasurable, or an effect chain of the request failed: its
+        layer would be baked without the effects) | None (no source)."""
+        if self.render_source(key) is None:
+            return None
+        rq = self._reqs[key]
+        if any(i in self._fx_fail for i in rq["ids"]):
+            return "failed"
+        st = [self._text_status(n) for n in sorted(rq["texts"])]
+        return "failed" if "failed" in st else "pending" if "pending" in st else "ready"
+
+    def render_ready(self, key):
+        return self.render_status(key) == "ready"
+
+    def _request_layers(self, layers, spec, tag):
+        """The synthetic layer list of a render request (ids ``<tag>.<id>``; top-level layers of the request have no parent).  Raises
+        ValueError with a user message for a request that cannot be served.  Flatten = the layer alone (opacity 1, Normal, visible; mask,
+        transform and effects kept; a group with its descendants); mergeDown = the layer below the adjustment (as flatten) + the adjustment
+        (opacity, mask, effects kept); layers = the given layers in stack order with their own opacity / blend / visibility."""
+        byid = {l.get("id"): l for l in layers if isinstance(l, dict)}
+        kids = {}
+        for l in layers:
+            kids.setdefault(l.get("parentId") if l.get("parentId") in byid else None, []).append(l)
+        order = {}
+
+        def walk(pid):
+            for l in kids.get(pid, ()):
+                order[l["id"]] = len(order)
+                walk(l["id"])
+        walk(None)
+
+        def new(l, parent, **over):
+            return dict(l, id="%s.%s" % (tag, l["id"]), parentId=parent, **over)
+
+        def tree(l, out, **over):
+            """``l`` (overrides applied) as a root, then all its descendants."""
+            out.append(new(l, None, **over))
+            stack = [l["id"]]
+            while stack:
+                pid = stack.pop()
+                for k in kids.get(pid, ()):
+                    out.append(new(k, "%s.%s" % (tag, pid)))
+                    stack.append(k["id"])
+
+        def plain(l):
+            return dict(visible=True, opacity=1.0, blend="normal")
+
+        def merge_down(l):
+            sib = kids.get(l.get("parentId") if l.get("parentId") in byid else None, [])
+            i = sib.index(l)
+            if i == 0:
+                raise ValueError("there is nothing below this adjustment layer to merge into")
+            below = sib[i - 1]
+            if below.get("kind") == "adjustment":
+                raise ValueError("cannot merge into an adjustment layer")
+            out = []
+            tree(below, out, **plain(below))
+            out.append(new(l, None, visible=True))
+            return out
+
+        out = []
+        if spec["kind"] == "layers":
+            ids = [i for i in spec["layerIds"] if i in byid]
+            if len(ids) != len(spec["layerIds"]):
+                raise ValueError("a layer to render does not exist in TouchDesigner's document")
+            chosen = set(ids)
+
+            def covered(l):
+                p = l.get("parentId")
+                while p in byid:
+                    if p in chosen:
+                        return True
+                    p = byid[p].get("parentId")
+                return False
+            for l in sorted((byid[i] for i in ids if not covered(byid[i])), key=lambda x: order[x["id"]]):
+                tree(l, out)
+            return out
+        l = byid.get(spec["layerId"])
+        if l is None:
+            raise ValueError("layer %r is not in TouchDesigner's document" % (spec["layerId"],))
+        if spec["mode"] == "mergeDown" or l.get("kind") == "adjustment":
+            if l.get("kind") != "adjustment":
+                raise ValueError("only an adjustment layer can be merged down")
+            return merge_down(l)
+        tree(l, out, **plain(l))
+        return out
 
     def output(self):
         return self._ops.get("out")
@@ -1367,7 +1336,7 @@ class DocNetwork:
         """The TOP with the layer's content AFTER its effects, in DOCUMENT space and document size, PREMULTIPLIED RGBA (TD row
         order, rgba8fixed): for a pixel / input / text / shape layer its masked, transformed content through its effect chain; for
         a group the isolated composite through its chain (its mask applied first); for an adjustment layer the adjusted result
-        through the chain (a filter adjustment: the filter applied to the composite below, i.e. before the opacity x mask mix).
+        through the chain (the stack applied to the composite below, i.e. before the opacity x mask mix).
         Never includes the layer's opacity, blend mode or (except groups / pixel layers, where it is applied before the effects)
         its mask.  ``None`` when the layer has no tdPreview effect, is hidden (itself or an ancestor; opacity 0 too), its chain failed (no effects would be shown) or it is gone."""
         return self._preview_op(layer_id)
@@ -1743,10 +1712,7 @@ class DocNetwork:
             del self._text_retry[gone]
         self._slot_nodes = {}
         self._new_sizes = {}
-        self._sources = {}
-        self._source_keys = {}
         self._boxes = {}
-        self._lazy = {}
         info = self._plan_info = {"layers": 0, "skipped": 0, "passes": 0, "merged": 0, "merged_layers": 0,
                                   "fmt8": 0, "cropped": 0, "skip_reasons": {}}
         opt = self._opt
@@ -1848,12 +1814,8 @@ class DocNetwork:
                     elif not opacity_value(opacity) > 0.0:
                         skip_why = "opacity"
                 kids_items = None
-                shape_full = None       # the full-size shape node, added below (or deferred, see _lazy)
-                plan_nodes = ()
+                shape_full = None       # the full-size shape node, added below (not when the blend does not use it)
                 sbox = None             # document box a text / shape / pixel layer can touch (None = nothing)
-                if kind in ("text", "shape"):
-                    self._source_keys[l["id"]] = json.dumps([kind, l.get(kind), doc_w, doc_h], sort_keys=True,
-                                                            separators=(",", ":"))
                 if kind in ("input", "base"):
                     n_in = input_index(l)
                     src, adjust = input_source(n_in), 0
@@ -1874,7 +1836,6 @@ class DocNetwork:
                         if not complete:
                             self._text_todo.add(src)
                         add(_Node(src, "textTOP", self._text_pars(spec, doc_w, doc_h, metrics), (), pos=(bx - 350, y)))
-                        self._sources[l["id"]] = src
                         if opt and text_is_empty(spec):
                             skip_why = skip_why or "empty"
                     else:
@@ -1885,7 +1846,6 @@ class DocNetwork:
                                 "vec4name": "uC"}
                         pars.update(shape_uniforms(spec, doc_h))
                         shape_full = _Node(src, "glslTOP", pars, (), pos=(bx - 350, y))
-                        self._sources[l["id"]] = src
                         if opt:
                             sbox = shape_box(spec, doc_w, doc_h)
                             if sbox is None:
@@ -1908,26 +1868,19 @@ class DocNetwork:
                         if opt:
                             skip_why = skip_why or "empty"
                 elif kind == "adjustment":
-                    adj = l.get("adjustment") or {}
-                    # a filter adjustment is an unknown type for adjustment_plan = identity passthrough (an adjustment that draws
-                    # nothing must show the image below, also without the skip rules); with a chain _emit replaces the passthrough
-                    plan = adjustment_plan(adj, sid, doc_w, doc_h, pyramid=opt)
-                    adjust = plan.adjust
-                    extra = plan.extra
-                    plan_nodes = plan.nodes
-                    src = "$plan" if plan.src == "$last" else plan.src
+                    # v8: the stack runs on the accumulated image (``$acc``); without drawing effects the layer mixes the image with itself
+                    # (it must show the image below, also without the skip rules)
+                    adjust, src = ADJ_PREMULT, "$acc"
                 else:
                     continue
                 # sTD2DInputs[] is sized by the number of wired inputs: always wire all three
                 has_mask = mask_name is not None
                 if kind in ("group", "adjustment"):
                     fx = self._layer_effects(l, kind)
-                    if kind == "adjustment" and opt and adjustment_is_noop(l.get("adjustment") or {}) and not fx:
+                    if kind == "adjustment" and opt and not fx:
                         skip_why = skip_why or "noop"
                 else:
                     fx = self._layer_effects(l, kind) if src != "blank" and not no_fx else None
-                if kind == "adjustment" and fx and (l.get("adjustment") or {}).get("type") == "filter":
-                    adjust, extra, plan_nodes, src = ADJ_PREMULT, {}, (), "blank"        # the chain runs on the accumulated image
                 need_doc = l["id"] in aux_targets and kind in ("pixel", "input", "base", "text", "shape") and src != "blank" and not no_fx
                 docspace = bool(fx and kind not in ("group", "adjustment")) or need_doc
                 if kind in ("pixel", "input", "base") and aff.dead:
@@ -1987,7 +1940,7 @@ class DocNetwork:
                     limit = 0.65 if l["id"] in self._shape_cropped else 0.5
                     if (cx1 - cx0) * (cy1 - cy0) <= limit * doc_w * doc_h:
                         # v6 bounding box: a second, cropped shape node renders only the box (the full-size ``shape_<id>`` stays
-                        # as the Flatten source and is never cooked by the blend); same shader, shifted uniforms
+                        # never cooked by the blend); same shader, shifted uniforms
                         cp = {"outputresolution": "custom", "resolutionw": cx1 - cx0, "resolutionh": cy1 - cy0,
                               "pixeldat": "shape_glsl", "format": FMT_SHAPE,
                               "vec0name": "uParams", "vec1name": "uOffset", "vec2name": "uA", "vec3name": "uB", "vec4name": "uC"}
@@ -1998,12 +1951,10 @@ class DocNetwork:
                         self._boxes[l["id"]] = sbox
                         cropped_shape.add(l["id"])
                 if shape_full is not None:
-                    # the full-size node is the Flatten source and the input of effect chains; nothing else cooks it.  When the
-                    # blend does not use it (cropped / skipped, no effects) it is built only when render_layer_source asks.
+                    # the full-size node is the input of effect chains; nothing else cooks it.  When the blend does not use it
+                    # (cropped / skipped, no effects) it is not built at all (render requests plan their own nodes).
                     unused = opt and not docspace and (src != "shape_" + sid or skip_why is not None)
-                    if unused and l["id"] not in self._flat_want:
-                        self._lazy[l["id"]] = shape_full
-                    else:
+                    if not unused:
                         add(shape_full)
                 if skip_why is not None and not SKIP_RULES:
                     skip_why = None
@@ -2015,7 +1966,7 @@ class DocNetwork:
                 items.append({"id": l["id"], "sid": sid, "kind": kind, "name": bname, "src": src,
                               "mask": mask_name or "blank", "has_mask": has_mask, "mode": mode, "opacity": opacity,
                               "xf": xf, "mip": mip, "adjust": adjust, "extra": extra, "bypass": not visible,
-                              "pos": (bx, y), "plan_nodes": plan_nodes, "kids": kids_items, "xpos": bx - 350,
+                              "pos": (bx, y), "kids": kids_items, "xpos": bx - 350,
                               "layer_y": y, "layer": l if kind in ("group", "adjustment") else None,
                               "fx": fx if kind in ("group", "adjustment") else None})
             return items
@@ -2029,12 +1980,64 @@ class DocNetwork:
         cropped_shape = set()
         items = walk(children.get(None, []), 0)
         self._shape_cropped = cropped_shape
-        self._flat_want &= known         # (keep requested full-size nodes only for layers that still exist)
         root = self._emit(add, items, "blank", True, doc_w, doc_h)
         add(_Node("out", "nullTOP", {}, [root], pos=(1000, 0)))
+        for rq in self._reqs.values():           # v8: temporary render-request networks (flatten / merge), same planner, own node names
+            rq.update(out=None, texts=set(), slots=set(), inputs=set(), ids=frozenset(), sig=None)
+            before_nodes, before_fx, before_children = set(d), set(self._fx_todo), dict(children)
+            try:
+                self._plan_request(rq, layers, children, walk, add, doc_w, doc_h)
+                rq["error"] = None
+            except ValueError as e:
+                rq["error"] = str(e)
+            except Exception as e:      # noqa: BLE001 - a request that cannot be planned must never break the document's own apply
+                rq["error"] = "cannot plan the render request: %s: %s" % (type(e).__name__, e)
+                rq.update(out=None, texts=set(), slots=set(), inputs=set(), ids=frozenset(), sig=None)
+                for name in [n for n in d if n not in before_nodes]:
+                    del d[name]
+                for alias in [a for a in self._fx_todo if a not in before_fx]:
+                    del self._fx_todo[alias]
+                children.clear()
+                children.update(before_children)
         for gone in [n for n in self._text_retry if n not in self._text_nodes]:
             del self._text_retry[gone]
         return d
+
+    def _plan_request(self, rq, layers, children, walk, add, doc_w, doc_h):
+        """Plan one render request's temporary nodes (called by _plan); raises ValueError for a request that cannot be served."""
+        syn = self._request_layers(layers, rq["spec"], rq["tag"])
+        byid = {l.get("id"): l for l in layers if isinstance(l, dict)}
+        kids = {}
+
+        def note(layer):
+            for sv in (layer.get("slot"), (layer.get("mask") or {}).get("slot") if isinstance(layer.get("mask"), dict) else None):
+                if sv is not None:
+                    rq["slots"].add(int(sv))
+        for sl in syn:
+            kids.setdefault(sl.get("parentId"), []).append(sl)
+            note(sl)
+            if sl.get("kind") in ("input", "base"):
+                rq["inputs"].add(input_index(sl))
+            ref = effect_aux_ref(self._effect_list(sl)) if self._fx is not None else None
+            if ref is not None:        # the aux image of an effect: another layer's pixels (and mask) or a COMP input
+                if ref[0] == "input":
+                    rq["inputs"].add(ref[1])
+                else:
+                    src = byid.get(ref[1]) or byid.get(ref[1].partition(".")[2])
+                    if src is not None:
+                        note(src)
+                        if src.get("kind") in ("input", "base"):
+                            rq["inputs"].add(input_index(src))
+        rq["ids"] = frozenset(sl["id"] for sl in syn)
+        top = kids.pop(None, [])
+        children.update(kids)
+        texts0 = set(self._text_nodes)
+        ritems = walk(top, 0)
+        rroot = self._emit(add, ritems, "blank", True, doc_w, doc_h)
+        rq["out"] = "rqout_" + rq["tag"]
+        rq["texts"] = set(self._text_nodes) - texts0
+        rq["sig"] = json.dumps(syn, sort_keys=True, separators=(",", ":"), default=str)
+        add(_Node(rq["out"], "nullTOP", {}, [rroot], pos=(1000, -300)))
 
     def _surface_size(self, layer, doc_w, doc_h):
         """(w, h) of a pixel layer's surface (document size when the spec has none)."""
@@ -2135,35 +2138,12 @@ class DocNetwork:
                 info["merged_layers"] += len(run)
                 acc = name
             else:
-                prev = None
-                ax = it["xpos"]
-                for nname, optype, npars, byp, ins, nk in it["plan_nodes"]:
-                    npars = dict(npars)
-                    if optype not in ("nullTOP", "constantTOP"):
-                        npars["format"] = FMT
-                    ins = [acc if k == "$acc" else prev if k == "$prev" else k for k in ins]
-                    add(_Node(nname, optype, npars, ins, bypass=byp, pos=(ax, it["layer_y"])))
-                    prev = nname
-                    ax += 120
                 src = it["src"]
-                if src == "$plan":
-                    src = prev
                 adjust, extra = it["adjust"], it["extra"]
-                if it.get("fx") and it["kind"] == "adjustment":
-                    # effects on an adjustment layer: chain(adjusted image) is mixed with the image below by opacity x mask
-                    # (uAdjust 1).  Filter adjustments: the chain runs on the accumulated image itself.
-                    if prev is not None:
-                        adjusted = prev
-                    elif adjust == ADJ_PREMULT:
-                        adjusted = acc
-                    else:
-                        adjusted = "adjx_L_%s" % it["sid"]
-                        ap = self._blend_pars(0, 1.0, False, adjust, IDENTITY_XF, False, fmt=FMT)
-                        ap.update(extra)
-                        add(_Node(adjusted, "glslTOP", ap, [acc, "blank", "blank"], pos=(it["xpos"], it["layer_y"])))
-                    src = self._plan_effects(add, it["layer"], it["sid"], adjusted, it["fx"], doc_w, doc_h,
-                                             (it["xpos"] + 60, it["layer_y"]))
-                    adjust, extra = ADJ_PREMULT, {}
+                if it["kind"] == "adjustment":
+                    # the layer's effect stack runs on the accumulated image; chain(acc) is mixed with acc by opacity x mask (uAdjust 1)
+                    src = acc if not it.get("fx") else self._plan_effects(
+                        add, it["layer"], it["sid"], acc, it["fx"], doc_w, doc_h, (it["xpos"] + 60, it["layer_y"]))
                 bp = self._blend_pars(it["mode"], it["opacity"], it["has_mask"], adjust, it["xf"], it["mip"], fmt=fmt)
                 bp.update(extra)
                 add(_Node(it["name"], "glslTOP", bp, [acc, src, it["mask"]], bypass=it["bypass"], pos=it["pos"]))
@@ -2196,11 +2176,9 @@ class DocNetwork:
             self.fx_error = "%s: %s" % (type(e).__name__, e)
 
     def _effect_list(self, layer):
-        """Every effect dict that is applied to the layer's content: its ``effects`` plus, for a filter adjustment, the
-        filter itself FIRST (it is the adjusted image; the layer's effects then decorate it)."""
-        fx = [e for e in (layer.get("effects") or ()) if isinstance(e, dict)] if isinstance(layer.get("effects"), (list, tuple)) else []
-        f = adjustment_filter(layer.get("adjustment")) if layer.get("kind") == "adjustment" else None
-        return ([f] if f is not None else []) + fx
+        """Every effect dict that is applied to the layer's content (an adjustment layer: the stack applied to everything below;
+        the ext's ``parse_doc`` has already migrated legacy ``adjustment`` specs into it)."""
+        return [e for e in (layer.get("effects") or ()) if isinstance(e, dict)] if isinstance(layer.get("effects"), (list, tuple)) else []
 
     def _layer_effects(self, layer, kind):
         """The layer's effect list when at least one effect draws something, else None.  All layer kinds (v7: groups and
@@ -2334,7 +2312,9 @@ class DocNetwork:
                     self.doc, "fx_" + sanitize(lid), self._fx_shaders, acquire=self._fx_acquire,
                     release=self._fx_release, pos=pos, adopt=False)
             c0 = dict(chain.counters)
-            out = chain.apply(fx, src_op, aux=aux) if aux is not None else chain.apply(fx, src_op)
+            cur = self._cur
+            dw, dh = (cur[1], cur[2]) if cur else (None, None)      # chain inputs are document sized (docspace): do not trust a fresh node's .width
+            out = chain.apply(fx, src_op, dw, dh, aux=aux) if aux is not None else chain.apply(fx, src_op, dw, dh)
             for k in ("par_sets", "connects"):
                 self._counters[k] += chain.counters[k] - c0[k]
             self._fx_fail.pop(lid, None)
@@ -2569,6 +2549,8 @@ class DocNetwork:
                 if pool:
                     op, cache = pool.pop()
                     self._counters["recycled"] += 1
+                    if spec.multi:
+                        cache["verify"] = True      # a pooled Multi TOP keeps its connections; TD may have cut / compacted some meanwhile
                 else:
                     op, cache = self._make_multi_node() if spec.multi else self._make_pool_node()
                 self._cache[name] = cache
@@ -2621,6 +2603,17 @@ class DocNetwork:
         want_all = [(n, self._gen[n]) for n in inputs]
         outs = self._fx_out
         cur = cache["inputs"]
+        if cache.pop("verify", False) and cur and op.OPType == "glslmultiTOP":
+            # recycled Multi TOP: the cache says "wired like in the previous role", but destroying a source op (a render request's text /
+            # shape node, a recycled surface...) makes TD cut that connector (and shrink / shift the list): trust the real wiring
+            cur = list(cur)
+            for i, w in enumerate(want_all):
+                if i < len(cur) and cur[i] == w:
+                    tgt = outs[w[0]] if w[0] in outs else self._ops[w[0]]
+                    got = op.inputConnectors[i].connections if i < len(op.inputConnectors) else []
+                    owner = (getattr(got[0], "owner", got[0]) if got else None)
+                    if owner is not tgt:
+                        cur[i] = None
         if cur is not None and cur == want_all and (op.OPType != "glslmultiTOP" or len(op.inputConnectors) > len(cur)):
             return
         if cur is None:     # adopted: unknown state, rewire everything

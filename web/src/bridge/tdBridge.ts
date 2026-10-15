@@ -1,9 +1,11 @@
 import type { CanvasMode, EditorEngine, LayerSpec, Rect } from '../engine/types';
 import type { FileResult } from '../state/filesSlice';
 import type { InputItem } from '../state/inputsSlice';
+import { layerBelow } from '../state/layerDrop';
+import { RENDER_STALE_MESSAGE } from '../state/layersSlice';
 import {
   FRAME_BASE, FRAME_LAYER_PREVIEW, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, FRAME_VIEW, MAX_BAND_PAYLOAD, PROTOCOL_VERSION,
-  decodeFrame, decodeTdMessage, encodeBands, encodeMessage, isStale, type ChoosePurpose, type TdMessage, type TopItem, type ViewMode, type ViewRect, type WebMessage,
+  decodeFrame, decodeTdMessage, encodeBands, encodeMessage, isStale, type ChoosePurpose, type TdMessage, type TopItem, type ViewMode, type ViewRect, type RenderMode, type WebMessage,
 } from './codec';
 
 export type Connection = 'linked' | 'standalone' | 'reconnecting';
@@ -52,7 +54,9 @@ export interface Bridge {
   /** v4: snapshot a TOP once and add it as a pixel layer (engine.importImage). Resolves with the new layer id. */
   importTop(path: string): Promise<string>;
   /** v5 Flatten: TD renders the text/shape layer alone at document size, the pixels replace the layer (engine.replaceWithPixels). */
-  renderLayer(layerId: string): Promise<void>;
+  renderLayer(layerId: string, mode?: RenderMode): Promise<void>;
+  /** v8 Merge Selected: TD renders the given layers as one isolated composite; they are replaced by one pixel layer (engine.replaceLayersWithPixels). */
+  renderLayers(layerIds: string[]): Promise<void>;
   /** v5: tell TD the canvas size / mode (active, loaded page only). Returns false when nothing was sent. */
   setCanvas(w: number, h: number, mode: CanvasMode): boolean;
   /** v6 files (written/read by TD). `path` omitted = the TD parameter value. Reject when not linked / on timeout; resolve with TD's `fileResult` (ok may be false). */
@@ -745,7 +749,9 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     if (!m) return;
     switch (m.t) {
       case 'hello': {
-        if (m.protocol !== PROTOCOL_VERSION) { status.setNotice(`Protocol mismatch (TD ${m.protocol})`); return; }
+        if (m.protocol !== PROTOCOL_VERSION) { status.setNotice(m.protocol < PROTOCOL_VERSION
+          ? `Protocol mismatch: this page speaks protocol ${PROTOCOL_VERSION} but the TouchDesigner component speaks ${m.protocol} - update the component (.tox)`
+          : `Protocol mismatch: the TouchDesigner component speaks protocol ${m.protocol}, this page ${PROTOCOL_VERSION} - reload the page`); return; }
         backoff = BACKOFF_MIN;
         clientId = m.clientId;
         maxFps = m.maxSendFps > 0 ? m.maxSendFps : DEFAULT_FPS;
@@ -1041,27 +1047,56 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     return engine.importImage(frame.payload, frame.w, frame.h, name);
   }
 
-  /** v5 Flatten: renderLayer → topReady → GET /top (document-sized) → engine.replaceWithPixels. */
-  async function renderLayer(layerId: string): Promise<void> {
+  /** Ask TD for an isolated render (renderLayer / renderLayers), fetch it from GET /top and hand it to `apply` unless the layers changed meanwhile. */
+  async function renderRequest(prefix: string, msg: (requestId: string) => WebMessage, ids: string[], apply: (frame: { w: number; h: number; payload: Uint8Array }) => void): Promise<void> {
     if (!isOpen() || !clientId) throw new Error('Not connected to TouchDesigner');
-    const requestId = `r${++requestSeq}`;
+    const requestId = `${prefix}${++requestSeq}`;
     const sock = ws;
+    // everything the render depends on: the layers asked for, the document revision and the undo position / history version
     const fingerprint = () => {
-      const l = engine.layers().find((x) => x.id === layerId);
-      return l ? JSON.stringify([l.kind, l.text, l.shape, engine.width, engine.height]) : null;
+      const all = engine.layers(), h = engine.history();
+      return JSON.stringify([engine.width, engine.height, engine.docSpec().rev, engine.historyVersion?.() ?? null, h.entries.length, h.index,
+        ids.map((id) => { const l = all.find((x) => x.id === id); return l ? [l.id, l.kind, l.parentId, l.text, l.shape, l.effects, l.mask, l.transform, l.visible, l.opacity, l.blend] : null; })]);
     };
     const before = fingerprint();
-    if (canSend() && lastDocRev !== engine.docSpec().rev) sendDocNow(); // TD must render the layer as the page has it now
+    if (canSend() && lastDocRev !== engine.docSpec().rev) sendDocNow(); // TD must render the layers as the page has them now
     await new Promise<{ w: number; h: number }>((resolve, reject) => {
       const timer = setTimeout(() => { pendingImports.delete(requestId); reject(new Error('TouchDesigner did not answer')); }, RENDER_LAYER_TIMEOUT_MS);
       pendingImports.set(requestId, { resolve: (w, h) => resolve({ w, h }), reject, timer });
-      sendJson({ t: 'renderLayer', requestId, layerId });
+      sendJson(msg(requestId));
     });
     const frame = await fetchTop(requestId, sock);
     if (disposed) throw new Error('Bridge closed');
-    const l = engine.layers().find((x) => x.id === layerId);
-    if (!l || (l.kind !== 'text' && l.kind !== 'shape') || fingerprint() !== before) throw new Error('The layer changed during Flatten');
-    engine.replaceWithPixels(layerId, frame.payload, frame.w, frame.h);
+    if (fingerprint() !== before) { status.setNotice(RENDER_STALE_MESSAGE); throw new Error(RENDER_STALE_MESSAGE); }
+    apply(frame);
+  }
+
+  /** v5/v8 Flatten: renderLayer {mode} → topReady → GET /top (document-sized) → replace the layer (mergeDown: the adjustment and the layer below) by one pixel layer. */
+  async function renderLayer(layerId: string, mode: RenderMode = 'flatten'): Promise<void> {
+    if (!isOpen() || !clientId) throw new Error('Not connected to TouchDesigner');
+    const all = engine.layers();
+    const l = all.find((x) => x.id === layerId);
+    if (!l) throw new Error('Layer not found');
+    let ids = [layerId];
+    let name: string | undefined;
+    if (mode === 'mergeDown') {
+      const below = layerBelow(all, layerId);
+      if (l.kind !== 'adjustment' || !below) throw new Error('Nothing below to merge into');
+      if (below.kind === 'input' || below.kind === 'adjustment') throw new Error(`Cannot merge down into ${below.kind === 'input' ? 'an input layer' : 'another adjustment'}`);
+      ids = [layerId, below.id];
+      name = below.name; // the merged layer keeps the name of the layer it was merged into
+    }
+    const legacy = mode === 'flatten' && (l.kind === 'text' || l.kind === 'shape');
+    await renderRequest('r', (requestId) => ({ t: 'renderLayer', requestId, layerId, mode }), ids, (f) => {
+      if (legacy) engine.replaceWithPixels(layerId, f.payload, f.w, f.h);
+      else engine.replaceLayersWithPixels(ids, f.payload, f.w, f.h, name);
+    });
+  }
+
+  /** v8 Merge Selected: renderLayers → topReady → GET /top → engine.replaceLayersWithPixels(ids). */
+  async function renderLayers(layerIds: string[]): Promise<void> {
+    if (!layerIds.length) throw new Error('No layers to merge');
+    await renderRequest('m', (requestId) => ({ t: 'renderLayers', requestId, layerIds }), layerIds, (f) => { engine.replaceLayersWithPixels(layerIds, f.payload, f.w, f.h); });
   }
 
   function setCanvas(w: number, h: number, mode: CanvasMode): boolean {
@@ -1270,6 +1305,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     listTops,
     importTop,
     renderLayer,
+    renderLayers,
     setCanvas,
     saveProject: (path, opts) => fileOp('saveProject', path, opts),
     clearStoredHistory,

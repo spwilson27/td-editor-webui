@@ -30,7 +30,7 @@ export type FilterField = NumField | EnumField | ColorFieldDef | BoolField | See
 
 export const FILTER_GROUPS: { id: FilterGroupId; label: string; order: string[] }[] = [
   { id: 'blur', label: 'Blur & sharpen', order: ['motionBlur', 'radialBlur', 'zoomBlur', 'lensBlur', 'unsharp', 'highPass', 'blur'] },
-  { id: 'color', label: 'Colour', order: ['curves', 'gradientMap', 'colorBalance', 'vibrance', 'channelMixer', 'selectiveColor', 'posterize', 'duotone', 'lut'] },
+  { id: 'color', label: 'Colour', order: ['levels', 'brightnessContrast', 'hueSaturation', 'invert', 'threshold', 'curves', 'gradientMap', 'colorBalance', 'vibrance', 'channelMixer', 'selectiveColor', 'posterize', 'duotone', 'lut'] },
   { id: 'stylise', label: 'Stylise', order: ['emboss', 'edgeDetect', 'kuwahara', 'pixelate', 'dither', 'crt', 'grain', 'bloom'] },
   { id: 'distort', label: 'Distort', order: ['displace', 'twirl', 'ripple', 'lensDistortion', 'polar', 'kaleidoscope', 'tileMirror'] },
   { id: 'animated', label: 'Static animated', order: ['driftGlitch', 'feedback', 'echo', 'colorCycle'] },
@@ -38,6 +38,7 @@ export const FILTER_GROUPS: { id: FilterGroupId; label: string; order: string[] 
 
 const LABELS: Record<string, string> = {
   blur: 'Gaussian blur', motionBlur: 'Motion blur', radialBlur: 'Radial (spin) blur', zoomBlur: 'Zoom blur', lensBlur: 'Lens blur (bokeh)', unsharp: 'Unsharp mask', highPass: 'High pass',
+  levels: 'Levels', brightnessContrast: 'Brightness/Contrast', hueSaturation: 'Hue/Saturation', invert: 'Invert', threshold: 'Threshold',
   curves: 'Curves', gradientMap: 'Gradient map', colorBalance: 'Colour balance', vibrance: 'Vibrance & saturation', channelMixer: 'Channel mixer', selectiveColor: 'Selective colour',
   posterize: 'Posterize', duotone: 'Duotone', lut: 'Colour LUT (.cube)',
   emboss: 'Emboss', edgeDetect: 'Edge detect', kuwahara: 'Oil paint (Kuwahara)', pixelate: 'Pixelate', dither: 'Dither', crt: 'CRT', grain: 'Film grain & noise', bloom: 'Bloom',
@@ -51,6 +52,7 @@ const humanize = (key: string): string => {
 };
 
 const PARAM_LABELS: Record<string, string> = {
+  inLow: 'Input black', inHigh: 'Input white', outLow: 'Output black', outHigh: 'Output white',
   rr: 'Red from red', rg: 'Red from green', rb: 'Red from blue', gr: 'Green from red', gg: 'Green from green', gb: 'Green from blue',
   br: 'Blue from red', bg: 'Blue from green', bb: 'Blue from blue', r: 'Red constant', g: 'Green constant', b: 'Blue constant',
   grayRed: 'Gray from red', grayGreen: 'Gray from green', grayBlue: 'Gray from blue',

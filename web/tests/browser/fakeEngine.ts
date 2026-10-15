@@ -657,5 +657,80 @@ export class FakeEngine implements EditorEngine {
     this.layerPreviews.set(layerId, rgba ? new Uint8Array(rgba) : null);
     this.calls.push(`setLayerPreview:${layerId}:${rgba ? rgba.length : 'null'}`);
   }
+
+  // ---- v7: unified adjustments, batch layer ops, merge (docs/DESIGN_V7.md) ----
+  replacedMany: { ids: string[]; id: string; w: number; h: number; len: number }[] = [];
+  /** Run a stack change as one history entry whose undo restores the previous layer list and active layer. */
+  private structural(label: string, fn: () => void) {
+    const snap = this.store.map((l) => ({ ...l, effects: l.effects.map((e) => ({ ...e })), mask: l.mask ? { ...l.mask } : null }));
+    const active = this.active;
+    fn();
+    this.push(label);
+    this.undoers.set(this.entries[this.index].id, () => { this.store = snap; this.active = active; });
+    this.changed();
+  }
+  private subtree(ids: string[]): Set<string> {
+    const out = new Set(ids);
+    for (let grew = true; grew;) { grew = false; for (const l of this.store) if (l.parent && out.has(l.parent) && !out.has(l.id)) { out.add(l.id); grew = true; } }
+    return out;
+  }
+  addAdjustmentLayer(effects: Effect[], name?: string): string {
+    this.calls.push(`addAdjustmentLayer:${effects.map((e) => e.type).join(',')}`);
+    return this.add('adjustment', name ?? 'Adjustment', null, { effects: effects.map((e) => JSON.parse(JSON.stringify(e)) as Effect) });
+  }
+  deleteLayers(ids: string[]) {
+    this.calls.push(`deleteLayers:${ids.join(',')}`);
+    const gone = this.subtree(ids);
+    this.structural('Delete layers', () => {
+      const keep = this.store.filter((l) => !gone.has(l.id));
+      if (gone.has(this.active)) this.active = keep[keep.length - 1]?.id ?? '';
+      this.store = keep;
+    });
+  }
+  setLayersProps(ids: string[], props: Partial<Pick<LayerInfo, 'visible' | 'locked'>>) {
+    this.calls.push(`setLayersProps:${ids.join(',')}:${JSON.stringify(props)}`);
+    this.structural('Layer properties', () => { for (const l of this.store) if (ids.includes(l.id)) Object.assign(l, props); });
+  }
+  moveLayers(ids: string[], parent: string | null, index: number) {
+    this.calls.push(`moveLayers:${ids.join(',')}:${parent}:${index}`);
+    this.structural('Move layers', () => {
+      const moved = this.store.filter((l) => ids.includes(l.id));
+      this.store = this.store.filter((l) => !ids.includes(l.id));
+      for (const l of moved) l.parent = parent;
+      const sibs = this.store.filter((x) => x.parent === parent);
+      const below = [...sibs].reverse()[index];
+      const at = below ? this.store.indexOf(below) + 1 : sibs.length ? this.store.indexOf(sibs[0]) : this.store.length;
+      this.store.splice(at, 0, ...moved);
+    });
+  }
+  groupLayers(ids: string[], name?: string): string {
+    this.calls.push(`groupLayers:${ids.join(',')}`);
+    const id = `L${this.nextId++}`;
+    this.structural('Group layers', () => {
+      const members = this.store.filter((l) => ids.includes(l.id));
+      const top = members[members.length - 1];
+      const g: FakeLayer = { id, name: name ?? `Group ${this.nextId}`, kind: 'group', visible: true, locked: false, opacity: 1, blend: 'normal', expanded: true, parent: top.parent, colour: '#777777', slot: null, mask: null, adjustment: null, x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0, input: null, effects: [], surfaceW: null, surfaceH: null };
+      this.store.splice(this.store.indexOf(top) + 1, 0, g);
+      for (const m of members) m.parent = id;
+      this.active = id;
+    });
+    return id;
+  }
+  replaceLayersWithPixels(ids: string[], rgba: Uint8Array | Uint8ClampedArray, w: number, h: number, name?: string): string {
+    this.calls.push(`replaceLayersWithPixels:${ids.join(',')}:${w}x${h}`);
+    const id = `L${this.nextId++}`;
+    this.structural('Merge layers', () => {
+      const gone = this.subtree(ids);
+      const top = [...this.store].reverse().find((l) => ids.includes(l.id))!;
+      const slot = this.nextSlot++;
+      this.surfaces.set(slot, new Uint8ClampedArray(rgba));
+      const n: FakeLayer = { id, name: name ?? 'Merged', kind: 'pixel', visible: true, locked: false, opacity: 1, blend: 'normal', expanded: true, parent: top.parent, colour: '#aa7744', slot, mask: null, adjustment: null, x: 0, y: 0, sx: 1, sy: 1, rot: 0, kx: 0, ky: 0, input: null, effects: [], surfaceW: w, surfaceH: h };
+      this.store.splice(this.store.indexOf(top) + 1, 0, n);
+      this.store = this.store.filter((l) => !gone.has(l.id));
+      this.active = id;
+    });
+    this.replacedMany.push({ ids: [...ids], id, w, h, len: rgba.length });
+    return id;
+  }
   dispose() { this.listeners.clear(); }
 }

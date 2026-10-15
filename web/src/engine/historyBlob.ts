@@ -21,7 +21,7 @@ import type { SelState } from './selection';
 import { createSurface, releaseSurface, type Surface } from './surface';
 import type { Patch } from './tiles';
 import { sanitizeEffects } from './effectsSanitize';
-import { clampAdjustment, defaultAdjustment } from './adjustments';
+import { ADJUSTMENT_NAMES, migrateAdjustmentEffects } from './adjustments';
 import { sanitizeShape, sanitizeText } from './textShape';
 import type { AdjustmentSpec, BlendMode, ShapeSpec, TextSpec } from './types';
 
@@ -394,14 +394,19 @@ function readTables(head: J, bin: Uint8Array, doc: Document, created: Surface[],
     if (seenL.has(layer) || seenId.has(layer.id)) bad('layer twice in one snapshot');
     seenL.add(layer);
     seenId.add(layer.id);
-    const fx = sanitizeEffects(v.fx) as Effect[];
+    let fx = sanitizeEffects(v.fx) as Effect[];
     const kids = v.kids === null ? null : arr(v.kids, 'children', MAX_TABLE).map((c) => readNode(c, depth + 1));
     if ((layer.kind === 'group') !== (kids !== null)) bad('children of a non-group');
     const surfI = int(v.surf, 'node surface', -1, surfaces.length);
     const maskI = int(v.mask, 'node mask', -1, masks.length);
     const blend = str(v.bl, 'blend');
-    const adj = v.adj === null ? null : clampAdjustment(v.adj as AdjustmentSpec);
-    if (layer.kind === 'adjustment' && !adj) bad('adjustment');
+    // v7: blobs written before the adjustment/FX unification carry the adjustment spec: it migrates into the front of the node's effects
+    // (the same rule as loadDocument); a spec that cannot be understood refuses the blob (restoreHistory returns false, history starts empty).
+    if (layer.kind === 'adjustment' && v.adj != null) {
+      if (!isObj(v.adj) || typeof v.adj.type !== 'string' || !(v.adj.type in ADJUSTMENT_NAMES)) bad('adjustment');
+      fx = migrateAdjustmentEffects(v.adj as unknown as AdjustmentSpec, fx);
+    }
+    const adj = null;
     const spec = v.spec === null ? null : layer.kind === 'text' ? sanitizeText(v.spec as TextSpec) : layer.kind === 'shape' ? sanitizeShape(v.spec as ShapeSpec) : bad('spec');
     if ((layer.kind === 'text' || layer.kind === 'shape') && !spec) bad('vector spec');
     if (layer.kind === 'pixel' && surfI < 0) bad('pixel surface');
@@ -503,7 +508,7 @@ function makeDead(doc: Document, id: string, kind: string, v: J, deadInputLayers
   const common = { id, name: id, visible: true, locked: false, opacity: 1, blend: 'normal' as BlendMode, effects: [] as Effect[] };
   switch (kind) {
     case 'group': return { ...common, kind: 'group', children: [], expanded: true } as GroupLayer;
-    case 'adjustment': return { ...common, kind: 'adjustment', adjustment: defaultAdjustment('invert'), mask: null } as AdjustmentLayer;
+    case 'adjustment': return { ...common, kind: 'adjustment', adjustment: null, mask: null } as AdjustmentLayer;
     case 'text': return { ...common, kind: 'text', spec: sanitizeText({} as TextSpec), mask: null } as TextLayer;
     case 'shape': return { ...common, kind: 'shape', spec: sanitizeShape({} as ShapeSpec), mask: null } as ShapeLayer;
     case 'pixel': {

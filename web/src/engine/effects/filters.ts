@@ -26,6 +26,7 @@ export interface EffectPass {
   aux?: boolean;
 }
 
+export const MAX_BLUR_PX = 600; // blur filter kernel half width cap (px) = 3 * the old adjustment blur sigma max (200); only reachable through `sigma`
 export const MAX_RADIUS = 200; // blur size cap (px); sizes above PYR_THRESHOLD run as a down-sample pyramid
 export const PYR_THRESHOLD = 16;
 export const GLOBAL_REACH = 1 << 20; // extent of a filter that reads anywhere in the document
@@ -45,19 +46,30 @@ export function pyrLevel(px: number): number {
   return lv;
 }
 
-/** Blur size (px) -> [sigma, kernel radius, level] of the passes that really run (see effects.py `_blur_plan`). */
-export function blurPlan(px: number): [number, number, number] {
-  px = Math.min(MAX_RADIUS, Math.max(0, px));
+/** Blur size (px) -> [sigma, kernel radius, level] of the passes that really run (see effects.py `_blur_plan`); `sigma` > 0 replaces px / 3. */
+export function blurPlan(px: number, sigma = 0): [number, number, number] {
+  px = Math.min(sigma > 0 ? MAX_BLUR_PX : MAX_RADIUS, Math.max(0, px));
   const r = Math.ceil(px);
   const lv = pyrLevel(px);
-  const sg = px / 3;
+  const sg = sigma > 0 ? sigma : px / 3;
   if (lv === 0) return [sg, r, 0];
   const s = 1 << lv;
   return [Math.sqrt(Math.max(sg * sg - (s * s) / 4, 0)) / s, Math.floor((r + s - 1) / s), lv];
 }
 
-export function blurReach(px: number): number {
-  const [, r, lv] = blurPlan(px);
+/**
+ * Canonical migration of a v6 Blur adjustment `{type:'blur', radius: r}` (gaussian sigma = r px, 0..200, edge pixels held outside the document) to the
+ * blur filter: `{type:'blur', radius: k, sigma: r, edge:'hold'}`, k = 4r while that is <= 16 px (exact path, no 3-sigma truncation error), else min(200, 3r) (`radius` = the kernel half width the planner uses, shown in the UI; `sigma` is what runs).
+ * r < 0.05 (the old identity) -> radius 0 / sigma 0 = no-op.  Mirrored by effects.py `legacy_blur_to_filter`.
+ */
+export function legacyBlurToFilter(radius: number): { enabled: true; type: 'blur'; radius: number; sigma: number; edge: 'hold' } {
+  const r = Math.min(200, Math.max(0, num(radius, 0)));
+  if (r < 0.05) return { enabled: true, type: 'blur', radius: 0, sigma: 0, edge: 'hold' };
+  return { enabled: true, type: 'blur', radius: Math.min(200, 4 * r <= 16 ? 4 * r : 3 * r), sigma: r, edge: 'hold' };
+}
+
+export function blurReach(px: number, sigma = 0): number {
+  const [, r, lv] = blurPlan(px, sigma);
   return lv === 0 ? r : (r + 2) * (1 << lv);
 }
 
@@ -189,10 +201,10 @@ const FUNCS: Record<string, (...a: number[]) => number> = {
   mod: (a, b) => (b !== 0 ? a - b * Math.floor(a / b) : 0),
   sign: (x) => (x > 0 ? 1 : x < 0 ? -1 : 0),
   fract: (x) => x - Math.floor(x),
-  pyrL: (px) => pyrLevel(Math.min(MAX_RADIUS, Math.max(0, px))),
-  blurSig: (px) => blurPlan(px)[0],
-  blurR: (px) => blurPlan(px)[1],
-  blurReach: (px) => blurReach(px),
+  pyrL: (px) => pyrLevel(Math.min(MAX_BLUR_PX, Math.max(0, px))),
+  blurSig: (px, sg = 0) => blurPlan(px, sg)[0],
+  blurR: (px, sg = 0) => blurPlan(px, sg)[1],
+  blurReach: (px, sg = 0) => blurReach(px, sg),
 };
 const CONSTS: Record<string, number> = { pi: Math.PI, G: GLOBAL_REACH, MAXR: MAX_RADIUS, SEEDMOD: SEED_MOD };
 

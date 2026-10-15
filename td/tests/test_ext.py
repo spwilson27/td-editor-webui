@@ -215,7 +215,7 @@ def test_first_client_becomes_active_and_gets_hello(env):
     env.pump()
     a = env.connect("external")
     (hello,) = env.s.messages(a, "hello")
-    assert hello["protocol"] == 7 and hello["active"] is True and hello["hasInput"] is False
+    assert hello["protocol"] == 8 and hello["active"] is True and hello["hasInput"] is False
     assert hello["doc"] == {"w": 64, "h": 32, "mode": "input"} and hello["inputs"] == [IN(1)] and "baseSize" not in hello and hello["maxSendFps"] == 30
     assert hello["hasDocument"] is False and hello["rev"] is None
 
@@ -3865,7 +3865,7 @@ def test_render_layer_errors():
     e, a = flatten_env()
     e.o.net.render_sources["s1"] = FakeTop("/project1/raster_editor/doc/s1_render", 64, 32, array=tops_img(64, 32))
     install_tops(e)
-    cases = [("p1", "not a text or shape"), ("nope", "not a text or shape"), ("t1", "cannot render")]  # t1: network has no source
+    cases = [("p1", "cannot render"), ("nope", "not a layer of"), ("t1", "cannot render")]  # p1 / t1: the network has no source
     for i, (layer, text) in enumerate(cases):
         render_ready(e, a, layer, f"e{i}", frames=6)
         errs = [m for m in e.s.messages(a, "topError") if m["requestId"] == f"e{i}"]
@@ -4009,7 +4009,7 @@ def test_a_restored_v4_document_without_surface_sizes_uses_the_document_size():
     assert all(buf.shape == (32, 64, 4) for buf in b.x.surfaces.values()) and b.x.doc_rev == 6
 
 
-def test_adjustment_mask_without_a_size_keeps_its_buffer_across_canvas_resize(env):
+def test_adjustment_mask_without_a_size_follows_the_document_size_across_canvas_resize(env):
     env.pump()
     a = env.connect("panel")
     layers = [L("base", "input", input=1), L("adj", "adjustment", mask={"slot": 4, "enabled": True}, adjustment={"type": "invert"})]
@@ -4017,8 +4017,10 @@ def test_adjustment_mask_without_a_size_keeps_its_buffer_across_canvas_resize(en
     assert env.x.surfaces[4].shape == (32, 64, 4)
     env.send(a, {"t": "setCanvas", "w": 128, "h": 64, "mode": "fixed"})
     env.doc(a, layers, rev=2)
-    assert env.x.surfaces[4].shape == (32, 64, 4)
-    assert env.dump(a, 4)[0].doc_w == 64
+    # (the page models the mask of a surface-less layer at document size and reframes it with the canvas: TD's buffer must match, or its
+    # SURFACE dump is rejected as stale by the page and the document never finishes loading)
+    assert env.x.surfaces[4].shape == (64, 128, 4)
+    assert env.dump(a, 4)[0].doc_w == 128
 
 
 def test_render_layer_aborts_when_the_source_operator_is_replaced_mid_readback():
@@ -4026,7 +4028,7 @@ def test_render_layer_aborts_when_the_source_operator_is_replaced_mid_readback()
     first = FakeTop("/project1/raster_editor/doc/t1_render", 64, 32, array=tops_img(64, 32))
     e.o.net.render_sources["t1"] = first
     e.send(a, {"t": "renderLayer", "requestId": "f1", "layerId": "t1"})
-    e.pump(1)   # readback in progress
+    e.pump(2)   # request opened, readback in progress
     e.o.net.render_sources["t1"] = FakeTop("/project1/raster_editor/doc/other", 64, 32, array=tops_img(64, 32, 9))
     e.pump(8)
     assert e.s.messages(a, "topError")[-1]["msg"] == "layer changed" and not e.s.messages(a, "topReady")
@@ -4037,7 +4039,7 @@ def test_render_layer_aborts_when_the_layer_vanishes_or_its_token_changes():
         e, a = flatten_env()
         e.o.net.render_sources["t1"] = FakeTop("/p/t1", 64, 32, array=tops_img(64, 32))
         e.send(a, {"t": "renderLayer", "requestId": "f1", "layerId": "t1"})
-        e.pump(1)
+        e.pump(2)
         if how == "gone":
             del e.o.net.render_sources["t1"]
         else:

@@ -1,6 +1,9 @@
 """Colour filters: python side data helpers (.cube parser and atlas), same cases as web/tests/browser/effects.filters.color.test.ts."""
 
+import math
+
 import effects
+import pytest
 
 ID2 = "0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n"
 
@@ -53,3 +56,20 @@ def test_atlas_layout_and_ordering():
     o = ((5 + 2) * 15 + 5 + 3) * 4
     assert list(tex.data[o:o + 4]) == [round(0.75 * 255), round(0.5 * 255), 255, 255]
     assert effects.cube_atlas("junk") is None
+
+
+def test_legacy_blur_migration_and_edge_hold_plan():
+    f = effects.legacy_blur_to_filter(4)
+    assert f == {"enabled": True, "type": "blur", "radius": 16.0, "sigma": 4, "edge": "hold"} or f["sigma"] == 4.0
+    assert effects.legacy_blur_to_filter(1e9)["sigma"] == 200.0 and effects.legacy_blur_to_filter(0.01)["sigma"] == 0.0
+    assert effects.legacy_blur_to_filter("x")["radius"] == 0.0
+    assert effects.plan_effect(effects.legacy_blur_to_filter(0.01)) == []
+    # sigma 200 = kernel half width 600 -> pyramid level 6; edge hold travels as uP1.z; plain blur (edge default) is unchanged
+    ps = effects.plan_effect(effects.legacy_blur_to_filter(200))
+    assert [p.pid for p in ps] == [2, 3, 4, 5] and ps[0].level == 6
+    assert ps[0].u[6] == 1.0 and ps[0].u[4] == 0.0
+    assert effects.plan_effect({"enabled": True, "type": "blur", "radius": 10})[0].u[6] == 0.0
+    sg, r, lv = effects._blur_plan(600, 200.0)
+    assert lv == 6 and r == 10 and sg == pytest.approx(math.sqrt(200.0 ** 2 - 32 ** 2) / 64)
+    assert effects.effect_extent(effects.legacy_blur_to_filter(4))[0] == 16
+    assert effects._blur_plan(1e9)[1:] == (13, 4)          # sigma 0: unchanged cap

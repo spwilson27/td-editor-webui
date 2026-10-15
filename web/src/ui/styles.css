@@ -5,7 +5,10 @@ html[data-td-panel],html[data-td-panel] body{background:transparent}
 #app .ib:hover{background:#3a3a3a}
 #app .menu:hover,#app .menu.open{background:#3a3a3a}
 #app .row:hover{background:#353535}
+#app .row[data-tint]{background-image:var(--tint)}
+#app .row[data-tint]:hover{background-image:var(--tint)}
 #app .row.sel,#app .row.sel:hover{background:#3d6fb4}
+#app .row.sel2,#app .row.sel2:hover{background:#2f5382}
 #app .sw:hover{outline:2px solid #e8e8e8;outline-offset:1px}
 #app .mi:hover:not([aria-disabled=true]){background:#3d6fb4;color:#fff}
 #app [aria-disabled=true]{cursor:default}

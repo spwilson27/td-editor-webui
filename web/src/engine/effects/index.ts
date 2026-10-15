@@ -31,10 +31,10 @@ import {
   effectExtent, effectNeedsNeighbourhood, effectReach, effectReads, effectsReach, effectTdPreview, expandRect, filterTypes, planChain, planEffect,
   type AnyEffect, type EffectPass,
 } from './plan';
-import { cubeAtlas, parseCube } from './filters';
+import { cubeAtlas, legacyBlurToFilter, parseCube } from './filters';
 
 export { effectExtent, effectNeedsNeighbourhood, effectReach, effectReads, effectsReach, effectTdPreview, expandRect, filterTypes, planChain, planEffect };
-export { cubeAtlas, parseCube };
+export { cubeAtlas, legacyBlurToFilter, parseCube };
 export type { AnyEffect, EffectPass };
 
 const BUCKET = 64;

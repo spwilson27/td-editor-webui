@@ -221,7 +221,7 @@ def test_json_decode_rejects(bad):
 
 def test_json_builders():
     assert json.loads(P.hello(10, 20, True, 30, False, "abc")) == {
-        "t": "hello", "protocol": 7, "doc": {"w": 10, "h": 20, "mode": "input"}, "inputs": [],
+        "t": "hello", "protocol": 8, "doc": {"w": 10, "h": 20, "mode": "input"}, "inputs": [],
         "hasInput": True, "maxSendFps": 30, "active": False, "clientId": "abc", "hasDocument": False, "rev": None}
     items = [{"input": 2, "w": 5, "h": 6, "connected": True}, {"input": 1, "w": 640, "h": 480, "connected": True},
              {"input": 3, "w": 9, "h": 9, "connected": False}]
@@ -255,7 +255,7 @@ def test_json_builders():
 
 def test_web_side_builders_roundtrip_through_decode():
     m = P.decode_json(P.ready("panel", "tok", True, "v1"))
-    assert (m["t"], m["protocol"], m["client"], m["token"], m["fresh"]) == ("ready", 7, "panel", "tok", True)
+    assert (m["t"], m["protocol"], m["client"], m["token"], m["fresh"]) == ("ready", 8, "panel", "tok", True)
     assert P.decode_json(P.request_doc()) == {"t": "requestDoc"}
     d = P.decode_json(P.doc(4, [LAYER]))
     assert P.parse_doc(d) == (4, [LAYER])
@@ -388,7 +388,7 @@ def parse(*layers):
 
 
 def test_version_and_new_frame_type():
-    assert P.PROTOCOL_VERSION == 7 and P.TYPE_TOP_IMAGE == 6 and 6 in P.VALID_TYPES and P.TYPE_LAYER_PREVIEW == 7
+    assert P.PROTOCOL_VERSION == 8 and P.TYPE_TOP_IMAGE == 6 and 6 in P.VALID_TYPES and P.TYPE_LAYER_PREVIEW == 7
 
 
 def test_top_image_frame_uses_the_tops_own_size_as_doc_size():
@@ -553,8 +553,16 @@ def test_slot_sizes_per_surface_mask_follows_layer_and_fallbacks():
               {"id": "old", "kind": "pixel", "slot": 5, "surfaceW": None}]
     assert P.slot_sizes(layers, 64, 32) == {1: (300, 200), 2: (300, 200), 3: (7, 9), 4: (64, 32), 5: (64, 32)}
     # a surface without a size in the spec keeps its buffer's size (a canvas resize never reallocates)
-    assert P.slot_sizes(layers, 99, 98, {4: (64, 32), 5: (10, 11), 1: (1, 1)}) == {1: (300, 200), 2: (300, 200), 3: (7, 9),
-                                                                                     4: (64, 32), 5: (10, 11)}
+    assert P.slot_sizes(layers, 99, 98, {4: (99, 98), 5: (10, 11), 1: (1, 1)}) == {1: (300, 200), 2: (300, 200), 3: (7, 9),
+                                                                                     4: (99, 98), 5: (10, 11)}
+
+
+def test_slot_sizes_surfaceless_layer_masks_are_document_sized_even_over_a_stale_buffer():
+    """Regression (live validation v7): a leftover 1920x1080 buffer under an adjustment mask made the page's surface load fail forever."""
+    layers = [{"id": "adj", "kind": "adjustment", "mask": {"slot": 4, "enabled": True}},
+              {"id": "g", "kind": "group", "mask": {"slot": 6, "enabled": True}},
+              {"id": "t", "kind": "text", "mask": {"slot": 7, "enabled": True}}]
+    assert P.slot_sizes(layers, 512, 256, {4: (1920, 1080), 6: (1920, 1080), 7: (1, 1)}) == {4: (512, 256), 6: (512, 256), 7: (512, 256)}
 
 
 def test_set_canvas_and_render_layer_parsers():

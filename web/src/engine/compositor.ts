@@ -1,12 +1,12 @@
-import type { BlendMode, Effect, Rect } from './types';
+import type { AdjustmentSpec, BlendMode, Effect, Rect } from './types';
 import { createSurface, releaseSurface, type Ctx2D, type Surface } from './surface';
 import { floatingBounds, grow, isVector, layerExtent, specBounds, surfaceDocBounds, type AdjustmentLayer, type Document, type GroupLayer, type Layer, type Mask, type PixelLayer, type VectorLayer } from './model';
 import { drawMapped, IDENT, isAligned, outerRect, type Xf } from './xform';
-import { auxRef, applyEffectsSafe, effectIsTdPreview, effectsReach, effectsSourceRect, hasEffects, tdPreviewFlag, withoutTdPreview } from './effectsAdapter';
+import { auxRef, applyEffectsSafe, effectsReach, effectsSourceRect, hasEffects, tdPreviewFlag, withoutTdPreview } from './effectsAdapter';
 import { drawText } from './textShape';
 import { drawShapeWith } from './shapeSdf';
 import { clipToSize, intersect, union } from './rect';
-import { adjustmentReach, isIdentity, pixRect, renderAdjusted } from './adjustments';
+import { CLASSIC_EFFECT_TYPES, isIdentity, pixRect, renderAdjusted, specOfClassicEffect } from './adjustments';
 
 const OPS: Record<BlendMode, GlobalCompositeOperation> = {
   normal: 'source-over', multiply: 'multiply', screen: 'screen', overlay: 'overlay',
@@ -24,6 +24,8 @@ interface FxEntry { sig: unknown[]; rect: Rect; surf: Surface }
 /** Document-sized effect input / output pair per nesting level (a group's effects paint its children, which may have effects of their own). */
 interface FxPair { src: Surface; out: Surface; pool: Surface[]; aux?: Surface }
 /** Where a layer's effects come from this frame: computed here (`effects`), or TD's render of it (`preview`, doc sized). */
+type AdjStep = { spec: AdjustmentSpec } | { fx: Effect[] };
+interface AdjPlan { preview: Surface | null; steps: AdjStep[] }
 interface FxPlan { effects: readonly Effect[]; preview: Surface | null }
 /** Composite of the root layers below the stroke's layer (see Compositor.holdBelow). */
 interface BelowCache { surf: Surface; built: Set<number>; top: Layer; k: number }
@@ -190,7 +192,7 @@ export class Compositor {
     for (const l of this.doc.all()) {
       if (!l.visible || l.opacity <= 0) continue;
       const eff = l.effects.length && tdPreviewFlag(l.effects) ? (this.freshPreview(l) ? [] : withoutTdPreview(l.effects)) : l.effects; // a TD image needs no local reach
-      if (l.kind === 'adjustment') n += adjustmentReach(l.adjustment) + (eff.length ? effectsReach(eff) : 0);
+      if (l.kind === 'adjustment') n += eff.length ? effectsReach(eff) : 0;
       else if (l.kind === 'group') n += eff.length ? effectsReach(eff) : 0; // v6: chained through the parent
       else if (eff.length) fx = Math.max(fx, effectsReach(eff));
     }
@@ -276,7 +278,6 @@ export class Compositor {
     for (const l of this.doc.all()) {
       if (!l.visible || l.opacity <= 0) continue;
       add(l.effects);
-      if (l.kind === 'adjustment' && l.adjustment.type === 'filter') add([l.adjustment.effect]);
     }
     return out;
   }
@@ -400,7 +401,7 @@ export class Compositor {
   private ownSig(l: Layer): unknown[] {
     const px = l.kind === 'pixel' || l.kind === 'input' ? l : null;
     return [l.effects, px?.x, px?.y, px?.sx, px?.sy, px?.rot, px?.kx, px?.ky, px?.surface, l.kind === 'group' ? null : l.mask, l.kind === 'group' ? null : l.mask?.enabled,
-      l.kind === 'adjustment' ? l.adjustment : null, l.kind === 'text' || l.kind === 'shape' ? l.spec : null];
+      l.kind === 'text' || l.kind === 'shape' ? l.spec : null];
   }
 
   /** Does a pixel change inside `r` (null = everywhere) change what layer `l`'s TD image shows? */
@@ -504,20 +505,34 @@ export class Compositor {
     return hasEffects(l.effects) ? { effects: l.effects, preview: null } : null;
   }
 
-  /** The chain an adjustment layer runs after its own adjustment: the filter of a filter adjustment, then the layer's effects. */
-  private adjFx(l: AdjustmentLayer, k: number): FxPlan | null {
-    if (k !== 1) return null;
-    const spec = l.adjustment;
-    const own: readonly Effect[] = spec.type === 'filter' ? [spec.effect] : [];
-    if (!own.length && !l.effects.length) return null;
-    const flagged = tdPreviewFlag(l.effects) || (own.length > 0 && effectIsTdPreview(own[0]));
-    if (flagged) {
+  /**
+   * v7: what an adjustment layer does to the accumulated below: its effects[] in order. Classic adjustments the effects module lacks run as JS
+   * steps (adjustments.ts maths, any scale); the other effects run through the module (scale 1 only), consecutive ones as one chain.
+   * With a fresh TD image (flagged effects) the preview replaces the whole result.
+   */
+  private adjPlan(l: AdjustmentLayer, k: number): AdjPlan | null {
+    if (!l.effects.length) return null;
+    const flagged = tdPreviewFlag(l.effects);
+    if (flagged && k === 1) {
       const p = this.freshPreview(l);
-      if (p) return { effects: [], preview: p };
+      if (p) return { preview: p, steps: [] };
     }
-    const all = own.concat(l.effects);
-    const chain = flagged ? all.filter((e) => !effectIsTdPreview(e)) : all;
-    return hasEffects(chain) ? { effects: chain, preview: null } : null;
+    const list = flagged ? withoutTdPreview(l.effects) : l.effects;
+    const steps: AdjStep[] = [];
+    for (const e of list) {
+      if (!e.enabled) continue;
+      if (CLASSIC_EFFECT_TYPES.has(e.type)) { // classic point adjustments: JS LUT / HSV maths (cheaper than a GL round trip, any scale, <= 1/255 of the module)
+        const spec = specOfClassicEffect(e);
+        if (spec && !isIdentity(spec)) steps.push({ spec });
+      } else if (k === 1) {
+        const last = steps[steps.length - 1];
+        if (last && 'fx' in last) last.fx.push(e);
+        else steps.push({ fx: [e] });
+      }
+    }
+    const fxSteps = steps.filter((s): s is { fx: Effect[] } => 'fx' in s).filter((s) => hasEffects(s.fx));
+    if (!steps.some((s) => 'spec' in s) && !fxSteps.length) return null;
+    return { preview: null, steps };
   }
 
   private renderGroup(tgt: Target, group: GroupLayer, r: Rect, depth: number, from = group.children.length - 1, to = 0): void {
@@ -545,10 +560,9 @@ export class Compositor {
     }
   }
 
-  /** Does the adjustment layer change anything at this scale (identity adjustments without effects are skipped)? */
+  /** Does the adjustment layer change anything at this scale (identity adjustments are skipped)? */
   private adjusts(l: AdjustmentLayer, k: number): boolean {
-    if (l.adjustment.type !== 'filter' && !isIdentity(l.adjustment)) return true;
-    return this.adjFx(l, k) !== null;
+    return this.adjPlan(l, k) !== null;
   }
 
   /** A group with effects: its isolated composite goes through the effects (document space) before it is blended. */
@@ -560,7 +574,7 @@ export class Compositor {
     if (!vis) return;
     let sum = 0;
     let aux = false; // a descendant displaces by a layer outside the group: its result depends on pixels this signature cannot see
-    const walk = (x: GroupLayer): void => { for (const c of x.children) { sum += this.layerEpoch.get(c) ?? 0; if (auxRef(c.effects) || (c.kind === 'adjustment' && c.adjustment.type === 'filter' && auxRef([c.adjustment.effect]))) aux = true; if (c.kind === 'group') walk(c); } };
+    const walk = (x: GroupLayer): void => { for (const c of x.children) { sum += this.layerEpoch.get(c) ?? 0; if (auxRef(c.effects)) aux = true; if (c.kind === 'group') walk(c); } };
     walk(g);
     const res = this.fxResult(g, [this.propsEpoch, sum, this.doc.shapeRenderer], vis, f, (c, cr, p) => {
       this.renderGroup({ ctx: c, canvas: p.src.canvas, ox: 0, oy: 0, k: 1, pool: p.pool }, g, cr, 0);
@@ -757,7 +771,7 @@ export class Compositor {
   /** Forget cached effect results of layers that are gone (called after every flush). */
   private pruneFxCache(): void {
     if (this.previews.size) {
-      const flagged = new Set(this.doc.all().filter((l) => tdPreviewFlag(l.effects) || (l.kind === 'adjustment' && l.adjustment.type === 'filter' && effectIsTdPreview(l.adjustment.effect))).map((l) => l.id));
+      const flagged = new Set(this.doc.all().filter((l) => tdPreviewFlag(l.effects)).map((l) => l.id));
       this.previews.forEach((p, id) => {
         if (!flagged.has(id)) { // gone, or no longer needs TD
           releaseSurface(p.surf);
@@ -813,23 +827,27 @@ export class Compositor {
    * (a filter adjustment runs its filter in the effects chain); the layer's own effects (v6) run on the adjusted result before the mix.
    */
   private applyAdjustment(tgt: Target, l: AdjustmentLayer, r: Rect, depth: number): void {
-    const spec = l.adjustment;
     const opacity = l.opacity;
     const mask = l.mask && l.mask.enabled ? l.mask : null;
     const tmp = this.scratch(tgt, depth, r);
-    const f = this.adjFx(l, tgt.k);
-    if (f?.preview) {
-      // TD's adjusted + filtered result of this layer (document space)
+    const plan = this.adjPlan(l, tgt.k);
+    if (plan?.preview) {
+      // TD's result of this layer's whole stack (document space)
       tmp.ctx.clearRect(r.x, r.y, r.w, r.h);
-      tmp.ctx.drawImage(f.preview.canvas as CanvasImageSource, r.x, r.y, r.w, r.h, r.x, r.y, r.w, r.h);
+      tmp.ctx.drawImage(plan.preview.canvas as CanvasImageSource, r.x, r.y, r.w, r.h, r.x, r.y, r.w, r.h);
     } else {
-      if (spec.type !== 'filter' && !isIdentity(spec)) renderAdjusted(spec, tgt, tmp, r, { w: this.doc.width, h: this.doc.height }, (p) => this.padTarget(p, tgt.k));
-      else {
-        const fp = pixRect(tgt, r);
-        tmp.ctx.clearRect(r.x, r.y, r.w, r.h);
-        tmp.ctx.drawImage(tgt.canvas as CanvasImageSource, fp.x, fp.y, fp.w, fp.h, r.x, r.y, r.w, r.h);
+      let have = false; // tmp holds the running result over r
+      const docSize = { w: this.doc.width, h: this.doc.height };
+      for (const st of plan?.steps ?? []) {
+        if ('spec' in st) {
+          renderAdjusted(st.spec, have ? tmp : tgt, tmp, r, docSize, (p) => this.padTarget(p, tgt.k));
+        } else {
+          if (!have) this.copyWindow(tgt, tmp, r);
+          this.fxInPlace(tmp, st.fx, r, l);
+        }
+        have = true;
       }
-      if (f) this.fxInPlace(tmp, f.effects as Effect[], r, l);
+      if (!have) this.copyWindow(tgt, tmp, r);
     }
     if (mask) this.maskIn(tmp.ctx, mask, IDENT, r); // adjusted * mask
     const ctx = tgt.ctx;
@@ -852,6 +870,12 @@ export class Compositor {
     const tp = pixRect(tmp, r);
     ctx.drawImage(tmp.canvas as CanvasImageSource, tp.x, tp.y, tp.w, tp.h, r.x, r.y, r.w, r.h);
     ctx.restore();
+  }
+
+  private copyWindow(from: Target, to: Target, r: Rect): void {
+    const fp = pixRect(from, r);
+    to.ctx.clearRect(r.x, r.y, r.w, r.h);
+    to.ctx.drawImage(from.canvas as CanvasImageSource, fp.x, fp.y, fp.w, fp.h, r.x, r.y, r.w, r.h);
   }
 
   /**

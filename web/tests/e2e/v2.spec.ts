@@ -31,7 +31,7 @@ test('a fresh page loads TD\'s stored document: layers, mask, adjustment and sur
     layer('fx', { kind: 'adjustment', name: 'Levels', adjustment: { type: 'levels', inLow: 0.1, inHigh: 0.9, gamma: 1.4, outLow: 0, outHigh: 1 } }),
   ], 9, { 4: [200, 20, 30, 255], 5: [255, 255, 255, 255] });
   await open(page);
-  await expect(page.getByRole('tab', { name: 'Adjustment' })).toHaveAttribute('aria-selected', 'true'); // the loaded active layer is the adjustment
+  await expect(page.getByRole('tab', { name: 'Layers' })).toHaveAttribute('aria-selected', 'true'); // a loaded adjustment does not steal the panel (only a newly created one opens Effects)
   await page.getByRole('tab', { name: 'Layers' }).click();
   await expect(page.locator('[data-layer] [data-name]')).toHaveText(['Levels', 'Painted', 'TD Input']);
   await expect(page.locator('[data-layer="paint"] [data-act=mask]')).toBeVisible();
@@ -43,7 +43,8 @@ test('a fresh page loads TD\'s stored document: layers, mask, adjustment and sur
   expect(td.frames.length).toBe(0);
   const spec = await hook<any>(page, 'docSpec');
   expect(spec.layers.map((l: LayerSpec) => l.id)).toEqual(['base', 'paint', 'fx']);
-  expect(spec.layers[2].adjustment).toMatchObject({ type: 'levels', gamma: 1.4 });
+  expect(spec.layers[2].adjustment).toBeNull(); // v8: the legacy spec migrated to the layer's FX stack
+  expect(spec.layers[2].effects[0]).toMatchObject({ type: 'levels', enabled: true, gamma: 1.4 });
   // the red layer shows through the Levels adjustment in the local preview (non-zero red, no green dominance)
   const [r, g] = await hook<number[]>(page, 'readPixel', 40, 40);
   expect(r).toBeGreaterThan(g);
@@ -56,10 +57,11 @@ test('painting sends SURFACE tiles; adjustment + mask edits round-trip into the 
   // mask on Layer 1 via the UI, then an adjustment via the footer menu
   await page.getByRole('button', { name: 'Add mask' }).click();
   await page.getByRole('button', { name: 'New adjustment' }).click();
-  await page.getByRole('menuitem', { name: 'Blur', exact: true }).click();
-  await expect(page.getByRole('tab', { name: 'Adjustment' })).toHaveAttribute('aria-selected', 'true');
+  await page.locator('[data-new-adjustment=blur]').click();
+  await expect(page.getByRole('tab', { name: 'Effects' })).toHaveAttribute('aria-selected', 'true');
+  await page.locator('[data-fx-open]').click();
   await page.getByLabel('Radius').fill('25');
-  await td.waitFor(() => td.doc?.layers.some((l) => l.adjustment?.type === 'blur' && (l.adjustment as any).radius === 25) ?? false);
+  await td.waitFor(() => td.doc?.layers.some((l) => l.kind === 'adjustment' && (l.effects as any[]).some((e) => e.type === 'blur' && e.radius === 25)) ?? false);
   const stored = td.doc!.layers;
   expect(stored.map((l) => l.kind)).toEqual(['input', 'pixel', 'adjustment']);
   const paintLayer = stored[1];
@@ -171,7 +173,7 @@ test('test hook drives adjustments, masks and paint targets', async ({ page }) =
   await hook(page, 'setPaintTarget', l1, 'mask');
   const st = await hook<any>(page, 'loadState');
   expect(st.paintTarget).toEqual({ layerId: l1, target: 'mask' });
-  expect(st.docSpec.layers.find((l: LayerSpec) => l.id === adj).adjustment).toEqual({ type: 'threshold', level: 0.25 });
+  expect(st.docSpec.layers.find((l: LayerSpec) => l.id === adj).effects).toMatchObject([{ type: 'threshold', enabled: true, level: 0.25 }]);
   await td.waitFor(() => td.doc?.layers.some((l) => l.id === adj) ?? false);
   expect(td.doc!.layers.find((l) => l.id === l1)!.mask).not.toBeNull();
 });

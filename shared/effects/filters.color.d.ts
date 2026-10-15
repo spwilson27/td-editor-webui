@@ -20,6 +20,17 @@ export type ColorFilter =
       highlightsCyanRed?: number; highlightsMagentaGreen?: number; highlightsYellowBlue?: number;
       preserveLuminosity?: boolean;
     }
+  /** v7 point ops, the classic adjustments as filters (same maths and units as the v2 adjustment layers; sRGB encoded straight colour, alpha unchanged). */
+  /** `inLow`, `inHigh`, `outLow`, `outHigh` 0..1 (inHigh kept >= inLow + 1e-4), `gamma` 0.1..10 (> 1 brightens mid-tones): out = outLow + (outHigh - outLow) * clamp((c - inLow) / (inHigh - inLow))^(1 / gamma). */
+  | { type: 'levels'; inLow?: number; inHigh?: number; gamma?: number; outLow?: number; outHigh?: number }
+  /** `brightness` -1..1 MULTIPLIES (c * (1 + b)), `contrast` -1..1 pivots at 0.5. */
+  | { type: 'brightnessContrast'; brightness?: number; contrast?: number }
+  /** True HSV edit: `hue` degrees -180..180 (+ = red -> green -> blue), `saturation` / `value` multipliers 0..2 (default 1). */
+  | { type: 'hueSaturation'; hue?: number; saturation?: number; value?: number }
+  /** 1 - c. */
+  | { type: 'invert' }
+  /** Rec.709 luma of the straight colour >= `level` (0..1, default 0.5) -> white, else black. */
+  | { type: 'threshold'; level?: number }
   /** `vibrance` % -100..100 (low-saturation colours move most), `saturation` % -100..100 (-100 = luma grey, +100 = twice the distance from grey). */
   | { type: 'vibrance'; vibrance?: number; saturation?: number }
   /** Matrix rows (R', G', B') = coefficients in % -200..200 (identity 100 on the diagonal) + constants r, g, b in % -100..100.

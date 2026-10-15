@@ -1,16 +1,14 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { effectLabel } from '../state/effectDefaults';
-import { filterDoc, filterGroups } from '../state/filterSchema';
 import { store, type Store } from '../state/store';
 import { MODES } from '../state/tools';
 import { formatZoom } from '../state/view';
+import { EffectCatalogue } from './EffectCatalogue';
 import { Icon, NOT_IN_VERSION } from './Icon';
 
-type Item = 'sep' | { label: string; hint?: string; flyout?: 'filters'; run?: (s: Store) => void; checked?: (s: Store) => boolean; enabled?: (s: Store) => boolean; title?: (s: Store) => string | undefined };
+type Item = 'sep' | { label: string; hint?: string; flyout?: 'adjustments'; run?: (s: Store) => void; checked?: (s: Store) => boolean; enabled?: (s: Store) => boolean; title?: (s: Store) => string | undefined };
 interface MenuDef { label: string; items: Item[] | ((s: Store) => Item[]) }
 
 const off = (label: string, hint?: string): Item => ({ label, hint });
-const isEditable = (kind?: string) => kind === 'text' || kind === 'shape';
 
 const MENUS: MenuDef[] = [
   { label: 'File', items: [
@@ -26,14 +24,16 @@ const MENUS: MenuDef[] = [
   { label: 'Document', items: [off('Resize document…'),
     { label: 'Canvas Size…', run: (s) => { s.canvasDialog.value = true; } },
     { label: 'Follow Input Size', run: (s) => s.followInput(), checked: (s) => s.canvasMode.value === 'input', title: () => 'The document size tracks the TouchDesigner Input resolution' }, off('Rotate…')] },
-  { label: 'Layer', items: (s) => [off('Duplicate'), off('Merge down'), off('Layer properties…'), 'sep',
+  { label: 'Layer', items: (s) => [off('Duplicate'), off('Layer properties…'), 'sep',
+    { label: 'Group Layers', hint: 'Ctrl+G', run: (x) => void x.groupSelected(), enabled: (x) => x.canGroupSelected() },
+    { label: 'Merge Selected', run: (x) => void x.mergeSelected(), enabled: (x) => x.canMergeSelected(), title: (x) => x.mergeBlock() ?? 'Merge the selected layers into one pixel layer, rendered by TouchDesigner' }, 'sep',
     { label: 'Layer Effects…', run: (x) => x.openEffects(), enabled: (x) => x.canHaveEffects(x.activeLayer()?.kind) },
-    { label: 'New Filter Adjustment ▸', flyout: 'filters', run: () => {}, enabled: (x) => x.hasEngine() },
+    { label: 'New Adjustment ▸', flyout: 'adjustments', run: () => {}, enabled: (x) => x.hasEngine() },
     ...(s.connectedInputs().length
       ? s.connectedInputs().map((i): Item => ({ label: `Add Input Layer ▸ Input ${i.input}`, run: (x) => void x.addInputLayer(i.input) }))
       : [{ label: 'Add Input Layer ▸ (no connected inputs)', run: () => {}, enabled: () => false } as Item]), 'sep',
     { label: 'Flatten Layer', run: (s) => { const l = s.activeLayer(); if (l) void s.flattenLayer(l.id); }, enabled: (s) => s.canFlatten(s.activeLayer()),
-      title: (s) => (isEditable(s.activeLayer()?.kind) && s.connection.value !== 'linked' ? 'Flatten needs TouchDesigner' : undefined) },
+      title: (s) => s.flattenTooltip(s.activeLayer()) },
     { label: 'Apply Transform', run: (s) => s.applyTransform(), enabled: (s) => s.canApplyTransform(s.activeLayer()) },
     { label: 'Reset Transform', run: (s) => s.resetTransform(), enabled: (s) => s.canResetTransform(s.activeLayer()) }, 'sep', { label: 'Add mask', run: (s) => s.addMask(), enabled: (s) => s.canAddMask() }, { label: 'Delete mask', run: (s) => s.deleteMask(), enabled: (s) => !!s.activeLayer()?.mask }] },
   { label: 'Select', items: [{ label: 'Select All', hint: 'Ctrl+A', run: (s) => s.selectAll() }, { label: 'Deselect', hint: 'Ctrl+D', run: (s) => s.deselect() },
@@ -102,21 +102,8 @@ function MenuBar() {
                         <span style="flex:1 1 auto">{it.label}</span>
                       </button>
                       {fly && (
-                        <div role="menu" aria-label="New Filter Adjustment" style="position:absolute;left:100%;top:-4px;z-index:60;min-width:210px;max-height:min(520px,80vh);overflow-y:auto;padding:4px;background:#2f2f2f;border:1px solid #161616;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,0.55)">
-                          {filterGroups().map((g, gi) => (
-                            <div key={g.id} role="group" aria-label={g.label}>
-                              {gi > 0 && <div role="separator" style="height:1px;background:#444;margin:4px 2px" />}
-                              <div style="padding:3px 10px 2px;font-size:10px;letter-spacing:0.04em;text-transform:uppercase;color:#8f8f8f">{g.label}</div>
-                              {g.types.map((t) => (
-                                <button key={t} role="menuitem" class="mi" data-new-filter-adjustment={t} title={filterDoc(t)}
-                                  onClick={() => { setOpen(-1); store.addFilterAdjustment(t); }}
-                                  style="display:flex;width:100%;box-sizing:border-box;align-items:center;height:26px;padding:0 10px;border-radius:4px;text-align:left;color:#e3e3e3">
-                                  {effectLabel(t)}
-                                </button>
-                              ))}
-                            </div>
-                          ))}
-                        </div>
+                        <EffectCatalogue label="New Adjustment" attr="data-new-adjustment" onPick={(t) => { setOpen(-1); store.addAdjustment(t); }}
+                          style="position:absolute;left:100%;top:-4px;z-index:60;min-width:210px;max-height:min(520px,80vh);overflow-y:auto;padding:4px;background:#2f2f2f;border:1px solid #161616;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,0.55)" />
                       )}
                     </div>
                   );

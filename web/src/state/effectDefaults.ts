@@ -12,6 +12,10 @@ export const EFFECT_LABELS: Record<EffectType, string> = {
   colorOverlay: 'Colour Overlay', pixelSort: 'Pixel Sort', glitch: 'Glitch', chromaticAberration: 'Chromatic Aberration', halftone: 'Halftone',
 };
 
+/** v8: the classic adjustments are ordinary FX types now (Levels, Brightness/Contrast, Hue/Saturation, Blur, Invert, Threshold). `blur` is the library filter. */
+export const CLASSIC_ORDER: string[] = ['levels', 'brightnessContrast', 'hueSaturation', 'blur', 'invert', 'threshold'];
+export const isClassicType = (type: string): boolean => CLASSIC_ORDER.includes(type);
+
 export type EffectField =
   | { kind: 'num'; key: string; label: string; min: number; max: number; step: number; unit?: string; digits?: number }
   | { kind: 'enum'; key: string; label: string; options: [string, string][] }
@@ -38,6 +42,9 @@ export const EFFECT_FIELDS: Record<EffectType, EffectField[]> = {
   halftone: [num('cellSize', 'Cell size', 2, 128, 1, ' px'), num('angle', 'Angle', 0, 360, 1, '°'),
     { kind: 'enum', key: 'shape', label: 'Shape', options: [['dot', 'Dot'], ['line', 'Line']] }],
 };
+
+/** The field list of an effect type that has hand-written editors (v5 effects), else undefined (library filter incl. the classic FX). */
+export const fieldsOf = (type: string): EffectField[] | undefined => (EFFECT_FIELDS as Record<string, EffectField[]>)[type];
 
 const BLACK: RGBA = { r: 0, g: 0, b: 0, a: 255 };
 const WHITE: RGBA = { r: 255, g: 255, b: 255, a: 255 };

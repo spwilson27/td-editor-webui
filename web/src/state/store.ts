@@ -1,5 +1,5 @@
 import { computed, effect, signal } from '@preact/signals';
-import type { Anchor, AdjustmentSpec, AdjustmentType, BrushSettings, CanvasMode, EditorEngine, LayerInfo, Rect, RGBA, SelectionOptions, SnapOptions, ToolId } from '../engine/types';
+import type { Anchor, BrushSettings, CanvasMode, EditorEngine, LayerInfo, Rect, RGBA, SelectionOptions, SnapOptions, ToolId } from '../engine/types';
 import { NO_LATENCY, type Bridge, type LatencyStats } from '../bridge/tdBridge';
 import { decodeImage } from './importImage';
 import { DEFAULT_SHAPE_OPTIONS, DEFAULT_TEXT_OPTIONS, newTextSpec, type ShapeOptions, type TextOptions } from './specs';
@@ -13,6 +13,7 @@ import { createEffectsSlice } from './effectsSlice';
 import { createFilesSlice } from './filesSlice';
 import { createInputsSlice } from './inputsSlice';
 import { createBrushesSlice } from './brushesSlice';
+import { createLayersSlice } from './layersSlice';
 import { BIG_DOC_KEY } from './brushes';
 import { defaultEffect, effectLabel } from './effectDefaults';
 
@@ -35,7 +36,7 @@ function saveFlag(key: string, on: boolean) {
 export interface GuideDrag { axis: 'h' | 'v'; index: number | null; pos: number; remove: boolean }
 
 /** What the store needs from the bridge; Flatten / canvas calls are optional (standalone, tests). */
-export type StoreBridge = Pick<Bridge, 'listTops' | 'importTop'> & Partial<Pick<Bridge, 'renderLayer' | 'setCanvas' | 'saveProject' | 'openProject' | 'exportPng' | 'chooseFile' | 'readTextFile' | 'clearStoredHistory' | 'placeImageViaTd'>>;
+export type StoreBridge = Pick<Bridge, 'listTops' | 'importTop'> & Partial<Pick<Bridge, 'renderLayer' | 'renderLayers' | 'setCanvas' | 'saveProject' | 'openProject' | 'exportPng' | 'chooseFile' | 'readTextFile' | 'clearStoredHistory' | 'placeImageViaTd'>>;
 
 export const SHAPE_RENDERER_KEY = 'raster-editor.shapeRenderer';
 export type ShapeRenderer = 'sdf' | 'canvas';
@@ -91,14 +92,13 @@ export function createStore() {
   const snapLines = signal<{ x: number | null; y: number | null }>({ x: null, y: null });
   const cursorPos = signal<{ x: number; y: number } | null>(null); // viewport-local CSS px, for the ruler markers
   const aspectLock = signal(true);
-  const flattening = signal<string | null>(null);
 
   // v6: big-document notice (dismissal remembered per viewer), TD renders of tdPreview layers
   const bigDocDismissed = signal(loadFlag(BIG_DOC_KEY, false));
   const layerPreviews = signal<ReadonlyMap<string, 'pending' | 'ready'>>(new Map());
 
   const colorTab = signal<'color' | 'swatches' | 'brushes'>('color');
-  const layerTab = signal<'layers' | 'history' | 'adjust' | 'fx'>('layers');
+  const layerTab = signal<'layers' | 'history' | 'fx'>('layers');
 
   // v2: view mode (Local preview vs TouchDesigner output), client kind, latency readouts
   const viewMode = signal<'local' | 'td'>('local');
@@ -109,10 +109,9 @@ export function createStore() {
   const viewAge = signal<number | null>(null);
   const tdViewTick = signal(0);
   const loadingDoc = signal(false);
-  const adjDraft = signal<{ id: string; spec: AdjustmentSpec } | null>(null);
   let tdViewSource: HTMLCanvasElement | null = null;
   let lastActiveId: string | null = null;
-  let adjFlush: number | null = null;
+  let autoFx: string | null = null; // the adjustment layer whose activation switched the panel to Effects
 
   const view = signal<View>({ zoom: 1, x: 0, y: 0 });
   const zoom = computed(() => view.value.zoom);
@@ -155,8 +154,11 @@ export function createStore() {
     setLayerTab: (t) => { layerTab.value = t; },
   };
 
+  const layers = createLayersSlice(ctx);
+
   const store = {
     ...createToolsSlice(ctx), ...createEffectsSlice(ctx), ...createFilesSlice(ctx), ...createInputsSlice(ctx),
+    ...layers,
     ...createBrushesSlice(ctx, { brush, brushPreset, setBrush: (p) => store.setBrush(p) }),
     tool, hsv, primary, secondary, alpha, recent, customSwatches, brush, brushPreset, fillTolerance,
     selOpts, textOpts, shapeOpts, fonts, textEdit, topDialog, shapeRenderer,
@@ -169,14 +171,14 @@ export function createStore() {
     /** The bridge's TOP import API (null in standalone mode). */
     get bridge() { return bridgeApi; },
     set bridge(b: StoreBridge | null) { bridgeApi = b; },
-    showRulers, showGuides, snapOn, canvasMode, canvasDialog, docspecVersion, guideDrag, snapLines, cursorPos, aspectLock, flattening,
+    showRulers, showGuides, snapOn, canvasMode, canvasDialog, docspecVersion, guideDrag, snapLines, cursorPos, aspectLock,
     setShowRulers(on: boolean) { showRulers.value = on; saveFlag(RULERS_KEY, on); },
     setShowGuides(on: boolean) { showGuides.value = on; saveFlag(GUIDES_KEY, on); },
     setSnapOn(on: boolean) { snapOn.value = on; saveFlag(SNAP_KEY, on); },
     snapOptions(): SnapOptions { return { enabled: snapOn.value, guides: true, canvas: true, layers: true, threshold: SNAP_THRESHOLD }; },
     /** Set by the App: opens the Place Image file chooser. */
     openPlace: null as (() => void) | null,
-    colorTab, layerTab, viewMode, clientKind, viewRect, latency, viewLatency, viewAge, tdViewTick, adjDraft, loadingDoc,
+    colorTab, layerTab, viewMode, clientKind, viewRect, latency, viewLatency, viewAge, tdViewTick, loadingDoc,
     view, zoom, spaceHeld, docSize, docName, connection, active, notice, fatal, layerPreviews,
     docVersion, historyVersion, selectionVersion, thumbTick,
     takeover: null as (() => void) | null,
@@ -207,12 +209,13 @@ export function createStore() {
             if (id !== lastActiveId) {
               lastActiveId = id;
               const layer = e.layers().find((l) => l.id === id);
-              const kind = layer?.kind;
               if (layer) store.syncOptionsFrom(layer);
               if (textEdit.peek() && textEdit.peek()!.id !== id) store.commitText();
-              if (kind === 'adjustment') layerTab.value = 'adjust';
-              else if (layerTab.peek() === 'adjust') layerTab.value = 'layers';
+              // leaving the adjustment layer that opened the Effects tab returns to Layers
+              if (autoFx && id !== autoFx && layerTab.peek() === 'fx') layerTab.value = 'layers';
+              if (id !== autoFx) autoFx = null;
             }
+            store.syncSelection();
             break;
           }
           case 'surface':
@@ -379,16 +382,15 @@ export function createStore() {
     setLoading: (b: boolean) => { loadingDoc.value = b; },
     setLatency: (s: LatencyStats) => { latency.value = s; },
     setViewLatency: (s: LatencyStats) => { viewLatency.value = s; },
-    addAdjustment: (type: AdjustmentType) => store.engine.addAdjustment(type),
-    /** Layer ▸ New Filter Adjustment: an adjustment layer {type:'filter'} holding a library filter with its default parameters. */
-    addFilterAdjustment(filterType: string): string {
-      const e = store.engine, fx = defaultEffect(filterType), name = effectLabel(filterType);
-      if (e.addFilterAdjustment) return e.addFilterAdjustment(fx, name); // one history entry
-      const id = e.addAdjustment('filter');
-      e.setAdjustment(id, { type: 'filter', effect: fx });
-      e.setLayerProps(id, { name });
+    /** Layer ▸ New Adjustment ▸ X (and the footer menu): an adjustment layer whose FX stack is the catalogue entry with its default parameters. */
+    addAdjustment(type: string): string {
+      const id = store.engine.addAdjustmentLayer([defaultEffect(type)], effectLabel(type));
+      // a newly created adjustment is an FX stack: open it in the Effects tab (only on creation, not on undo / delete / selection)
+      layerTab.value = 'fx';
+      autoFx = id;
       return id;
     },
+    addFilterAdjustment(type: string): string { return store.addAdjustment(type); },
     // v6: big-document notice, TD layer renders
     /** The document is larger than ~8 MP in the Local preview and the notice was not dismissed on this viewer. */
     bigDocNotice: computed(() => !bigDocDismissed.value && viewMode.value === 'local' && docSize.value.w * docSize.value.h > BIG_DOC_PIXELS),
@@ -417,26 +419,10 @@ export function createStore() {
       const l = store.activeLayer();
       if (l?.mask) store.engine.deleteMask(l.id);
     },
-    /** Live adjustment edits: latest spec wins, applied at most once per animation frame. */
-    editAdjustment(id: string, spec: AdjustmentSpec) {
-      adjDraft.value = { id, spec };
-      if (adjFlush !== null) return;
-      adjFlush = requestAnimationFrame(() => {
-        adjFlush = null;
-        const d = adjDraft.peek();
-        adjDraft.value = null;
-        if (d && engine) engine.setAdjustment(d.id, d.spec);
-      });
-    },
-
     // Document actions
     addLayer: () => store.engine.addPixelLayer(),
     addGroup: () => store.engine.addGroup(),
     flatten: () => store.engine.flattenToNewLayer(),
-    deleteActive() {
-      const e = store.engine, id = e.activeLayerId();
-      if (id) e.deleteLayer(id);
-    },
     undo: () => engine?.undo(),
     redo: () => engine?.redo(),
     deselect: () => engine?.deselect(),
@@ -538,30 +524,6 @@ export function createStore() {
       secondary.value = hex;
       const l = store.boundShape();
       if (l && l.shape) engine!.setShape(l.id, { ...l.shape, stroke: { ...l.shape.stroke, color: toRgba(hex, 100) } } as typeof l.shape);
-    },
-
-    // v4: Flatten (TouchDesigner renders the text / shape layer alone, the pixels replace the layer)
-    canFlatten(l: LayerInfo | undefined): boolean {
-      return !!l && (l.kind === 'text' || l.kind === 'shape') && connection.value === 'linked' && !!bridgeApi?.renderLayer && flattening.value === null;
-    },
-    flattenTitle(): string {
-      return connection.value === 'linked' ? 'Flatten to pixels' : 'Flatten to pixels (needs TouchDesigner)';
-    },
-    async flattenLayer(id: string): Promise<boolean> {
-      const l = engine?.layers().find((x) => x.id === id);
-      if (!engine || !l || (l.kind !== 'text' && l.kind !== 'shape')) return false;
-      if (connection.peek() !== 'linked' || !bridgeApi?.renderLayer) { setNotice('Flatten needs a TouchDesigner connection'); return false; }
-      if (flattening.peek() !== null) return false;
-      flattening.value = id;
-      try {
-        await bridgeApi.renderLayer(id);
-        return true;
-      } catch (err) {
-        setNotice(`Flatten failed: ${err instanceof Error ? err.message : String(err)}`);
-        return false;
-      } finally {
-        flattening.value = null;
-      }
     },
 
     // v4: transforms

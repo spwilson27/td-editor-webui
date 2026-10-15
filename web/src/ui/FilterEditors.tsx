@@ -72,7 +72,7 @@ export function CurvesEditor({ vals, keys, onSet }: { vals: Vals; keys: string[]
   const key = (e: KeyboardEvent, i: number) => {
     const step = e.shiftKey ? 0.05 : 0.01;
     const d: Record<string, [number, number]> = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, step], ArrowDown: [0, -step] };
-    if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); remove(i); return; }
+    if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); e.stopPropagation(); remove(i); return; }
     const v = d[e.key];
     if (v) { e.preventDefault(); commit(move(i, [clamp01(pts[i][0] + v[0]), clamp01(pts[i][1] + v[1])], pts)); }
   };
@@ -326,7 +326,9 @@ export function FilterParams({ fx, onSet, selfId }: { fx: Effect; onSet: (p: Pat
       case 'aux': return <AuxPicker key="aux" vals={vals} onSet={onSet} selfId={selfId} />;
     }
   };
-  return <>{filterFields(fx.type).map(one)}</>;
+  // blur: a sigma > 0 overrides the radius (migrated legacy blurs), so the Radius slider would do nothing then
+  const fields = filterFields(fx.type).filter((f) => !((fx.type as string) === 'blur' && f.key === 'radius' && Number(vals.sigma) > 0));
+  return <>{fields.map(one)}</>;
 }
 
 /** Apply a Patch to an effect. */

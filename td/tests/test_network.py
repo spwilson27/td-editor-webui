@@ -454,7 +454,11 @@ def test_move_layer_into_group_rewires_only(env):
 
 
 def adj(id_, spec, **kw):
-    return L(id_, "adjustment", adjustment=spec, **kw)
+    """An adjustment layer; ``spec`` = a classic v2..v7 AdjustmentSpec, read like parse_doc's migration does (v8: its effect leads effects[])."""
+    import protocol
+    e = protocol.legacy_adjustment_effect(spec)
+    kw["effects"] = ([e] if e is not None else []) + list(kw.get("effects") or [])
+    return L(id_, "adjustment", **kw)
 
 
 LEVELS = {"type": "levels", "inLow": 0.1, "inHigh": 0.9, "gamma": 2.0, "outLow": 0.2, "outHigh": 0.8}
@@ -556,7 +560,7 @@ def test_backlog_is_bounded_without_ticks(env):
 
 def test_adopts_existing_network_without_creating(env):
     net, comp, log, clock = env
-    st = [base(), px("a", 1, mask={"slot": 9, "enabled": True}), L("g", "group"), px("b", 2, parentId="g"), adj("lv", LEVELS)]
+    st = [base(), px("a", 1, mask={"slot": 9, "enabled": True}), L("g", "group"), px("b", 2, parentId="g")]
     net.apply(st, W, H)
     settle(net)
     for s in (1, 2, 9):
@@ -569,7 +573,6 @@ def test_adopts_existing_network_without_creating(env):
     assert not d["destroys"]
     assert net2.slots() == [1, 2, 9]
     assert all(net2.surface_top(s).lock for s in (1, 2, 9))           # locked pixels are not touched
-    assert source_of(net2, "blend_L_lv", 1) == "blank"
     assert net2._ops["blend_L_a"].tags == ["role:blend_L_a"]
 
 
@@ -850,8 +853,8 @@ def test_resize_while_surface_pending_then_undo(env):
 
 def test_blur_tiny_radius_is_identity(env):
     net, comp, log, _ = env
-    net.apply([base(), px("a", 1), adj("bl", {"type": "blur", "radius": 0.03})], W, H)
-    assert net._ops["adj_L_bl"].bypass is True
+    net.apply([base(), px("a", 1), adj("bl", {"type": "blur", "radius": 0.0})], W, H)
+    assert not net._chains                                    # a blur that draws nothing builds no chain
 
 
 def test_unknown_removal_survives_children_dying_with_parent(env, monkeypatch):
@@ -875,123 +878,52 @@ def test_tick_prunes_junk_that_died_with_its_parent(env):
     assert net.stats()["junk"] == 0
 
 
-def uvals(net, role):
-    pv = net._ops[role].par.value
-    return tuple(pv(k) for k in ("vec2valuex", "vec2valuey", "vec2valuez", "vec2valuew", "vec3valuex"))
-
-
-def test_levels_is_one_pass_with_uniforms(env):
+def test_adjustment_is_a_chain_on_the_accumulated_image_mixed_by_opacity_and_mask(env):
     net, comp, log, _ = env
-    net.apply([base(), px("a", 1), adj("lv", LEVELS, opacity=0.7)], W, H)
-    assert source_of(net, "blend_L_lv", 0) == "blend_L_a"
-    assert source_of(net, "blend_L_lv", 1) == "blank"
-    assert not [r for r in net._ops if r.startswith("adj_")]          # no helper nodes at all
+    net.apply([base(), px("a", 1), adj("lv", LEVELS, opacity=0.7, mask={"slot": 7, "enabled": True})], W, H)
+    assert chain_in(net, "lv") == "blend_L_a" and fx_chain_nodes(net, "lv")
     pv = net._ops["blend_L_lv"].par.value
-    assert pv("vec0valuew") == network.ADJ_LEVELS and pv("vec0valuey") == 0.7
-    assert uvals(net, "blend_L_lv") == (0.1, 0.9, 2.0, 0.2, 0.8)
-    assert net._ops["blend_L_lv"].par.value("vec2name") == "uA"
+    assert (pv("vec0valuew"), pv("vec0valuey"), pv("vec0valuez")) == (float(network.ADJ_PREMULT), 0.7, 1.0)
+    assert source_of(net, "blend_L_lv", 0) == "blend_L_a" and net._ops["blend_L_lv"].inputConnectors[1].source is fx_chain_nodes(net, "lv")[-1]
+    assert source_of(net, "blend_L_lv", 2) == "s7"
+    assert not [r for r in net._ops if r.startswith(("adj_", "adjx_"))]          # no helper nodes: the chain is the adjustment
 
 
-def test_levels_degenerate_input_range_is_guarded():
-    p = network.adjustment_plan({"type": "levels", "inLow": 0.5, "inHigh": 0.5, "gamma": 1, "outLow": 0, "outHigh": 1}, "x")
-    assert p.extra["vec2valuey"] > p.extra["vec2valuex"]
-    p = network.adjustment_plan({"type": "levels", "inLow": 0, "inHigh": 1, "gamma": 99, "outLow": 0, "outHigh": 1}, "x")
-    assert p.extra["vec2valuez"] == 10.0
-
-
-def test_adjustment_param_edit_is_par_sets_only(env):
+def test_adjustment_without_drawing_effects_mixes_the_image_with_itself(env):
     net, comp, log, _ = env
-    net.apply([base(), px("a", 1), adj("lv", LEVELS)], W, H)
-    settle(net)
-    m = log.mark()
-    net.apply([base(), px("a", 1), adj("lv", dict(LEVELS, gamma=1.5))], W, H)
-    d = log.since(m)
-    assert not d["creates"] and not d["destroys"] and not d["connects"]
-    assert [k for n, k, v in d["par_sets"]] == ["vec2valuez"]
+    net.apply([base(), px("a", 1), adj("e", {"type": "none"})], W, H)
+    assert not net._chains
+    assert net._ops["blend_L_e"].inputConnectors[1].source is net._ops["blend_L_e"].inputConnectors[0].source   # (v5: no skip rules)
 
 
-def test_brightness_contrast_invert_threshold_hue_mapping(env):
+def test_adjustments_see_the_result_below_in_chain_order(env):
     net, comp, log, _ = env
     net.apply([base(), px("a", 1),
                adj("bc", {"type": "brightnessContrast", "brightness": 0.25, "contrast": -0.5}),
                adj("iv", {"type": "invert"}),
                adj("th", {"type": "threshold", "level": 0.3}),
                adj("hs", {"type": "hueSaturation", "hue": 30, "saturation": 1.5, "value": 0.8})], W, H)
-    code = lambda r: net._ops[r].par.value("vec0valuew")
-    assert (code("blend_L_bc"), code("blend_L_iv"), code("blend_L_th"), code("blend_L_hs")) == \
-        (network.ADJ_BC, network.ADJ_INVERT, network.ADJ_THRESHOLD, network.ADJ_HSV)
-    assert uvals(net, "blend_L_bc")[:2] == (0.25, -0.5)
-    assert uvals(net, "blend_L_th")[0] == 0.3
-    assert uvals(net, "blend_L_hs")[:3] == (30, 1.5, 0.8)
-    # each adjustment sees the accumulated result below it (chain order)
-    assert source_of(net, "blend_L_iv", 0) == "blend_L_bc" and source_of(net, "blend_L_th", 0) == "blend_L_iv"
-    assert source_of(net, "blend_L_hs", 0) == "blend_L_th"
+    assert chain_in(net, "bc") == "blend_L_a" and chain_in(net, "iv") == "blend_L_bc"
+    assert chain_in(net, "th") == "blend_L_iv" and chain_in(net, "hs") == "blend_L_th"
 
 
-def test_blur_mapping_and_preshrink(env):
-    net, comp, log, _ = env
-    net.apply([base(), px("a", 1), adj("bl", {"type": "blur", "radius": 4})], W, H)
-    b = net._ops["adj_L_bl"]
-    assert b.OPType == "blurTOP" and source_of(net, "adj_L_bl", 0) == "blend_L_a"
-    assert b.par.value("type") == "gaussian" and b.par.value("extend") == "hold"
-    assert b.par.value("size") == round(4 * 4.698) and b.par.value("preshrink") == 1
-    assert net._ops["blend_L_bl"].par.value("vec0valuew") == network.ADJ_PREMULT
-    assert source_of(net, "blend_L_bl", 1) == "adj_L_bl"
-    for r, ps in ((5.9, 1), (6, 2), (13.9, 2), (14, 4), (31.9, 4), (32, 8), (200, 8)):
-        assert network.blur_preshrink(r) == ps
-    n = network.adjustment_plan({"type": "blur", "radius": 100}, "z").nodes[0]
-    assert n[2]["preshrink"] == 8 and n[2]["size"] == round(100 * 4.698 / 8)
-    net.apply([base(), px("a", 1), adj("bl", {"type": "blur", "radius": 0})], W, H)
-    assert net._ops["adj_L_bl"].bypass is True
-
-
-def test_adjustment_type_change_rewires(env):
+def test_adjustment_effect_type_change_rewires_and_frees_the_old_chain(env):
     net, comp, log, _ = env
     net.apply([base(), px("a", 1), adj("x", {"type": "blur", "radius": 8})], W, H)
-    blur_op = net._ops["adj_L_x"]
+    n_blur = len(fx_chain_nodes(net, "x"))
     net.apply([base(), px("a", 1), adj("x", LEVELS)], W, H)
-    assert "adj_L_x" not in net._ops
-    assert source_of(net, "blend_L_x", 1) == "blank"
-    assert net._ops["blend_L_x"].par.value("vec0valuew") == network.ADJ_LEVELS
-    net.apply([base(), px("a", 1), adj("x", {"type": "blur", "radius": 8})], W, H)
-    assert net._ops["blend_L_x"].inputConnectors[1].source is net._ops["adj_L_x"]
-    assert net._ops["blend_L_x"].par.value("vec0valuew") == network.ADJ_PREMULT
-    assert blur_op.valid or True
+    assert len(fx_chain_nodes(net, "x")) == 1 and n_blur > 1
+    assert net._ops["blend_L_x"].inputConnectors[1].source is fx_chain_nodes(net, "x")[-1]
+    net.apply([base(), px("a", 1)], W, H)
+    assert "x" not in net._chains and "blend_L_x" not in net._ops
 
 
 def test_adjustment_inside_group_sees_only_group_content(env):
     net, comp, log, _ = env
     st = [base(), px("a", 1), L("g", "group"), px("b", 2, parentId="g"), adj("lv", LEVELS, parentId="g")]
     net.apply(st, W, H)
-    assert source_of(net, "blend_L_lv", 0) == "blend_L_b"
+    assert chain_in(net, "lv") == "blend_L_b"
     assert source_of(net, "blend_L_g", 1) == "blend_L_lv"
-
-
-def test_delete_blur_defers_destroy_to_tick(env):
-    net, comp, log, _ = env
-    net.apply([base(), px("a", 1), adj("bl", {"type": "blur", "radius": 8})], W, H)
-    settle(net)
-    m = log.mark()
-    net.apply([base(), px("a", 1)], W, H)
-    assert not log.since(m)["destroys"]
-    assert net.stats()["garbage"] == 1
-    for _ in range(5):
-        net.tick()
-    assert "adj_L_bl" not in net._ops and net.stats()["garbage"] == 0
-
-
-def test_garbage_resurrection_keeps_live_nodes(env):
-    net, comp, log, _ = env
-    with_adj = [base(), px("a", 1), adj("bl", {"type": "blur", "radius": 8})]
-    net.apply(with_adj, W, H)
-    settle(net)
-    net.apply([base(), px("a", 1)], W, H)
-    assert net.stats()["garbage"] == 1
-    net.apply(with_adj, W, H)
-    for _ in range(8):
-        net.tick()
-    assert _all_valid(net) and comp.op("doc").op("adj_L_bl").valid
-    assert source_of(net, "blend_L_bl", 1) == "adj_L_bl"
 
 
 def test_nested_group_and_adjustment_type_change_in_one_apply(env):
@@ -1003,11 +935,8 @@ def test_nested_group_and_adjustment_type_change_in_one_apply(env):
            adj("x", {"type": "blur", "radius": 10}, parentId="g2"),
            adj("y", {"type": "hueSaturation", "hue": 5, "saturation": 1, "value": 1}, parentId="g1")]
     net.apply(st2, W, H)
-    assert net._ops["adj_L_x"].OPType == "blurTOP"
-    assert source_of(net, "adj_L_x", 0) == "blend_L_a"
-    assert net._ops["blend_L_x"].inputConnectors[1].source is net._ops["adj_L_x"]
-    assert net._ops["blend_L_y"].par.value("vec0valuew") == network.ADJ_HSV
-    assert source_of(net, "blend_L_y", 0) == "blend_L_g2"
+    assert chain_in(net, "x") == "blend_L_a" and chain_in(net, "y") == "blend_L_g2"
+    assert net._ops["blend_L_x"].inputConnectors[1].source is fx_chain_nodes(net, "x")[-1]
 
 
 # --------------------------------------------------------------------------- v3: text and shape layers
@@ -1752,74 +1681,6 @@ def test_set_input_connected_true_replans_the_base_transform(env):
     assert "xf_L_base" in net._ops and net._ops["src_in1"].par.value("top") == "../in1"
 
 
-def test_render_layer_source_returns_the_unblended_source_node(env):
-    net, comp, log, _ = env
-    net.apply([base(), px("p", 1), shp("s", opacity=0.3, blend="multiply", visible=False,
-                                       mask={"slot": 7, "enabled": True}), txt("t", opacity=0.5),
-               L("empty", "text", text=None)], W, H)
-    s, t = net.render_layer_source("s"), net.render_layer_source("t")
-    assert s is net._ops["shape_s"] and t is net._ops["text_t"]               # not the blend node (opacity / mask / mode)
-    assert s.par.value("resolutionw") == W and t.par.value("resolutionh") == H
-    assert net.render_layer_source("empty") is net._ops["blank"]               # no spec: transparent
-    assert net.render_layer_source("p") is None and net.render_layer_source("nope") is None
-
-
-def test_render_layer_status_finishes_pending_text_with_a_bounded_budget(env, monkeypatch):
-    net, comp, log, _ = env
-    monkeypatch.setattr(network, "MEASURE_BUDGET", 0)
-    spec = dict(TEXT, boxWidth=40.0, text="aaa bbb ccc ddd eee fff")
-    net.apply([base(), txt("t", spec)], W, H)
-    assert "text_t" in net._text_todo
-    before = net._ops["text_t"].par.value(network.TEXT_PAR["text"]), net._ops["text_t"].par.value(network.TEXT_PAR["spacing"])
-    tok = net.render_layer_token("t")
-    assert net.render_layer_ready("t") is True                           # bounded work inside the call converges
-    assert "text_t" not in net._text_todo and net._budget == 0           # the budget is restored (try/finally)
-    after = net._ops["text_t"].par.value(network.TEXT_PAR["text"]), net._ops["text_t"].par.value(network.TEXT_PAR["spacing"])
-    assert after != before                                               # real (measured) layout, not the fallback
-    assert net.render_layer_token("t") != tok                            # the readback in flight must be dropped
-    assert net.render_layer_source("t") is net._ops["text_t"]
-
-
-def test_render_layer_status_signals_failure_and_never_blocks(env, monkeypatch):
-    net, comp, log, clock = env
-    net.apply([base(), txt("t")], W, H)
-    net._ops["text_measure"].cook = lambda force=False: (_ for _ in ()).throw(RuntimeError("cook failed"))
-    net._text_todo.add("text_t")
-    net._metrics.clear()
-    net._widths.clear()
-    b0 = net._budget
-    assert net.render_layer_status("t") == "failed"
-    assert net._budget == b0                                              # restored even though the measurement raised
-
-
-def test_render_layer_source_after_delete_and_kind_change(env):
-    net, comp, log, _ = env
-    net.apply([base(), shp("s"), txt("t")], W, H)
-    tok = net.render_layer_token("s")
-    assert tok is not None and net.render_layer_status("s") == "ready"
-    net.apply([base(), txt("t")], W, H)
-    assert net.render_layer_source("s") is None and net.render_layer_token("s") is None
-    assert net.render_layer_status("s") is None and net.render_layer_ready("s") is False
-    net.apply([base(), px("s", 3), txt("t")], W, H)                       # same id, now a pixel layer
-    assert net.render_layer_source("s") is None
-    net.apply([base(), shp("s"), txt("t")], W, H)
-    assert net.render_layer_source("s") is not None and net.render_layer_token("s") != tok    # new node: token differs
-    net.apply([base(), shp("s", x=0, opacity=0.5), txt("t")], W, H)       # any apply invalidates an in-flight readback
-    assert net.render_layer_source("s") is not None
-
-
-def test_render_layer_token_changes_with_every_real_apply(env):
-    net, comp, log, _ = env
-    st = [base(), shp("s")]
-    net.apply(st, W, H)
-    t0 = net.render_layer_token("s")
-    net.apply(st, W, H)
-    assert net.render_layer_token("s") == t0                               # no-op apply: same pixels
-    st2 = [base(), shp("s", dict(RECT, x=11))]
-    net.apply(st2, W, H)
-    assert net.render_layer_token("s") != t0
-
-
 def test_surface_size_is_consistent_for_slots_in_grace_and_after_destroy(env):
     net, comp, log, clock = env
     net.apply([base(), px("a", 1, surfaceW=30, surfaceH=20)], W, H)
@@ -2073,36 +1934,6 @@ def test_mask_is_not_wired_on_the_blend_after_resampling(env):
 
 
 # --------------------------------------------------------------------------- per-layer Flatten token
-
-
-def test_render_layer_token_is_per_layer(env):
-    net, comp, log, _ = env
-    st = lambda **kw: [base(), px("p", 1, **kw), shp("s"), txt("t")]
-    net.apply(st(), W, H)
-    ts, tt = net.render_layer_token("s"), net.render_layer_token("t")
-    net.apply(st(x=5, opacity=0.5, visible=False), W, H)               # unrelated pixel layer edits
-    assert net.render_layer_token("s") == ts and net.render_layer_token("t") == tt
-    net.apply([base(), px("p", 1), shp("s", dict(RECT, x=40)), txt("t")], W, H)       # the shape's own edit
-    assert net.render_layer_token("s") != ts and net.render_layer_token("t") == tt
-    net.apply([base(), px("p", 1), shp("s", dict(RECT, x=40), opacity=0.2, blend="multiply"), txt("t")], W, H)
-    assert net.render_layer_token("s") == net.render_layer_token("s")      # opacity / blend never matter
-    t2 = net.render_layer_token("s")
-    net.apply([base(), px("p", 1), shp("s", dict(RECT, x=40), opacity=0.9), txt("t")], W, H)
-    assert net.render_layer_token("s") == t2
-    net.apply([base(), px("p", 1), shp("s", dict(RECT, x=40)), txt("t")], 100, 80)    # document size does
-    assert net.render_layer_token("s") != t2 and net.render_layer_token("t") != tt
-
-
-def test_status_polls_with_no_change_keep_the_token(env):
-    net, comp, log, _ = env
-    net.apply([base(), txt("t")], W, H)
-    assert net.render_layer_ready("t") is True
-    tok = net.render_layer_token("t")
-    for _ in range(3):
-        assert net.render_layer_status("t") == "ready"
-    net._text_todo.add("text_t")                      # forced re-poll: the measurements are cached, the pars identical
-    assert net.render_layer_status("t") == "ready"
-    assert net.render_layer_token("t") == tok
 
 
 # --------------------------------------------------------------------------- v6: affine (rotate / skew) resample
@@ -2432,7 +2263,6 @@ def test_text_and_shape_effects(env):
     assert pvals(net, "xf_L_t", "vec1") == (1.0, 0.0, 0.0, 1.0) and net._ops["xf_L_t"].par.value("vec0valuez") == 1.0
     assert fx_chain_nodes(net, "t")[0].inputConnectors[0].source is net._ops["xf_L_t"]
     assert net._ops["blend_L_t"].par.value("vec0valuez") == 0.0 and source_of(net, "blend_L_t", 2) == "blank"
-    assert net.render_layer_source("s") is net._ops["shape_s"]           # Flatten = content only
 
 
 def test_input_layer_effects(env):
@@ -2787,8 +2617,6 @@ def test_text_empty_and_adjustment_noop_and_opacity_value():
     assert network.text_is_empty({"text": "", "color": RED}) and network.text_is_empty({"text": " \n ", "color": RED})
     assert network.text_is_empty({"text": "x", "color": dict(RED, a=0)})
     assert not network.text_is_empty({"text": "x", "color": RED}) and network.text_is_empty(None)
-    assert network.adjustment_is_noop({"type": "blur", "radius": 0.04}) and not network.adjustment_is_noop({"type": "blur", "radius": 0.06})
-    assert network.adjustment_is_noop({"type": "mystery"}) and not network.adjustment_is_noop(LEVELS)
     assert network.opacity_value(None) == 1.0 and network.opacity_value("x") == 1.0 and network.opacity_value(0.25) == 0.25
     assert network.opacity_value(float("nan")) == 1.0
 
@@ -2801,7 +2629,7 @@ def test_skip_rules_remove_the_blend_pass_but_keep_sources_and_surfaces(opt):
     st = [base(), px("hid", 1, visible=False), px("zero", 2, opacity=0.0), px("noslot", None),
           px("off", 3, x=500), px("ok", 4),
           txt("t_empty", dict(TEXT, text="  ")), shp("s_empty", dict(RECT, fill={"enabled": False, "color": RED}, stroke=NOSTROKE)),
-          adj("noop_blur", {"type": "blur", "radius": 0.01}), adj("noop_unknown", {"type": "mystery"}),
+          adj("noop_blur", {"type": "blur", "radius": 0.0}), adj("noop_unknown", {"type": "mystery"}),
           L("empty_group", "group"),
           shp("s_hidden", visible=False), txt("t_hidden", visible=False), px("ok2", 5)]
     net.apply(st, W, H)
@@ -2812,13 +2640,8 @@ def test_skip_rules_remove_the_blend_pass_but_keep_sources_and_surfaces(opt):
     assert live == ["mrg_L_base"] and ins(net, "mrg_L_base")[1:4] == ["src_in1", "s4", "s5"]
     # the surfaces of the skipped pixel layers stay allocated (the ext writes them), hidden text / shape keep their source
     assert net.slots() == [1, 2, 3, 4, 5]
-    assert "text_t_hidden" in net._ops and "shape_s_hidden" not in net._ops            # (the shape node is built when asked for)
-    assert net.render_layer_source("t_hidden") is net._ops["text_t_hidden"]
-    src = net.render_layer_source("s_hidden")
-    assert src is net._ops["shape_s_hidden"] and src.par.value("resolutionw") == W
-    net.apply(st, W, H)                                                                # stays after the next apply()
-    assert net.render_layer_source("s_hidden") is src and net._ops["shape_s_hidden"] is src
-    assert net.render_layer_source("t_empty") is net._ops["text_t_empty"]
+    assert "text_t_hidden" in net._ops and "shape_s_hidden" not in net._ops            # (the shape node is not built)
+    assert "text_t_empty" in net._ops
     assert source_of(net, "out") == "mrg_L_base"
 
 
@@ -2839,7 +2662,7 @@ def test_skip_hidden_group_keeps_children_text_source(opt):
     net, comp, log, _ = opt
     net.apply([base(), L("g", "group", visible=False), txt("t", parentId="g"), px("p", 1, parentId="g")], W, H)
     assert source_of(net, "out") == "blend_L_base"
-    assert "text_t" in net._ops and net.render_layer_source("t") is net._ops["text_t"]
+    assert "text_t" in net._ops
     assert not any(r.startswith(("blend_L_t", "blend_L_p", "blend_L_g", "mrg_L_t", "mrg_L_p")) for r in net._ops)
     net.apply([base(), L("g", "group"), px("p", 1, parentId="g")], W, H)
     assert ins(net, "mrg_L_base")[1:3] == ["src_in1", "blend_L_p"]
@@ -3260,74 +3083,6 @@ def test_content_bounds_hint_shrinks_the_resample_pass_and_skips_empty(opt):
     assert net.content_box("a") == full_a and plan(net)["skipped"] == 0
 
 
-# ---- blur pyramid
-
-
-def test_blur_shrink_factor_and_sigma_band():
-    assert network.blur_shrink(0) == 1 and network.blur_shrink(6.9) == 1
-    for r, s in ((7, 2), (13.9, 2), (14, 4), (27, 4), (28, 8), (56, 16), (100, 16), (200, 32), (400, 64), (1000, 256)):
-        assert network.blur_shrink(r) == s, r
-    for r in (7, 9, 20, 55, 100, 150, 399, 700):
-        sigma = r / network.blur_shrink(r)
-        assert 3.5 <= sigma < 7.0 + 1e-9
-
-
-def test_blur_pyramid_nodes_and_legacy_path(opt, env):
-    net, comp, log, _ = opt
-    net.apply([base(), px("a", 1), adj("b", {"type": "blur", "radius": 100})], 1920, 1080)
-    assert ins(net, "adj_L_b")[0] == "adj_L_b_dn" and ins(net, "adj_L_b_dn")[0] == "mrg_L_base"
-    assert ins(net, "adj_L_b_up")[0] == "adj_L_b" and source_of(net, "blend_L_b", 1) == "adj_L_b_up"
-    dn, bl, up = (net._ops[n].par.value for n in ("adj_L_b_dn", "adj_L_b", "adj_L_b_up"))
-    size = round(100 / 16 * network.BLUR_SIZE_PER_RADIUS)
-    k = size + 1
-    assert (dn("resolutionw"), dn("resolutionh")) == (120 + 2 * k, 68 + 2 * k) and dn("vec0valuew") == network.ADJ_SHRINK
-    assert dn("vec1valuex") == 16.0 and dn("vec2valuex") == float(k) and net._ops["adj_L_b_dn"].OPType == "glslTOP"
-    assert (up("resolutionw"), up("resolutionh")) == (1920, 1080) and up("inputfiltertype") == "linear" and up("vec0valuew") == network.ADJ_ENLARGE
-    assert up("vec1valuex") == 16.0 and up("vec2valuex") == float(k)
-    assert bl("size") == size and bl("preshrink") == 1 and bl("extend") == "hold"
-    assert all(net._ops[n].par.value("format") == "rgba16float" for n in ("adj_L_b_dn", "adj_L_b", "adj_L_b_up"))
-    # cost of the filter no longer depends on the radius
-    net.apply([base(), px("a", 1), adj("b", {"type": "blur", "radius": 400})], 1920, 1080)
-    assert net._ops["adj_L_b"].par.value("size") == round(400 / 64 * network.BLUR_SIZE_PER_RADIUS)
-    net.apply([base(), px("a", 1), adj("b", {"type": "blur", "radius": 5})], 1920, 1080)     # small radii: the single Blur TOP
-    assert "adj_L_b_dn" not in net._ops and net._ops["adj_L_b"].par.value("preshrink") == 1
-    net, comp, log, _ = env
-    net.apply([base(), px("a", 1), adj("b", {"type": "blur", "radius": 100})], 1920, 1080)   # optimize off: v5 preshrink
-    assert "adj_L_b_dn" not in net._ops and net._ops["adj_L_b"].par.value("preshrink") == 8
-
-
-def shrink_port(img, s, k):
-    """numpy port of shrinkPass() (texel space, edge hold): mean of the clamped s x s block of every padded cell."""
-    h, w = img.shape[:2]
-    gh, gw = -(-h // s) + 2 * k, -(-w // s) + 2 * k
-    ys = np.clip((np.arange(gh)[:, None] - k) * s + np.arange(s)[None, :], 0, h - 1)
-    xs = np.clip((np.arange(gw)[:, None] - k) * s + np.arange(s)[None, :], 0, w - 1)
-    return np.stack([[img[ys[j]][:, xs[i]].mean(axis=(0, 1)) for i in range(gw)] for j in range(gh)])
-
-
-def test_pyramid_shrink_pad_cells_are_the_edge_pixels_not_block_means():
-    """The reason for the padded GLSL shrink: with a mipmapped downsample the cell outside the image would be the mean of the
-    s x s border block; here it is the mean of clamped (repeated) edge pixels."""
-    img = np.zeros((32, 32, 1))
-    img[:2, :, 0] = 1.0                                         # two bright rows on the border
-    g = shrink_port(img, 16, 2)
-    assert g.shape == (6, 6, 1)
-    assert g[1, 3, 0] == pytest.approx(1.0)                      # pad cell below the border: the repeated edge row, fully bright
-    assert g[2, 3, 0] == pytest.approx(2 / 16)                   # first real cell: the block mean
-    assert g[0, 0, 0] == pytest.approx(1.0)                      # corner pad: the corner texel
-
-
-def test_blur_pyramid_tracks_document_size(opt):
-    net, comp, log, _ = opt
-    st = [base(), adj("b", {"type": "blur", "radius": 64})]
-    net.apply(st, 1000, 500)
-    k = net._ops["adj_L_b_dn"].par.value("vec2valuex")
-    assert (net._ops["adj_L_b_dn"].par.value("resolutionw"), net._ops["adj_L_b_dn"].par.value("resolutionh")) == (63 + 2 * k, 32 + 2 * k)
-    net.apply(st, 640, 480)
-    assert (net._ops["adj_L_b_dn"].par.value("resolutionw"), net._ops["adj_L_b_dn"].par.value("resolutionh")) == (40 + 2 * k, 30 + 2 * k)
-    assert net._ops["adj_L_b_up"].par.value("resolutionw") == 640
-
-
 # ---- pools
 
 
@@ -3435,16 +3190,9 @@ def test_shift_shape_spec_and_cropped_shape_node(opt):
     assert pv("vec1valuey") == pytest.approx(full["vec1valuey"] - (100 - box[3]))
     assert uL(net, "mrg_L_base", 1)[2:] == (float(box[0]), float(box[1]))
     assert source_of(net, "out") == "mrg_L_base" and ins(net, "mrg_L_base")[2] == "shapec_s"
-    # the Flatten source stays the full document-size node
-    tok0 = net.render_layer_token("s")
-    flat = net.render_layer_source("s")                          # built lazily, pooled, uncooked
-    assert flat is net._ops["shape_s"] and flat.par.value("resolutionw") == 200 and flat.par.value("resolutionh") == 100
-    assert flat.par.value("vec1valuex") == pytest.approx(network.shape_uniforms(spec, 100)["vec1valuex"])
-    assert net.render_layer_token("s") is not None and net.render_layer_token("s") == net.render_layer_token("s")
-    net.apply([base(), shp("s", spec)], 200, 100)
-    assert net.render_layer_source("s") is flat and "shapec_s" in net._ops             # kept, still cropped
+    assert "shape_s" not in net._ops            # (the full-size node is not built when the blend does not use it)
     net.apply([base()], 200, 100)
-    assert "shape_s" not in net._ops and "s" not in net._flat_want
+    assert "shapec_s" not in net._ops
     # a mask, a big shape or effects: no crop
     net.apply([base(), shp("s", dict(spec, w=190, h=90, x=2, y=2)), shp("m", spec, mask={"slot": 3, "enabled": True})], 200, 100)
     assert "shapec_s" not in net._ops and "shapec_m" not in net._ops
@@ -3520,117 +3268,6 @@ def test_dropped_multi_nodes_keep_their_16_connections(opt):
     assert ins(net, "mrg_L_base")[:3] == ["blank", "src_in1", "s1"]
 
 
-def test_blur_radius_is_clamped_to_the_web_limit(opt):
-    net, comp, log, _ = opt
-    net.apply([base(), adj("b", {"type": "blur", "radius": 900})], 1920, 1080)
-    net.apply([base(), adj("c", {"type": "blur", "radius": 200})], 1920, 1080)
-    c200 = (net._ops["adj_L_c"].par.value("size"), net._ops["adj_L_c_dn"].par.value("vec1valuex"))
-    net.apply([base(), adj("b", {"type": "blur", "radius": 900})], 1920, 1080)
-    assert (net._ops["adj_L_b"].par.value("size"), net._ops["adj_L_b_dn"].par.value("vec1valuex")) == c200
-    assert network.adjustment_plan({"type": "blur", "radius": 5000}, "z").nodes[0][3] is False
-    assert network.adjustment_plan({"type": "blur", "radius": 5000}, "z").nodes[0][2]["size"] == round(200 * network.BLUR_SIZE_PER_RADIUS / 8)
-
-
-def test_materialised_lazy_shape_persists_with_the_same_op_and_token(opt):
-    net, comp, log, _ = opt
-    spec = dict(RECT, x=40, y=30, w=10, h=8)
-    st = [base(), shp("s", spec)]
-    net.apply(st, 200, 100)
-    assert "shape_s" not in net._ops
-    flat = net.render_layer_source("s")
-    tok = net.render_layer_token("s")
-    assert "s" in net._flat_want and tok is not None
-    for opacity in (1.0, 0.5):                                            # unrelated edits and plain re-applies
-        st[1]["opacity"] = opacity
-        net.apply(st, 200, 100)
-        assert net._ops["shape_s"] is flat and net.render_layer_source("s") is flat
-        assert net.render_layer_token("s") == tok
-    st[1]["visible"] = False                                              # hidden: still there
-    net.apply(st, 200, 100)
-    assert net.render_layer_source("s") is flat and net.render_layer_token("s") == tok
-    st[1]["shape"] = dict(spec, w=12)                                     # an edit of the layer's own spec changes the token
-    net.apply(st, 200, 100)
-    assert net.render_layer_source("s") is flat and net.render_layer_token("s") != tok
-
-
-# ---- blur pyramid shaders: text pins + numpy ports
-
-
-def enlarge_port(grid, s, k, out_w, out_h):
-    """numpy port of enlargePass(): bilinear (clamp) at ((x + .5) / s + k) / gridSize, texel space."""
-    gh, gw = grid.shape[:2]
-    xs, ys = (np.arange(out_w) + 0.5) / s + k, (np.arange(out_h) + 0.5) / s + k
-    fx, fy = xs - 0.5, ys - 0.5
-    x0, y0 = np.floor(fx).astype(int), np.floor(fy).astype(int)
-    tx, ty = (fx - x0)[None, :, None], (fy - y0)[:, None, None]
-    g = lambda yy, xx: grid[np.clip(yy, 0, gh - 1)[:, None], np.clip(xx, 0, gw - 1)[None, :]]
-    return (g(y0, x0) * (1 - tx) * (1 - ty) + g(y0, x0 + 1) * tx * (1 - ty) + g(y0 + 1, x0) * (1 - tx) * ty + g(y0 + 1, x0 + 1) * tx * ty)
-
-
-def _gauss(img, sigma):
-    r = int(np.ceil(sigma * 4))
-    k = np.exp(-np.arange(-r, r + 1) ** 2 / (2 * sigma * sigma))
-    k /= k.sum()
-    for ax in (0, 1):
-        pad = [(0, 0)] * 3
-        pad[ax] = (r, r)
-        p = np.pad(img, pad, mode="edge")
-        img = sum(k[i] * np.take(p, np.arange(i, i + img.shape[ax]), axis=ax) for i in range(len(k)))
-    return img
-
-
-@pytest.mark.parametrize("w,h,s", [(96, 80, 4), (100, 70, 8), (130, 65, 16)])
-def test_pyramid_shrink_blur_enlarge_matches_a_direct_gaussian_incl_border(w, h, s):
-    rng = np.random.default_rng(w + s)
-    img = np.zeros((h, w, 4))
-    img[..., 3] = 1.0
-    img[:3, :, :3] = 1.0
-    img[:, -2:, 0] = 1.0
-    img[h // 3:2 * h // 3, w // 4:w // 2, :3] = rng.random(3)
-    sigma = 3.5 * s
-    size = round(sigma * network.BLUR_SIZE_PER_RADIUS / s)
-    k = size + 1
-    grid = _gauss(shrink_port(img, s, k), sigma / s)
-    out = enlarge_port(grid, s, k, w, h)
-    ref = _gauss(img, sigma)
-    assert np.abs(out - ref).max() * 255 < 12, np.abs(out - ref).max() * 255
-    bad = enlarge_port(grid, s, 0, w, h)                    # the mutation: no k offset in enlarge
-    assert np.abs(bad - ref).max() * 255 > 12
-    wrong_shrink = _gauss(shrink_port(img, s, k + 1), sigma / s)       # shrink grid and enlarge disagree on k
-    assert np.abs(enlarge_port(wrong_shrink, s, k, w, h) - ref).max() * 255 > 12
-
-
-PYRAMID_PINS = {
-    "shrink -k offset": "ivec2 o = (ivec2(gl_FragCoord.xy) - ivec2(k)) * s;",
-    "shrink clamp x": "int xx = clamp(o.x + x, 0, src.x - 1);",
-    "shrink clamp y": "int yy = clamp(o.y + y, 0, src.y - 1);",
-    "shrink mean": "fragColor = TDOutputSwizzle(sum / n);",
-    "enlarge k offset": "vec2 q = (gl_FragCoord.xy / s) + vec2(k);",
-    "enlarge grid uv": "texture(sTD2DInputs[0], q / grid)",
-    "pass dispatch": "if (uParams.w > 9.5) { enlargePass(); return; }",
-}
-
-
-def test_pyramid_glsl_pins_present():
-    for name, text in PYRAMID_PINS.items():
-        assert text in GLSL, name
-
-
-@pytest.mark.parametrize("pin,old,new", [
-    ("shrink -k offset", "ivec2(gl_FragCoord.xy) - ivec2(k)", "ivec2(gl_FragCoord.xy)"),
-    ("shrink clamp x", "clamp(o.x + x, 0, src.x - 1)", "o.x + x"),
-    ("shrink clamp y", "clamp(o.y + y, 0, src.y - 1)", "o.y + y"),
-    ("shrink mean", "sum / n", "sum"),
-    ("enlarge k offset", "+ vec2(k);", ";"),
-    ("enlarge grid uv", "q / grid", "q"),
-    ("pass dispatch", "uParams.w > 9.5", "uParams.w > 10.5"),
-])
-def test_pyramid_shader_mutations_are_caught(pin, old, new):
-    assert old in GLSL
-    mutated = GLSL.replace(old, new, 1)
-    assert mutated != GLSL and pin in [k for k, v in PYRAMID_PINS.items() if v not in mutated]
-
-
 def test_rewiring_a_recycled_multi_node_whose_connectors_were_cut_by_destroyed_sources(opt):
     """Regression (live v5 validation: IndexError in _wire): a pooled Multi TOP keeps its connections; when TD cuts them
     (destroyed sources) the connector list SHRINKS below what the cache believes, so connecting input i raised IndexError."""
@@ -3651,6 +3288,27 @@ def test_rewiring_a_recycled_multi_node_whose_connectors_were_cut_by_destroyed_s
     del node.inputConnectors[3:]
     net._wire("mrg_L_base", ["blank"] * 3 + ["src_in1"] * 13)
     assert len(node.inputConnectors) >= 16 and ins(net, "mrg_L_base")[3:5] == ["src_in1", "src_in1"]
+
+
+def test_wire_verify_branch_of_a_recycled_multi_rewires_inputs_cut_behind_the_cache(opt):
+    """cache["verify"] (set when a pooled Multi TOP is recycled): TD cut one connector but the connector list kept its length, so the
+    cached wiring looks right; _wire must compare with the real connections and reconnect exactly the cut input."""
+    net, comp, log, _ = opt
+    net.apply([base(), px("a", 1), px("b", 2)], W, H)
+    name = "mrg_L_base"
+    op = net._ops[name]
+    want = ins(net, name)[:4]
+    names = [n for n, _g in net._cache[name]["inputs"]]
+    op.inputConnectors[2].source = None                             # a destroyed source: TD cut input 2, the list did not shrink
+    net._cache[name]["verify"] = True
+    m = log.mark()
+    net._wire(name, names)
+    assert ins(net, name)[:4] == want
+    assert len([x for x in log.since(m)["connects"] if x[0] == op.name]) == 1                # only the cut one
+    assert "verify" not in net._cache[name]
+    m = log.mark()
+    net._wire(name, names)                                           # verified once: the shortcut applies again
+    assert not [x for x in log.since(m)["connects"] if x[0] == op.name]
 
 
 def test_repeat_apply_shortcut_does_not_skip_after_a_pool_reset(opt):
@@ -3683,12 +3341,13 @@ ADJ_DOCS = [
 
 
 def _assert_adjustment_uniforms(net, aid, spec):
-    plan_ = network.adjustment_plan(spec, network.sanitize(aid), W, H, pyramid=True)
-    node = net._ops["blend_L_" + network.sanitize(aid)]
-    pv = node.par.value
-    assert pv("vec0valuew") == plan_.adjust, (aid, spec)
-    for k, v in plan_.extra.items():
-        assert pv(k) == v, (aid, spec, k, pv(k), v)
+    """The blend node mixes (uAdjust 1) and the layer's chain was planned with the effect of ``spec`` (v8: parameters live in the chain)."""
+    sid = network.sanitize(aid)
+    pv = net._ops["blend_L_" + sid].par.value
+    assert pv("vec0valuew") == float(network.ADJ_PREMULT), (aid, spec)
+    planned = net._fx_todo["fx_L_" + sid][2]
+    assert planned[0]["type"] == spec["type"], (aid, spec)
+    assert all(planned[0].get(k) == v for k, v in spec.items() if k != "type" and spec["type"] != "blur"), (aid, spec, planned)
 
 
 @pytest.mark.parametrize("optimize", [True, False])
@@ -3920,12 +3579,12 @@ def test_filter_adjustment_that_draws_nothing_shows_the_image_below(both):
         for lid in "fgh":
             n = net._ops["blend_L_" + lid]
             src = n.inputConnectors[1].source
-            assert src is not net._ops["blank"] and src.OPType == "nullTOP", lid
-            assert source_of(net, "adj_L_" + lid, 0) in ("blend_L_a", "blend_L_f", "blend_L_g"), lid
+            assert src is not net._ops["blank"] and src is n.inputConnectors[0].source, lid
     # the effects module missing: same
     net2 = DocNetwork(fakenet.make_comp()[0], GLSL, effects=object(), effect_shaders={}, optimize=False)
     net2.apply([base(), fadj("f")], W, H)
-    assert net2._ops["blend_L_f"].inputConnectors[1].source.OPType == "nullTOP"
+    n2 = net2._ops["blend_L_f"]
+    assert n2.inputConnectors[1].source is n2.inputConnectors[0].source
 
 
 def test_filter_adjustment_inside_a_group_sees_only_the_group(both):
@@ -3988,30 +3647,18 @@ def test_group_without_effects_keeps_its_8bit_inner_pass(opt):
     assert fmt(net, [n for n in net._ops if n.startswith(("blend_L_c", "mrg_L_c"))][0]) == network.FMT8
 
 
-def test_effects_on_an_adjustment_apply_to_the_adjusted_image_before_the_mix(both):
+def test_adjustment_effects_are_one_stack_on_the_accumulated_image_before_the_mix(both):
     net, comp, log, _ = both
     net.apply([base(), px("a", 1, surfaceW=8, surfaceH=8),
                adj("lv", LEVELS, effects=[shadow()], opacity=0.4, mask={"slot": 4, "enabled": True})], W, H)
     below = "blend_L_a" if not net._opt else "mrg_L_base"
-    # helper pass: the plain adjustment at opacity 1 without mask
-    a = net._ops["adjx_L_lv"]
-    assert ins(net, "adjx_L_lv")[0] == below and a.par.value("vec0valuew") == float(network.ADJ_LEVELS)
-    assert (a.par.value("vec0valuey"), a.par.value("vec0valuez")) == (1.0, 0.0)
-    assert (a.par.value("vec2valuex"), a.par.value("vec2valuey"), a.par.value("vec2valuez")) == (0.1, 0.9, 2.0)
-    assert a.par.value("format") == network.FMT
-    assert chain_in(net, "lv") == "adjx_L_lv"
+    assert [e["type"] for e in net._fx_todo["fx_L_lv"][2]] == ["levels", "dropShadow"]      # the migrated adjustment leads the stack
+    assert len(fx_chain_nodes(net, "lv")) == 1 + 2 and chain_in(net, "lv") == below
+    assert not any(n.startswith("adjx_L") for n in net._ops)
     pv = net._ops["blend_L_lv"].par.value
     assert (pv("vec0valuew"), pv("vec0valuey"), pv("vec0valuez")) == (float(network.ADJ_PREMULT), 0.4, 1.0)
     assert net._ops["blend_L_lv"].inputConnectors[1].source is fx_chain_nodes(net, "lv")[-1]
     assert source_of(net, "blend_L_lv", 2) == "s4" and ins(net, "blend_L_lv")[0] == below
-
-
-def test_effects_on_a_blur_adjustment_use_the_blur_result(both):
-    net, comp, log, _ = both
-    net.apply([base(), adj("b", {"type": "blur", "radius": 12.0}, effects=[overlay()])], W, H)
-    want = "adj_L_b_up" if net._opt else "adj_L_b"
-    assert chain_in(net, "b") == want and "adjx_L_b" not in net._ops
-    assert net._ops["blend_L_b"].par.value("vec0valuew") == float(network.ADJ_PREMULT)
 
 
 def test_noop_adjustment_with_effects_is_not_skipped(opt):
@@ -4024,12 +3671,12 @@ def test_effects_toggle_on_adjustments_and_groups_leaves_no_nodes(both):
     net, comp, log, _ = both
     on = [base(), L("g", "group", effects=[shadow()]), px("c", 1, parentId="g", surfaceW=8, surfaceH=8),
           adj("lv", LEVELS, effects=[shadow()]), fadj("f")]
-    off = [base(), L("g", "group"), px("c", 1, parentId="g", surfaceW=8, surfaceH=8), adj("lv", LEVELS), fadj("f", flt(enabled=False))]
+    off = [base(), L("g", "group"), px("c", 1, parentId="g", surfaceW=8, surfaceH=8), adj("lv", {"type": "none"}), fadj("f", flt(enabled=False))]
     net.apply(on, W, H)
     settle(net)
     assert set(net._chains) == {"g", "lv", "f"}
     net.apply(off, W, H)
-    assert not net._chains and not net._fx_out and not any(n.startswith(("fx_", "adjx_L_lv")) for n in net._ops)
+    assert not net._chains and not net._fx_out and not any(n.startswith("fx_") for n in net._ops)
     settle(net)
     net.apply(on, W, H)
     assert set(net._chains) == {"g", "lv", "f"}
@@ -4198,7 +3845,7 @@ def test_adopted_v7_nodes_get_canonical_names_and_values(opt):
     """After a component rebuild a new DocNetwork adopts tagged nodes of the new kinds (adjusted-image helper pass, group mask
     resample, aux input resample) and re-pools untagged spares that served as effect slots: their vector names must be canonical."""
     net, comp, log, clock = opt
-    roles = ["adjx_L_lv", "xf_L_g", "auxin_2"]
+    roles = ["xf_L_g", "auxin_2"]
     for i, r in enumerate(roles):
         _stale_node(comp, "g%d" % (300 + i), "glslTOP", tags=["role:" + r])
     _stale_node(comp, "g400")
@@ -4215,14 +3862,13 @@ def test_adopted_v7_nodes_get_canonical_names_and_values(opt):
         pv = net2._ops[name].par.value
         assert (pv("vec0name"), pv("vec1name"), pv("pixeldat")) == ("uParams", "uXform", "blend_glsl"), name
         assert (pv("vec2name"), pv("vec3name")) == ("uA", "uB"), name
-        assert pv("inputfiltertype") == ("nearest" if name == "adjx_L_lv" else "linear"), name
+        assert pv("inputfiltertype") == "linear", name
     for name, spec in net2._desired.items():
         op_ = net2._ops[name]
         if op_.OPType != "glslTOP":
             continue
         for k, v in spec.pars.items():
             assert op_.par.value(k) == v, (name, k, op_.par.value(k), v)
-    assert net2._ops["adjx_L_lv"].par.value("vec2valuez") == 1.5
     assert "lv" in net2._chains and "g" in net2._chains and "a" in net2._chains
     assert chain_aux(net2, "a") == "auxin_2"
     assert net2.fx_error is None
@@ -4452,12 +4098,6 @@ def test_fx_failure_backoff_is_per_aux_reference(opt, monkeypatch):
     key = net._fx_fail["a"][2]
     net.apply(mk("input:2"), W, H)
     assert net._fx_fail["a"][2] != key and net._fx_fail["a"][0] == 2                     # a different aux = a new key, retried at once
-
-
-def test_helper_node_name_cannot_collide_with_a_blur_adjustment_id(both):
-    net, comp, log, _ = both
-    net.apply([base(), adj("x", LEVELS, effects=[overlay()]), adj("x_a", {"type": "blur", "radius": 3.0})], W, H)
-    assert "adjx_L_x" in net._ops and "adj_L_x_a" in net._ops and net._ops["adjx_L_x"] is not net._ops["adj_L_x_a"]
 
 
 def test_preview_layers_are_the_same_in_every_optimize_mode(both):

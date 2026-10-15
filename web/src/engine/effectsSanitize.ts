@@ -48,6 +48,20 @@ export function sanitizeEffect(e: unknown): Effect | null {
       return { enabled, type, amount: fnum(o.amount, -1000, 1000, 4), angle: fnum(o.angle, -3600, 3600, 0) };
     case 'halftone':
       return { enabled, type, cellSize: fnum(o.cellSize, 1, 512, 8), angle: fnum(o.angle, -3600, 3600, 45), shape: fpick(o.shape, ['dot', 'line'] as const, 'dot') };
+    // v7 classic adjustments as effects (same ranges as the former AdjustmentSpec; docs/PROTOCOL.md §10)
+    case 'levels': {
+      const inLow = fnum(o.inLow, 0, 1, 0);
+      const inHigh = fnum(o.inHigh, 0, 1, 1);
+      return { enabled, type, inLow, inHigh: Math.max(inHigh, Math.min(1, inLow + 1e-4)), gamma: fnum(o.gamma, 0.1, 10, 1), outLow: fnum(o.outLow, 0, 1, 0), outHigh: fnum(o.outHigh, 0, 1, 1) } as unknown as Effect;
+    }
+    case 'brightnessContrast':
+      return { enabled, type, brightness: fnum(o.brightness, -1, 1, 0), contrast: fnum(o.contrast, -1, 1, 0) } as unknown as Effect;
+    case 'hueSaturation':
+      return { enabled, type, hue: fnum(o.hue, -180, 180, 0), saturation: fnum(o.saturation, 0, 2, 1), value: fnum(o.value, 0, 2, 1) } as unknown as Effect;
+    case 'invert':
+      return { enabled, type } as unknown as Effect;
+    case 'threshold':
+      return { enabled, type, level: fnum(o.level, 0, 1, 0.5) } as unknown as Effect;
     default: {
       try { if (JSON.stringify(o).length > 1_000_000) return null; } catch { return null; } // opaque parameters: bounded
       let c: Record<string, unknown>;
@@ -68,4 +82,15 @@ export function sanitizeEffects(list: unknown): Effect[] {
   }
   return out;
 }
-export const sameEffects = (a: Effect[], b: Effect[]): boolean => a.length === b.length && JSON.stringify(a) === JSON.stringify(b);
+function deepEq(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || !a || !b) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const x = a as Record<string, unknown>;
+  const y = b as Record<string, unknown>;
+  const kx = Object.keys(x);
+  if (kx.length !== Object.keys(y).length) return false;
+  return kx.every((k) => k in y && deepEq(x[k], y[k]));
+}
+/** Structural equality of two effect stacks (no serialisation: slider ticks call this per change). */
+export const sameEffects = (a: Effect[], b: Effect[]): boolean => a === b || (a.length === b.length && a.every((e, i) => deepEq(e, b[i])));

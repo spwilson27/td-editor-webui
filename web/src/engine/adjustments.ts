@@ -42,7 +42,9 @@
 import type { AdjustmentSpec, AdjustmentType, Effect, Rect } from './types';
 import type { Ctx2D, Surface } from './surface';
 import { sanitizeEffect } from './effectsSanitize';
+import { legacyBlurToFilter } from './effects';
 import { effectsReach, hasEffects } from './effectsAdapter';
+import { CLASSIC_EFFECT_TYPES } from './adjustmentTypes';
 
 /** A drawing surface with the document position (ox, oy) of its top-left pixel. */
 export interface AdjTarget {
@@ -59,6 +61,38 @@ export const ADJUSTMENT_NAMES: Record<AdjustmentType, string> = {
   levels: 'Levels', brightnessContrast: 'Brightness/Contrast', hueSaturation: 'Hue/Saturation',
   blur: 'Blur', invert: 'Invert', threshold: 'Threshold', filter: 'Filter',
 };
+
+export { CLASSIC_EFFECT_TYPES };
+
+/** The effect a legacy (v2-v7) adjustment spec migrates to: classic spec -> {enabled, ...params}; {type:'filter', effect} -> that effect. */
+export function effectFromAdjustment(a: AdjustmentSpec): Effect | null {
+  if (a.type === 'filter') return sanitizeEffect(a.effect);
+  const c = clampAdjustment(a);
+  if (c.type === 'blur') return legacyBlurToFilter(c.radius) as unknown as Effect; // canonical v6 blur migration (effects/filters.ts)
+  const e = sanitizeEffect({ ...(c as unknown as Record<string, unknown>), enabled: true });
+  return e;
+}
+
+/** Default effect of a classic adjustment type (what addAdjustment(type) puts into the new layer's stack). */
+export function defaultAdjustmentEffect(type: AdjustmentType): Effect {
+  return effectFromAdjustment(defaultAdjustment(type)) as Effect;
+}
+
+/** The effects[] of a layer ingested with an optional legacy adjustment: the migrated adjustment prepended. */
+export function migrateAdjustmentEffects(adjustment: AdjustmentSpec | null | undefined, effects: Effect[]): Effect[] {
+  if (!adjustment || typeof adjustment !== 'object' || !('type' in adjustment)) return effects;
+  let e: Effect | null = null;
+  try { e = effectFromAdjustment(adjustment); } catch { e = null; }
+  return e ? [e, ...effects] : effects;
+}
+
+/** The AdjustmentSpec view of a JS-computed classic effect (null for any other effect). */
+export function specOfClassicEffect(e: Effect): AdjustmentSpec | null {
+  if (!CLASSIC_EFFECT_TYPES.has(e.type)) return null;
+  const { enabled: _enabled, ...rest } = e as unknown as Record<string, unknown>;
+  void _enabled;
+  return clampAdjustment(rest as unknown as AdjustmentSpec);
+}
 
 export const DEFAULT_BLUR_RADIUS = 4;
 
@@ -285,4 +319,23 @@ export function renderAdjusted(
     }
     c.putImageData(img, tp.x, tp.y + y0);
   }
+}
+
+/** Display name of an effect type (adjustment layer default name): the classic adjustment name or the type itself. */
+export function effectLabel(e: Effect): string {
+  return (ADJUSTMENT_NAMES as Record<string, string>)[e.type] ?? e.type;
+}
+
+/** True when an effect stack cannot change the image (no enabled effect, or only identity classic adjustments). */
+export function stackIsIdentity(effects: readonly Effect[]): boolean {
+  return effects.every((e) => {
+    if (!e.enabled) return true;
+    const spec = specOfClassicEffect(e);
+    return spec ? isIdentity(spec) : (e.type as string) === 'blur' ? blurIsNoop(e as unknown as { radius?: number; sigma?: number }) : false;
+  });
+}
+
+/** The blur filter does nothing when neither sigma nor radius is positive (sigma > 0 overrides radius; effects/filters blur.filter.json noop `px <= 0`). */
+function blurIsNoop(b: { radius?: number; sigma?: number }): boolean {
+  return !((b.sigma ?? 0) > 0) && !((b.radius ?? 0) > 0);
 }

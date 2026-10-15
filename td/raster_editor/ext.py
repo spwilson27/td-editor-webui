@@ -312,6 +312,7 @@ class RasterEditorExt:
         self._tops_held = collections.OrderedDict()  # (client cid, str(requestId)) -> {msg, expires, w, h}
         self._tops_bytes = 0
         self._top_frame_id = 0
+        self._req_serial = 0       # render request keys (network.render_open)
 
     def _p(self, name):
         return getattr(self.o.par, name).eval()
@@ -908,7 +909,7 @@ class RasterEditorExt:
             self._on_list_tops(c, msg)
         elif t == "importTop":
             self._on_import_top(c, msg)
-        elif t == "renderLayer":
+        elif t in ("renderLayer", "renderLayers"):
             self._on_render_layer(c, msg)
         elif t == "activeLayer":
             self._on_active_layer(c, msg)
@@ -2098,11 +2099,7 @@ class RasterEditorExt:
         for l in layers or ():
             if flag is None or l.get("visible") is False:
                 continue
-            effs = list(l.get("effects") or ())
-            a = l.get("adjustment")
-            if l.get("kind") == "adjustment" and isinstance(a, dict) and a.get("type") == "filter" and isinstance(a.get("effect"), dict):
-                effs.append(a["effect"])
-            for e in effs:
+            for e in l.get("effects") or ():       # (v8: legacy adjustment specs are migrated into effects[] when the document arrives)
                 try:
                     if isinstance(e, dict) and flag(e):
                         ids.append(l["id"])
@@ -2701,27 +2698,33 @@ class RasterEditorExt:
                                    "calls": 0, "started": None, "scaler": None, "temps": []})
 
     def _on_render_layer(self, c, msg):
-        """`renderLayer {requestId, layerId}` (Flatten): TD renders that text / shape layer alone at document size
-        (network.render_layer_source) and serves it like a TOP import (`topReady` + `GET /top`, frame type 6)."""
+        """`renderLayer {requestId, layerId, mode?}` (Flatten / merge down, any layer kind) and `renderLayers {requestId, layerIds}`
+        (merge selected): the network plans a temporary render network for the request (network.render_open, closed again when the job
+        ends) and TD serves its document-size result like a TOP import (`topReady` + `GET /top`, frame type 6)."""
         P = self.protocol
         try:
-            rid, lid = P.parse_render_layer(msg)
+            req = P.parse_render_request(msg)
         except P.ProtocolError as e:
-            self._send(c.id, P.error(f"bad renderLayer: {e}"))
+            self._send(c.id, P.error(f"bad {msg.get('t')}: {e}"))
             return
-        layer = next((l for l in (self.doc_layers or []) if l.get("id") == lid), None)
+        rid = req["rid"]
+        ids = [req["layerId"]] if req["kind"] == "layer" else req["layerIds"]
+        known = {l.get("id") for l in (self.doc_layers or [])}
+        missing = next((i for i in ids if i not in known), None)
         if not c.active:
             self._send(c.id, P.top_error(rid, "only the active editor can flatten a layer"))
         elif self._restore_pending or self._held:
             self._send(c.id, P.top_error(rid, "TouchDesigner is still restoring the document; try again"))
-        elif layer is None or layer.get("kind") not in ("text", "shape"):
-            self._send(c.id, P.top_error(rid, f"layer {lid!r} is not a text or shape layer of TouchDesigner's document"))
-        elif getattr(self.network, "render_layer_source", None) is None:
+        elif missing is not None:
+            self._send(c.id, P.top_error(rid, f"layer {missing!r} is not a layer of TouchDesigner's document"))
+        elif getattr(self.network, "render_open", None) is None:
             self._send(c.id, P.top_error(rid, "the document network cannot render layers"))
         elif self.doc_w * self.doc_h > P.MAX_TOP_PIXELS:
             self._send(c.id, P.top_error(rid, f"the document ({self.doc_w}x{self.doc_h}) is too large to flatten a layer"))
         else:
-            self._enqueue_job(c, rid, {"client": c.id, "ccid": c.cid, "rid": rid, "path": None, "layer": lid,
+            self._req_serial += 1
+            self._enqueue_job(c, rid, {"client": c.id, "ccid": c.cid, "rid": rid, "path": None, "req": req,
+                                       "rkey": f"job{self._req_serial}", "opened": False,
                                        "target": (self.doc_w, self.doc_h), "stage": "read", "calls": 0, "started": None,
                                        "scaler": None, "temps": []})
 
@@ -2741,16 +2744,21 @@ class RasterEditorExt:
             return
         self._imp_queue.append(job)
 
-    def _layer_token(self, layer_id):
-        fn = getattr(self.network, "render_layer_token", None)
-        return fn(layer_id) if fn is not None else None
+    def _layer_token(self, key):
+        fn = getattr(self.network, "render_token", None)
+        return fn(key) if fn is not None else None
 
-    def _layer_ready(self, layer_id):
-        fn = getattr(self.network, "render_layer_ready", None)
-        return True if fn is None else bool(fn(layer_id))
+    def _layer_ready(self, key):
+        fn = getattr(self.network, "render_ready", None)
+        return True if fn is None else bool(fn(key))
 
     def _release_job(self, job):
-        """Destroy the temporary operators of an import and drop its buffers."""
+        """Destroy the temporary operators of an import and drop its buffers (a render request's network is closed)."""
+        if job.pop("opened", False):
+            try:
+                self.network.render_close(job["rkey"])
+            except Exception as e:  # noqa: BLE001
+                self._report("renderClose", e)
         movie = job.pop("movie", None)
         if movie is not None:
             try:
@@ -2827,12 +2835,24 @@ class RasterEditorExt:
 
     def _top_read(self, job, now):
         P = self.protocol
-        label = job["path"] or (os.path.basename(job["file"]) if job.get("file") else f"layer {job.get('layer')!r}")
-        if job.get("layer") is not None:  # Flatten: the network's render source for the layer, at the document size
+        req = job.get("req")
+        label = job["path"] or (os.path.basename(job["file"]) if job.get("file") else
+                                (f"layer {req['layerId']!r}" if req and req["kind"] == "layer" else "the layers"))
+        if req is not None:  # Flatten / merge: the network's render source for the request, at the document size
             if job["target"] != (self.doc_w, self.doc_h):
                 return self._top_fail(job, "the document was resized while the layer was rendered")
-            try:  # re-resolved EVERY pump: an apply() can destroy / recycle the operator behind the layer
-                top = self.network.render_layer_source(job["layer"])
+            if not job["opened"]:   # plans the temporary nodes (one apply); they cook from the next pump on
+                job["opened"] = True
+                try:
+                    err = self.network.render_open(job["rkey"], req["kind"], layer_id=req.get("layerId"),
+                                                   layer_ids=req.get("layerIds"), mode=req.get("mode", "flatten"))
+                except Exception as e:  # noqa: BLE001
+                    return self._top_fail(job, f"cannot render {label}: {e}")
+                if err:
+                    return self._top_fail(job, str(err))
+                return
+            try:  # re-resolved EVERY pump: an apply() can destroy / recycle the operator behind the request
+                top = self.network.render_source(job["rkey"])
             except Exception as e:  # noqa: BLE001
                 return self._top_fail(job, f"cannot render {label}: {e}" if job.get("src") is None else "layer changed")
             if top is None:
@@ -2841,13 +2861,16 @@ class RasterEditorExt:
                 return self._top_fail(job, "layer changed")
             job["src"] = top
             if not job.get("ready"):
-                if not self._layer_ready(job["layer"]):  # text measurements still finishing: wait (bounded)
+                if not self._layer_ready(job["rkey"]):  # text measurements still finishing: wait (bounded)
+                    status = getattr(self.network, "render_status", None)
+                    if status is not None and status(job["rkey"]) == "failed":   # an effect chain (or a text layout) cannot be built: never bake it silently
+                        return self._top_fail(job, f"cannot render {label}: an effect or text layout of the layers failed in TouchDesigner (see its Textport)")
                     if now - job["started"] > TOP_READ_TIMEOUT_S:
                         return self._top_fail(job, "readback failed: the layer's text layout never became ready")
                     return
-                job["ready"], job["token"] = True, self._layer_token(job["layer"])  # (measuring refines the layout first)
+                job["ready"], job["token"] = True, self._layer_token(job["rkey"])  # (measuring refines the layout first)
                 job["calls"] = 0   # a delayed read issued before the layout was final is stale: the first result is discarded again
-            elif self._layer_token(job["layer"]) != job["token"]:
+            elif self._layer_token(job["rkey"]) != job["token"]:
                 return self._top_fail(job, "layer changed")
         elif job.get("movie") is not None:   # placeImage: a temporary Movie File In TOP loading the picked file
             top = job["movie"]
@@ -2914,10 +2937,10 @@ class RasterEditorExt:
         if job["row"] < h:
             return
         P = self.protocol
-        if job.get("layer") is not None:
+        if job.get("req") is not None:
             try:
-                same = (self.network.render_layer_source(job["layer"]) is job.get("src")
-                        and self._layer_token(job["layer"]) == job.get("token"))
+                same = (self.network.render_source(job["rkey"]) is job.get("src")
+                        and self._layer_token(job["rkey"]) == job.get("token"))
             except Exception:  # noqa: BLE001
                 same = False
             if not same:

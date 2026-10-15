@@ -145,25 +145,46 @@ class FakeNetwork:
         self.ticks = 0
         self.input_flags = []
         self.input_calls = []
-        self.render_sources = {}  # layer id -> TOP (FakeTop) returned by render_layer_source
+        self.render_sources = {}  # layer id -> TOP (FakeTop) returned by render_source
         self.render_calls = []
+        self.open_calls = []      # v8: render_open(key, kind, layer_id, layer_ids, mode)
+        self.req_layers = {}
+        self.closed = []
+        self.open_error = None
         self.token = 0          # bumped to simulate an apply() / layout refinement
+        self.failed = set()     # layer ids whose effect chain / text failed
         self.not_ready = set()  # layer ids whose text measurement is still pending
         self.active_calls = []    # v7: set_active_layer(id)
         self.bounds_calls = []    # v7: set_content_bounds({id: box | None})
         self.preview_tops = {}    # v7: layer id -> FakeTop returned by layer_preview_source
 
-    def render_layer_token(self, layer_id):
-        return (self.token, id(self.render_sources.get(layer_id)))
+    # v8 render requests: key -> the layer id (or "+"-joined ids) whose entry in ``render_sources`` is the result
+    def render_open(self, key, kind, layer_id=None, layer_ids=None, mode="flatten"):
+        self.open_calls.append((key, kind, layer_id, tuple(layer_ids or ()), mode))
+        self.req_layers[key] = layer_id if kind == "layer" else "+".join(layer_ids)
+        return self.open_error
 
-    def render_layer_ready(self, layer_id):
-        return layer_id not in self.not_ready
+    def render_close(self, key):
+        self.closed.append(key)
+        self.req_layers.pop(key, None)
 
-    def render_layer_source(self, layer_id):
-        self.render_calls.append(layer_id)
-        if layer_id not in self.render_sources:
-            raise KeyError(f"no text / shape layer {layer_id!r}")
-        return self.render_sources[layer_id]
+    def render_token(self, key):
+        lid = self.req_layers.get(key)
+        return (self.token, id(self.render_sources.get(lid)))
+
+    def render_status(self, key):
+        lid = self.req_layers.get(key)
+        return "failed" if lid in self.failed else "pending" if lid in self.not_ready else "ready"
+
+    def render_ready(self, key):
+        return self.render_status(key) == "ready"
+
+    def render_source(self, key):
+        lid = self.req_layers.get(key)
+        self.render_calls.append(lid)
+        if lid not in self.render_sources:
+            raise KeyError(f"no layer {lid!r}")
+        return self.render_sources[lid]
 
     def set_active_layer(self, layer_id):
         self.active_calls.append(layer_id)

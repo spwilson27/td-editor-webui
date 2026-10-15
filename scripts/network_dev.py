@@ -206,6 +206,13 @@ _emit("ok")
 
 
 def layer(id_, kind="pixel", **kw) -> dict:
+    """A layer spec.  v8: a legacy ``adjustment=`` spec (classic / filter) becomes the layer's effects[] like parse_doc migrates it."""
+    if kind == "adjustment" and kw.get("adjustment") is not None and not kw.pop("raw", False):
+        import effects as fxm
+        import protocol as Pm
+        e = Pm.legacy_adjustment_effect(kw.pop("adjustment"), fxm)
+        kw["effects"] = ([e] if e is not None else []) + list(kw.get("effects") or [])
+        kw["adjustment"] = None
     d = dict(id=id_, kind=kind, parentId=None, name=id_, visible=True, opacity=1.0, blend="normal",
              x=0, y=0, sx=1.0, sy=1.0, rot=0.0, kx=0.0, ky=0.0, surfaceW=None, surfaceH=None, slot=None, mask=None, adjustment=None)
     d.update(kw)
@@ -580,7 +587,7 @@ def test_adjust():
     check("adjust: levels/brightnessContrast/hueSaturation/invert/threshold vs documented formulas (<= 3/255)",
           worst <= 3.0, f"worst {worst:.2f}")
     # blur on a structured image: pixels outside the document repeat the edge (Blur TOP hold == web preview)
-    for S2, rad, touch in ((128, 3.0, False), (128, 8.0, True), (256, 20.0, True), (512, 40.0, True)):
+    for S2, rad, touch in ((128, 3.0, False), (128, 8.0, True), (256, 20.0, True), (512, 40.0, True), (512, 100.0, True), (512, 200.0, True)):
         img = np.zeros((S2, S2, 4), np.uint8)
         img[..., 3] = 255
         if not touch:
@@ -962,7 +969,7 @@ _emit({"g": g, "cpu": cpu, "by": by})
     g2 = gpu_cook()
     print(f"  with blur(radius 8) instead of hue/bc: gpu median {g2['gpu_med']:.2f} ms")
     lays3, _, _ = perf_doc(adjs=("levels", "blur", "invert"))
-    lays3[[i for i, l in enumerate(lays3) if l['id'] == 'a1'][0]]["adjustment"] = {"type": "blur", "radius": 100}
+    lays3[[i for i, l in enumerate(lays3) if l['id'] == 'a1'][0]]["effects"] = [__import__("protocol").legacy_blur_to_filter(100)]
     apply(lays3, W, H)
     g3 = gpu_cook()
     print(f"  with blur(radius 100): gpu median {g3['gpu_med']:.2f} ms")
@@ -993,7 +1000,7 @@ _emit({"g": g, "cpu": cpu, "by": by})
     t_vis = prop_times(lambda ls, i: ls[7].__setitem__("visible", i % 2 == 0))
     t_off = prop_times(lambda ls, i: ls[8].__setitem__("x", i))
     adj_i = [i for i, l in enumerate(lays) if l["kind"] == "adjustment"][0]
-    t_adj = prop_times(lambda ls, i: ls[adj_i]["adjustment"].__setitem__("gamma", 1.0 + 0.05 * i))
+    t_adj = prop_times(lambda ls, i: ls[adj_i]["effects"][0].__setitem__("gamma", 1.0 + 0.05 * i))
     print(f"  apply() prop change (ms, median/max): opacity {med(t_op):.2f}/{max(t_op):.2f}  blend {med(t_bl):.2f}/{max(t_bl):.2f}  "
           f"visible {med(t_vis):.2f}/{max(t_vis):.2f}  offset {med(t_off):.2f}/{max(t_off):.2f}  adj param {med(t_adj):.2f}/{max(t_adj):.2f}")
     worst_prop = max(med(t_op), med(t_bl), med(t_vis), med(t_off), med(t_adj))
@@ -1262,7 +1269,7 @@ def test_xform():
 
 
 def test_xform_base_and_flatten():
-    """Base layer transform on a TD Input of its own resolution; render_layer_source() for Flatten."""
+    """Base layer transform on a TD Input of its own resolution (flatten / merge render requests: validate_td steps 28 / 49)."""
     sys.path.insert(0, os.path.join(ROOT, "td", "tests"))
     import fakenet
     DW, DH = 96, 80
@@ -1322,40 +1329,6 @@ for n in ("_netdev_src2", "_netdev_src2_cb"):
     if p.op(n): p.op(n).destroy()
 _emit(1)
 """)
-
-    # ---- flatten: render_layer_source == the layer alone, unaffected by opacity / mask / blend / visibility
-    setup(DW, DH)
-    rng = np.random.default_rng(2)
-    upload(1, rng.integers(0, 256, (DH, DW, 4), dtype=np.uint8))
-    upload(9, np.concatenate([np.repeat(rng.integers(0, 256, (DH, DW, 1), dtype=np.uint8), 3, -1), np.full((DH, DW, 1), 255, np.uint8)], -1))
-    rect = {"type": "rect", "x": 10.0, "y": 8.0, "w": 50.0, "h": 40.0, "radius": 6, "fill": fill_(), "stroke": stroke_(w=4), "rotation": 12}
-    ts = text_spec(size=24.0, text="Flatten me", x=6.0, y=30.0)
-    noisy = dict(opacity=0.3, blend="multiply", visible=False, mask={"slot": 9, "enabled": True})
-    full = [base_layer(), layer("p", slot=1, surfaceW=DW, surfaceH=DH),
-            shape_layer("sh", dict(rect), **noisy), text_layer("tx", dict(ts), **noisy)]
-    plain = [base_layer(), shape_layer("sh", dict(rect)), text_layer("tx", dict(ts))]
-    flat_path = os.path.join(WORK, "flat.npy")
-    for lid, kind in (("sh", "shape"), ("tx", "text")):
-        apply(full, DW, DH)
-        settle()
-        t = td(PRELUDE + f"""
-net = _st().net
-for _ in range(3):
-    if net.render_layer_ready({lid!r}): break
-tok = net.render_layer_token({lid!r})
-op_ = net.render_layer_source({lid!r})
-op_.cook(force=True)
-np.save({flat_path!r}, op_.numpyArray().astype(np.float32))
-_emit({{"w": op_.width, "h": op_.height, "name": op_.name, "same": tok == net.render_layer_token({lid!r})}})
-""")
-        flat = np.load(flat_path)[::-1]
-        only = [base_layer()] + [l for l in plain if l["id"] == lid]
-        apply(only, DW, DH)
-        ref = read_out(True)
-        d = np.abs(flat - ref).max() * 255
-        ink = int((ref[..., 3] > 0).sum())
-        check(f"flatten: render_layer_source({kind}) = the layer alone at document size, premultiplied (hidden, opacity .3, multiply, masked)",
-              t["w"] == DW and t["h"] == DH and ink > 50 and d < 1.5 and t['same'], f"{t['w']}x{t['h']} node {t['name']}, {ink} inked px, max diff {d:.2f}/255")
 
 
 def _over(below, src):
@@ -2564,6 +2537,241 @@ _emit("ok")
     return np.load(pa)[::-1].copy(), np.load(pb)[::-1].copy()
 
 
+def setup_v6ref() -> None:
+    """``st.net2`` = the v0.6.0 DocNetwork (git HEAD's network.py + blend.glsl: the special adjustment passes) next to ``st.net``; both
+    share the surface buffers of the stand-in extension."""
+    raster_dir = os.path.join(ROOT, "td", "raster_editor")
+    paths = {}
+    for f in ("network.py", "blend.glsl"):
+        out = os.path.join(WORK, "v6ref_" + f)
+        with open(out, "wb") as fh:
+            fh.write(subprocess.check_output(["git", "show", "v0.6.0:td/raster_editor/" + f], cwd=ROOT))
+        paths[f] = out
+    td(PRELUDE + f"""
+st = _st()
+c = op("/project1/_netdev")
+c2 = c.create(baseCOMP, "v6ref")
+c2.par.parentshortcut = "RasterEditor"
+c2.par.ext0object = "op('/project1/_netdev/ext_stub').module.Stub(me)"
+c2.par.ext0name = "Stub"
+c2.par.ext0promote = 1
+c2.initializeExtensions()
+def _rd(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+ref_mod = types.ModuleType("re_network_v6"); ref_mod.__dict__["__name__"] = "re_network_v6"
+exec(compile(_rd({paths['network.py']!r}), "re_network_v6", "exec"), ref_mod.__dict__); sys.modules["re_network_v6"] = ref_mod
+st.net2 = ref_mod.DocNetwork(c2, _rd({paths['blend.glsl']!r}), shape_glsl=_rd({os.path.join(raster_dir, 'shape.glsl')!r}), effects=st.fx_mod, effect_shaders=st.fx_shaders)
+_emit("ok")
+""")
+
+
+def migrate(layers):
+    """parse_doc's migration of a v2..v7 document (what the ext hands to the network)."""
+    import effects as fxm
+    import protocol as Pm
+    return Pm.parse_doc({"rev": 1, "layers": json.loads(json.dumps(layers))}, fxm)[1]
+
+
+def apply_ref(layers, w, h, legacy_layers=None):
+    """apply() the legacy document on the v0.6.0 network (st.net2) and its migration on the v8 network (st.net)."""
+    migrated = migrate(layers)
+    return td(PRELUDE + f"""
+st = _st()
+st.net2.apply(json.loads({json.dumps(json.dumps(layers))}), {w}, {h})
+st.net.apply(json.loads({json.dumps(json.dumps(migrated))}), {w}, {h})
+s1, s2 = st.net.stats(), st.net2.stats()
+_emit({{"plan": s1["plan"], "nodes": s1["nodes"], "nodes2": s2["nodes"]}})
+""")
+
+
+def read_req(key):
+    """The render request ``key`` of st.net as float (h, w, 4) premultiplied, top row first."""
+    path = os.path.join(WORK, "req.npy")
+    td(PRELUDE + f"""
+st = _st()
+o = st.net.render_source({key!r})
+o.cook(force=True)
+np.save({path!r}, o.numpyArray().astype(np.float32))
+_emit("ok")
+""")
+    return np.load(path)[::-1].copy()
+
+
+def req_open(key, kind, layer_id=None, layer_ids=None, mode="flatten"):
+    return td(PRELUDE + f"""
+st = _st()
+err = st.net.render_open({key!r}, {kind!r}, layer_id={layer_id!r}, layer_ids={layer_ids!r}, mode={mode!r})
+for _ in range(60):
+    st.net.tick()
+_emit({{"err": err, "status": st.net.render_status({key!r})}})
+""")
+
+
+def req_close(key):
+    td(PRELUDE + f"""
+_st().net.render_close({key!r})
+_emit("ok")
+""")
+
+
+def read_net(which="net"):
+    path = os.path.join(WORK, "o_" + which + ".npy")
+    td(PRELUDE + f"""
+o = getattr(_st(), {which!r}).output(); o.cook(force=True)
+np.save({path!r}, o.numpyArray().astype(np.float32))
+_emit("ok")
+""")
+    return np.load(path)[::-1].copy()
+
+
+def test_v8():
+    S = 96
+    rng = np.random.default_rng(88)
+    setup(S, S)
+    setup_v6ref()
+    # footprint of the contract: v8 adjustment-as-effect-chain vs the v0.6.0 special adjustment passes (<= 1/255 for the colour types)
+    below = rng.integers(0, 256, (S, S, 4), dtype=np.uint8)
+    sel = rng.random((S, S))
+    below[sel < 0.4, 3] = 255
+    below[sel > 0.9, 3] = 0
+    below2 = rng.integers(0, 256, (S, S, 4), dtype=np.uint8)
+    below2[..., 3] = np.where(rng.random((S, S)) < 0.5, 255, below2[..., 3])
+    mask = np.zeros((S, S, 4), np.uint8)
+    mask[..., :3] = rng.integers(0, 256, (S, S, 1))
+    mask[..., 3] = 255
+    SLOTS = (1, 2, 3, 4, 5, 6, 7, 8, 9)
+    for slot, img in ((1, below), (2, below2), (3, below), (4, below2), (5, mask), (6, below), (7, below2), (8, mask), (9, mask)):
+        upload(slot, img)
+
+    def cook_all(nets=("net", "net2")):
+        td(PRELUDE + f"""
+st = _st()
+for nm in {nets!r}:
+    for s in {SLOTS!r}:
+        t = getattr(st, nm).surface_top(s)
+        if t is not None: t.cook(force=True)
+_emit("ok")
+""")
+    cook_all()
+
+    def cmp(label, lays, tol, key=None):
+        info = apply_ref(lays, S, S)
+        cook_all()
+        a, b = read_net("net"), read_net("net2")
+        d = np.abs(a - b) * 255.0
+        check(f"v8 {label}: chain vs v0.6.0 adjustment pass <= {tol:g}/255", d.max() <= tol,
+              f"max {d.max():.2f} mean {d.mean():.4f} passes {info['plan']['passes']}")
+        return d.max()
+
+    specs = [{"type": "levels", "inLow": 0.1, "inHigh": 0.85, "gamma": 1.8, "outLow": 0.05, "outHigh": 0.9},
+             {"type": "levels", "inLow": 0.0, "inHigh": 1.0, "gamma": 0.5, "outLow": 0.0, "outHigh": 1.0},
+             {"type": "brightnessContrast", "brightness": 0.3, "contrast": -0.4},
+             {"type": "brightnessContrast", "brightness": -0.5, "contrast": 0.6},
+             {"type": "hueSaturation", "hue": 70, "saturation": 1.4, "value": 0.8},
+             {"type": "hueSaturation", "hue": -120, "saturation": 0.3, "value": 1.3},
+             {"type": "invert"}, {"type": "threshold", "level": 0.4}]
+    for sp in specs:
+        for use_mask in (False, True):
+            lays = [base_layer(), layer("b", slot=1),
+                    layer("adj", "adjustment", raw=True, opacity=0.8, adjustment=sp, mask={"slot": 5, "enabled": True} if use_mask else None)]
+            cmp(f"{sp['type']}{' + mask' if use_mask else ''}", lays, 1.01 if sp["type"] != "threshold" else 255.0)
+    # threshold: only pixels sitting exactly on the level may flip (rounding) -> compare the count of differing pixels instead
+    lays = [base_layer(), layer("b", slot=1), layer("adj", "adjustment", raw=True, adjustment={"type": "threshold", "level": 0.4})]
+    apply_ref(lays, S, S)
+    a, b = read_net("net"), read_net("net2")
+    check("v8 threshold: pixels that differ (> 1/255) are on the threshold itself (<= 0.5 %)", (np.abs(a - b).max(-1) * 255 > 1).mean() <= 0.005,
+          f"{(np.abs(a - b).max(-1) * 255 > 1).mean():.4%}")
+    for r in (3.0, 8.0, 20.0, 40.0):
+        cmp(f"blur radius {r:g}", [base_layer(), layer("b", slot=1), layer("adj", "adjustment", raw=True, adjustment={"type": "blur", "radius": r})], 12.0)
+    cmp("filter adjustment (blur 6) with a layer effect", [base_layer(), layer("b", slot=1),
+        layer("f", "adjustment", raw=True, opacity=0.7, adjustment={"type": "filter", "effect": {"type": "blur", "enabled": True, "radius": 6.0}},
+              effects=[{"type": "colorOverlay", "enabled": True, "opacity": 0.3, "color": {"r": 255, "g": 0, "b": 0, "a": 255}}])], 3.0)
+    # a stack: pixel layers, a group with its own adjustments inside, adjustments between non-Normal blends, merged runs on both sides
+    lays = [base_layer(), layer("a", slot=1), layer("lv", "adjustment", raw=True, adjustment=specs[0], opacity=0.9),
+            layer("g", "group", opacity=0.8, blend="multiply"), layer("c", slot=2, parentId="g"),
+            layer("hs", "adjustment", raw=True, adjustment=specs[4], parentId="g", mask={"slot": 8, "enabled": True}),
+            layer("d", slot=3, parentId="g", blend="screen", opacity=0.5),
+            layer("iv", "adjustment", raw=True, adjustment={"type": "invert"}, opacity=0.6),
+            layer("e", slot=4, blend="overlay"), layer("f", slot=6, x=3, y=2), layer("bc", "adjustment", raw=True, adjustment=specs[2]),
+            layer("h", slot=7, opacity=0.5)]
+    cmp("a stack with groups, masks, blend modes, runs and several adjustments", lays, 1.5)
+
+    # ---- render requests: each equals the same layers composited on their own in a fresh document
+    full = [base_layer(), layer("a", slot=1, effects=[{"type": "dropShadow", "enabled": True, "dx": 4, "dy": 4, "blur": 3, "opacity": 0.8,
+                                                      "color": {"r": 0, "g": 0, "b": 0, "a": 255}}], opacity=0.5, blend="multiply",
+                                mask={"slot": 5, "enabled": True}, x=3.5, y=2, rot=7.0),
+            layer("g", "group", opacity=0.4), layer("c", slot=2, parentId="g", blend="screen"), layer("d", slot=3, parentId="g", x=10, y=7),
+            layer("e", slot=4, opacity=0.7),
+            layer("iv", "adjustment", raw=True, adjustment={"type": "levels", "inLow": 0.2, "inHigh": 0.8, "gamma": 1.4, "outLow": 0.0, "outHigh": 1.0},
+                  opacity=0.6, mask={"slot": 8, "enabled": True}),
+            layer("f", slot=6, opacity=0.9)]
+    mig = migrate(full)
+    apply_ref(full, S, S)
+    cook_all()
+
+    def solo(only):
+        """The reference: a second document with just ``only`` (the output of st.net2, a v8-network instance on the other comp)."""
+        td(PRELUDE + f"""
+st = _st()
+st.net2.apply(json.loads({json.dumps(json.dumps(only))}), {S}, {S})
+_emit("ok")
+""")
+        cook_all(("net2",))
+        return read_net("net2")
+
+    td(PRELUDE + f"""
+st = _st()
+st.net2 = st.net_mod.DocNetwork(st.net2.comp, st.glsl, shape_glsl=open({os.path.join(ROOT, 'td', 'raster_editor', 'shape.glsl')!r}, encoding="utf-8").read(), effects=st.fx_mod, effect_shaders=st.fx_shaders)
+_emit("ok")
+""")
+
+    def plain(l, **kw):
+        return dict(l, parentId=None, visible=True, opacity=1.0, blend="normal", **kw)
+
+    byid = {l["id"]: l for l in mig}
+    cases = [
+        ("flatten pixel layer (effects, mask, rotation; opacity / blend ignored)", ("layer", "a", None, "flatten"), [plain(byid["a"])]),
+        ("flatten group (children composite, group opacity ignored)", ("layer", "g", None, "flatten"),
+         [plain(byid["g"]), dict(byid["c"]), dict(byid["d"])]),
+        ("merge down (levels + mask + opacity 0.6 on the layer below only)", ("layer", "iv", None, "mergeDown"), [plain(byid["e"]), dict(byid["iv"], visible=True)]),
+        ("merge selected a, d (stack order, out of order request)", ("layers", None, ["f", "a", "g"], None),
+         [dict(byid["a"]), dict(byid["g"]), dict(byid["c"]), dict(byid["d"]), dict(byid["f"])]),
+    ]
+    for label, (kind, lid, lids, mode), ref in cases:
+        r = req_open("k", kind, lid, lids, mode or "flatten")
+        if r["err"] or r["status"] != "ready":
+            check(f"v8 render request {label}", False, str(r))
+            continue
+        got = read_req("k")
+        req_close("k")
+        want = solo(ref)
+        d = np.abs(got - want) * 255.0
+        check(f"v8 render request: {label} equals the layers composited alone <= 1.5/255", d.max() <= 1.5,
+              f"max {d.max():.2f} mean {d.mean():.4f}")
+    n_nodes = td(PRELUDE + """
+st = _st()
+for _ in range(80): st.net.tick()
+_emit(len(st.net.doc.children))
+""")
+    td(PRELUDE + f"""
+st = _st()
+st.net.apply(json.loads({json.dumps(json.dumps(mig))}), {S}, {S})
+for _ in range(80): st.net.tick()
+_emit(len(st.net.doc.children))
+""")
+    r = req_open("k", "layers", None, ["a", "f"])
+    req_close("k")
+    n2 = td(PRELUDE + """
+st = _st()
+for _ in range(120): st.net.tick()
+_emit(len(st.net.doc.children))
+""")
+    check("v8 render request: temporary nodes are cleaned up after use", n2 <= n_nodes + 14, f"{n_nodes} -> {n2} children of doc")
+    stats = td(PRELUDE + "_emit(_st().net.stats()['plan']['layers'])")
+    check("v8 render request: the document plan is unchanged after closing", stats == len(mig), f"{stats} layers")
+
+
 def test_v6():
     S = 96
     rng = np.random.default_rng(66)
@@ -3056,6 +3264,8 @@ def main() -> int:
             test_v6()
         if which in ("all", "v7"):
             test_v7()
+        if which in ("all", "v8"):
+            test_v8()
         if which in ("all", "fonts"):
             test_fonts_ttc()
         if which == "wrap-fixture":

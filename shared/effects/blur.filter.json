@@ -1,36 +1,42 @@
 {
   "type": "blur",
   "group": "blur",
-  "doc": "Gaussian blur of the premultiplied layer (radius = kernel half width, sigma = radius / 3). Radii above 16 px run as a down-sample pyramid. threshold/knee (bloom building block): blur only the bright part of the image (soft threshold on luma).",
+  "doc": "Gaussian blur of the premultiplied layer (radius = kernel half width, sigma = radius / 3). Radii above 16 px run as a down-sample pyramid. threshold/knee (bloom building block): blur only the bright part of the image (soft threshold on luma). v7: `sigma` > 0 overrides radius (sigma in px, kernel half width 4 * sigma while that stays on the exact path (<= 16 px), else 3 * sigma, up to 600 px: the v6 adjustment blur has sigma == its radius, 0..200); `edge` 'hold' repeats the document's edge pixels outside the document (the v6 adjustment blur) instead of reading transparent. Legacy v6 Blur adjustment {radius: r} == {radius: legacy kernel half width, sigma: r, edge: 'hold'} (legacyBlurToFilter).",
   "include": ["filterlib", "blurlib"],
   "reads": "neighbourhood",
   "preservesTransparent": false,
   "params": {
     "radius": {"kind": "num", "default": 10, "min": 0, "max": 200, "unit": "px"},
     "threshold": {"kind": "num", "default": 0, "min": 0, "max": 1, "doc": "0 = blur everything; >0: only luma above it (bright pass)"},
-    "knee": {"kind": "num", "default": 0, "min": 0, "max": 1, "doc": "soft knee width of the bright pass"}
+    "knee": {"kind": "num", "default": 0, "min": 0, "max": 1, "doc": "soft knee width of the bright pass"},
+    "sigma": {"kind": "num", "default": 0, "min": 0, "max": 200, "unit": "px", "doc": "0 = radius / 3; > 0 overrides radius: gaussian standard deviation (kernel half width 3-4 sigma)"},
+    "edge": {"kind": "enum", "values": ["transparent", "hold"], "default": "transparent", "doc": "outside the document: transparent, or repeat the edge pixels"}
   },
   "vars": [
-    ["px", "radius"],
+    ["px", "if(sigma > 0, if(4 * sigma <= 16, 4 * sigma, min(600, 3 * sigma)), radius)"],
     ["L", "pyrL(px)"],
-    ["sig", "blurSig(px)"],
-    ["R", "blurR(px)"],
+    ["sig", "blurSig(px, sigma)"],
+    ["R", "blurR(px, sigma)"],
     ["mode", "if(threshold > 0, 3, 2)"]
   ],
   "noop": "px <= 0",
   "passes": [
-    {"when": "L == 0", "pass": 0, "u": ["sig", "R", "mode", "0", "threshold", "knee"]},
-    {"when": "L == 0", "pass": 1, "u": ["sig", "R", "mode", "0", "threshold", "knee"]},
-    {"when": "L > 0", "pass": 2, "level": "L", "u": ["sig", "R", "mode", "L", "threshold", "knee"]},
-    {"when": "L > 0", "pass": 3, "level": "L", "u": ["sig", "R", "mode", "L", "threshold", "knee"]},
-    {"when": "L > 0", "pass": 4, "level": "L", "u": ["sig", "R", "mode", "L", "threshold", "knee"]},
-    {"when": "L > 0", "pass": 5, "u": ["sig", "R", "mode", "L", "threshold", "knee"]}
+    {"when": "L == 0", "pass": 0, "u": ["sig", "R", "mode", "0", "threshold", "knee", "edge"]},
+    {"when": "L == 0", "pass": 1, "u": ["sig", "R", "mode", "0", "threshold", "knee", "edge"]},
+    {"when": "L > 0", "pass": 2, "level": "L", "u": ["sig", "R", "mode", "L", "threshold", "knee", "edge"]},
+    {"when": "L > 0", "pass": 3, "level": "L", "u": ["sig", "R", "mode", "L", "threshold", "knee", "edge"]},
+    {"when": "L > 0", "pass": 4, "level": "L", "u": ["sig", "R", "mode", "L", "threshold", "knee", "edge"]},
+    {"when": "L > 0", "pass": 5, "u": ["sig", "R", "mode", "L", "threshold", "knee", "edge"]}
   ],
-  "extent": ["blurReach(px)", "blurReach(px)", "0", "0"],
+  "extent": ["blurReach(px, sigma)", "blurReach(px, sigma)", "0", "0"],
   "samples": [
     {"radius": 6},
     {"radius": 40},
-    {"radius": 150, "threshold": 0.4, "knee": 0.2}
+    {"radius": 150, "threshold": 0.4, "knee": 0.2},
+    {"radius": 12, "sigma": 4, "edge": "hold"},
+    {"radius": 48, "sigma": 16, "edge": "hold"},
+    {"radius": 40, "edge": "hold"},
+    {"radius": 200, "sigma": 200, "edge": "hold"}
   ],
-  "degenerate": [{}, {"radius": 0}, {"radius": -5}, {"radius": 1e9}, {"radius": "12"}, {"radius": 16}, {"radius": 17}, {"radius": 33}, {"radius": 200.5}]
+  "degenerate": [{}, {"radius": 0}, {"radius": -5}, {"radius": 1e9}, {"radius": "12"}, {"radius": 16}, {"radius": 17}, {"radius": 33}, {"radius": 200.5}, {"sigma": 1e9, "edge": "hold"}, {"sigma": -3}, {"sigma": "x", "edge": "nope"}, {"radius": 0, "sigma": 0.01, "edge": "hold"}]
 }

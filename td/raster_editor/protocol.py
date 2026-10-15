@@ -1,4 +1,4 @@
-"""TD <-> web wire protocol (docs/PROTOCOL.md, version 7). Pure python, no TD or numpy needed.
+"""TD <-> web wire protocol (docs/PROTOCOL.md, version 8). Pure python, no TD or numpy needed.
 
 Binary frames: 24-byte little-endian header + RGBA8 straight-alpha payload (top row first).
 JSON messages: text frames with a string field ``t``.
@@ -10,7 +10,7 @@ import re
 import struct
 from typing import Iterator, NamedTuple, Optional, Tuple
 
-PROTOCOL_VERSION = 7
+PROTOCOL_VERSION = 8
 APP_VERSION = "0.5.0"  # written to .redoc meta.json
 MAGIC = b"REF1"
 HEADER_SIZE = 24
@@ -337,8 +337,15 @@ def set_canvas(w: int, h: int, mode: str) -> str:
     return encode_json({"t": "setCanvas", "w": w, "h": h, "mode": mode})
 
 
-def render_layer(request_id, layer_id: str) -> str:
-    return encode_json({"t": "renderLayer", "requestId": request_id, "layerId": layer_id})
+def render_layer(request_id, layer_id: str, mode=None) -> str:
+    msg = {"t": "renderLayer", "requestId": request_id, "layerId": layer_id}
+    if mode is not None:
+        msg["mode"] = mode
+    return encode_json(msg)
+
+
+def render_layers(request_id, layer_ids) -> str:
+    return encode_json({"t": "renderLayers", "requestId": request_id, "layerIds": list(layer_ids)})
 
 
 def list_tops(request_id) -> str:
@@ -587,17 +594,6 @@ def check_effects(layer: dict, fx=None) -> None:
         check_effect(e, f"layer {lid!r} effects[{i}]", fx)
 
 
-def check_adjustment(l: dict, fx=None) -> None:
-    """v7: ``adjustment: {type: "filter", effect: Effect}`` needs a valid effect; the other adjustment types are not validated here
-    (their parameters are clamped by the network)."""
-    a = l.get("adjustment")
-    if a is None or l.get("kind") != "adjustment":
-        return
-    _check(isinstance(a, dict), f"layer {l['id']!r} adjustment")
-    if a.get("type") == "filter":
-        check_effect(a.get("effect"), f"layer {l['id']!r} filter adjustment", fx)
-
-
 def check_brush_presets(presets) -> None:
     """DocSpec.brushPresets (web/src/engine/types.ts BrushPreset): at most MAX_BRUSH_PRESETS, MAX_CUSTOM_TIP_PRESETS with a custom tip
     (PNG data URL, <= MAX_TIP_DIM square, <= MAX_TIP_PNG_CHARS)."""
@@ -639,10 +635,58 @@ def brush_presets_of(msg: dict) -> list:
     return out
 
 
-def migrate_layer(l: dict) -> dict:
-    """v5 -> v6: a ``base`` layer is read as ``input: 1`` (id and everything else kept). Other layers are returned as they are."""
+CLASSIC_ADJUSTMENTS = {   # v2 AdjustmentSpec type -> {param: default}; the v8 effect of the same name takes the same parameters
+    "levels": {"inLow": 0.0, "inHigh": 1.0, "gamma": 1.0, "outLow": 0.0, "outHigh": 1.0},
+    "brightnessContrast": {"brightness": 0.0, "contrast": 0.0},
+    "hueSaturation": {"hue": 0.0, "saturation": 1.0, "value": 1.0},
+    "invert": {},
+    "threshold": {"level": 0.5},
+    "blur": {"radius": 0.0},
+}
+
+
+def legacy_blur_to_filter(radius):
+    """Canonical migration of a v6 Blur adjustment ``{"type": "blur", "radius": r}`` (gaussian sigma = r px, 0..200, edge pixels held outside
+    the document) to the blur filter: ``sigma`` = r, ``edge`` = "hold", ``radius`` = the kernel half width the planner uses for that sigma
+    (4r while <= 16 px = exact path, else 3r; max 200). r < 0.05 -> radius 0 / sigma 0 (no-op).  Pure: the single definition; effects.py mirrors
+    it and web/src/engine/effects/filters.ts ``legacyBlurToFilter`` too (shared/effects/legacy_blur_vectors.json is checked against all three)."""
+    ok = isinstance(radius, (int, float)) and not isinstance(radius, bool) and math.isfinite(radius)
+    r = min(200.0, max(0.0, float(radius) if ok else 0.0))
+    if r < 0.05:
+        return {"enabled": True, "type": "blur", "radius": 0.0, "sigma": 0.0, "edge": "hold"}
+    return {"enabled": True, "type": "blur", "radius": min(200.0, 4.0 * r if 4.0 * r <= 16.0 else 3.0 * r), "sigma": r, "edge": "hold"}
+
+
+def legacy_adjustment_effect(a, fx=None):
+    """The v8 effect for a legacy ``adjustment`` spec (classic types: an effect of the same type with the same parameters, the missing ones
+    defaulted; ``{type: "filter", effect}``: that effect), or ``None`` for an unknown / malformed spec (it drew nothing)."""
+    if not isinstance(a, dict):
+        return None
+    t = a.get("type")
+    if t == "filter":
+        e = a.get("effect")
+        return dict(e) if isinstance(e, dict) else None
+    if t not in CLASSIC_ADJUSTMENTS:
+        return None
+    e = {"type": t, "enabled": True}
+    for k, d in CLASSIC_ADJUSTMENTS[t].items():
+        v = a.get(k, d)
+        e[k] = v if _num(v) else d
+    if t == "blur":
+        return legacy_blur_to_filter(e["radius"])
+    return e
+
+
+def migrate_layer(l: dict, fx=None) -> dict:
+    """v5 -> v6: a ``base`` layer is read as ``input: 1`` (id and everything else kept). v7 -> v8: an adjustment layer with a legacy
+    ``adjustment`` spec gets ``adjustment: None`` and the spec's effect PREPENDED to its ``effects[]`` (the stack applied to everything
+    below; at most MAX_EFFECTS kept). Other layers are returned as they are."""
     if l.get("kind") == "base":
         l = dict(l, kind="input", input=1)
+    if l.get("kind") == "adjustment" and l.get("adjustment") is not None:
+        e = legacy_adjustment_effect(l["adjustment"], fx)
+        ef = l.get("effects") if isinstance(l.get("effects"), list) else []
+        l = dict(l, adjustment=None, effects=(([e] if e is not None else []) + ef)[:MAX_EFFECTS])
     return l
 
 
@@ -654,7 +698,8 @@ def parse_doc(msg: dict, fx=None):
     layers have no slot (TD renders them). A v5 ``base`` layer is migrated to ``input: 1`` (the returned list has
     the migrated layers). The optional ``guides`` / ``canvas`` / ``brushPresets`` are validated too; read them with ``doc_extras`` /
     ``brush_presets_of``. v7: filter-library effects (in ``effects[]`` and as ``adjustment: {type: "filter", effect}``) and effects on group /
-    adjustment layers are accepted; ``fx`` = the ``effects`` module (optional) validates filter parameters through ``norm_params``."""
+    adjustment layers are accepted. v8: a legacy ``adjustment`` spec of an adjustment layer is migrated to ``effects[]`` (``migrate_layer``);
+    ``fx`` = the ``effects`` module (optional) validates filter parameters through ``norm_params``."""
     layers = msg.get("layers")
     if not isinstance(layers, list) or not _num(msg.get("rev")):
         raise ProtocolError("doc needs a numeric rev and a layers list")
@@ -663,7 +708,11 @@ def parse_doc(msg: dict, fx=None):
     for l in layers:
         if not isinstance(l, dict) or not isinstance(l.get("id"), str) or l.get("kind") not in LAYER_KINDS:
             raise ProtocolError("bad layer spec")
-        l = migrate_layer(l)
+        if l.get("kind") == "adjustment" and l.get("adjustment") is not None:
+            _check(isinstance(l["adjustment"], dict), f"layer {l['id']!r} adjustment")
+            if l["adjustment"].get("type") == "filter":
+                check_effect(l["adjustment"].get("effect"), f"layer {l['id']!r} filter adjustment", fx)
+        l = migrate_layer(l, fx)
         out.append(l)
         kind = l["kind"]
         if kind in ("text", "shape"):
@@ -684,7 +733,6 @@ def parse_doc(msg: dict, fx=None):
                 l = dict(l, **{k: math.copysign(MAX_SKEW_DEG, l[k])})
                 out[-1] = l
         check_effects(l, fx)
-        check_adjustment(l, fx)
         if kind in SURFACE_KINDS:
             _check_surface_size(l)
         for s in (l.get("slot"), (l.get("mask") or {}).get("slot") if isinstance(l.get("mask"), dict) else None):
@@ -794,11 +842,33 @@ def parse_render_layer(msg: dict):
     return rid, lid
 
 
+RENDER_MODES = ("flatten", "mergeDown")
+MAX_RENDER_LAYERS = 4096
+
+
+def parse_render_request(msg: dict):
+    """Validate ``renderLayer`` / ``renderLayers`` (v8); returns ``{"rid", "kind": "layer" | "layers", "layerId"?, "mode"?, "layerIds"?}``.
+    ``mode`` of ``renderLayer`` defaults to ``"flatten"``; ``renderLayers.layerIds`` = 1..MAX_RENDER_LAYERS distinct ids."""
+    rid = _request_id(msg)
+    if msg.get("t") == "renderLayers":
+        ids = msg.get("layerIds")
+        _check(isinstance(ids, list) and 0 < len(ids) <= MAX_RENDER_LAYERS, "layerIds")
+        for i in ids:
+            _check(isinstance(i, str) and 0 < len(i) <= 256, "layerIds")
+        _check(len(set(ids)) == len(ids), "layerIds (duplicates)")
+        return {"rid": rid, "kind": "layers", "layerIds": list(ids)}
+    rid, lid = parse_render_layer(msg)
+    mode = msg.get("mode", "flatten")
+    _check(mode in RENDER_MODES, "mode")
+    return {"rid": rid, "kind": "layer", "layerId": lid, "mode": mode}
+
+
 def slot_sizes(layers: list, doc_w: int, doc_h: int, current=None) -> dict:
     """{slot: (w, h)} of every surface slot (pixel layer surfaces and masks, v5). A pixel layer's surface is its
     ``surfaceW x surfaceH``; its mask has the same size. A layer without a surface size (adjustment / group
     masks, or a v4 document) keeps the size of its existing buffer (``current``: {slot: (w, h)}), else the
-    document size: a canvas resize never reallocates a surface."""
+    document size: a canvas resize never reallocates a surface. Masks of layers that have no surface of their own are always
+    document-sized (the page loads them at that size: a stale 1080p leftover buffer would make every load fail)."""
     cur = current or {}
     out = {}
     for l in layers:
@@ -807,7 +877,10 @@ def slot_sizes(layers: list, doc_w: int, doc_h: int, current=None) -> dict:
         m = l.get("mask")
         for s in (l.get("slot"), m.get("slot") if isinstance(m, dict) else None):
             if s is not None:
-                out[s] = known or cur.get(s) or (doc_w, doc_h)
+                if l.get("kind") not in SURFACE_KINDS and l.get("slot") is None:
+                    out[s] = (doc_w, doc_h)   # mask of an adjustment / group / text / shape layer: the page models it at document size
+                else:
+                    out[s] = known or cur.get(s) or (doc_w, doc_h)
     return out
 
 

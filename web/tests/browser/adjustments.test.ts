@@ -2,9 +2,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { Engine } from '../../src/engine';
 import type { AdjustmentSpec, Rect } from '../../src/engine/types';
 import { levelsLut } from '../../src/engine/adjustments';
+import { effectsReach } from '../../src/engine/effectsAdapter';
 import { brushCtx, collect, maskAt, near, newEngine, px, rgba, setBase, solidLayer, stroke, type Px } from './engineTestUtils';
 
 let e: Engine;
+/** The primary (first) effect of the top layer (an adjustment layer's stack head). */
+const eff0 = () => e.layers()[0].effects[0];
 afterEach(() => e?.dispose());
 
 const SRC: Px = [100, 150, 200, 255];
@@ -38,7 +41,8 @@ describe('adjustment layers: formulas (see adjustments.ts)', () => {
     const c = e.addAdjustment('blur');
     expect(e.layers().map((l) => [l.id, l.kind, l.name])).toEqual([[c, 'adjustment', 'Blur'], [b, 'pixel', 'Layer 1'], [a, 'adjustment', 'Levels'], ['base', 'input', 'TD Input']]);
     expect(e.activeLayerId()).toBe(c);
-    expect(e.layers()[0].adjustment).toEqual({ type: 'blur', radius: 4 });
+    expect(e.layers()[0].adjustment).toBeNull();
+    expect(e.layers()[0].effects).toMatchObject([{ type: 'blur', enabled: true, sigma: 4, edge: 'hold' }]);
     expect(e.history().entries.map((x) => x.label)).toEqual(['Add adjustment', 'Add layer', 'Add adjustment']);
     e.undo();
     expect(e.layers()).toHaveLength(3);
@@ -117,7 +121,7 @@ describe('adjustment layers: formulas (see adjustments.ts)', () => {
     l.surface.ctx.fillRect(30, 0, 30, 20);
     e.changed({ x: 0, y: 0, w: 60, h: 20 });
     const a = e.addAdjustment('blur');
-    e.setAdjustment(a, { type: 'blur', radius: 4 });
+    e.setAdjustment(a, { type: 'blur', radius: 4 }); // migrated to the blur filter with sigma 4 + edge hold
     expect(Math.abs(px(e, 29, 10)[0] - 140)).toBeLessThan(25); // half way across the edge
     expect(px(e, 29, 10)[0]).toBeGreaterThan(px(e, 33, 10)[0]);
     expect(px(e, 5, 10)[0]).toBeGreaterThan(250);
@@ -218,13 +222,13 @@ describe('adjustment layers: editing and history', () => {
     e.setAdjustment(id, { type: 'threshold', level: 0.7 });
     e.setAdjustment(id, { type: 'threshold', level: 0.9 });
     e.setAdjustment(id, { type: 'threshold', level: 7 });
-    expect(e.layers()[0].adjustment).toEqual({ type: 'threshold', level: 1 });
+    expect(eff0()).toMatchObject({ type: 'threshold', level: 1 });
     expect(e.history().entries).toHaveLength(n + 1);
     expect(e.history().entries.slice(-1)[0]?.label).toBe('Adjustment');
     e.undo();
-    expect(e.layers()[0].adjustment).toEqual({ type: 'threshold', level: 0.5 });
+    expect(eff0()).toMatchObject({ type: 'threshold', level: 0.5 });
     e.redo();
-    expect(e.layers()[0].adjustment).toEqual({ type: 'threshold', level: 1 });
+    expect(eff0()).toMatchObject({ type: 'threshold', level: 1 });
     e.setAdjustment('base', { type: 'invert' });
     e.setAdjustment('nope', { type: 'invert' });
   });
@@ -232,7 +236,8 @@ describe('adjustment layers: editing and history', () => {
   it('the adjustment type can change; blend and lock props are fixed', () => {
     const id = withAdj({ type: 'invert' });
     e.setAdjustment(id, { type: 'blur', radius: 3 });
-    expect(e.layers()[0].adjustment).toEqual({ type: 'blur', radius: 3 });
+    expect(eff0()).toMatchObject({ type: 'blur', sigma: 3 });
+    expect(e.layers()[0].effects).toHaveLength(1);
     e.setLayerProps(id, { blend: 'multiply', name: 'x' });
     expect(e.layers()[0]).toMatchObject({ blend: 'normal', name: 'x', kind: 'adjustment' });
     expect(e.docSpec().layers[1].blend).toBe('normal');
@@ -265,13 +270,16 @@ describe('adjustment layers: blur dirty rect and preview switch', () => {
     return { layer };
   }
 
-  it('widens the redrawn area by the blur reach (3 * radius) and by nothing else', () => {
+  it('widens the redrawn area by the effects reach of the stack and by nothing else', () => {
     blurDoc();
     const ev = collect(e);
     e.changed({ x: 100, y: 50, w: 10, h: 10 });
     e.flush();
     const c = ev.filter((x) => x.type === 'composite').map((x) => (x as { rect: Rect }).rect);
-    expect(c).toEqual([{ x: 88, y: 38, w: 34, h: 34 }]); // 4 px blur = 12 px reach
+    const r = effectsReach(e.layers()[0].effects);
+    expect(r).toBeGreaterThanOrEqual(12);
+    const x0 = Math.max(0, 100 - r), y0 = Math.max(0, 50 - r), x1 = Math.min(200, 110 + r), y1 = Math.min(100, 60 + r);
+    expect(c).toEqual([{ x: x0, y: y0, w: x1 - x0, h: y1 - y0 }]);
   });
 
   it('stays local without blur', () => {
@@ -351,13 +359,13 @@ describe('adjustment layers: blur dirty rect and preview switch', () => {
 });
 
 describe('TD parity details (td/raster_editor/network.py)', () => {
-  it('blur holds the edge pixels instead of fading to transparent at the document border', () => {
+  it('blur holds the edge pixels instead of fading to transparent at the document border (migrated filter: edge hold)', () => {
     e = newEngine(40, 40);
     setBase(e, [200, 100, 50, 255]);
     const a = e.addAdjustment('blur');
     e.setAdjustment(a, { type: 'blur', radius: 6 });
     for (const [x, y] of [[0, 0], [39, 0], [0, 39], [39, 39], [0, 20], [20, 0], [39, 20], [20, 39], [20, 20]]) {
-      expect(near(px(e, x, y), [200, 100, 50, 255], 2)).toBe(true); // flat colour stays flat, edges and corners included
+      expect(near(px(e, x, y), [200, 100, 50, 255], 2)).toBe(true);
     }
   });
 
@@ -383,7 +391,7 @@ describe('TD parity details (td/raster_editor/network.py)', () => {
     e = newEngine(4, 4);
     const a = e.addAdjustment('levels');
     e.setAdjustment(a, { type: 'levels', inLow: 0.5, inHigh: 0.2, gamma: 1, outLow: 0, outHigh: 1 });
-    const adj = e.layers()[0].adjustment as { inLow: number; inHigh: number };
+    const adj = eff0() as unknown as { inLow: number; inHigh: number };
     expect(adj.inHigh).toBeCloseTo(adj.inLow + 1e-4, 9);
   });
 
@@ -407,13 +415,13 @@ describe('spec change tracking without serialising', () => {
   it('moving and slider ticks never JSON.stringify and still announce every change once', () => {
     e = newEngine(30, 30);
     const l = solidLayer(e, 'red');
-    const a = e.addAdjustment('blur');
+    const a = e.addAdjustment('threshold');
     const orig = JSON.stringify;
     let calls = 0;
     JSON.stringify = ((...args: Parameters<typeof JSON.stringify>) => { calls++; return orig(...args); }) as typeof JSON.stringify;
     try {
       const ev = collect(e);
-      for (let r = 1; r <= 20; r++) e.setAdjustment(a, { type: 'blur', radius: r });
+      for (let r = 1; r <= 20; r++) e.setAdjustment(a, { type: 'threshold', level: r / 25 });
       e.setActiveLayer(l);
       e.setTool('move');
       const p = (x: number) => ({ x, y: 3, pressure: 1, shift: false, alt: false, ctrl: false });

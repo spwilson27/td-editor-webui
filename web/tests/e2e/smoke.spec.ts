@@ -137,6 +137,9 @@ test('layers panel: add, rename, hide, lock, reorder, delete', async ({ page }) 
 
   await rows.nth(1).locator('[data-act=sel]').click();
   await page.getByRole('button', { name: 'Delete layer' }).click();
+  expect((await names()).length).toBe(4); // v7: the layer is locked, so delete skips it
+  await rows.nth(1).locator('[data-act=lock]').click({ force: true });
+  await page.getByRole('button', { name: 'Delete layer' }).click();
   expect((await names()).length).toBe(3);
 
   await page.getByRole('button', { name: 'New group' }).click();

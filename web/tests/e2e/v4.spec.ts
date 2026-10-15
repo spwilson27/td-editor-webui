@@ -54,7 +54,7 @@ test.describe('Flatten via TouchDesigner', () => {
     expect(spec.slot).not.toBeNull();
     await td.waitFor(() => near(td.surfacePixel(spec.slot!, 80, 45), [200, 100, 50, 255], 1));
     expect(await hook<number[]>(page, 'readPixel', 5, 5)).toEqual([200, 100, 50, 255]);
-    await expect(page.locator(`[data-layer="${id}"] [data-act=flatten]`)).toHaveCount(0);
+    await expect(page.locator(`[data-layer="${id}"] [data-act=flatten]`)).toHaveAttribute('aria-disabled', 'true'); // a plain pixel layer now
     await page.keyboard.press('Control+z'); // history entry: back to the shape
     await td.waitFor(() => specs().some((l) => l.id === id && l.kind === 'shape'));
   });

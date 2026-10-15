@@ -13,6 +13,16 @@
 // on both hosts; logical size = ceil((region + k) / s) + 2.
 // FIELD modes: 0 = (alpha,0,0,1)  1 = (1 - alpha,0,0,1)  2 = premultiplied rgba  3 = bright pass of rgba (uThr: threshold, knee in uBright).
 
+// v7 edge hold (blur filter `edge: hold`): reads outside the DOCUMENT repeat the nearest document pixel (the v6 adjustment blur).  Set by the shader's
+// main(); false = every read outside the region is transparent (all other users of this library).
+bool fxHold = false;
+ivec2 fxHoldPos(ivec2 f) {
+    ivec2 o = ivec2(int(uPass.y + 0.5), int(uPass.z + 0.5));
+    return clamp(f + o, ivec2(0), fxDocSize() - 1) - o;
+}
+vec4 fxSrcE(ivec2 f) { return fxSrc(fxHold ? fxHoldPos(f) : f); }
+vec4 fxAuxE(ivec2 f) { return fxAux(fxHold ? fxHoldPos(f) : f); }
+
 int fxLvlD(int L) { return 1 << L; }
 ivec2 fxLvlOff(int L) {
     int d = 1 << L;
@@ -37,6 +47,7 @@ ivec2 fxLvlPos(int L) {
 // input 1 = the low-res texture of level L (written by the previous pass)
 vec4 fxLvlFetch(ivec2 p, int L, vec4 outside) {
     ivec2 ls = fxLvlLogical(L);
+    if (fxHold) p = clamp(p, ivec2(0), ls - 1);
     if (p.x < 0 || p.y < 0 || p.x >= ls.x || p.y >= ls.y) return outside;
     ivec2 t = fxLvlTex(L);
     return texelFetch(sTD2DInputs[1], ivec2(p.x, t.y - 1 - p.y), 0);
@@ -64,7 +75,7 @@ vec4 fxDownBox(int mode, int L, ivec2 shift, vec2 bright) {
     ivec2 base = (p - 1) * d - fxLvlOff(L) - shift;
     vec4 acc = vec4(0.0);
     for (int j = 0; j < d; j++)
-        for (int i = 0; i < d; i++) acc += fxFieldOf(mode, fxSrc(base + ivec2(i, j)), bright);
+        for (int i = 0; i < d; i++) acc += fxFieldOf(mode, fxSrcE(base + ivec2(i, j)), bright);
     return acc / float(d * d);
 }
 

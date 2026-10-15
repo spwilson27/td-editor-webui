@@ -1,4 +1,4 @@
-"""Live validation of the raster_editor COMP (protocol v7) against a running TouchDesigner
+"""Live validation of the raster_editor COMP (protocol v8) against a running TouchDesigner
 (docs/TESTING.md section 3, docs/DESIGN_V2.md section 7).
 
     .venv/bin/python scripts/validate_td.py                  # every step (the real UI drives the UI steps)
@@ -6,7 +6,7 @@
     .venv/bin/python scripts/validate_td.py --fake-client    # same, but keeps the UI steps that tolerate it
     .venv/bin/python scripts/validate_td.py --only 5,7,9     # run chosen steps (numbers below)
 
-The fake client speaks protocol v7 over a stdlib WebSocket: it sends `doc` + SURFACE tiles like the web
+The fake client speaks protocol v8 over a stdlib WebSocket: it sends `doc` + SURFACE tiles like the web
 app, pulls BASE / VIEW / SURFACE over HTTP and measures `applied` latency.
 
 Flags: --no-build (reuse the COMP that exists), --port N, --only. Only operators inside
@@ -2316,7 +2316,7 @@ def s27_ui_canvas(args):
 
 def s28_render_layer(args):
     """Fake client: renderLayer (Flatten) of a text and a shape layer equals TD's own rendering (premultiplied compare),
-    errors for a pixel layer, an unknown layer and a standby client."""
+    errors for mergeDown of a non-adjustment, an unknown layer and a standby client."""
     reset_canvas(args, 512, 256)
     ed = Editor(args.port)
     standby = None
@@ -2356,8 +2356,8 @@ def s28_render_layer(args):
             ok_all &= bool(ok)
             notes.append(f"{label}: type-6 frame {(h.doc_w, h.doc_h)}, max |renderLayer - TD output| in its box {diff} (<= 3), "
                          f"alpha elsewhere {other_empty}: {'ok' if ok else 'FAIL'}")
-        for rid, lid, want in (("e1", "p1", "not a text or shape"), ("e2", "nope", "not a text or shape")):
-            ed.send(P.render_layer(rid, lid))
+        for rid, lid, want, mode in (("e1", "p1", "only an adjustment", "mergeDown"), ("e2", "nope", "not a layer of", "flatten")):
+            ed.send(P.render_layer(rid, lid, mode))
             ok = ed.wait(lambda: any(m["t"] == "topError" and m["requestId"] == rid for m in ed.texts), 5)
             msg = next((m for m in ed.texts if m["t"] == "topError" and m["requestId"] == rid), None)
             good = bool(ok and msg and want in msg["msg"])
@@ -2372,6 +2372,303 @@ def s28_render_layer(args):
         ed.close()
         if standby:
             standby.close()
+    return ok_all, "\n        ".join(notes)
+
+
+def s48_migration_v6_docs(args):
+    """Fake client: a v6 document with every adjustment type (classic + filter, opacity, mask, inside a group) is migrated by TD
+    (docState: adjustment null, the spec's effect leads effects[]) and renders like v6 did (the documented numpy formulas, <= 1.5/255;
+    blur <= 8/255 like the v6 step)."""
+    import effects as EF
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
+    import network_dev as ND
+    S = 128
+    reset_canvas(args, S, S)
+    rng = np.random.default_rng(48)
+    img = rng.integers(0, 256, (S, S, 4), dtype=np.uint8)
+    img[..., 3] = np.where(rng.random((S, S)) < 0.35, 255, img[..., 3])
+    mask = np.zeros((S, S, 4), np.uint8)
+    mask[..., :3] = rng.integers(0, 256, (S, S, 1))
+    mask[..., 3] = 255
+    cases = [{"type": "levels", "inLow": 0.1, "inHigh": 0.85, "gamma": 1.8, "outLow": 0.05, "outHigh": 0.9},
+             {"type": "brightnessContrast", "brightness": 0.3, "contrast": -0.4},
+             {"type": "hueSaturation", "hue": 70, "saturation": 1.4, "value": 0.8},
+             {"type": "invert"}, {"type": "threshold", "level": 0.4},
+             {"type": "blur", "radius": 4.0}, {"type": "blur", "radius": 12.0}]
+    ed = Editor(args.port)
+    notes, ok_all = [], True
+    try:
+        take_over(ed)
+        ed.send_canvas(S, S, "fixed")
+        wait_for(lambda: out1_size() == [S, S], 6)
+        rev = 100
+        ed.send_doc([L("base", "input", input=1), L("p1", slot=1, size=(S, S)),
+                     L("adj", "adjustment", mask={"slot": 2, "enabled": True})], rev)   # (slots exist before their pixels)
+        time.sleep(0.4)
+        ed.send_surface(1, (0, 0, S, S), img, (S, S))
+        wait_applied(ed, ed.send_surface(2, (0, 0, S, S), mask, (S, S)), 8)
+        bq = ND.premul_f(img)
+        mf = mask[..., 0].astype(np.float64) / 255
+        for spec in cases:
+            for use_mask, grouped in ((False, False), (True, False), (False, True)):
+                rev += 1
+                am = {"slot": 2, "enabled": True} if use_mask else None
+                layers = [L("base", "input", input=1)]
+                if grouped:
+                    layers += [L("g", "group"), L("p1", slot=1, size=(S, S), parentId="g"),
+                               L("adj", "adjustment", parentId="g", adjustment=spec, opacity=0.8, mask=am)]
+                else:
+                    layers += [L("p1", slot=1, size=(S, S)), L("adj", "adjustment", adjustment=spec, opacity=0.8, mask=am)]
+                ed.send_doc(layers, rev)
+                time.sleep(0.3)
+                ed.send_surface(1, (0, 0, S, S), img, (S, S))      # (a slot that left the document loses its pixels)
+                if use_mask:
+                    ed.send_surface(2, (0, 0, S, S), mask, (S, S))
+                time.sleep(0.4)
+                out = wait_stable((0, 0, S, S), 4.0).astype(np.float64) / 255
+                ref = np.clip(ND.ref_adjust(spec, bq, 0.8, mf if use_mask else None), 0, 1)
+                d = np.abs(out - ref) * 255
+                if spec["type"] == "threshold":
+                    a_ = bq[..., 3:4]
+                    c_ = np.where(a_ > 0, bq[..., :3] / np.maximum(a_, 1e-9), 0)
+                    d = np.where((np.abs(c_ @ np.array([0.2126, 0.7152, 0.0722]) - spec["level"]) < 0.01)[..., None], 0, d)
+                tol = 8.0 if spec["type"] == "blur" else 1.5
+                st = td_json("L = comp.ext.RasterEditorExt.doc_layers or []\n"
+                             "print(json.dumps([{k: l.get(k) for k in ('id', 'adjustment', 'effects')} for l in L if l['id'] == 'adj']))")
+                eff = (st[0].get("effects") or [{}])[0] if st else {}
+                mig = bool(st) and st[0]["adjustment"] is None and eff.get("type") == spec["type"]
+                ok = d.max() <= tol and mig
+                ok_all &= ok
+                notes.append(f"{spec['type']}{' r=%g' % spec['radius'] if 'radius' in spec else ''} mask={use_mask} group={grouped}: "
+                             f"max {d.max():.2f} mean {d.mean():.3f} (<= {tol}), migrated {mig}: {'ok' if ok else 'FAIL'}")
+        # filter adjustment (v7 doc): the effect leads the layer's own effects, ordering kept
+        rev += 1
+        fl = {"type": "filter", "effect": {"type": "blur", "enabled": True, **v7_defaults(EF, "blur")}}
+        own = {"type": "colorOverlay", "enabled": True, "color": {"r": 255, "g": 0, "b": 0, "a": 255}, "opacity": 0.3}
+        ed.send_doc([L("base", "input", input=1), L("p1", slot=1, size=(S, S)), L("adj", "adjustment", adjustment=fl, effects=[own])], rev)
+        time.sleep(0.5)
+        st = td_json("L = comp.ext.RasterEditorExt.doc_layers or []\nprint(json.dumps([l.get('effects') for l in L if l['id'] == 'adj']))")
+        good = bool(st) and [e["type"] for e in st[0]] == ["blur", "colorOverlay"]
+        ok_all &= good
+        notes.append(f"filter adjustment migrated: effects {[e['type'] for e in st[0]] if st else None}: {'ok' if good else 'FAIL'}")
+    finally:
+        ed.close()
+    return ok_all, "\n        ".join(notes)
+
+
+def s49_render_requests(args):
+    """Fake client: renderLayer (flatten of a pixel layer with effects + mask + rotation, a group, a text, a shape; mergeDown of an
+    adjustment with opacity + mask) and renderLayers (merge selected) equal TD's own composite of exactly those layers (the same layers
+    sent alone, opacity 1 / Normal for the flatten kinds); temporary nodes are gone afterwards."""
+    S_W, S_H = 256, 160
+    reset_canvas(args, S_W, S_H)
+    ed = Editor(args.port)
+    notes, ok_all = [], True
+    rng = np.random.default_rng(49)
+    img = rng.integers(0, 256, (S_H, S_W, 4), dtype=np.uint8)
+    img[..., 3] = np.where(rng.random((S_H, S_W)) < 0.5, 255, img[..., 3])
+    img2 = rng.integers(0, 256, (S_H, S_W, 4), dtype=np.uint8)
+    mask = np.zeros((S_H, S_W, 4), np.uint8)
+    mask[..., :3] = rng.integers(0, 256, (S_H, S_W, 1))
+    mask[..., 3] = 255
+    try:
+        take_over(ed)
+        ed.wait(lambda: any(m["t"] == "fonts" for m in ed.texts), 5)
+        fonts = next((m["families"] for m in ed.texts if m["t"] == "fonts"), [])
+        text = dict(SPEC_TEXT, font=pick_font(fonts), size=30)
+        ed.send_canvas(S_W, S_H, "fixed")
+        wait_for(lambda: out1_size() == [S_W, S_H], 6)
+        shadow = {"type": "dropShadow", "enabled": True, "dx": 5, "dy": 4, "blur": 3, "color": {"r": 0, "g": 0, "b": 0, "a": 255}, "opacity": 0.8}
+        levels = {"type": "levels", "enabled": True, "inLow": 0.2, "inHigh": 0.8, "gamma": 1.4, "outLow": 0.0, "outHigh": 1.0}
+        full = [L("base", "input", input=1),
+                L("a", slot=1, size=(S_W, S_H), effects=[shadow], opacity=0.5, blend="multiply", mask={"slot": 3, "enabled": True},
+                  x=10.5, y=6, rot=8.0, sx=0.7, sy=0.7),
+                L("g", "group", opacity=0.4), L("c", slot=2, size=(S_W, S_H), parentId="g", blend="screen"),
+                L("d", slot=4, size=(S_W, S_H), parentId="g", x=20, y=10),
+                L("t", "text", text=text, shape=None, opacity=0.6, blend="overlay"),
+                L("s", "shape", text=None, shape=SPEC_SHAPES["rect"], opacity=0.7),
+                L("e", slot=5, size=(S_W, S_H), opacity=0.7),
+                L("lv", "adjustment", effects=[levels], opacity=0.6, mask={"slot": 6, "enabled": True}),
+                L("f", slot=7, size=(S_W, S_H), opacity=0.9)]
+        rev = [200]
+        ed.send_doc(full, rev[0])
+        time.sleep(0.4)
+        fid = None
+        for sl, im in ((1, img), (2, img2), (3, mask), (4, img2), (5, img), (6, mask), (7, img2)):
+            fid = ed.send_surface(sl, (0, 0, S_W, S_H), im, (S_W, S_H))
+        wait_applied(ed, fid, 10)
+
+        surf = ((1, img), (2, img2), (3, mask), (4, img2), (5, img), (6, mask), (7, img2))
+
+        def send(layers):
+            rev[0] += 1
+            ed.send_doc(layers, rev[0])
+            time.sleep(0.3)
+            used = {l.get("slot") for l in layers} | {(l.get("mask") or {}).get("slot") for l in layers}
+            fid = None
+            for sl, im in surf:                                  # (a slot that left the document loses its pixels)
+                if sl in used:
+                    fid = ed.send_surface(sl, (0, 0, S_W, S_H), im, (S_W, S_H))
+            time.sleep(0.6)
+
+        def td_out():
+            return wait_stable((0, 0, S_W, S_H), 5.0)
+
+        def plain(l):
+            return dict(l, parentId=None, visible=True, opacity=1, blend="normal")
+        byid = {l["id"]: l for l in full}
+        kidsof = lambda gid: [l for l in full if l.get("parentId") == gid]      # noqa: E731
+        cases = [
+            ("flatten pixel (effects + mask + rotation)", lambda i: P.render_layer(i, "a"), [plain(byid["a"])]),
+            ("flatten group", lambda i: P.render_layer(i, "g"), [plain(byid["g"])] + kidsof("g")),
+            ("flatten text", lambda i: P.render_layer(i, "t"), [plain(byid["t"])]),
+            ("flatten shape", lambda i: P.render_layer(i, "s"), [plain(byid["s"])]),
+            ("mergeDown adjustment (opacity 0.6 + mask on the layer below)", lambda i: P.render_layer(i, "lv", "mergeDown"),
+             [plain(byid["e"]), dict(byid["lv"], parentId=None, visible=True)]),
+            ("merge selected [a, g]", lambda i: P.render_layers(i, ["a", "g"]), [byid["a"], byid["g"]] + kidsof("g")),
+            ("merge selected [g, t]", lambda i: P.render_layers(i, ["t", "g"]), [byid["g"]] + kidsof("g") + [byid["t"]]),
+            ("merge selected [a, f]", lambda i: P.render_layers(i, ["f", "a"]), [byid["a"], byid["f"]]),
+            ("merge selected [a, g, t]", lambda i: P.render_layers(i, ["t", "g", "a"]), [byid["a"], byid["g"]] + kidsof("g") + [byid["t"]]),
+            ("merge selected [g, t, f]", lambda i: P.render_layers(i, ["f", "t", "g"]), [byid["g"]] + kidsof("g") + [byid["t"], byid["f"]]),
+            ("merge selected [f, a, g, t] (out of order)", lambda i: P.render_layers(i, ["f", "a", "g", "t"]),
+             [byid["a"], byid["g"]] + kidsof("g") + [byid["t"], byid["f"]]),
+        ]
+        only = [x for x in os.environ.get('S49_ONLY', '').split(',') if x]
+        for n, (label, build, solo) in enumerate(cases):
+            if only and str(n) not in only:
+                continue
+            send(full)
+            before = td_json("print(json.dumps(len(op(%r + '/doc').children)))" % COMP)
+            rid = f"rr{n}"
+            ed.send(build(rid))
+            ok = ed.wait(lambda: any(m["t"] in ("topReady", "topError") and m["requestId"] == rid for m in ed.texts), 25)
+            msg = next((m for m in ed.texts if m["t"] in ("topReady", "topError") and m["requestId"] == rid), None) if ok else None
+            if not msg or msg["t"] != "topReady":
+                notes.append(f"{label}: FAIL {msg}")
+                ok_all = False
+                continue
+            stt, h, got = fetch_top(ed, rid)
+            if stt != 200:
+                notes.append(f"{label}: FAIL GET /top {stt}")
+                ok_all = False
+                continue
+            got = premult(got)
+            time.sleep(1.0)
+            after = td_json("print(json.dumps(len(op(%r + '/doc').children)))" % COMP)
+            send(solo)
+            want = td_out()
+            if os.environ.get('S49_DUMP'):
+                time.sleep(3.0)
+                want2 = td_out()
+                print('solo layers:', [(l['id'], l.get('slot'), l.get('opacity')) for l in td_json("print(json.dumps([{k: l.get(k) for k in ('id','slot','opacity')} for l in comp.ext.RasterEditorExt.doc_layers]))")], flush=True)
+                print(td("""
+c = op('/project1/raster_editor'); net = c.ext.RasterEditorExt.network
+for n, o in net._ops.items():
+    if n.startswith(('mrg_', 'blend_L', 'xf_', 'rqout', 'text_')):
+        ins = [(i.connections[0].owner.name if i.connections else None) for i in o.inputConnectors]
+        print(n, o.OPType, o.bypass, ins[:12], o.par.format.eval() if hasattr(o.par, 'format') else '')
+ex = c.ext.RasterEditorExt
+import json as _j
+print('LAYERS', [(l['id'], l.get('kind'), l.get('slot'), l.get('visible'), l.get('opacity'), l.get('parentId')) for l in _j.loads(net._prev_layers)])
+print('DES', {k: v.inputs for k, v in net._desired.items() if k.startswith(('mrg', 'blend_L'))})
+print('PB', ex._pbounds, 'HINTS', net._hints, net._plan_info.get('skip_reasons'), 'IN', ex._hints_sent)
+"""), flush=True)
+                print('solo changed after 3 s:', int(np.abs(want2.astype(int) - want.astype(int)).max()), flush=True)
+            d = np.abs(got.astype(int) - want.astype(int))
+            if os.environ.get('S49_DUMP'):
+                np.save(os.environ['S49_DUMP'] + f'_got{n}.npy', got)
+                np.save(os.environ['S49_DUMP'] + f'_want{n}.npy', want)
+            leak = after - before
+            good = d.max() <= 3 and leak <= 12 and int(got[..., 3].astype(int).sum()) > 1000 and (h.doc_w, h.doc_h) == (S_W, S_H)
+            ok_all &= bool(good)
+            ys, xs = np.nonzero(d.max(-1) > 3)
+            where = f" at x {xs.min()}..{xs.max()} y {ys.min()}..{ys.max()}" if len(xs) else ""
+            notes.append(f"{label}: max |request - TD composite of those layers| {int(d.max())}{where} (<= 3), mean {d.mean():.3f}, "
+                         f"alpha sum {int(got[..., 3].astype(int).sum())}, doc children after/before {after}/{before}: {'ok' if good else 'FAIL'}")
+        send(full)
+        # an adjustment with nothing below:
+        send([L("lv0", "adjustment", effects=[levels]), L("base", "input", input=1)])
+        ed.send(P.render_layer("rr-none", "lv0", "mergeDown"))
+        ok = ed.wait(lambda: any(m["t"] == "topError" and m["requestId"] == "rr-none" for m in ed.texts), 10)
+        m = next((m for m in ed.texts if m["t"] == "topError" and m["requestId"] == "rr-none"), None)
+        good = bool(ok and m and "nothing below" in m["msg"])
+        ok_all &= good
+        notes.append(f"mergeDown with nothing below -> topError {m and m['msg']!r}: {'ok' if good else 'FAIL'}")
+    finally:
+        ed.close()
+    return ok_all, "\n        ".join(notes)
+
+
+def s50_ui_flatten_merge_multiselect(args):
+    """Real UI: merge down (flatten an adjustment), Merge Selected, flatten of a group, and the multi-select ops (group, delete) through the
+    test hook -- the page composite equals TD's out1 after each, and TD's document has the same layers as the page."""
+    W, H = 320, 200
+    err = ui_doc(args, W, H)
+    if err:
+        return None, err
+    if hook_missing("selectLayers", "mergeSelected", "deleteSelected", "groupSelected", "flatten"):
+        return None, "multi-select hooks not available"
+    notes, ok_all = [], True
+
+    def chk(label, cond, extra=""):
+        nonlocal ok_all
+        ok_all &= bool(cond)
+        notes.append(f"{label}: {'ok' if cond else 'FAIL'} {extra}".rstrip())
+
+    def same_layers():
+        page = [l["id"] for l in (hook_call("layers()") or [])]
+        # (the page lists top-first and depth-first, TD's document is bottom-first: compare the layer SETS; the order is covered by the
+        #  composite parity after every operation)
+        return page, wait_for(lambda: sorted(l["id"] for l in td_layers()) == sorted(page), 6)
+
+    def parity(label):
+        time.sleep(0.8)
+        ok, n = compare_page_td([(label, (0, 0, W, H), 3, 2.0, 0.02)])
+        chk(f"{label}: page composite equals TD", ok, " ".join(n))
+
+    hook_call("addLayer()")
+    paint_all(W, H, "#3060c0")
+    a = next(l["id"] for l in hook_call("layers()") if l["kind"] == "pixel")
+    adj = hook_call("addAdjustment('hueSaturation', {hue: 60, saturation: 1.2, value: 1})")
+    parity("adjustment on a blue layer")
+    n0 = len(hook_call("layers()"))
+    hook_call(f"flatten({adj!r})")                                  # merge down
+    chk("merge down removes the adjustment layer", wait_for(lambda: len(hook_call("layers()")) == n0 - 1, 8), f"{n0} -> {len(hook_call('layers()'))}")
+    page, same = same_layers()
+    chk("TD has the same layers after merge down", same, str(page))
+    parity("after merge down")
+    hook_call("addLayer()")
+    paint_all(W, H, "#c04020")
+    hook_call("addLayer()")
+    hook_call("selectRect(40, 30, 120, 80)")
+    paint_all(W, H, "#20c060")
+    hook_call("deselect()")
+    ids = [l["id"] for l in hook_call("layers()") if l["kind"] == "pixel"]
+    parity("three pixel layers")
+    hook_call(f"selectLayers({ids[-2:]!r})")
+    hook_call("groupSelected()")
+    page, same = same_layers()
+    chk("group selected -> a group in TD too", same and any(l["kind"] == "group" for l in hook_call("layers()")), str(page))
+    parity("after group")
+    hook_call(f"selectLayers({ids[-2:]!r})")
+    hook_call("mergeSelected()")
+    chk("merge selected leaves one pixel layer for the two", wait_for(lambda: len(hook_call("layers()")) <= len(page) - 1, 15), str([l['id'] for l in hook_call('layers()')]))
+    page, same = same_layers()
+    chk("TD has the same layers after merge selected", same, str(page))
+    parity("after merge selected")
+    g = next((l["id"] for l in hook_call("layers()") if l["kind"] == "group"), None)
+    if g:
+        hook_call(f"flatten({g!r})")
+        chk("flatten of a group -> a pixel layer", wait_for(lambda: not any(l["kind"] == "group" for l in hook_call("layers()")), 15))
+        page, same = same_layers()
+        chk("TD has the same layers after flattening the group", same, str(page))
+        parity("after flatten group")
+    pix = [l["id"] for l in hook_call("layers()") if l["kind"] == "pixel"]
+    hook_call(f"selectLayers({pix[-2:]!r})")
+    hook_call("deleteSelected()")
+    page, same = same_layers()
+    chk("delete selected reaches TD", same, str(page))
+    parity("after delete selected")
     return ok_all, "\n        ".join(notes)
 
 
@@ -3417,6 +3714,11 @@ def s43_layer_preview(args):
         wait_applied(ed, f2, 10)
         chk("pixelSort is flagged tdPreview by the planner", flagged)
         got = ed.wait(lambda: ed.previews and "ps" in ed.preview_frames, 8)
+        # (the first frames settle: the surfaces arrive after the layer was first rendered.  Nothing but this harness pulls the document output, so
+        #  it cooks it itself, twice, and lets the frame produced by the second cook arrive before anything is compared or counted)
+        for _ in range(2):
+            td("n = comp.ext.RasterEditorExt.network; n.output().cook(force=True); n.layer_preview_source('ps').cook(force=True)")
+            ed.run(2.0)
         chk("layerPreview notice + GET /layer", got, f"notices {[(m['layerId'], m['frameId']) for m in ed.previews]}")
         if got:
             hdr, payload = ed.preview_frames["ps"][-1][0], ed.preview_frames["ps"][-1][1]
@@ -3433,7 +3735,6 @@ def s43_layer_preview(args):
             m_ = px[..., 3] > 250
             chk("the pixel sort changed the layer's colours (it is TD's effect, not the raw surface)", float(np.abs(raw[..., :3] - px[..., :3].astype(int))[m_].mean()) > 2.0,
                 f"mean colour change {float(np.abs(raw[..., :3] - px[..., :3].astype(int))[m_].mean()):.1f}")
-        ed.run(2.0)      # (the first frames settle: the surfaces arrive after the layer was first rendered)
         n0 = len(ed.previews)
         stat0 = td_json("x = comp.ext.RasterEditorExt; p = x.layer_pipes.get('ps'); print(json.dumps([p.frame_id if p else None, len(x.stats['lpreadback'])]))")
         ed.run(2.5)
@@ -3442,8 +3743,11 @@ def s43_layer_preview(args):
         px2 = px.copy()
         px2[..., 0] = 255 - px2[..., 0]
         ed.send_surface(1, (0, 0, 64, 64), px2, (64, 64))
-        again = ed.wait(lambda: len(ed.previews) > n0, 6)
-        chk("an edit of the layer's pixels produces a new frame", again, f"notices {n0} -> {len(ed.previews)}")
+        t_edit = time.time()
+        # (something must pull the document output for the chain to cook; in the live editor a viewer / the panel does, a headless harness
+        #  does it itself: one forced cook of out per poll, exactly what td_rect() does for the pixel comparisons)
+        again = ed.wait(lambda: (td("comp.ext.RasterEditorExt.network.output().cook(force=True)"), len(ed.previews) > n0)[1], 20)
+        chk("an edit of the layer's pixels produces a new frame", again, f"notices {n0} -> {len(ed.previews)} after {time.time() - t_edit:.1f}s")
         st, _ = http_get(args.port, f"/layer?token={ed.token}&client={ed.client_id}&layerId=plain")
         chk("an unflagged layer has no preview (404)", st == 404, f"status {st}")
         st, _ = http_get(args.port, f"/layer?token=bad&client={ed.client_id}&layerId=ps")
@@ -3733,6 +4037,9 @@ STEPS = [
     (45, ".redoc with history.bin round trip (save, change, open, undo)", "uiredoc", True),
     (46, "TTC fonts: Helvetica / Menlo bold + italic render different glyphs than regular", "ttc", False),
     (47, "activeLayer reaches the network; top-layer edit recooks fewer nodes with it", "active", False),
+    (48, "v6 documents with every adjustment type migrate (adjustment -> effects) and render like v6", "migrate", False),
+    (49, "renderLayer flatten / mergeDown + renderLayers equal TD's composite of those layers; temporary nodes cleaned up", "renderreq", False),
+    (50, "real UI: merge down, merge selected, flatten group, group / delete selected via the hook -- page equals TD, same layers", "uimulti", True),
     (99, "deleting the COMP with clients connected does not freeze TD; undo of the delete restores the pixels (run last)", "delete", False),
 ]
 FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinput": "s4_no_input", "scene": "s5_scene",
@@ -3747,7 +4054,8 @@ FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinp
          "uieffects": "s35_ui_effects_parity", "uitools": "s36_ui_tools", "choose": "s37_choose_file", "filters": "s38_filters_compile",
          "uifilters": "s39_ui_filters_parity", "uigroupfx": "s40_ui_filter_adjust_group_fx", "uiselectadj": "s41_ui_selection_adjustment",
          "uibrush": "s42_ui_brush_tips_presets", "layerpreview": "s43_layer_preview", "uihistory": "s44_ui_history_reload",
-         "uiredoc": "s45_ui_redoc_history", "ttc": "s46_ttc_fonts", "active": "s47_active_layer_hint"}
+         "uiredoc": "s45_ui_redoc_history", "ttc": "s46_ttc_fonts", "active": "s47_active_layer_hint",
+         "migrate": "s48_migration_v6_docs", "renderreq": "s49_render_requests", "uimulti": "s50_ui_flatten_merge_multiselect"}
 
 
 def main():
