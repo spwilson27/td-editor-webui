@@ -320,3 +320,15 @@ Further v5 details (TD implementation):
   server passes the header on, otherwise after it was read (`413`). `readText` decodes `utf-8-sig`. Brush preset names that are missing,
   empty or too long are normalised by TD (`"Brush preset"`, 256 chars) instead of rejecting the document. Layer-preview notice records are
   created only for layers that have a stream.
+
+## 10. Version 8 additions (DESIGN_V7)
+
+`ready.protocol` / `hello.protocol` = **8**.
+- Adjustment layers: `adjustment: null` and `effects[]` = the FX stack applied to everything below. A layer with a
+  non-null legacy `adjustment` (v2–v7 docs) is migrated on read: classic spec → `{type:<same name>, enabled:true, …params}`
+  effect; `{type:'filter', effect}` → that effect; prepended to the layer's existing `effects[]`.
+- New effect types `levels`, `brightnessContrast`, `hueSaturation`, `invert`, `threshold` (params as the former
+  `AdjustmentSpec` variants).
+- `renderLayer` gains `mode: "flatten" | "mergeDown"` (default `"flatten"`; v7 `renderLayer` on text/shape = flatten).
+- New `renderLayers {requestId, layerIds: string[]}` → isolated composite of those layers (stack order) → `topReady` /
+  `topError`, fetched with `GET /top` (frame type 6, doc-sized).

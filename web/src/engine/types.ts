@@ -302,6 +302,16 @@ export interface EditorEngine {
   setInputs(items: Array<{ input: number; w: number; h: number; connected: boolean }>): void; // from TD; auto-creates layers
   addInputLayer(input: number): string;
 
+  // v7: unified adjustments, batch layer ops, flatten/merge (docs/DESIGN_V7.md)
+  addAdjustmentLayer(effects: Effect[], name?: string): string; // adjustment layer = FX stack over everything below
+  deleteLayers(ids: string[]): void; // one history entry
+  setLayersProps(ids: string[], props: Partial<Pick<LayerInfo, 'visible' | 'locked'>>): void; // one history entry
+  moveLayers(ids: string[], targetParentId: string | null, index: number): void; // keeps relative order; one entry
+  groupLayers(ids: string[], name?: string): string; // wraps them (stack order kept) in a new group; one entry
+  replaceLayersWithPixels(ids: string[], rgba: Uint8Array | Uint8ClampedArray, w: number, h: number, name?: string): string;
+  // ^ flatten / merge result from TD (doc-sized straight RGBA): removes ids, inserts one pixel layer at the topmost one's
+  //   position (mergeDown: ids = [adjustment, layerBelow]); one history entry; returns the new layer id
+
   // v6: brushes, history persistence, below-cache, tdPreview layers (docs/DESIGN_V6.md §5)
   setBrushTip(tip: TipShape, dynamics: BrushDynamics, customTip?: { w: number; h: number; alpha: Uint8Array }): void;
   tipFromSelection(): { w: number; h: number; alpha: Uint8Array } | null; // active layer luminance × alpha in the selection
