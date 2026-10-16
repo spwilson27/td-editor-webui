@@ -2,10 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { PROTOCOL_VERSION, type WebMessage, decodeTdMessage, normalizeLayer, decodeWebMessage, encodeMessage } from '../../src/bridge/codec';
 
 describe('protocol v8 messages', () => {
-  it('is protocol 10 (hello / ready)', () => {
-    expect(PROTOCOL_VERSION).toBe(10);
-    expect(decodeWebMessage(encodeMessage({ t: 'ready', protocol: 10, client: 'external', version: '1', token: 't', fresh: true }))).toMatchObject({ t: 'ready', protocol: 10 });
-    expect(decodeTdMessage('{"t":"hello","protocol":10,"doc":{"w":4,"h":4},"hasInput":true,"maxSendFps":30,"active":true,"clientId":"c","hasDocument":false,"rev":null}')).toMatchObject({ t: 'hello', protocol: 10 });
+  it('is protocol 11 (hello / ready)', () => {
+    expect(PROTOCOL_VERSION).toBe(11);
+    expect(decodeWebMessage(encodeMessage({ t: 'ready', protocol: 11, client: 'external', version: '1', token: 't', fresh: true }))).toMatchObject({ t: 'ready', protocol: 11 });
+    expect(decodeTdMessage('{"t":"hello","protocol":11,"doc":{"w":4,"h":4},"hasInput":true,"maxSendFps":30,"active":true,"clientId":"c","hasDocument":false,"rev":null}')).toMatchObject({ t: 'hello', protocol: 11 });
   });
 
   it('renderLayer carries mode flatten | mergeDown; without a mode (v7 shape) it still decodes', () => {

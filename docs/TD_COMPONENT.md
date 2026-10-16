@@ -25,7 +25,7 @@ external browser (**Open in Browser**). Every editor is complete and can be the 
 The Web Render TOP, the panel mouse / keyboard forwarding (`panel_exec`, `keyboard`) and the panel TD-view overlay of v0.7 are gone.
 
 **Runtime-created child operators** (anything the extension creates while running, e.g. `_imp_sel*`, `_imp_res*`, `_imp_mov*`,
-`_font_probe_tmp`) must (1) start with `_` and (2) be tagged `reRuntime`: Upgrade All Editors never copies such operators into
+`_font_probe_tmp`, `_view_crop<n>` / `_view_rs<n>` / `_view_px<n>`) must (1) start with `_` and (2) be tagged `reRuntime`: Upgrade All Editors never copies such operators into
 a target. `doc` and `doc_state` are preserved, `in<N>` / `out<N>` keep their names.
 
 ## 2. Custom parameters (page "Raster Editor")
@@ -38,7 +38,7 @@ a target. `doc` and `doc_state` are preserved, `in<N>` / `out<N>` keep their nam
 | `Docsizemode` | menu | Follow Input | `input` / `fixed` (§8) |
 | `Docw`, `Doch` | int | 1920, 1080 | document size when Fixed, or Follow Input with no input |
 | `Premultiplied` | toggle | on | TD data is premultiplied alpha |
-| `Maxsendfps`, `Maxinputfps`, `Maxviewfps` | int | 30 | rate limits (§3) |
+| `Maxsendfps`, `Maxinputfps`, `Maxviewfps` | int | 30 | rate limits (§3); the TD view can not be faster than the project's cook rate (§13) |
 | `Viewmode` | menu (read-only) | Local | the active browser tab's view mode |
 | `Devurl` | str | "" | developer: Open in Browser opens this URL (a Vite dev server) with `ws=ws://127.0.0.1:<Port>/ws` instead of the built-in page |
 | `Openbrowser` | pulse | | **Open in Browser**: with a live master the browser opens the master's page with this editor's tab (`http://127.0.0.1:<Port>/#token=<token>&e=<editorId>`); otherwise this editor becomes the master first |
@@ -83,7 +83,7 @@ Keep TD glue thin. All pixel math lives in `frames.py`, all byte layout in `prot
 - **Upgrade hooks** (called by `upgrade.py`): `PrepareUpgrade()` (flush the document, keep the master role for 15 s), `Freeze()`, `Stop()`,
   `Start()` (idempotent; a master resumes with the same port / token), `OnEditorsChanged()` (refresh list + election).
 - **Pump (each frame start)**: module check, router tick, doc size, hints, input / output / layer previews, notices, TOP requests,
-  surfaces, files, replay, network, doc state, switch.
+  surfaces, **view11** (v11 fast / exact view frames, §13), files, replay, network, doc state, switch.
 - Exceptions inside callbacks are caught, printed once per distinct message and shown in `Status`.
 
 *Sections 5 onwards describe earlier protocol versions; wherever they mention the panel, the Web Render TOP, `Panelquery` or
@@ -360,3 +360,52 @@ See `PROTOCOL.md` section 9 for the wire details. Extension behaviour:
 - Tests: `td/tests/test_network.py` (v9 block), `test_protocol_v7.py`, `test_ext.py` (v9 block); live: `scripts/network_dev.py v9` (masked input with
   integer offset / rotation / skew and a half-size mask, with an effect, disconnect + resolution change; masked group with a multiply child,
   group effects, between plain layers, flatten, renderLayers), `scripts/validate_td.py` step 53.
+
+## 13. Protocol v11 additions (DESIGN_V9): fast / exact TD view (`ext.py` v11 view stream, `frames.py`, `protocol.py`)
+
+Wire format: `PROTOCOL.md` section 13 (golden files `docs/fixtures/view_*.bin` + `view_v11.json`, written by `scripts/make_fixtures.py`).
+
+- **Per client state** (`_Client.v*`): quality (`auto` / `fast` / `exact`), viewport `{x, y, w, h, scale}` (+ serial), un-acked frames
+  (`v_inflight`, <= `VIEW_MAX_INFLIGHT` = 2; an entry older than `VIEW_ACK_TIMEOUT_S` = 2 s expires, 10 s without any ack shows `stalled`
+  in Status), frame counter, JPEG quality, dirty flags, the last exact frame sent to that client (`v_prev`, the base of tile diffs) and
+  `v_showing` (`fast` | `exact`). `ready.protocol` 10 is still accepted (`hello.protocol` echoes it) and keeps the v3 notice + `GET /view`
+  path (`_poll_view`, `_Pipe` `out`); `_view_subscribers()` = those, `_view11_subscribers()` = protocol >= 11.
+- **Pump order**: the step `view11` runs after `surfaces` (the uploads of this tick) so the frame contains the edit that
+  `appliedFrameId` names. Change token = `doc_out.totalCooks` (+ size + Premultiplied) after `doc_out.cook()`; a changed token or a
+  viewport / quality change marks the client dirty.
+- **Fast frames** (`_send_fast`): per client with fast quality a lazily created GPU chain inside the COMP: `doc_out` -> **Crop TOP**
+  (integer document region of the viewport, never more than the document) -> **Resolution TOP** (device pixel size, `rgba8fixed`,
+  mipmap filter, capped at `FAST_MAX_PIXELS` = 2.4 M) -> **GLSL TOP** (`view_fast_glsl`: colour | alpha as grey side by side, rows top-first,
+  premultiplies when `Premultiplied` is off). One `saveByteArray('.bmp')` readback (the BMP alpha byte is junk, hence the alpha half),
+  `cv2.cvtColor` / `extractChannel`, two `cv2.imencode` JPEGs (colour q75 adaptive 40..75 by `FAST_BYTES_BUDGET`, alpha q90; alpha
+  omitted when fully opaque), `webSocketSendBinary` in the same tick. Rate: `Maxviewfps` leaky bucket; when two frames are un-acked
+  nothing is captured (the next frame is captured after the ack, so it is always the newest). Chains are named `_view_crop<n>`,
+  `_view_rs<n>`, `_view_px<n>` (tag `reRuntime`), exist only while a client takes fast frames and are destroyed on `view local`, on
+  disconnect and by `Stop`. At most `VIEW_MAX_CHAINS` = 4 chains per editor; further clients (or no OpenCV) get exact frames only.
+  A slave editor creates its chains only when one of its own clients subscribes.
+- **Exact frames**: the existing `view_pack` GLSL TOP (float32, straight alpha, flipped, `floor(c*255+0.5)` — the same semantics
+  as `GET /view` of v3) is read with the budgeted two-step `numpyArray(delayed=True)` pipe `vx` (`_poll_pipe`, sink = `_vx_sink`
+  instead of publishing a message): ~1 + 2.5 ms main thread per 1080p frame. Dispatch gates (`_exact_takes`): `auto` = fast frames are
+  flushed, nothing is un-acked, `VIEW_IDLE_S` = 0.2 s without a change and the frame was read after the last change; `exact` = on change,
+  at most every `VIEW_EXACT_PERIOD_S` = 0.1 s (a frame read before the latest change is sent and followed by another read).
+  The worker thread (`_exact_work`, one `ThreadPoolExecutor` thread; `_sync_view_workers` runs it inline in tests) does the tile diff
+  per distinct previous frame (`frames.plan_exact`: > 30 % of the 64 px tiles changed, no previous frame or another size -> full) and
+  `zlib.compress(raw, 1)` (a single C call that releases the GIL). The pump sends the results: <= 4 MB inline over the WebSocket, larger
+  ones are stored per client (`v_big`) and announced with `viewExact {frameId, size}` for `GET /view?exact=1&frameId=`. A tile frame is only
+  sent if the client's `v_prev` is still the frame it was diffed against. An unchanged picture is not sent again (a client that was last
+  sent a fast frame gets an empty tile frame, `nTiles` 0: "your exact buffer is current"). `viewExactReset` drops `v_prev`.
+- **Animated / live sources**: while the output keeps changing (a moving input, a generative layer) `auto` stays in fast mode, because
+  the idle timer never expires; choose Accurate (`exact`) to get exact frames of moving content (rate limited to 10 per second).
+  Failures: a chain that cannot be created or read is retried after `VCHAIN_BACKOFF_S` = 5 s (the client gets exact frames meanwhile);
+  an ack timeout puts the client back into slow start (`v_acked` False: one low-quality fast frame at a time, exact frames announced
+  with `viewExact`, next exact frame full). An exact result is dropped (and recomputed) when a newer fast frame, an output change or a
+  canvas resize happened while the worker ran. Viewport numbers are clamped (`parse_view11` and `_fast_geometry`).
+- **Cook rate**: the view can not be faster than the project's cook rate (frames are produced in the tick the output was cooked).
+  A 60 fps project roughly halves the preview latency of a 30 fps one. The component never changes the cook rate; `Status` shows
+  `(preview latency follows the 30 fps cook rate)` while a client is in TD view and the rate is below 45 fps, and the `Maxviewfps` help
+  says so.
+- **Stats** (`GetStats`): `vfast` (main thread per fast frame) = `vfastcap` (capture) + `vfastenc` (JPEG), `vfastrs` (readback),
+  `vfastflip` (BGRA split), `vxmain` (main thread per exact tick while exact work is pending), `vxreadback` / `vxconvert` / `vxpublish`
+  (the `vx` pipe), `vxenc` (worker time per exact job).
+- **Tests**: `td/tests/test_v11view.py` (codecs vs the golden fixtures, tile diffs, state machine on fakes, router); live: `scripts/validate_td.py`
+  step 7 (needs OpenCV inside TD only; JPEG content is decoded in TD, the exact buffer is compared band by band with `out1`).

@@ -61,7 +61,7 @@ class Env:
                     if c.view.outstanding is not None and cid not in self.fetch_skip and self.autofetch_view:
                         self.fetch_view(cid)
 
-    def connect(self, kind="panel", protocol=P.PROTOCOL_VERSION, ready=True, token=None, fresh=False):
+    def connect(self, kind="panel", protocol=10, ready=True, token=None, fresh=False):
         self.n += 1
         cid = f"127.0.0.1:{5000 + self.n}"
         self.s.webSocketConnections.append(cid)

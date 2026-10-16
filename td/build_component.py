@@ -96,6 +96,19 @@ void main() {
 }
 '''
 
+VIEW_FAST_GLSL = '''uniform vec4 uCfg;
+out vec4 fragColor;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    ivec2 res = ivec2(uTDOutputInfo.res.zw);
+    int w = res.x / 2;
+    vec4 c = texelFetch(sTD2DInputs[0], ivec2(p.x % w, res.y - 1 - p.y), 0);
+    if (uCfg.x < 0.5) c.rgb *= c.a;
+    c = clamp(c, 0.0, 1.0);
+    fragColor = TDOutputSwizzle(p.x < w ? vec4(c.rgb, 1.0) : vec4(c.aaa, 1.0));
+}
+'''
+
 FRAME_EXEC = '''# Execute DAT: drives the extension.
 def onStart():
     parent().Start()
@@ -166,7 +179,9 @@ HELP = {
                    "(video, generative). Lower it to save CPU; static inputs cost nothing.",
     "Maxviewfps": "Upper limit, in frames per second (1-120, default 30), at which the finished output is sent to "
                   "the editor while its view mode is TD (the editor shows TouchDesigner's result). Lower it to save "
-                  "CPU; it does not affect the output TOP itself.",
+                  "CPU; it does not affect the output TOP itself. The preview can not be faster than the project's "
+                  "cook rate: a 60 fps project (Timeline Settings) roughly halves the preview latency of a 30 fps one. "
+                  "The component never changes the cook rate. Animated sources keep Auto in fast mode; use Accurate for exact frames.",
     "Viewmode": "Informational, read-only: whether the active editor currently shows its own preview (Local) or "
                 "TouchDesigner's rendered output (TD). Switch it in the editor's View menu, not here.",
     "Devurl": "Developer option: URL of a web development server (for example http://localhost:5173/) that Open in "
@@ -437,6 +452,9 @@ def build(dev=False, name=NAME, in_place=True):
     pack_dat = comp.create(textDAT, "view_pack_glsl")
     pack_dat.text = VIEW_PACK_GLSL
     pack_dat.nodeX, pack_dat.nodeY = -600, -250
+    fast_dat = comp.create(textDAT, "view_fast_glsl")  # the lazily created fast-view chains (ext.py) read this
+    fast_dat.text = VIEW_FAST_GLSL
+    fast_dat.nodeX, fast_dat.nodeY = -600, -350
     pack = comp.create(glslTOP, "view_pack")
     pack.nodeX, pack.nodeY = -100, -250
     pack.par.pixeldat = pack_dat

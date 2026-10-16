@@ -23,6 +23,8 @@ import tempfile
 import threading
 import time
 import traceback
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs
 
 import numpy as np
@@ -50,6 +52,17 @@ EARLY_MAX_FRAMES = 512  # ... per slot
 STATUS_PERIOD_S = 0.25
 LOG_PER_SECOND = 20
 STAT_WINDOW = 300
+VIEW_IDLE_S = 0.2  # v11 auto: this long without a change -> one exact frame
+VIEW_MAX_INFLIGHT = 2  # v11: un-acked view frames per client
+VIEW_ACK_TIMEOUT_S = 2.0  # an un-acked frame older than this is forgotten (a lost ack must not stall the stream for good)
+VIEW_MAX_CHAINS = 4  # v11: GPU downscale chains (one per fast client); more clients get exact frames only
+VIEW_EXACT_PERIOD_S = 0.1  # v11 `exact` quality: at most this often
+FAST_MAX_PIXELS = 2_400_000  # a fast frame is never larger than this (viewport pixel size is clamped)
+FAST_BYTES_BUDGET = 200 * 1024  # JPEG quality goes down when a colour frame exceeds this, back up when far below
+FAST_Q_DEFAULT, FAST_Q_MIN = 75, 40
+FAST_ALPHA_Q = 90
+VCHAIN_BACKOFF_S = 5.0  # a chain that could not be created / read is retried this late (the client gets exact frames meanwhile)
+GL_MAX_DIM = 16384
 NET_RETRY_S = 1.0  # a network that failed to apply is retried this often
 MISSING_TOP_S = 3.0  # a dirty slot without a Script TOP this long is dropped (with a report) so `applied` is not blocked
 REPLAY_BUDGET_S = 0.004  # held messages replayed per pump after a restore
@@ -113,6 +126,10 @@ def _guard(fn):
     return wrapper
 
 
+class _BmpMismatch(RuntimeError):
+    """The BMP read back has another size than the chain was asked for (the resolution is still changing)."""
+
+
 class _Notice:
     """Per client and stream (base / view): the one un-fetched notice, newest frame fetched, stall flag."""
     __slots__ = ("outstanding", "sent_at", "stalled", "fetched")
@@ -131,7 +148,9 @@ class _Notice:
 
 class _Client:
     __slots__ = ("id", "cid", "kind", "ready", "active", "seq", "fresh", "bases", "view", "view_msg", "view_td",
-                 "fid_pending", "fid_applied", "reloading", "active_layer", "lp")
+                 "fid_pending", "fid_applied", "reloading", "active_layer", "lp", "protocol",
+                 "vq", "vp", "vserial", "v_inflight", "v_fid", "v_q", "v_tok", "v_changed", "v_fast_dirty", "v_exact_dirty",
+                 "v_showing", "v_prev", "v_prev_applied", "v_next_at", "v_next_exact", "v_big", "v_vserial_seen", "v_unacked_since", "v_eq", "v_acked", "v_nfast")
 
     def __init__(self, cid):
         self.id = cid  # socket peer string, used for webSocketSend*
@@ -150,6 +169,29 @@ class _Client:
         self.fid_applied = None  # newest one uploaded to its Script TOP (reported via `applied`)
         self.active_layer = None  # v7: the layer id the editor named in `activeLayer`
         self.lp = {}  # v7: layer id -> _Notice of its LAYER_PREVIEW stream
+        self.protocol = 10  # hello.protocol of the client (>= 11: fast / exact view frames over the WebSocket)
+        # --- v11 view stream state (DESIGN_V9)
+        self.vq = "auto"  # auto | fast | exact (what the client asked for)
+        self.v_eq = "auto"  # what it gets: `exact` when it cannot have a GPU chain (no OpenCV, more clients than chains)
+        self.vp = None  # last viewport {x, y, w, h, scale}
+        self.vserial = 0  # bumped by every viewport / quality change
+        self.v_inflight = {}  # frameId -> send time of the un-acked fast / exact frames
+        self.v_fid = 0  # per-client frame counter (fast and exact share it)
+        self.v_q = FAST_Q_DEFAULT  # adaptive JPEG quality
+        self.v_tok = None  # output change token last seen
+        self.v_changed = 0.0  # time of the last change (surface edit, document change, viewport)
+        self.v_fast_dirty = False
+        self.v_exact_dirty = False
+        self.v_showing = None  # "fast" | "exact": what the client was last sent
+        self.v_prev = None  # the last exact frame (wire RGBA8) sent to this client: tile diffs are taken against it
+        self.v_prev_applied = None
+        self.v_next_at = -1e9  # leaky bucket of the fast frame rate
+        self.v_next_exact = 0.0
+        self.v_big = None  # (frameId, message) of an exact frame announced with `viewExact` (GET /view?exact=1)
+        self.v_vserial_seen = 0
+        self.v_nfast = 0  # fast frames sent so far (an exact result computed before the newest one is stale)
+        self.v_acked = False  # has acknowledged a view frame: until then one small frame at a time and no inline exact frames (a client that never reads must not block the WebSocket write)
+        self.v_unacked_since = None  # first time a frame went un-acked past the timeout (cleared by any ack): shown as `stalled`
 
     def notice(self, n):
         return self.bases.setdefault(n, _Notice())
@@ -166,6 +208,7 @@ class _Pipe:
     def __init__(self, name, mtype, stat, input=None, layer=None):
         self.name, self.type, self.stat, self.input, self.layer = name, mtype, stat, input, layer
         self.src = None  # layer previews: the TOP this pipe reads (a replaced node restarts the stream)
+        self.sink = None  # v11 exact stream: called with (wire, snap, cooks-at-issue) instead of publishing a message
         self.frame_id = 0  # never reset: clients compare frame ids across restarts
         self.wire = None  # conversion scratch (reused); published messages are immutable copies
         self.reset()
@@ -180,6 +223,7 @@ class _Pipe:
         self.inflight = None  # (cooks, applied-snapshot) of the GPU read the next numpyArray call will return
         self.next_at = -1e9  # leaky bucket for the frame rate limit
         self.conv = None
+        self.pub_cooks = None  # change token of the read being published
 
 
 def _median(xs):
@@ -207,6 +251,16 @@ class RasterEditorExt:
         self._fonts = None  # cached family list (the menu does not change while TD runs)
         self.bases = {}  # input index -> _Pipe (BASE stream of that TD input)
         self.out = _Pipe("view", 5, "v")
+        self.vx = _Pipe("vexact", 9, "vx")   # v11: full-resolution straight-alpha frames for the exact view
+        self.vx.sink = lambda wire, snap, cooks: self._vx_sink(wire, snap, cooks)
+        self._vx_frame = None      # newest converted exact frame waiting for the clients that take it
+        self._vx_busy = False      # a worker job is encoding
+        self._vx_results = collections.deque()   # (job, results) from the worker, handled by the pump
+        self._vx_pool = None
+        self._sync_view_workers = False   # tests: run the exact encoder inline
+        self._vchains = {}         # client socket id -> GPU downscale chain (fast view)
+        self._vfail = {}           # client socket id -> time until which its chain is not retried (exact only meanwhile)
+        self._cv2 = None           # False = not importable
         self._file_replace = os.replace  # test seam for the project / PNG writers
         self._file_results = collections.deque()  # results from worker threads, handled by the pump
         self._sync_file_ops = False  # tests: run file workers inline
@@ -242,7 +296,8 @@ class RasterEditorExt:
         self._reset_state()
         self.stats = {k: collections.deque(maxlen=STAT_WINDOW) for k in (
             "pump", "paste", "cook", "convert", "publish", "readback", "vconvert", "vpublish", "vreadback",
-            "apply", "dump", "top", "lpreadback", "lpconvert", "lppublish")}
+            "apply", "dump", "top", "lpreadback", "lpconvert", "lppublish",
+            "vfast", "vfastcap", "vfastenc", "vfastrs", "vfastflip", "vxreadback", "vxconvert", "vxpublish", "vxmain", "vxenc")}
 
     # ------------------------------------------------------------------ setup / lifecycle
 
@@ -381,6 +436,7 @@ class RasterEditorExt:
         # (while a restore is pending the buffers are blank placeholders: the pixels are still in the locked TOPs / the undo cache)
         carry_stale = set() if self._restore_pending else set(self._stale_enc)  # ...and which of them still wait for a Premultiplied re-encode
         self._close_own_sockets()
+        self._sweep_view_nodes()
         self._load_modules()
         self._reset_state()
         self._carry = carry
@@ -415,6 +471,7 @@ class RasterEditorExt:
             self._flush_doc_state()
         self._close_own_sockets()
         self._drop_all_tops()
+        self._drop_all_vchains()
         self.clients.clear()
         self.active_id = None
         self._started = False
@@ -456,6 +513,7 @@ class RasterEditorExt:
                 ("sockets", self._close_own_sockets),
                 ("server", lambda: setattr(self._op("webserver").par, "active", 0)),
                 ("handover", self._on_destroy_router),
+                ("view nodes", self._drop_all_vchains),
                 ("clients", self.clients.clear)):
             try:
                 step()
@@ -1336,6 +1394,7 @@ class RasterEditorExt:
             for pipe in list(self.bases.values()):
                 self._invalidate(pipe)
             self._invalidate(self.out)
+            self._view11_reset_all()
             self._invalidate_previews()
         # Maxsendfps/Maxinputfps/Maxviewfps are read on use.
 
@@ -1521,6 +1580,7 @@ class RasterEditorExt:
         c = self.clients.pop(client, None)
         if c is None:
             return
+        self._view11_unsub(c)
         self._drop_client_tops(c)
         if self.active_id == client:
             self.active_id = None
@@ -1567,6 +1627,10 @@ class RasterEditorExt:
             self._on_choose_file(c, msg)
         elif t == "view":
             self._on_view(c, msg)
+        elif t == "viewAck":
+            self._on_view_ack(c, msg)
+        elif t == "viewExactReset":
+            self._on_view_exact_reset(c)
         elif t == "listTops":
             self._on_list_tops(c, msg)
         elif t == "importTop":
@@ -1624,11 +1688,13 @@ class RasterEditorExt:
             self._server().webSocketClose(c.id)
             self.clients.pop(c.id, None)
             return
-        if msg.get("protocol") != P.PROTOCOL_VERSION:
+        proto = msg.get("protocol")
+        if not isinstance(proto, int) or isinstance(proto, bool) or not P.MIN_PROTOCOL <= proto <= P.PROTOCOL_VERSION:
             self._send(c.id, P.error(f"unsupported protocol {msg.get('protocol')!r}, server speaks {P.PROTOCOL_VERSION}"))
             self._server().webSocketClose(c.id)
             self.clients.pop(c.id, None)
             return
+        c.protocol = proto
         c.kind = "external"  # (v10: the in-TD panel is gone)
         c.fresh = bool(msg.get("fresh"))
         self._seq += 1
@@ -1640,7 +1706,7 @@ class RasterEditorExt:
             self.active_id = c.id
         items = self._input_items()
         self._send(c.id, P.hello(self.doc_w, self.doc_h, self.has_input, self._p("Maxsendfps"), c.active, c.cid,
-                                 self.doc_layers is not None, self.doc_rev, self._mode(), items))
+                                 self.doc_layers is not None, self.doc_rev, self._mode(), items, c.protocol))
         self._send(c.id, P.inputs_msg(items))  # (also in hello.inputs: for pages that only read one of them)
         self._send(c.id, P.files_msg(*self._files_values()))
         self._send(c.id, P.fonts(self._font_families()))
@@ -2897,6 +2963,9 @@ class RasterEditorExt:
                 self._lp_cursor = lid
 
     def _on_view(self, c, msg):
+        if c.protocol >= 11:
+            self._on_view11(c, msg)
+            return
         try:
             view = self.protocol.parse_view(msg)
         except self.protocol.ProtocolError as e:
@@ -2911,6 +2980,513 @@ class RasterEditorExt:
         c.view_td = sub
         self._sync_viewmode()
         self._status_at = 0.0
+
+    # ------------------------------------------------------------------ v11 view stream (DESIGN_V9, PROTOCOL.md section 13)
+    #
+    # Per client: `fast` frames (GPU crop + downscale of the output to the client's viewport, JPEG colour + JPEG alpha, pushed over
+    # the WebSocket in the tick the output was cooked, <= 2 un-acked) and `exact` frames (full-resolution straight-alpha RGBA8,
+    # zlib in a worker thread, only the changed 64 px tiles after the first). `auto` = fast while things change, one exact frame
+    # after VIEW_IDLE_S without a change. The step runs AFTER the surface upload of the same pump so the picture contains it.
+
+    def _view11_subscribers(self):
+        return [c for c in self.clients.values() if c.ready and c.view_td and c.protocol >= 11]
+
+    def _get_cv2(self):
+        if self._cv2 is None:
+            try:
+                import cv2  # noqa: PLC0415 - TD's Python ships OpenCV; unit tests stub the encoder
+                self._cv2 = cv2
+            except Exception:  # noqa: BLE001
+                self._cv2 = False
+        return self._cv2
+
+    def _on_view11(self, c, msg):
+        P = self.protocol
+        try:
+            v = P.parse_view11(msg)
+        except P.ProtocolError as e:
+            self._send(c.id, P.error(f"bad view: {e}"))
+            return
+        c.view_msg = {"mode": v["mode"]}
+        now = self._now()
+        if v["mode"] == "td":
+            fresh = not c.view_td
+            changed = fresh or v["quality"] != c.vq or (v["viewport"] is not None and v["viewport"] != c.vp)
+            c.vq = v["quality"]
+            if v["viewport"] is not None:
+                c.vp = v["viewport"]
+            c.view_td = True
+            if fresh:
+                c.v_tok = None
+                c.v_prev = None
+                c.v_prev_applied = None
+                c.v_inflight.clear()
+                c.v_showing = None
+                c.v_next_at = -1e9
+            if changed:
+                c.vserial += 1
+                c.v_changed = now
+                c.v_fast_dirty = c.v_exact_dirty = True
+        else:
+            self._view11_unsub(c)
+            c.view_td = False
+        self._sync_viewmode()
+        self._status_at = 0.0
+
+    def _view11_unsub(self, c):
+        """The client left TD mode / disconnected: its GPU nodes and exact buffer go."""
+        self._drop_vchain(c.id)
+        c.v_prev = None
+        c.v_prev_applied = None
+        c.v_big = None
+        c.v_inflight.clear()
+        c.v_fast_dirty = c.v_exact_dirty = False
+        c.v_showing = None
+
+    def _on_view_ack(self, c, msg):
+        try:
+            fid = self.protocol.parse_view_ack(msg)
+        except self.protocol.ProtocolError as e:
+            self._send(c.id, self.protocol.error(f"bad viewAck: {e}"))
+            return
+        c.v_inflight.pop(fid, None)
+        c.v_acked = True
+        c.v_unacked_since = None
+        if c.view.stalled:
+            c.view.stalled = False
+            self._status_at = 0.0
+        if c.v_big is not None and c.v_big[0] == fid:
+            c.v_big = None
+
+    def _on_view_exact_reset(self, c):
+        """The client has no (matching) exact buffer: the next exact frame is a full one, now."""
+        c.v_prev = None
+        c.v_prev_applied = None
+        c.v_exact_dirty = True
+        c.v_showing = None
+        c.v_changed = min(c.v_changed, self._now() - VIEW_IDLE_S)
+
+    def _view11_reset_all(self):
+        """The output's encoding / size changed (Premultiplied toggle, canvas resize): everything in flight is stale."""
+        self.vx.reset()
+        self.vx.pending = True
+        self._vx_frame = None
+        now = self._now()
+        for c in self._view11_subscribers():
+            c.v_fast_dirty = c.v_exact_dirty = True
+            c.v_changed = now
+
+    def _view_src(self):
+        top = self._opt("doc_out")
+        if top is None and self.network is not None:
+            top = self.network.output()
+        return top
+
+    def _cook_rate(self):  # test seam
+        try:
+            return float(project.cookRate)  # noqa: F821 - TD global
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def _fast_clients(self, subs, now=0.0):
+        """Ids of the clients that get fast frames: asked for them, OpenCV is there, and a GPU chain is free (clients that
+        already own one keep it; the others take the free ones in connection order)."""
+        if not self._get_cv2():
+            return set()
+        free = VIEW_MAX_CHAINS
+        out = set()
+        for c in sorted(subs, key=lambda c: (c.id not in self._vchains, c.seq)):
+            if c.vq != "exact" and free > 0 and self._vfail.get(c.id, 0.0) <= now:
+                out.add(c.id)
+                free -= 1
+        return out
+
+    def _poll_view11(self, now):
+        subs = self._view11_subscribers()
+        if not subs:
+            for cid in list(self._vchains):
+                self._drop_vchain(cid)
+            self._vfail.clear()
+            if self.vx.msg is not None or self.vx.conv is not None or self.vx.inflight is not None or self._vx_frame is not None:
+                self.vx.reset()
+                self._vx_frame = None
+            return
+        want = self._fast_clients(subs, now)
+        for cid in [k for k in self._vchains if k not in want]:
+            self._drop_vchain(cid)
+        for cid in [k for k in self._vfail if k not in self.clients]:
+            del self._vfail[cid]
+        for c in subs:
+            c.v_eq = c.vq if c.id in want or c.vq == "exact" else "exact"
+            if c.id not in want:
+                c.v_fast_dirty = False
+        if self.network is None or not self._net_applied:
+            return
+        src = self._view_src()
+        src.cook()
+        tok = (src.totalCooks, self.doc_w, self.doc_h, bool(self._p("Premultiplied")))
+        for c in subs:
+            old = [f for f, t in c.v_inflight.items() if now - t > VIEW_ACK_TIMEOUT_S]
+            for fid in old:
+                del c.v_inflight[fid]   # (a lost ack must not stall the stream)
+            if old:
+                c.v_acked = False    # back to slow start: one small frame at a time, exact frames announced instead of pushed
+                c.v_prev = None      # ... and whatever it missed makes the next exact frame a full one
+                c.v_prev_applied = None
+                c.v_exact_dirty = True
+                if c.v_unacked_since is None:
+                    c.v_unacked_since = now
+            if c.v_unacked_since is not None and not c.view.stalled and now - c.v_unacked_since > STALL_S:
+                c.view.stalled = True
+                self._status_at = 0.0
+                print(f"[raster_editor] client {c.id} has not acknowledged view frames for {STALL_S:.0f}s: stalled (a frame every "
+                      f"{VIEW_ACK_TIMEOUT_S:.0f}s until it does)")
+            if tok != c.v_tok or c.vserial != c.v_vserial_seen:
+                c.v_tok = tok
+                c.v_vserial_seen = c.vserial
+                c.v_changed = now
+                c.v_fast_dirty = c.id in want
+                c.v_exact_dirty = True
+        period = 1.0 / max(1, self._p("Maxviewfps"))
+        for c in subs:
+            if c.id in want and c.v_fast_dirty and len(c.v_inflight) < (VIEW_MAX_INFLIGHT if c.v_acked else 1) and now >= c.v_next_at - 0.002:
+                try:
+                    if self._send_fast(c, now, src, period):
+                        c.v_next_at = max(c.v_next_at + period, now - period / 2)
+                except _BmpMismatch:
+                    pass   # the chain is still changing size: next tick
+                except Exception as e:  # noqa: BLE001 - one client's failure must not starve the others
+                    self._report("fast view", e)
+                    self._drop_vchain(c.id)
+                    self._vfail[c.id] = now + VCHAIN_BACKOFF_S
+                    c.v_fast_dirty = False
+                    c.v_exact_dirty = True
+        t = self._now()
+        busy = self.vx.conv is not None or self.vx.inflight is not None or self._vx_frame is not None or self._vx_busy or self._vx_results
+        self._poll_vexact(now, subs, tok)
+        self._collect_exact(now)
+        if busy or self.vx.conv is not None or self._vx_frame is not None:
+            self.stats["vxmain"].append(self._now() - t)
+
+    # --- fast frames
+
+    def _fast_geometry(self, c):
+        """(integer document region (x, y, w, h), pixel size) of the client's viewport: the visible part of the document at
+        device pixels, never more pixels than the region has (no upscaling) and never more than FAST_MAX_PIXELS."""
+        W, H = self.doc_w, self.doc_h
+        vp = c.vp or {"x": 0.0, "y": 0.0, "w": float(W), "h": float(H), "scale": 1.0}
+        cl = lambda v, lo, hi: min(hi, max(lo, v)) if v == v else lo   # noqa: E731 - (also guards a NaN)
+        vx, vy = cl(vp["x"], -1e7, 1e7), cl(vp["y"], -1e7, 1e7)
+        vw, vh = cl(vp["w"], 1e-3, 1e6), cl(vp["h"], 1e-3, 1e6)
+        x0, y0 = max(0, int(vx // 1)), max(0, int(vy // 1))
+        x1, y1 = min(W, -int(-(vx + vw) // 1)), min(H, -int(-(vy + vh) // 1))
+        if x1 <= x0 or y1 <= y0:
+            x0, y0, x1, y1 = 0, 0, W, H
+        rw, rh = x1 - x0, y1 - y0
+        sc = cl(vp["scale"], 1e-3, 64.0)
+        pw, ph = max(1, min(rw, int(rw * sc + 0.5))), max(1, min(rh, int(rh * sc + 0.5)))
+        if pw * ph > FAST_MAX_PIXELS:
+            f = (FAST_MAX_PIXELS / (pw * ph)) ** 0.5
+            pw, ph = max(1, int(pw * f)), max(1, int(ph * f))
+        pw, ph = min(pw, GL_MAX_DIM // 2), min(ph, GL_MAX_DIM)   # (the packed texture is 2 * pw wide)
+        return (x0, y0, rw, rh), pw, ph
+
+    def _send_fast(self, c, now, src, period):
+        """Capture + encode + send one fast frame to ``c``. True when a frame went out."""
+        P = self.protocol
+        t0 = self._now()
+        chain = self._vchains.get(c.id)
+        if chain is not None and chain.get("src", src) is not src:
+            self._drop_vchain(c.id)   # the output the chain reads was replaced
+            chain = None
+        if chain is None:
+            used = {ch["n"] for ch in self._vchains.values()}
+            chain = self._make_vchain(next(n for n in range(VIEW_MAX_CHAINS + 1) if n not in used), src)
+            if chain is None:
+                raise RuntimeError("the fast view nodes could not be created")
+            self._vchains[c.id] = chain
+        region, pw, ph = self._fast_geometry(c)
+        self._set_vchain(chain, region, pw, ph)
+        bgr, alpha = self._capture_fast(chain, pw, ph, bool(self._p("Premultiplied")))
+        t1 = self._now()
+        rgb = self._encode_jpeg(bgr, c.v_q if c.v_acked else FAST_Q_MIN)
+        al = b"" if alpha is None else self._encode_jpeg(alpha, FAST_ALPHA_Q)
+        if len(rgb) > FAST_BYTES_BUDGET:
+            c.v_q = max(FAST_Q_MIN, c.v_q - 5)
+        elif len(rgb) < FAST_BYTES_BUDGET // 2 and c.v_q < FAST_Q_DEFAULT:
+            c.v_q = min(FAST_Q_DEFAULT, c.v_q + 5)
+        t2 = self._now()
+        c.v_fid = (c.v_fid + 1) & 0xFFFFFFFF
+        applied = P.NO_APPLIED if c.fid_applied is None else c.fid_applied
+        msg = P.encode_view_fast(c.v_fid, applied, self.doc_w, self.doc_h, tuple(float(v) for v in region), pw, ph, rgb, al)
+        self._server().webSocketSendBinary(c.id, msg)
+        c.v_inflight[c.v_fid] = now
+        c.v_fast_dirty = False
+        c.v_showing = "fast"
+        c.v_nfast += 1
+        t3 = self._now()
+        self.stats["vfastcap"].append(t1 - t0)
+        self.stats["vfastenc"].append(t2 - t1)
+        self.stats["vfast"].append(t3 - t0)
+        return True
+
+    def _make_vchain(self, n, src):  # pragma: no cover - needs TD (test seam)
+        """doc_out -> Crop TOP (document region) -> Resolution TOP (pixel size, 8 bit) -> GLSL TOP (colour | alpha plane, flipped).
+        Hidden runtime operators (`_` prefix, tag reRuntime); None when they cannot be created."""
+        made = []
+        try:
+            def mk(kind, name):
+                o = self.o.create(kind, f"_view_{name}{n}")
+                o.tags.add("reRuntime")
+                made.append(o)
+                return o
+            crop = mk("cropTOP", "crop")
+            crop.inputConnectors[0].connect(src)
+            for side in ("left", "right", "bottom", "top"):
+                setattr(crop.par, f"crop{side}unit", "pixels")
+            rs = mk("resolutionTOP", "rs")
+            rs.inputConnectors[0].connect(crop)
+            rs.par.outputresolution = "custom"
+            rs.par.fillmode = "fill"
+            rs.par.format = "rgba8fixed"
+            try:
+                rs.par.inputfiltertype = "mipmap"
+            except Exception:  # noqa: BLE001 - older menu
+                pass
+            px = mk("glslTOP", "px")   # [colour | alpha as grey] side by side, rows top-first: ONE 8 bit readback per frame
+            dat = self._opt("view_fast_glsl")
+            if dat is None:
+                raise RuntimeError("view_fast_glsl is missing (rebuild the component)")
+            px.par.pixeldat = dat
+            px.par.format = "rgba8fixed"
+            px.par.outputresolution = "custom"
+            px.par.vec0name = "uCfg"
+            px.inputConnectors[0].connect(rs)
+            return {"n": n, "ops": made, "crop": crop, "rs": rs, "px": px, "geom": None, "pre": None, "src": src}
+        except Exception as e:  # noqa: BLE001
+            self._report("view chain", e)
+            for o in made:
+                try:
+                    o.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+            return None
+
+    def _set_vchain(self, chain, region, pw, ph):  # pragma: no cover - needs TD (test seam)
+        pre = 1.0 if self._p("Premultiplied") else 0.0
+        if chain["pre"] != pre:
+            chain["pre"] = chain["px"].par.vec0valuex = pre   # (also when the geometry did not change: a live Premultiplied toggle)
+        geom = (region, pw, ph, self.doc_w, self.doc_h)
+        if chain["geom"] == geom:
+            return
+        chain["geom"] = geom
+        x, y, w, h = region
+        crop, rs, px = chain["crop"], chain["rs"], chain["px"]
+        crop.par.cropleft, crop.par.cropright = x, x + w
+        crop.par.cropbottom, crop.par.croptop = self.doc_h - (y + h), self.doc_h - y   # (TD: origin bottom-left)
+        rs.par.resolutionw, rs.par.resolutionh = pw, ph
+        px.par.resolutionw, px.par.resolutionh = 2 * pw, ph
+
+    def _sweep_view_nodes(self):
+        """Orphaned fast-view nodes (a crash / an earlier instance): this instance has none yet."""
+        for o in list(getattr(self.o, "children", ()) or ()):
+            if re.match(r"^_view_(crop|rs|px)\d+$", str(getattr(o, "name", ""))):
+                try:
+                    o.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _drop_all_vchains(self):
+        for cid in list(self._vchains):
+            self._drop_vchain(cid)
+        pool, self._vx_pool = self._vx_pool, None
+        if pool is not None:
+            pool.shutdown(wait=False)
+
+    def _drop_vchain(self, cid):
+        chain = self._vchains.pop(cid, None)
+        if chain is not None:
+            self._destroy_vchain(chain)
+
+    def _destroy_vchain(self, chain):  # test seam
+        for o in reversed(chain.get("ops", ())):
+            try:
+                o.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+
+    @staticmethod
+    def _bmp_bgra(top, w, h):  # pragma: no cover - needs TD
+        """saveByteArray('.bmp') of an 8-bit TOP -> (h, w, 4) BGRA view, bottom row first (the alpha byte is not reliable)."""
+        raw = np.frombuffer(top.saveByteArray(".bmp"), np.uint8)
+        off = int.from_bytes(raw[10:14].tobytes(), "little")
+        bw, bh = int.from_bytes(raw[18:22].tobytes(), "little", signed=True), int.from_bytes(raw[22:26].tobytes(), "little", signed=True)
+        bpp = int.from_bytes(raw[28:30].tobytes(), "little")
+        if bh < 0 and (bw, -bh, bpp) == (w, h, 32):
+            raise RuntimeError("top-down BMP from saveByteArray: the fast view assumes bottom-up rows")   # (backs off; exact frames meanwhile)
+        if (bw, bh, bpp) != (w, h, 32) or len(raw) < off + w * h * 4:
+            raise _BmpMismatch(f"unexpected bmp {bw}x{bh}x{bpp} for {w}x{h}")   # (the resolution is still changing: next tick)
+        return raw[off: off + w * h * 4].reshape(h, w, 4)
+
+    def _capture_fast(self, chain, pw, ph, premult):  # pragma: no cover - needs TD (test seam)
+        """(BGR uint8 (ph, pw, 3) premultiplied colour, alpha uint8 (ph, pw) | None when fully opaque), top row first. The GLSL TOP
+        premultiplies when the output is straight (Premultiplied off)."""
+        cv2 = self._get_cv2()
+        t = self._now()
+        bmp = self._bmp_bgra(chain["px"], 2 * pw, ph)
+        t1 = self._now()
+        bgr = cv2.cvtColor(bmp[:, :pw], cv2.COLOR_BGRA2BGR)
+        alpha = cv2.extractChannel(bmp[:, pw:], 0)
+        self.stats["vfastrs"].append(t1 - t)
+        self.stats["vfastflip"].append(self._now() - t1)
+        if alpha.min() == 255:
+            alpha = None
+        return bgr, alpha
+
+    def _encode_jpeg(self, arr, q):  # test seam
+        cv2 = self._get_cv2()
+        ok, buf = cv2.imencode(".jpg", arr, [cv2.IMWRITE_JPEG_QUALITY, int(q)])
+        if not ok:
+            raise RuntimeError("jpeg encode failed")
+        return buf.tobytes()
+
+    # --- exact frames
+
+    def _exact_wanted(self, c, now):
+        """Does ``c`` want a fresh exact picture to be READ now (the frame is dispatched once its own conditions hold)?"""
+        if not c.v_exact_dirty or c.v_eq == "fast":
+            return False
+        if c.v_eq == "exact":
+            return now >= c.v_next_exact
+        return not c.v_fast_dirty and now - c.v_changed >= VIEW_IDLE_S * 0.25
+
+    def _exact_takes(self, c, now, frame_tok, cur_tok):
+        if not c.v_exact_dirty or c.v_eq == "fast" or c.v_inflight:
+            return False
+        if c.v_eq == "exact":
+            return now >= c.v_next_exact
+        return not c.v_fast_dirty and now - c.v_changed >= VIEW_IDLE_S and frame_tok == cur_tok
+
+    def _poll_vexact(self, now, subs, tok):
+        wanted = any(self._exact_wanted(c, now) for c in subs)
+        pack = self._opt("view_pack")  # GPU: unpremultiply + flip + scale to 0..255 (CPU then only casts)
+        top = pack if pack is not None else self.network.output()
+        if wanted:
+            top.cook()
+            if self._vx_frame is None and not self._vx_busy:
+                self.vx.pending = True   # (a reset / new subscriber / viewport change: read even though the picture did not change)
+        self._poll_pipe(self.vx, top, now, VIEW_EXACT_PERIOD_S, wanted, (self.doc_w, self.doc_h), packed=pack is not None, key=tok)
+        self._dispatch_exact(now, subs, tok)
+
+    def _vx_sink(self, wire, snap, cooks):
+        self._vx_frame = {"arr": wire, "snap": snap, "tok": cooks}
+
+    def _dispatch_exact(self, now, subs, cur_tok):
+        fr = self._vx_frame
+        if fr is None or self._vx_busy:
+            return
+        targets = [c for c in subs if self._exact_takes(c, now, fr["tok"], cur_tok)]
+        if not targets:
+            if not any(c.v_eq == "exact" and c.v_exact_dirty for c in subs) and fr["tok"] != cur_tok:
+                self._vx_frame = None   # the picture changed again: a fresh read follows
+            return
+        self._vx_frame = None
+        for c in targets:
+            c.v_exact_dirty = fr["tok"] != cur_tok   # (a frame read before the latest change leaves the client dirty: `exact` quality takes it, the next read follows)
+            c.v_next_exact = now + VIEW_EXACT_PERIOD_S
+        job = {"cur": fr["arr"], "snap": fr["snap"], "targets": [(c.id, c.v_prev) for c in targets],
+               "mark": {c.id: (c.v_nfast, c.v_tok, c.vserial) for c in targets}}
+        self._vx_busy = True
+        if self._sync_view_workers:
+            self._exact_work(job)
+            return
+        if self._vx_pool is None:
+            self._vx_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="re_exact")
+        self._vx_pool.submit(self._exact_work, job)
+
+    def _exact_work(self, job):
+        """Worker thread: tile diff per distinct previous frame + zlib (one C call each). Only touches ``job``."""
+        t = self._now()
+        F = self.frames
+        cur = job["cur"]
+        plans, bodies, out = {}, {}, {}
+        try:
+            for cid, prev in job["targets"]:
+                key = id(prev)
+                if key not in plans:
+                    plans[key] = F.plan_exact(cur, prev)
+                kind = plans[key][0]
+                if kind == "none":
+                    out[cid] = None
+                    continue
+                bk = (key if kind == "tiles" else "full")
+                if bk not in bodies:
+                    bodies[bk] = F.compress_exact(cur, plans[key])
+                out[cid] = bodies[bk]
+            job["results"] = out
+        except Exception as e:  # noqa: BLE001
+            job["error"] = e
+        self.stats["vxenc"].append(self._now() - t)
+        self._vx_results.append(job)
+
+    def _collect_exact(self, now):
+        P = self.protocol
+        while self._vx_results:
+            job = self._vx_results.popleft()
+            self._vx_busy = False
+            if "error" in job:
+                self._report("exact view", job["error"])
+                continue
+            cur = job["cur"]
+            current_size = (self.doc_h, self.doc_w, 4) == tuple(cur.shape)
+            for cid, prev in job["targets"]:
+                c = self.clients.get(cid)
+                if c is None or not c.view_td or c.protocol < 11:
+                    continue
+                nf, tok, ser = job["mark"][cid]
+                if not current_size or c.v_nfast != nf or (c.v_eq == "auto" and (c.v_tok != tok or c.vserial != ser)):
+                    c.v_exact_dirty = True   # a newer fast frame went out / the output or the canvas changed while the worker ran: stale
+                    continue
+                res = job["results"][cid]
+                if (c.v_prev is not prev and not (res is not None and res[0] == 0)) or len(c.v_inflight) >= (VIEW_MAX_INFLIGHT if c.v_acked else 1):
+                    c.v_exact_dirty = True   # a reset / ack race: redo against its current state
+                    continue
+                applied = job["snap"].get(c.cid)
+                if res is None:
+                    if c.v_showing == "exact" and c.v_prev_applied == applied:
+                        continue   # nothing changed for this client and it is already showing the exact picture
+                    kind, n, body = 1, 0, zlib.compress(b"", 1)   # "your exact buffer is current": an empty tile frame
+                else:
+                    kind, n, body = res
+                c.v_fid = (c.v_fid + 1) & 0xFFFFFFFF
+                msg = P.encode_view_exact(c.v_fid, P.NO_APPLIED if applied is None else applied, cur.shape[1], cur.shape[0], kind, n, body)
+                try:
+                    if len(msg) <= P.MAX_EXACT_INLINE and c.v_acked:
+                        self._server().webSocketSendBinary(c.id, msg)
+                        c.v_big = None
+                    else:
+                        c.v_big = (c.v_fid, msg)
+                        self._send(c.id, P.view_exact_notice(c.v_fid, len(msg)))
+                except Exception as e:  # noqa: BLE001 - a closing socket must not cost the other clients their frame
+                    self._report("exact view send", e)
+                    c.v_exact_dirty = True
+                    continue
+                c.v_inflight[c.v_fid] = now
+                c.v_prev = cur
+                c.v_prev_applied = applied
+                c.v_showing = "exact"
+
+    def _serve_exact(self, request, response, c, pars):
+        """GET /view?exact=1&frameId=N: the exact message announced by `viewExact` (same bytes as the binary frame)."""
+        big = c.v_big if c is not None else None
+        try:
+            want = int(pars.get("frameId", -1))
+        except (TypeError, ValueError):
+            want = -1
+        if big is None or big[0] != want:
+            return self._cors(request, self._reply(response, 404, "Not Found", "no such exact frame"))
+        response["Cache-Control"] = "no-store"
+        return self._cors(request, self._reply(response, 200, "OK", big[1], "application/octet-stream"))
 
     def _sync_viewmode(self):
         act = self.clients.get(self.active_id)
@@ -2954,7 +3530,7 @@ class RasterEditorExt:
                 ("input", lambda: self._poll_base(now)), ("output", lambda: self._poll_view(now)),
                 ("layers", lambda: self._poll_layer_previews(now)),
                 ("notify", lambda: self._notify_clients(now)), ("tops", lambda: self._tick_tops(now)),
-                ("surfaces", self._cook_surfaces), ("files", lambda: self._tick_files(now)), ("choose", self._tick_choose),
+                ("surfaces", self._cook_surfaces), ("view11", lambda: self._poll_view11(now)), ("files", lambda: self._tick_files(now)), ("choose", self._tick_choose),
                 ("replay", self._replay_step), ("reencode", self._reencode_one), ("frozen", lambda: self._check_frozen(now)), ("network", lambda: self._tick_network(now)), ("docstate", self._flush_if_dirty),
                 ("switch", self._update_switch)):
             try:
@@ -3145,6 +3721,7 @@ class RasterEditorExt:
         self._sized = True
         if size_changed or first:
             self._invalidate(self.out)
+            self._view11_reset_all()
             self._invalidate_previews()
         for n in set(old_sizes) | set(sizes):  # a changed / (dis)connected input starts a fresh BASE stream
             if first or old_sizes.get(n) != sizes.get(n):
@@ -3722,7 +4299,7 @@ class RasterEditorExt:
         out = pipe.wire
         if out is None or out.shape != arr.shape:
             out = pipe.wire = np.empty(arr.shape, np.uint8)  # safe to reuse: publishing copies it
-        pipe.conv = {"arr": arr, "out": out, "row": 0, "rows": 128, "snap": prev[1], "packed": packed}
+        pipe.conv = {"arr": arr, "out": out, "row": 0, "rows": 128, "snap": prev[1], "packed": packed, "cooks": prev[0]}
         if convert:
             self._convert_some(pipe)
 
@@ -3753,7 +4330,8 @@ class RasterEditorExt:
                 self._conv_cursor = n
 
     def _view_subscribers(self):
-        return [c for c in self.clients.values() if c.ready and c.view_td]
+        """Protocol < 11 clients in TD mode: the v3 `view` notice + GET /view path."""
+        return [c for c in self.clients.values() if c.ready and c.view_td and c.protocol < 11]
 
     def _poll_view(self, now):
         subs = self._view_subscribers()
@@ -3789,6 +4367,7 @@ class RasterEditorExt:
         self.stats[pipe.stat + "convert"].append(self._now() - start)
         if c["row"] >= h:
             pipe.conv = None
+            pipe.pub_cooks = c["cooks"]
             self._publish(pipe, c["out"], c["snap"])
 
     def _invalidate(self, pipe):
@@ -3808,6 +4387,11 @@ class RasterEditorExt:
         """Store the converted image as the newest frame of the stream: one immutable message that
         GET /base | /view serve from TD's HTTP thread (never touched again, so no aliasing). One copy."""
         t = self._now()
+        if pipe.sink is not None:   # v11 exact stream: the converted frame (ownership passes to the sink)
+            pipe.wire = None
+            pipe.sink(wire, snap, pipe.pub_cooks)
+            self.stats[pipe.stat + "publish"].append(self._now() - t)
+            return
         P = self.protocol
         pipe.frame_id = (pipe.frame_id + 1) & 0xFFFFFFFF
         h, w = wire.shape[:2]  # BASE: the input's size (v5), VIEW: the document's
@@ -3899,6 +4483,10 @@ class RasterEditorExt:
             n = None if c is None else (c.notice(inp) if kind == "base" and 1 <= inp <= MAX_INPUTS else (c.view if kind == "view" else None))
         if subscribed_only and (c is None or not c.view_td):
             return self._cors(request, self._reply(response, 404, "Not Found", "not subscribed (send view mode td)"))
+        if kind == "view" and c is not None and c.protocol >= 11:
+            if pars.get("exact") == "1":
+                return self._serve_exact(request, response, c, pars)
+            return self._cors(request, self._reply(response, 404, "Not Found", "protocol 11 clients get view frames over the WebSocket (exact=1 for large exact frames)"))
         if pipe is None or pipe.msg is None or (kind == "base" and inp not in self.in_sizes):
             if n is not None:  # whatever it was told about is gone; it gets a new notice with the next frame
                 n.outstanding = None
@@ -3972,9 +4560,12 @@ class RasterEditorExt:
                     text += f" · doc r{self.doc_rev} {len(self._slot_set)} surfaces"
                 if len(ready) > 1:
                     text += f" · {len(ready) - 1} standby"
-                nview = len(self._view_subscribers())
+                nview = len(self._view_subscribers()) + len(self._view11_subscribers())
                 if nview:
                     text += f" · {nview} td-view"
+                    rate = self._cook_rate()
+                    if 0 < rate < 45:
+                        text += f" (preview latency follows the {rate:g} fps cook rate)"
                 stalled = sum(1 for c in ready if c.view.stalled or any(nt.stalled for nt in c.bases.values()))
                 if stalled:
                     text += f" · {stalled} stalled"

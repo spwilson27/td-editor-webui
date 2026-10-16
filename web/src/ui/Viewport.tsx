@@ -11,6 +11,7 @@ import { clampCrop } from '../state/toolsSlice';
 import { boxAabb, cursorFor, hitOriented, isAxisAligned, rotateDrag, scaleDrag, skewDrag, type OHit } from '../state/affine';
 import { orientedTarget, type OTarget } from '../state/xtarget';
 import { TextEditor } from './TextEditor';
+import { peekTdViewGl } from './tdViewGl';
 import { Backdrop, drawDocument, drawOverlay, type CursorShape, type Pt } from './viewportDraw';
 
 /** Tools whose points snap to guides / canvas / layers (v4). */
@@ -29,6 +30,7 @@ export function Viewport() {
     const backdrop = new Backdrop();
     let vw = 0, vh = 0, dpr = 1;
     let mainQueued = false, overQueued = false, dash = 0;
+    let shownGl: HTMLCanvasElement | null = null; // the TD view's WebGL canvas while it is attached to this viewport
     let hover: { x: number; y: number } | null = null;
     let activeId: number | null = null;
     let mode: 'pan' | 'draw' | 'shape' | 'xform' | 'guide' | 'crop' | null = null;
@@ -58,9 +60,17 @@ export function Viewport() {
       const e = store.engine;
       setScale(mainCtx);
       const td = store.viewMode.peek() === 'td';
-      // Local: the engine's preview. TD: TD's image.
-      const source = !td ? e.compositeSource() : store.tdViewSource();
-      drawDocument(mainCtx, backdrop, vw, vh, store.view.peek(), e.width, e.height, source, false);
+      // Local: the engine's preview. TD (v11): the WebGL composite of TD's fast / exact frame, a canvas layered above the backdrop (no copy).
+      const gl = td ? peekTdViewGl() : null;
+      const showGl = !!(gl && gl.available && gl.hasContent);
+      const glEl = gl?.canvas ?? shownGl;
+      if (glEl) {
+        if (showGl && glEl.parentElement !== el) { glEl.style.cssText = layer + ';pointer-events:none'; el.insertBefore(glEl, overEl); }
+        glEl.style.display = showGl ? 'block' : 'none';
+        shownGl = glEl;
+      }
+      if (showGl) gl.draw({ vw, vh, cw: mainEl.width, ch: mainEl.height, view: store.view.peek(), docW: e.width, docH: e.height });
+      drawDocument(mainCtx, backdrop, vw, vh, store.view.peek(), e.width, e.height, !td ? e.compositeSource() : null, false);
     };
     const paintOver = () => {
       overQueued = false;
@@ -519,7 +529,7 @@ export function Viewport() {
     resize();
 
     return () => {
-      ro.disconnect(); off(); stopWant(); stopSync(); stopFx(); stopOverFx(); stopCursor(); if (ants) clearInterval(ants);
+      shownGl?.remove(); ro.disconnect(); off(); stopWant(); stopSync(); stopFx(); stopOverFx(); stopCursor(); if (ants) clearInterval(ants);
       offAnts(); stopAntsFx();
       el.removeEventListener('contextmenu', onContext);
       dprQuery?.removeEventListener('change', onDprChange);

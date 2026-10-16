@@ -2,6 +2,7 @@ import type { Store } from './store';
 import type { BrushDynamics, CloneOptions, DodgeBurnRange, Effect, TipShape, Rect, Anchor, CanvasMode, LayerTransform, PaintTarget, SnapOptions, SelectionOptions, ShapeSpec, ShapeType, TextSpec, ToolId, ToolPointer } from '../engine/types';
 import { completeShapeSpec, completeTextSpec } from './specs';
 import { defaultEffect, effectLabel } from './effectDefaults';
+import { peekTdViewGl } from '../ui/tdViewGl';
 
 /** `window.__editorTest`, installed only with ?test=1; used by automated TouchDesigner validation. */
 export function installTestHook(store: Store, win: Window = window): void {
@@ -31,6 +32,25 @@ export function installTestHook(store: Store, win: Window = window): void {
     setViewMode: (m: 'local' | 'td') => { store.setViewMode(m); return store.viewMode.peek(); },
     latency: () => ({ strokeToTd: store.latency.peek(), strokeToView: store.viewLatency.peek(), viewAgeMs: store.viewAge.peek(), mode: store.viewMode.peek() }),
     docSpec: () => store.engine.docSpec(),
+    // v11: the TD view. `tdViewPixel(x, y)` re-draws the compositor at the current view and reads the screen pixel of document pixel (x, y).
+    tdView: () => ({ shown: store.viewShown.peek(), quality: store.viewQuality.peek(), mode: store.viewMode.peek(), hasGl: peekTdViewGl() !== null }),
+    /** Simulates a GPU context loss (`true`) and its restoration (`false`). */
+    tdContext: (lose: boolean) => {
+      const w = window as unknown as { __loseExt?: WEBGL_lose_context | null };
+      if (lose) w.__loseExt = peekTdViewGl()?.gl?.getExtension('WEBGL_lose_context'); // (not available again once lost)
+      if (lose) w.__loseExt?.loseContext(); else w.__loseExt?.restoreContext();
+      return !!w.__loseExt;
+    },
+    setViewQuality: (q: 'auto' | 'fast' | 'exact') => store.setViewQuality(q),
+    tdViewPixel: (x: number, y: number): number[] | null => {
+      const g = peekTdViewGl(), r = store.viewRect.peek(), v = store.view.peek(), d = store.docSize.peek();
+      if (!g || !g.available || !g.hasContent) return null;
+      g.draw({ vw: r.w, vh: r.h, cw: g.canvas.width, ch: g.canvas.height, view: v, docW: d.w, docH: d.h });
+      const all = g.readCanvas(), k = g.canvas.width / r.w;
+      const sx = Math.min(g.canvas.width - 1, Math.max(0, Math.round((v.x + (x + 0.5) * v.zoom) * k - 0.5)));
+      const sy = Math.min(g.canvas.height - 1, Math.max(0, Math.round((v.y + (y + 0.5) * v.zoom) * k - 0.5)));
+      return Array.from(all.subarray((sy * g.canvas.width + sx) * 4, (sy * g.canvas.width + sx) * 4 + 4));
+    },
     // v10: editor tabs
     editor: () => ({ id: store.editorId.peek(), master: store.editorMaster.peek(), list: store.editors.peek(), switching: store.editorSwitching.peek() }),
     switchEditor: (id: string) => store.switchEditor?.(id),

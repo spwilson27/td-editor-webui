@@ -22,7 +22,7 @@ const pixelLayer = async (page: Page) => (await layers(page)).find((l) => l.kind
 
 test('protocol 7 hello, activeLayer follows the active layer', async ({ page }) => {
   await open(page);
-  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 10 });
+  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 11 });
   const id = await hook<string>(page, 'addLayer');
   await td.waitFor(() => td.activeLayers.includes(id));
   const other = (await layers(page)).find((l) => l.id !== id)!.id;

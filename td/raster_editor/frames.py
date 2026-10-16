@@ -186,6 +186,97 @@ def convert_premultiplication(buf: np.ndarray, to_premultiplied: bool) -> None:
         _unpremultiply_u8_inplace(buf)
 
 
+# --------------------------------------------------------------------------- v11 exact view frames (VIEW_EXACT bodies)
+#
+# Wire-order straight RGBA8 (h, w, 4). A full body is the raw pixels; a tile body is an index of ``nTiles`` x (u16 tx, u16 ty,
+# u16 w, u16 h) (tx / ty in 64 px tile units, w / h in pixels) followed by each tile's rows. The message carries
+# ``zlib.compress(raw, 1)`` of either (browser ``DecompressionStream('deflate')``). One C call per frame, so a worker thread
+# can run it without holding the GIL for long.
+
+EXACT_TILE = 64
+EXACT_FULL_FRACTION = 0.30  # more than this fraction of tiles changed -> send the full frame
+EXACT_MAX_TILES = 0xFFFF
+
+
+def dirty_tiles(cur: np.ndarray, prev: np.ndarray, tile: int = EXACT_TILE) -> np.ndarray:
+    """Bool grid (ceil(h / tile), ceil(w / tile)): True where ``cur`` differs from ``prev`` (same shape, uint8 RGBA)."""
+    if cur.shape != prev.shape:
+        raise ValueError(f"shape {cur.shape} vs {prev.shape}")
+    h, w = cur.shape[:2]
+    a = np.ascontiguousarray(cur).view(np.uint32).reshape(h, w)
+    b = np.ascontiguousarray(prev).view(np.uint32).reshape(h, w)
+    d = (a != b).view(np.uint8)
+    rows = np.maximum.reduceat(d, np.arange(0, h, tile), axis=0)
+    return np.maximum.reduceat(rows, np.arange(0, w, tile), axis=1).astype(bool)
+
+
+def tiles_raw(cur: np.ndarray, tiles: np.ndarray, tile: int = EXACT_TILE) -> bytes:
+    """Uncompressed tile body for ``tiles`` (an (n, 2) array of (ty, tx), row-major order)."""
+    h, w = cur.shape[:2]
+    n = len(tiles)
+    sizes = []
+    for ty, tx in tiles.tolist():
+        sizes.append((min(tile, w - tx * tile), min(tile, h - ty * tile)))
+    total = n * 8 + sum(tw * th * 4 for tw, th in sizes)
+    out = bytearray(total)
+    index = np.empty((n, 4), "<u2")
+    index[:, 0] = tiles[:, 1]
+    index[:, 1] = tiles[:, 0]
+    index[:, 2] = [s[0] for s in sizes]
+    index[:, 3] = [s[1] for s in sizes]
+    out[: n * 8] = index.tobytes()
+    pos = n * 8
+    for (ty, tx), (tw, th) in zip(tiles.tolist(), sizes):
+        nb = tw * th * 4
+        np.frombuffer(out, np.uint8, nb, pos).reshape(th, tw, 4)[...] = cur[ty * tile: ty * tile + th, tx * tile: tx * tile + tw]
+        pos += nb
+    return bytes(out)
+
+
+def plan_exact(cur: np.ndarray, prev=None, threshold: float = EXACT_FULL_FRACTION):
+    """What to send a client that holds ``prev`` (None / other size = nothing): ("full", None), ("none", None) when nothing
+    changed, or ("tiles", (n, 2) tile list)."""
+    if prev is None or prev.shape != cur.shape:
+        return "full", None
+    d = dirty_tiles(cur, prev)
+    n = int(d.sum())
+    if n == 0:
+        return "none", None
+    if n > EXACT_MAX_TILES or n > threshold * d.size:
+        return "full", None
+    return "tiles", np.argwhere(d)
+
+
+def compress_exact(cur: np.ndarray, plan) -> tuple:
+    """(kind, nTiles, zlib bytes) for one plan from ``plan_exact`` (not "none")."""
+    kind, tiles = plan
+    if kind == "full":
+        return 0, 0, zlib.compress(memoryview(np.ascontiguousarray(cur)).cast("B"), 1)
+    return 1, len(tiles), zlib.compress(tiles_raw(cur, tiles), 1)
+
+
+def decode_exact_body(body, doc_w: int, doc_h: int, kind: int, n_tiles: int, buf=None):
+    """Inverse (tests / validators / the reference client): inflate ``body`` and patch / create the exact buffer
+    (h, w, 4). A tile frame needs ``buf`` of the document size, otherwise ValueError (the client sends `viewExactReset`)."""
+    raw = zlib.decompress(body)
+    if kind == 0:
+        if len(raw) != doc_w * doc_h * 4:
+            raise ValueError("full exact frame has the wrong size")
+        return np.frombuffer(raw, np.uint8).reshape(doc_h, doc_w, 4).copy()
+    if buf is None or buf.shape != (doc_h, doc_w, 4):
+        raise ValueError("tile frame without a matching exact buffer")
+    index = np.frombuffer(raw, "<u2", n_tiles * 4).reshape(n_tiles, 4)
+    pos = n_tiles * 8
+    for tx, ty, tw, th in index.tolist():
+        nb = tw * th * 4
+        buf[ty * EXACT_TILE: ty * EXACT_TILE + th, tx * EXACT_TILE: tx * EXACT_TILE + tw] = \
+            np.frombuffer(raw, np.uint8, nb, pos).reshape(th, tw, 4)
+        pos += nb
+    if pos != len(raw):
+        raise ValueError("tile frame has trailing bytes")
+    return buf
+
+
 # --------------------------------------------------------------------------- PNG / .redoc codecs (v6 files)
 #
 # No PIL / cv2 dependency (TD's Python is not guaranteed to have them). The writer emits 8-bit RGBA, non-interlaced,

@@ -366,7 +366,7 @@
       "frame": "invalid",
       "valid": false,
       "size": 40,
-      "error": "unknown type"
+      "error": "unknown type (v11: 8 / 9 are VIEW_FAST / VIEW_EXACT)"
     },
     {
       "name": "invalid_type_2",

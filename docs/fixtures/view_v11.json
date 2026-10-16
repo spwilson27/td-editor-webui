@@ -1,0 +1,192 @@
+{
+  "pixel": "same as fixtures.json; the exact frames are W x H = 70 x 66 (tiles: 64 px, edge tiles clipped)",
+  "tilesVariant": "view_exact_tiles = view_exact_full pixels with (x 64..69, y 10..20) xor 0x55 and (x 0..5, y 64..65) xor 0x33 on all four channels",
+  "messages": [
+    {
+      "name": "view_fast",
+      "file": "view_fast.bin",
+      "size": 1126,
+      "type": 8,
+      "frameHeader": {
+        "flags": 1,
+        "slot": 0,
+        "frameId": 77,
+        "docW": 100,
+        "docH": 60,
+        "x": 0,
+        "y": 0,
+        "w": 0,
+        "h": 0
+      },
+      "subHeaderSize": 36,
+      "applied": 70,
+      "rect": [
+        10.5,
+        4.25,
+        80.0,
+        48.0
+      ],
+      "pw": 8,
+      "ph": 6,
+      "rgbLen": 715,
+      "alphaLen": 351,
+      "rgbSha256": "22c12a8c7896de3bf5b59633632a532dcd5234e2170301f35a6eb31f79987ea1",
+      "alphaSha256": "e1148794e425f9865d59be05171fb5b8c20076f60a6b4d07880820572c4687e9",
+      "note": "subheader <u32 frameId, u32 appliedFrameId, f32 x y w h, u16 pw ph, u32 rgbLen alphaLen> at byte 24; JPEG colour then JPEG alpha"
+    },
+    {
+      "name": "view_fast_opaque",
+      "file": "view_fast_opaque.bin",
+      "size": 775,
+      "type": 8,
+      "frameHeader": {
+        "flags": 1,
+        "slot": 0,
+        "frameId": 4294967294,
+        "docW": 100,
+        "docH": 60,
+        "x": 0,
+        "y": 0,
+        "w": 0,
+        "h": 0
+      },
+      "subHeaderSize": 36,
+      "applied": null,
+      "rect": [
+        0.0,
+        0.0,
+        100.0,
+        60.0
+      ],
+      "pw": 8,
+      "ph": 6,
+      "rgbLen": 715,
+      "alphaLen": 0,
+      "rgbSha256": "22c12a8c7896de3bf5b59633632a532dcd5234e2170301f35a6eb31f79987ea1",
+      "alphaSha256": null,
+      "note": "alphaLen 0 = fully opaque; applied 0xFFFFFFFF = none"
+    },
+    {
+      "name": "view_exact_full",
+      "file": "view_exact_full.bin",
+      "size": 18444,
+      "type": 9,
+      "frameHeader": {
+        "flags": 1,
+        "slot": 0,
+        "frameId": 90,
+        "docW": 70,
+        "docH": 66,
+        "x": 0,
+        "y": 0,
+        "w": 0,
+        "h": 0
+      },
+      "subHeaderSize": 16,
+      "applied": 80,
+      "kind": 0,
+      "tile": 64,
+      "nTiles": 0,
+      "inflatedSize": 18480,
+      "pixelsSha256": "44a58eaad1e6f280e6aee3ce68dd91106277440308a36c3f2d1228f517b5f49f",
+      "note": "body = zlib(RGBA8 straight, row 0 = top); pixel(x, y) as in fixtures.json"
+    },
+    {
+      "name": "view_exact_tiles",
+      "file": "view_exact_tiles.bin",
+      "size": 2115,
+      "type": 9,
+      "frameHeader": {
+        "flags": 1,
+        "slot": 0,
+        "frameId": 91,
+        "docW": 70,
+        "docH": 66,
+        "x": 0,
+        "y": 0,
+        "w": 0,
+        "h": 0
+      },
+      "subHeaderSize": 16,
+      "applied": 81,
+      "kind": 1,
+      "tile": 64,
+      "nTiles": 2,
+      "inflatedSize": 2064,
+      "index": [
+        {
+          "tx": 1,
+          "ty": 0,
+          "w": 6,
+          "h": 64
+        },
+        {
+          "tx": 0,
+          "ty": 1,
+          "w": 64,
+          "h": 2
+        }
+      ],
+      "appliesTo": "view_exact_full",
+      "pixelsAfterSha256": "2aa58f485af6b7b9249a9ed6712ed6600488af1a9a6194276bba6919c8e751a2",
+      "note": "inflated = nTiles x <u16 tx ty w h> then each tile's RGBA rows (row-major); patch onto the buffer left by view_exact_full"
+    },
+    {
+      "name": "view_exact_empty",
+      "file": "view_exact_empty.bin",
+      "size": 48,
+      "type": 9,
+      "frameHeader": {
+        "flags": 1,
+        "slot": 0,
+        "frameId": 92,
+        "docW": 70,
+        "docH": 66,
+        "x": 0,
+        "y": 0,
+        "w": 0,
+        "h": 0
+      },
+      "subHeaderSize": 16,
+      "applied": 81,
+      "kind": 1,
+      "tile": 64,
+      "nTiles": 0,
+      "inflatedSize": 0,
+      "appliesTo": "any buffer of W x H",
+      "note": "nTiles 0: the exact picture is unchanged, show the exact buffer again (sent at idle after fast frames / a viewport change)"
+    },
+    {
+      "name": "invalid_view_fast_short",
+      "file": "invalid_view_fast_short.bin",
+      "size": 1125,
+      "type": 8,
+      "valid": false,
+      "error": "body shorter than rgbLen + alphaLen"
+    },
+    {
+      "name": "invalid_view_fast_rect",
+      "file": "invalid_view_fast_rect.bin",
+      "size": 1126,
+      "type": 8,
+      "valid": false,
+      "error": "VIEW_FAST frames carry a zero rect in the 24-byte header"
+    },
+    {
+      "name": "invalid_view_exact_kind",
+      "file": "invalid_view_exact_kind.bin",
+      "size": 18444,
+      "type": 9,
+      "valid": false,
+      "error": "kind must be 0 or 1"
+    },
+    {
+      "name": "invalid_view_exact_tile",
+      "file": "invalid_view_exact_tile.bin",
+      "size": 18444,
+      "type": 9,
+      "valid": false,
+      "error": "tile must be 64"
+    }
+  ]
+}

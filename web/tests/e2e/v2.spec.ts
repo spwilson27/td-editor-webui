@@ -111,40 +111,55 @@ test('latency readout fills in from TD applied replies', async ({ page }) => {
   expect(lat.strokeToTd.median).toBeGreaterThanOrEqual(0);
 });
 
-test('external client: TD view shows the image served by TD, Local restores the preview', async ({ page }) => {
+const tdPixel = (page: Page, x: number, y: number) => hook<number[] | null>(page, 'tdViewPixel', x, y);
+const near = (a: number[] | null, b: number[], tol = 8) => !!a && a.every((v, i) => Math.abs(v - b[i]) <= tol);
+
+test('external client: TD view shows what TD streams (fast, then exact), Local restores the preview', async ({ page }) => {
   await open(page);
   await td.waitFor(() => td.doc !== null);
   expect(await mainPixel(page, 0.5, 0.5)).not.toEqual([10, 200, 30, 255]);
   await page.locator('[data-view-mode=td]').click();
   await td.waitFor(() => td.viewSubscribed);
-  expect(td.lastView).toMatchObject({ t: 'view', mode: 'td' });
-  const rgba = new Uint8Array(160 * 90 * 4);
-  for (let i = 0; i < rgba.length; i += 4) { rgba[i] = 10; rgba[i + 1] = 200; rgba[i + 2] = 30; rgba[i + 3] = 255; }
-  td.setViewImage(rgba);
-  await expect.poll(() => mainPixel(page, 0.5, 0.5)).toEqual([10, 200, 30, 255]);
+  expect(td.lastView).toMatchObject({ t: 'view', mode: 'td', quality: 'auto' });
+  // a fast frame: green JPEG over the whole document
+  td.fastColor = 'green';
+  td.sendFast();
+  await expect.poll(() => tdPixel(page, 80, 45).then((p) => near(p, [0, 255, 0, 255]))).toBe(true);
+  await expect(page.locator('[data-status=view-frame]')).toHaveText('≈');
   await expect(page.locator('[data-status=view-age]')).toContainText('view age');
-  expect(td.viewFetches.every((f) => f.status === 200)).toBe(true);
-  // a newer TD frame replaces it
-  const rgba2 = new Uint8Array(rgba).map((v, i) => (i % 4 === 0 ? 250 : i % 4 === 3 ? 255 : v));
-  td.setViewImage(rgba2);
-  await expect.poll(() => mainPixel(page, 0.5, 0.5)).toEqual([250, 200, 30, 255]);
-  // painting in TD mode does not recomposite locally
+  await td.waitFor(() => td.acks.length >= 1);
+  // the exact frame lands after idle and replaces it, bit-exact
+  const img = new Uint8Array(160 * 90 * 4);
+  for (let i = 0; i < img.length; i += 4) { img[i] = 10; img[i + 1] = 200; img[i + 2] = 30; img[i + 3] = 255; }
+  td.setOutput(img);
+  await expect(page.locator('[data-status=view-frame]')).toHaveText('exact');
+  expect(await tdPixel(page, 80, 45)).toEqual([10, 200, 30, 255]);
+  // a newer TD image replaces it
+  img.forEach((_, i) => { if (i % 4 === 0) img[i] = 250; });
+  td.setOutput(img);
+  await expect.poll(() => tdPixel(page, 80, 45)).toEqual([250, 200, 30, 255]);
   await page.locator('[data-view-mode=local]').click();
   await td.waitFor(() => td.lastView?.mode === 'local');
-  await expect.poll(() => mainPixel(page, 0.5, 0.5)).not.toEqual([250, 200, 30, 255]);
+  await expect(page.locator('[data-status=view-frame]')).toHaveCount(0);
+  await expect.poll(() => mainPixel(page, 0.5, 0.5).then((p) => p[3])).toBe(255);
+  expect(await mainPixel(page, 0.5, 0.5)).not.toEqual([250, 200, 30, 255]);
 });
 
-test('TD view reports the viewport to TD and forwards zoom changes', async ({ page }) => {
+test('TD view reports the visible document rect and device-pixel scale to TD and forwards zoom changes', async ({ page }) => {
   await open(page);
   await td.waitFor(() => td.doc !== null);
   await page.locator('[data-view-mode=td]').click();
   await td.waitFor(() => td.lastView?.mode === 'td');
-  expect(td.lastView!.zoom).toBeGreaterThan(0);
-  expect(td.lastView!.rect.w).toBeGreaterThan(300);
-  const z0 = td.lastView!.zoom;
+  const vp = () => (td.lastView as Extract<typeof td.lastView, { mode: 'td' }>).viewport;
+  expect(vp()).toMatchObject({ x: 0, y: 0, w: 160, h: 90 }); // fit: the whole document
+  const s0 = vp().scale;
+  expect(s0).toBeGreaterThan(0);
   await page.keyboard.press('1');
-  await td.waitFor(() => td.lastView!.zoom !== z0);
-  expect(td.lastView!.zoom).toBe(1);
+  await td.waitFor(() => vp().scale !== s0);
+  expect(vp().scale).toBe(await page.evaluate(() => window.devicePixelRatio)); // zoom 100 % x dpr
+  for (let i = 0; i < 12; i++) await page.keyboard.press('+'); // 1.25^12: the document no longer fits the viewport
+  await td.waitFor(() => vp().w < 160);
+  expect(vp().w).toBeLessThan(160);
   await page.locator('[data-view-mode=local]').click();
   await expect.poll(() => mainPixel(page, 0.5, 0.5).then((p) => p[3])).toBe(255);
 });

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, FRAME_VIEW, decodeFrame, encodeFrame, decodeWebMessage, encodeBands, encodeMessage,
+  FRAME_BASE, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, decodeFrame, encodeFrame, decodeWebMessage, encodeBands, encodeMessage,
   type Frame, type TdMessage, type WebMessage,
 } from '../../src/bridge/codec';
 import {
@@ -9,6 +9,8 @@ import {
 } from '../../src/bridge/tdBridge';
 import type { LayerSpec } from '../../src/engine/types';
 import { FakeEngine } from '../browser/fakeEngine';
+import { fastFrame, exactFull, exactTiles, solid } from '../helpers/viewFrames';
+import type { ViewSink } from '../../src/bridge/tdViewClient';
 
 type Sent = { json: WebMessage } | { frame: Frame };
 
@@ -47,23 +49,21 @@ class FakeSocket {
 }
 
 const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({
-  t: 'hello', protocol: 10, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
+  t: 'hello', protocol: 11, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
 });
 
 interface TestStatus {
   conn: Connection[]; active: boolean[]; notices: string[]; latency: LatencyStats[]; viewLatency: LatencyStats[];
   loading: boolean[];
-  viewFrames: { w: number; h: number; first: number[]; age: number }[];
   setConnection(c: Connection): void; setActive(a: boolean): void; setNotice(m: string): void;
   setLoading(b: boolean): void;
-  setLatency(s: LatencyStats): void; setViewLatency(s: LatencyStats): void; setViewFrame(w: number, h: number, d: Uint8ClampedArray, age: number): void;
+  setLatency(s: LatencyStats): void; setViewLatency(s: LatencyStats): void;
 }
 const makeStatus = (): TestStatus => ({
-  conn: [], active: [], notices: [], latency: [], viewLatency: [], viewFrames: [], loading: [],
+  conn: [], active: [], notices: [], latency: [], viewLatency: [], loading: [],
   setLoading(b) { this.loading.push(b); },
   setConnection(c) { this.conn.push(c); }, setActive(a) { this.active.push(a); }, setNotice(m) { this.notices.push(m); },
   setLatency(s) { this.latency.push(s); }, setViewLatency(s) { this.viewLatency.push(s); },
-  setViewFrame(w, h, d, age) { this.viewFrames.push({ w, h, first: Array.from(d.subarray(0, 4)), age }); },
 });
 
 let engine: FakeEngine;
@@ -74,14 +74,14 @@ const at = <T>(a: T[], i: number): T => a[a.length + i];
 const sock = () => FakeSocket.all[FakeSocket.all.length - 1];
 const raf = (cb: () => void) => setTimeout(cb, 16);
 
-function start(w = 64, h = 48, prep?: (e: FakeEngine) => void) {
+function start(w = 64, h = 48, prep?: (e: FakeEngine) => void, extra: Partial<Parameters<typeof startTdBridge>[2]> = {}) {
   engine = new FakeEngine(w, h);
   prep?.(engine);
   status = makeStatus();
   fm = new FetchMock();
   bridge = startTdBridge(engine, status, {
     url: 'ws://td:9980/ws', token: 'tok-123', WebSocketCtor: FakeSocket as unknown as typeof WebSocket,
-    forwardLogs: false, fetch: fm.fn, raf,
+    forwardLogs: false, fetch: fm.fn, raf, dpr: () => 1, ...extra,
   });
 }
 function connectActive(over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}) { sock().open(); sock().tell(hello({ doc: { w: engine.width, h: engine.height }, ...over })); }
@@ -97,7 +97,7 @@ describe('tdBridge session', () => {
     expect(sock().url).toBe('ws://td:9980/ws');
     expect(sock().binaryType).toBe('arraybuffer');
     sock().open();
-    expect(sock().json()).toEqual([{ t: 'ready', protocol: 10, client: 'external', version: '0.1.0', token: 'tok-123', fresh: true }]);
+    expect(sock().json()).toEqual([{ t: 'ready', protocol: 11, client: 'external', version: '0.1.0', token: 'tok-123', fresh: true }]);
   });
 
   it('becomes linked on hello and pushes doc + every surface in full when TD has no document', () => {
@@ -793,23 +793,68 @@ describe('tdBridge latency', () => {
   });
 });
 
-describe('tdBridge view messages', () => {
+describe('tdBridge view messages (protocol 11)', () => {
   const view = (o: Partial<ViewState> = {}): ViewState => ({ mode: 'local', zoom: 1, panX: 10, panY: 20, rect: { x: 5, y: 6, w: 700, h: 500 }, ...o });
+  const views = () => sock().json().filter((m) => m.t === 'view');
 
-  it('sends view at most once per animation frame with the latest state', () => {
+  it('local: one {mode:local}; panning and zooming in Local sends nothing more', () => {
     start();
     connectActive();
-    const n = () => sock().json().filter((m) => m.t === 'view').length;
     bridge.setView(view());
     bridge.setView(view({ zoom: 2 }));
-    bridge.setView(view({ zoom: 3, mode: 'td' }));
-    expect(n()).toBe(0);
     vi.advanceTimersByTime(16);
-    expect(n()).toBe(1);
-    expect(at(sock().json(), -1)).toEqual({ t: 'view', mode: 'td', zoom: 3, panX: 10, panY: 20, rect: { x: 5, y: 6, w: 700, h: 500 } });
+    expect(views()).toEqual([{ t: 'view', mode: 'local' }]);
     bridge.setView(view({ panX: 99 }));
+    vi.advanceTimersByTime(300);
+    expect(views()).toHaveLength(1);
+  });
+
+  it('td: quality + the visible document rect + device-pixel scale; mode and quality changes go out at once', () => {
+    start(640, 480);
+    connectActive();
+    bridge.setView(view({ mode: 'td', zoom: 2, panX: 0, panY: 0, rect: { x: 0, y: 0, w: 400, h: 300 }, quality: 'fast' }));
     vi.advanceTimersByTime(16);
-    expect(n()).toBe(2);
+    expect(at(views(), -1)).toEqual({ t: 'view', mode: 'td', quality: 'fast', viewport: { x: 0, y: 0, w: 200, h: 150, scale: 2 } });
+    bridge.setView(view({ mode: 'td', zoom: 2, panX: 0, panY: 0, rect: { x: 0, y: 0, w: 400, h: 300 }, quality: 'exact' }));
+    vi.advanceTimersByTime(16);
+    expect(views()).toHaveLength(2);
+    expect(at(views(), -1)).toMatchObject({ quality: 'exact' });
+  });
+
+  it('viewport updates are throttled to 10 Hz with a trailing send of the newest state', () => {
+    start(640, 480);
+    connectActive();
+    const td = (panX: number) => view({ mode: 'td', zoom: 1, panX, panY: 0, rect: { x: 0, y: 0, w: 100, h: 100 } });
+    bridge.setView(td(0));
+    vi.advanceTimersByTime(16);
+    expect(views()).toHaveLength(1);
+    for (let i = 1; i <= 5; i++) { bridge.setView(td(-i * 10)); vi.advanceTimersByTime(16); }
+    expect(views()).toHaveLength(1); // 80 ms since the first send
+    vi.advanceTimersByTime(30);
+    expect(views()).toHaveLength(2);
+    expect(at(views(), -1)).toMatchObject({ viewport: { x: 50, w: 100 } }); // the newest state, not an intermediate one
+    for (let i = 6; i <= 40; i++) { bridge.setView(td(-i * 10)); vi.advanceTimersByTime(16); }
+    expect(views().length).toBeLessThanOrEqual(2 + Math.ceil((35 * 16) / 100) + 1);
+  });
+
+  it('an unchanged viewport is not re-sent', () => {
+    start(640, 480);
+    connectActive();
+    bridge.setView(view({ mode: 'td' }));
+    vi.advanceTimersByTime(16);
+    bridge.setView(view({ mode: 'td' }));
+    vi.advanceTimersByTime(300);
+    expect(views()).toHaveLength(1);
+  });
+
+  it('leaving TD mode sends {mode:local}', () => {
+    start(640, 480);
+    connectActive();
+    bridge.setView(view({ mode: 'td' }));
+    vi.advanceTimersByTime(16);
+    bridge.setView(view({ mode: 'local' }));
+    vi.advanceTimersByTime(16);
+    expect(at(views(), -1)).toEqual({ t: 'view', mode: 'local' });
   });
 
   it('sends view while a document load is pending and after a failed load', async () => {
@@ -817,19 +862,19 @@ describe('tdBridge view messages', () => {
     connectActive({ hasDocument: true, rev: 1 });
     bridge.setView(view({ mode: 'td' }));
     vi.advanceTimersByTime(60);
-    expect(sock().json().filter((m) => m.t === 'view')).toHaveLength(1); // still waiting for docState
+    expect(views()).toHaveLength(1); // still waiting for docState
     sock().tell(docState(1, [tdLayers[0], tdLayers[1]]));
     await flushP();
-    bridge.setView(view({ mode: 'td', zoom: 4 })); // mid-load
-    vi.advanceTimersByTime(60);
-    expect(sock().json().filter((m) => m.t === 'view')).toHaveLength(2);
+    bridge.setView(view({ mode: 'td', zoom: 4, panX: 0, panY: 0 })); // mid-load
+    vi.advanceTimersByTime(160);
+    expect(views()).toHaveLength(2);
     fm!.calls[0].settle(new Response('', { status: 500 }));
     fm!.calls[1].settle(new Response('', { status: 500 }));
     await vi.advanceTimersByTimeAsync(600);
     fm!.calls[2].settle(new Response('', { status: 500 }));
     fm!.calls[3].settle(new Response('', { status: 500 }));
     await flushP();
-    expect(sock().json().filter((m) => m.t === 'view').length).toBeGreaterThanOrEqual(3); // re-sent when the load ended (failed)
+    expect(views().length).toBeGreaterThanOrEqual(3); // re-sent when the load ended (failed)
   });
 
   it('does not stall when requestAnimationFrame never fires (hidden page)', () => {
@@ -839,13 +884,14 @@ describe('tdBridge view messages', () => {
     fm = new FetchMock();
     bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', token: 't', WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, fetch: fm.fn, raf: () => {} });
     connectActive();
-    bridge.setView(view());
-    bridge.setView(view({ zoom: 2 }));
+    bridge.setView(view({ mode: 'td' }));
+    bridge.setView(view({ mode: 'td', zoom: 2 }));
     vi.advanceTimersByTime(60);
-    expect(sock().json().filter((m) => m.t === 'view')).toHaveLength(1);
-    bridge.setView(view({ zoom: 3 }));
-    vi.advanceTimersByTime(60);
-    expect(sock().json().filter((m) => m.t === 'view')).toHaveLength(2);
+    expect(views()).toHaveLength(1);
+    vi.advanceTimersByTime(100);
+    bridge.setView(view({ mode: 'td', zoom: 3 }));
+    vi.advanceTimersByTime(160);
+    expect(views()).toHaveLength(2);
     const docs = () => sock().json().filter((m) => m.t === 'doc').length;
     const n = docs();
     engine.setLayerProps('L1', { opacity: 0.5 });
@@ -870,7 +916,7 @@ describe('tdBridge view messages', () => {
     vi.advanceTimersByTime(500);
     sock().open();
     sock().tell(hello());
-    expect(sock().json().filter((m) => m.t === 'view')).toHaveLength(1);
+    expect(views()).toHaveLength(1);
   });
 
   it('a view set while disconnected is sent on the next hello, nothing is sent offline', () => {
@@ -879,103 +925,7 @@ describe('tdBridge view messages', () => {
     vi.advanceTimersByTime(16);
     expect(sock().sent.length).toBe(0);
     connectActive();
-    expect(sock().json().filter((m) => m.t === 'view')).toHaveLength(1);
-  });
-});
-
-const viewBody = (w: number, h: number, v: number) =>
-  encodeBands({ type: FRAME_VIEW, frameId: 1, docW: w, docH: h, rect: { x: 0, y: 0, w, h }, pixels: new Uint8Array(w * h * 4).fill(v), maxPayload: 1 << 30 }).next().value as Uint8Array;
-const viewNotice = (frameId: number, applied = -1, w = 64, h = 48): TdMessage => ({ t: 'view', frameId, docW: w, docH: h, w, h, appliedFrameId: applied });
-
-describe('tdBridge view stream (external client)', () => {
-  it('fetches /view on a notice and hands the straight RGBA image to the status sink', async () => {
-    start();
-    connectActive();
-    sock().tell(viewNotice(3));
-    await flushP();
-    expect(fm!.calls.map((c) => c.url)).toEqual(['http://td:9980/view?token=tok-123&client=c1&frameId=3']);
-    vi.advanceTimersByTime(30);
-    fm!.calls[0].settle(okBytes(viewBody(64, 48, 77)));
-    await flushP();
-    expect(status.viewFrames).toEqual([{ w: 64, h: 48, first: [77, 77, 77, 77], age: 30 }]);
-    expect(engine.inputWrites).toEqual([]);
-  });
-
-  it('keeps one fetch in flight; newer notices cause exactly one more with the newest id', async () => {
-    start();
-    connectActive();
-    sock().tell(viewNotice(1));
-    await flushP();
-    sock().tell(viewNotice(2));
-    sock().tell(viewNotice(3));
-    await flushP();
-    expect(fm!.calls.length).toBe(1);
-    fm!.calls[0].settle(okBytes(viewBody(64, 48, 1)));
-    await flushP();
-    expect(fm!.calls.length).toBe(2);
-    expect(fm!.calls[1].url).toContain('frameId=3');
-    fm!.calls[1].settle(okBytes(viewBody(64, 48, 2)));
-    await flushP();
-    expect(fm!.calls.length).toBe(2);
-    expect(status.viewFrames).toHaveLength(2);
-  });
-
-  it('drops stale-size, wrong-type and malformed bodies; 404 is quiet', async () => {
-    start();
-    connectActive();
-    for (const [i, body] of [okBytes(viewBody(10, 10, 1)), okBytes(dump(0, 64, 48, 1)), okBytes(new Uint8Array(4)), new Response('', { status: 404 })].entries()) {
-      sock().tell(viewNotice(i + 1));
-      await flushP();
-      fm!.calls[i].settle(body);
-      await flushP();
-    }
-    expect(status.viewFrames).toEqual([]);
-    expect(status.notices).toEqual([]);
-  });
-
-  it('computes stroke -> view latency from appliedFrameId', async () => {
-    start(64, 48, withLayer);
-    connectActive();
-    vi.advanceTimersByTime(100);
-    engine.emit({ type: 'surface', slot: 1, rect: { x: 0, y: 0, w: 2, h: 2 } });
-    vi.advanceTimersByTime(40);
-    const id = at(sock().frames(), -1).frameId;
-    vi.advanceTimersByTime(60);
-    sock().tell(viewNotice(1, id));
-    await flushP();
-    vi.advanceTimersByTime(10);
-    fm!.calls[0].settle(okBytes(viewBody(64, 48, 3)));
-    await flushP();
-    expect(status.viewLatency).toHaveLength(1);
-    expect(status.viewLatency[0].median).toBe(110);
-  });
-
-  it('a failed view fetch re-subscribes (view message) after 2 s so TD re-announces', async () => {
-    start();
-    connectActive();
-    bridge.setView({ mode: 'td', zoom: 1, panX: 0, panY: 0, rect: { x: 0, y: 0, w: 10, h: 10 } });
-    vi.advanceTimersByTime(16);
-    const n = () => sock().json().filter((m) => m.t === 'view').length;
-    const before = n();
-    sock().tell(viewNotice(1));
-    await flushP();
-    fm!.calls[0].settle(new TypeError('net'));
-    await vi.advanceTimersByTimeAsync(1999);
-    expect(n()).toBe(before);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(n()).toBe(before + 1);
-  });
-
-  it('aborts the in-flight view fetch on socket close and ignores late results', async () => {
-    start();
-    connectActive();
-    sock().tell(viewNotice(1));
-    await flushP();
-    sock().close();
-    expect(fm!.calls[0].signal?.aborted).toBe(true);
-    fm!.calls[0].settle(okBytes(viewBody(64, 48, 1)));
-    await flushP();
-    expect(status.viewFrames).toEqual([]);
+    expect(views()).toHaveLength(1);
   });
 });
 
@@ -2138,4 +2088,87 @@ describe('tdBridge v6 chooseFile', () => {
 
 
 
+});
+
+// ---- v11: VIEW_FAST / VIEW_EXACT over the socket ----
+
+describe('tdBridge v11 view frames', () => {
+  const bmp = () => ({ width: 16, height: 16, close() {} }) as unknown as ImageBitmap;
+  const decodeJpeg = () => Promise.resolve(bmp());
+  const log: string[] = [];
+  const shown: (string | null)[] = [];
+  const sink: ViewSink = { fast: (i) => { log.push(`fast ${i.x},${i.y},${i.w},${i.h}`); }, exact: (b, d) => { log.push(`exact ${d.length} ${b.w}x${b.h}`); }, show: (k) => log.push(`show ${k}`), clear: () => log.push('clear') };
+  const startV = () => {
+    log.length = 0; shown.length = 0;
+    start(64, 48, withLayer, { decodeJpeg });
+    // the sink is read from the status object at construction: rebuild with it
+    bridge.dispose();
+    engine = new FakeEngine(64, 48); withLayer(engine);
+    status = Object.assign(makeStatus(), { viewSink: sink, setViewShown: (k: string | null) => shown.push(k) });
+    fm = new FetchMock();
+    bridge = startTdBridge(engine, status as never, { url: 'ws://td:9980/ws', token: 'tok-123', WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, fetch: fm.fn, raf, dpr: () => 1, decodeJpeg });
+    connectActive();
+    bridge.setView({ mode: 'td', zoom: 1, panX: 0, panY: 0, rect: { x: 0, y: 0, w: 64, h: 48 } });
+    vi.advanceTimersByTime(20);
+    log.length = 0; shown.length = 0;
+  };
+  const acks = () => sock().json().filter((m) => m.t === 'viewAck').map((m) => (m as { frameId: number }).frameId);
+
+  it('a binary VIEW_FAST frame is decoded, shown and acked; the stroke -> view latency comes from appliedFrameId', async () => {
+    startV();
+    engine.emit({ type: 'surface', slot: 1, rect: { x: 0, y: 0, w: 2, h: 2 } });
+    vi.advanceTimersByTime(40);
+    const id = at(sock().frames(), -1).frameId;
+    vi.advanceTimersByTime(60);
+    sock().binary(fastFrame({ frameId: 4, appliedFrameId: id, x: 1, y: 2, w: 30, h: 20 }));
+    await flushP();
+    expect(log).toEqual(['fast 1,2,30,20', 'show fast']);
+    expect(acks()).toEqual([4]);
+    expect(shown).toEqual(['fast']);
+    expect(status.viewLatency).toHaveLength(1);
+    expect(status.viewLatency[0].median).toBeGreaterThanOrEqual(80);
+    expect(status.viewLatency[0].median).toBeLessThanOrEqual(100);
+  });
+
+  /** DecompressionStream runs on real macrotasks: wait for a condition with real timers while the fake clock stays installed. */
+  const until = async (cond: () => boolean) => {
+    vi.useRealTimers();
+    try { for (let i = 0; i < 200 && !cond(); i++) await new Promise<void>((r) => setTimeout(r, 10)); } finally { vi.useFakeTimers(); vi.setSystemTime(100000); }
+  };
+
+  it('exact frames (socket) apply, and a tile frame without a buffer asks for a reset', async () => {
+    startV();
+    sock().binary(await exactTiles(64, 48, [{ tx: 0, ty: 0, w: 64, h: 48, rgba: solid(64, 48, 1, 2, 3) }]));
+    await until(() => sock().json().some((m) => m.t === 'viewExactReset'));
+    expect(sock().json().filter((m) => m.t === 'viewExactReset')).toHaveLength(1);
+    sock().binary(await exactFull(64, 48, solid(64, 48, 1, 2, 3), 5, 1));
+    await until(() => log.includes('exact 1 64x48'));
+    expect(log).toContain('exact 1 64x48');
+    expect(shown.at(-1)).toBe('exact');
+    expect(acks()).toEqual([2, 5]); // both exact frames are acked (default tile frame id 2)
+  });
+
+  it('a viewExact notice is fetched with GET /view?exact=1&frameId=', async () => {
+    startV();
+    sock().tell({ t: 'viewExact', frameId: 12, size: 9e6 });
+    await flushP();
+    expect(fm!.calls.map((c) => c.url)).toEqual(['http://td:9980/view?token=tok-123&client=c1&exact=1&frameId=12']);
+  });
+
+  it('leaving TD mode and a socket close reset the view state; unknown frame types are ignored', async () => {
+    startV();
+    sock().binary(fastFrame({ frameId: 1 }));
+    await flushP();
+    log.length = 0;
+    bridge.setView({ mode: 'local', zoom: 1, panX: 0, panY: 0, rect: { x: 0, y: 0, w: 64, h: 48 } });
+    vi.advanceTimersByTime(20);
+    expect(log).toEqual(['clear']);
+    log.length = 0;
+    const junk = new Uint8Array(40); junk.set([0x52, 0x45, 0x46, 0x31, 99]);
+    sock().binary(junk);
+    await flushP();
+    expect(log).toEqual([]);
+    sock().close();
+    expect(log).toEqual(['clear']);
+  });
 });

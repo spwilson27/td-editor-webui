@@ -159,7 +159,7 @@ describe('frame types', () => {
 });
 
 describe('protocol v3 messages', () => {
-  it('is protocol version 10', () => { expect(PROTOCOL_VERSION).toBe(10); });
+  it('is protocol version 11', () => { expect(PROTOCOL_VERSION).toBe(11); });
 
   it('decodes a base notice and rejects incomplete ones', () => {
     const n = { t: 'base', frameId: 4000000000, input: 3, docW: 1920, docH: 1080, x: 0, y: 0, w: 1920, h: 1080 } as const;
@@ -183,9 +183,10 @@ describe('protocol v3 messages', () => {
       .toEqual({ t: 'docState', rev: 3, layers, docW: 8, docH: 4, guides: { h: [1, 2.5], v: [] }, canvas: { mode: 'fixed' } });
     expect(decodeTdMessage(JSON.stringify({ t: 'docState', rev: 3, layers: 'x', docW: 8, docH: 4 }))).toBeNull();
     expect(decodeTdMessage(JSON.stringify({ t: 'docState', rev: 3, layers, docW: 0, docH: 4 }))).toBeNull();
-    const v = { t: 'view', frameId: 9, docW: 8, docH: 4, w: 8, h: 4, appliedFrameId: 77 } as const;
+    const v = { t: 'viewExact', frameId: 9, size: 5000000 } as const;
     expect(decodeTdMessage(encodeMessage(v))).toEqual(v);
-    expect(decodeTdMessage('{"t":"view","frameId":9,"docW":8,"docH":4,"w":8,"h":4}')).toEqual({ ...v, appliedFrameId: -1 });
+    expect(decodeTdMessage('{"t":"viewExact","frameId":9}')).toBeNull();
+    expect(decodeTdMessage('{"t":"view","frameId":9,"docW":8,"docH":4,"w":8,"h":4}')).toBeNull(); // the v3 notice is gone
     expect(decodeTdMessage('{"t":"applied","frameId":5,"tdFrame":100}')).toEqual({ t: 'applied', frameId: 5, tdFrame: 100 });
     expect(decodeTdMessage('{"t":"applied"}')).toBeNull();
   });
@@ -195,7 +196,7 @@ describe('json messages', () => {
   it('web messages round trip', () => {
     const spec = { id: 'a', kind: 'adjustment', parentId: null, name: 'Levels', visible: true, opacity: 1, blend: 'normal', x: 0, y: 0, rot: 0, kx: 0, ky: 0, input: null, effects: [], slot: null, mask: { slot: 4, enabled: true }, adjustment: { type: 'invert' } };
     const msgs = [
-      { t: 'ready', protocol: 10, client: 'external', version: '0.1.0', token: 'abc', fresh: true },
+      { t: 'ready', protocol: 11, client: 'external', version: '0.1.0', token: 'abc', fresh: true },
       { t: 'doc', rev: 5, layers: [spec], guides: { h: [10], v: [] }, canvas: { mode: 'fixed' } },
       { t: 'setCanvas', w: 800, h: 600, mode: 'fixed' },
       { t: 'setCanvas', w: 0, h: 0, mode: 'input' },
@@ -205,7 +206,10 @@ describe('json messages', () => {
       { t: 'saveProject', requestId: 'f2', path: '/tmp/a.redoc' },
       { t: 'openProject', requestId: 'f3', path: '/tmp/a.redoc' },
       { t: 'exportPng', requestId: 'f4' },
-      { t: 'view', mode: 'td', zoom: 0.5, panX: 12, panY: -3, rect: { x: 100, y: 80, w: 900, h: 700 } },
+      { t: 'view', mode: 'td', quality: 'auto', viewport: { x: 12, y: 3, w: 900, h: 700, scale: 2 } },
+      { t: 'view', mode: 'local' },
+      { t: 'viewAck', frameId: 7 },
+      { t: 'viewExactReset' },
       { t: 'takeover' },
       { t: 'requestBase' },
       { t: 'log', level: 'warn', msg: 'x' },
@@ -262,7 +266,7 @@ describe('json messages', () => {
   });
 
   it('v6: hello may carry inputs (0x0 = unconnected); malformed lists are dropped; baseSize is gone', () => {
-    const h = { t: 'hello', protocol: 10, doc: { w: 4, h: 4 }, hasInput: true, maxSendFps: 30, active: true };
+    const h = { t: 'hello', protocol: 11, doc: { w: 4, h: 4 }, hasInput: true, maxSendFps: 30, active: true };
     const items = [{ input: 1, w: 1280, h: 720, connected: true }, { input: 2, w: 0, h: 0, connected: false }];
     expect(decodeTdMessage(JSON.stringify({ ...h, inputs: items }))).toMatchObject({ inputs: items });
     expect(decodeTdMessage(JSON.stringify({ ...h, inputs: [] }))).toMatchObject({ inputs: [] });

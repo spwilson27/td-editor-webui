@@ -378,3 +378,39 @@ Further v5 details (TD implementation):
 - **Failover / reconnect**: a page whose WebSocket closes keeps retrying the same URL (existing backoff); after a
   failover the new master serves the same port and token, the page reconnects and re-requests its editor's document
   (`requestDoc`). If its editor no longer exists the page switches to the master's editor with a notice.
+
+## 13. Version 11 additions (DESIGN_V9): fast TD view
+
+- `ready.protocol` = 11. A v11 client subscribes with `view {mode: "td", quality: "auto" | "fast" | "exact",
+  viewport: {x, y, w, h, scale}}` (document-space visible rect + device-pixel scale; re-sent on pan / zoom / resize,
+  throttled to ≤ 10 Hz). `view {mode: "local"}` unsubscribes.
+- **Frame header of types 8 / 9**: the usual 24 bytes with `flags` = FRAME_END, `slot` = 0, `frameId`, `docW` / `docH` = the
+  document size and **`x = y = w = h = 0`** (the rect rules of the other types do not apply). `frameId` is one counter per client
+  shared by fast and exact frames. `appliedFrameId` = the newest SURFACE frameId of *this* client that is part of the picture
+  (`0xFFFFFFFF` = none yet). The sub-header follows at byte 24.
+- **Fast frames** (TD → web, WebSocket binary, frame type `8` VIEW_FAST): **36-byte** sub-header (little endian)
+  `u32 frameId, u32 appliedFrameId, f32 x, f32 y, f32 w, f32 h` (document rect covered), `u16 pw, u16 ph` (pixel size of both
+  JPEGs), `u32 rgbLen, u32 alphaLen` (alphaLen 0 = fully opaque), then the RGB JPEG (premultiplied colour) and the alpha JPEG
+  (greyscale; a plain JPEG, decode and take one channel). (DESIGN_V9 said "32 bytes": the field list above is 36 bytes and is the
+  contract.) The client answers `viewAck {frameId}`; TD keeps ≤ 2 un-acked frames per client (newest wins: frames produced while
+  2 are pending replace the queued one).
+- **Exact frames** (frame type `9` VIEW_EXACT, WebSocket binary for ≤ 4 MB, else announced with
+  `viewExact {frameId, size}` and fetched with `GET /view?...&exact=1&frameId=` (the answer is the same binary message)): 16-byte
+  sub-header `u32 frameId, u32 appliedFrameId, u16 docW, u16 docH, u8 kind (0 full, 1 tiles), u8 tile (64), u16 nTiles`, then the
+  body = deflate (**zlib** wrapper, `DecompressionStream('deflate')`) stream of straight RGBA8 (row 0 = top) — full frame
+  (`docW×docH×4` bytes) or an index of `nTiles × (u16 tx, u16 ty, u16 w, u16 h)` (`tx`/`ty` in 64 px tile units, `w`/`h` in
+  pixels: edge tiles are clipped) followed by each tile's RGBA rows in index order (row-major). A tile frame applies to the
+  client's exact buffer for that `docW×docH`; if the client has no buffer or a different size it sends `viewExactReset` and TD
+  sends a full frame next. Exact frames are also acknowledged with `viewAck`. TD sends a tile frame only when ≤ 30 % of the tiles
+  changed (otherwise full) and nothing at all when the exact picture did not change for that client.
+- Viewport numbers are clamped by TD (|x|, |y| <= 1e7, 1e-3 <= w, h <= 1e6, 1e-3 <= scale <= 64). With `auto` and a source that keeps
+  changing (animated input) only fast frames are sent; use `exact` for exact frames of moving content.
+- **Empty tile frame**: in `auto`, whenever the client was last sent a fast frame and the exact picture turns out unchanged (a viewport-only
+  pan / zoom, or a fast burst whose exact result equals the last exact frame), TD still sends one `kind 1, nTiles 0` frame (body =
+  zlib of nothing) at idle: "unchanged, show the exact buffer". Nothing is sent when the client is already showing the exact picture.
+- Golden files: `docs/fixtures/view_fast.bin`, `view_fast_opaque.bin`, `view_exact_full.bin`, `view_exact_tiles.bin`, `view_exact_empty.bin` (applies on top of
+  `view_exact_full`) and `invalid_view_*.bin`, described in `docs/fixtures/view_v11.json` (`scripts/make_fixtures.py`).
+- `ready.protocol` 10 clients are still accepted (`hello.protocol` echoes the client's version) and keep the v3 path.
+- In `auto`, TD sends fast frames while changes happen and one exact frame ~200 ms after the last change (also after a
+  viewport change in auto/exact). `exact` sends only exact frames (on change, rate-limited); `fast` only fast frames.
+- Protocol < 11 clients keep the v3 `view` notice + `GET /view` raw path.

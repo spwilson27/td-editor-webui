@@ -9,7 +9,7 @@ PRESERVED (never rebuilt)
     comment, parameters that survive)
   * USER children: only children that belong to the editor TEMPLATE are replaced -- the names of the source's template, the
     names of earlier builds (``KNOWN_TEMPLATE_NAMES``, ``fx_*``, ``view_pack*``) and the extension's temporary operators
-    (``RUNTIME_RE``: ``_imp_*``, ``_font_probe_tmp``). Any other child is kept and listed in the report
+    (``RUNTIME_RE``: ``_imp_*``, ``_font_probe_tmp``, ``_view_crop|rs|px<n>``). Any other child is kept and listed in the report
   * every surviving custom parameter is kept IN PLACE (value, expression, export, bind); definitions (label, range, menu, help,
     order) are refreshed, new ones are added with their defaults. Only parameters that belong to the template (names of the
     source, of earlier builds, or recorded by an earlier upgrade in the COMP storage) are ever removed; user pages and user
@@ -65,9 +65,10 @@ KNOWN_TEMPLATE_NAMES = frozenset((
     "RasterEditorExt", "blend_glsl", "shape_glsl", "composite", "composite_callbacks", "doc_out", "effects", "font_probe",
     "frame_exec", "frames", "keyboard", "keyboard_callbacks", "network", "out_switch", "panel_exec", "panel_view", "par_exec",
     "protocol", "ui_html", "view_pack", "view_pack_glsl", "webrender", "webserver", "webserver_callbacks", "upgrade", "registry",
-    "view_doc", "view_glsl", "doc_view"))   # (the last three: the v0.7.x TD-view overlay nodes DocNetwork.set_view created next to doc)
+    "view_doc", "view_glsl", "doc_view",   # (v0.7.x TD-view overlay nodes DocNetwork.set_view created next to doc)
+    "view_fast_glsl"))                     # (v0.9: the shader of the lazily created fast-view chains)
 TEMPLATE_RE = re.compile(r"^(fx_\w+|view_pack_\w+)$")
-RUNTIME_RE = re.compile(r"^_(imp_(sel|res|mov)\w*|font_probe_tmp)$")        # the extension's temporary operators
+RUNTIME_RE = re.compile(r"^_(imp_(sel|res|mov)\w*|font_probe_tmp|view_(crop|rs|px)\d+)$")        # the extension's temporary operators
 KNOWN_PAR_NAMES = frozenset((
     "Active", "Devurl", "Doch", "Docsizemode", "Docw", "Exportdoc", "Exportpath", "Exportpng", "Maxinputfps", "Maxsendfps",
     "Maxviewfps", "Openbrowser", "Openproject", "Panelquery", "Pngfile", "Port", "Premultiplied", "Projectfile", "Reloadui",

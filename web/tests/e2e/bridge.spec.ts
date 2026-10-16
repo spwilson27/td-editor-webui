@@ -13,10 +13,10 @@ const open = async (page: Page, extra = '') => {
 const hook = <T,>(page: Page, fn: string, ...args: unknown[]) =>
   page.evaluate(([f, a]) => (window as any).__editorTest[f as string](...(a as unknown[])), [fn, args] as const) as Promise<T>;
 
-test('connects, says ready as the external client (protocol 10) and shows the linked state', async ({ page }) => {
+test('connects, says ready as the external client (protocol 11) and shows the linked state', async ({ page }) => {
   await open(page);
   await td.waitFor(() => td.messages.length > 0);
-  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 10, client: 'external', token: td.token, fresh: true });
+  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 11, client: 'external', token: td.token, fresh: true });
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   expect((await hook<any>(page, 'state')).doc).toEqual({ w: 160, h: 90 });
 });

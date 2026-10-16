@@ -9,6 +9,7 @@ import { installDropGuard, installPaste } from './state/paste';
 import { store } from './state/store';
 import { installTestHook } from './state/testHook';
 import { App } from './ui/App';
+import type { ViewSink } from './bridge/tdViewClient';
 import './ui/styles.css';
 
 const DEFAULT_W = 1920, DEFAULT_H = 1080;
@@ -19,11 +20,23 @@ function Root() {
   return <App key={store.sessionEpoch.value} />;
 }
 
+/** Frames of a session that has ended must not reach the shared compositor (their bitmaps are released). */
+function gatedSink(live: () => boolean): ViewSink {
+  return {
+    fast: (i) => { if (live()) return store.tdViewSink.fast(i); i.rgb.close(); i.alpha?.close(); return false; },
+    exact: (b, d) => (live() ? store.tdViewSink.exact(b, d) : false),
+    show: (k) => { if (live()) store.tdViewSink.show(k); },
+    clear: () => { if (live()) store.tdViewSink.clear(); },
+    maxExactDim: () => store.tdViewSink.maxExactDim?.() ?? 0,
+  };
+}
+
 function statusFor(live: () => boolean): BridgeStatus {
   const gate = <A extends unknown[]>(fn: (...a: A) => void) => (...a: A) => { if (live()) fn(...a); };
   return {
     setConnection: gate(store.setConnection), setActive: gate(store.setActive), setNotice: gate(store.setNotice), setFatal: gate(store.setFatal),
-    setLoading: gate(store.setLoading), setLatency: gate(store.setLatency), setViewLatency: gate(store.setViewLatency), setViewFrame: gate(store.setViewFrame),
+    setLoading: gate(store.setLoading), setLatency: gate(store.setLatency), setViewLatency: gate(store.setViewLatency), setViewShown: gate(store.setViewShown),
+    viewSink: gatedSink(live),
     setFonts: gate(store.setFonts), setInputs: gate(store.setInputs), setFiles: gate(store.setFiles), onFileResult: gate(store.onFileResult),
     setLayerPreview: gate(store.setLayerPreview), clearLayerPreviews: gate(store.clearLayerPreviews),
   };
@@ -42,7 +55,8 @@ function startSession(editor: string, token: string, hooks: SessionHooks): Edito
   store.bridge = bridge;
   const stopView = effect(() => {
     const v = store.view.value, r = store.viewRect.value;
-    bridge.setView({ mode: store.viewMode.value, zoom: v.zoom, panX: v.x, panY: v.y, rect: r });
+    store.docSize.value; // the visible document rect depends on the document size
+    bridge.setView({ mode: store.viewMode.value, quality: store.viewQuality.value, zoom: v.zoom, panX: v.x, panY: v.y, rect: r });
   });
   return {
     editor,

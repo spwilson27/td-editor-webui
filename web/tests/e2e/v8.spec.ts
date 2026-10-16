@@ -1,7 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import { FakeTd } from './fakeTd';
 
-// v8 (protocol 10): several editors per project as tabs, against the multi-editor fake TD (one server, one token, N independent documents).
+// v8 (protocol 10/11): several editors per project as tabs, against the multi-editor fake TD (one server, one token, N independent documents).
 let a: FakeTd; // the master editor ed1 (owns the server)
 let b: FakeTd; // ed2
 let c: FakeTd; // ed3
@@ -62,7 +62,7 @@ test('tab strip: one tab per editor (label = name, tooltip = path), the hash edi
   expect(a.connections).toBe(0);
   expect(c.connections).toBe(0);
   expect(a.requests.some((r) => r.path === '/editors')).toBe(true);
-  expect(b.messages[0]).toMatchObject({ t: 'ready', protocol: 10, client: 'external', token: a.token });
+  expect(b.messages[0]).toMatchObject({ t: 'ready', protocol: 11, client: 'external', token: a.token });
 });
 
 test('no e= in the hash: the master\'s editor opens and the hash gets e=<master>', async ({ page }) => {

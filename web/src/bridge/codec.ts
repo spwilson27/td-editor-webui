@@ -1,4 +1,4 @@
-// Pure encode/decode of docs/PROTOCOL.md (version 10). No sockets here.
+// Pure encode/decode of docs/PROTOCOL.md (version 11). No sockets here.
 import type { BrushPreset, CanvasMode, Guides, LayerSpec } from '../engine/types';
 import type { FileOp, FileResult } from '../state/filesSlice';
 import type { InputItem } from '../state/inputsSlice';
@@ -7,13 +7,15 @@ export const MAGIC = [0x52, 0x45, 0x46, 0x31]; // "REF1"
 export const HEADER_BYTES = 24;
 export const MAX_BAND_PAYLOAD = 2 * 1024 * 1024;
 export type RenderMode = 'flatten' | 'mergeDown';
-export const PROTOCOL_VERSION = 10;
+export const PROTOCOL_VERSION = 11;
 export const FRAME_BASE = 1;
 export const FRAME_SURFACE = 3;
 export const FRAME_SURFACE_DUMP = 4;
 export const FRAME_VIEW = 5;
 export const FRAME_TOP = 6; // v4: TD → web, GET /top (a TOP snapshot; docW/docH = the TOP's own size)
 export const FRAME_LAYER_PREVIEW = 7; // v7: TD → web, GET /layer (doc-sized render of one tdPreview layer after its effects; slot 0)
+export const FRAME_VIEW_FAST = 8; // v11: TD → web, WebSocket binary: two JPEGs (premultiplied RGB + alpha) of the visible region
+export const FRAME_VIEW_EXACT = 9; // v11: TD → web, WebSocket binary (or GET /view?exact=1): deflate RGBA, full document or 64 px tiles
 export const FLAG_FRAME_END = 1;
 
 export type FrameType = typeof FRAME_BASE | typeof FRAME_SURFACE | typeof FRAME_SURFACE_DUMP | typeof FRAME_VIEW | typeof FRAME_TOP | typeof FRAME_LAYER_PREVIEW;
@@ -140,6 +142,11 @@ export interface EditorList { master: string; editors: EditorInfo[] }
 export type ChoosePurpose = 'saveProject' | 'openProject' | 'exportPng';
 const PURPOSES: readonly string[] = ['saveProject', 'openProject', 'exportPng'];
 export type ViewMode = 'local' | 'td';
+/** v11: which kind of TD frames to stream. */
+export type ViewQuality = 'auto' | 'fast' | 'exact';
+export const VIEW_QUALITIES: readonly ViewQuality[] = ['auto', 'fast', 'exact'];
+/** v11: the visible part of the document (document px) and the device pixels per document pixel. */
+export interface ViewportReport { x: number; y: number; w: number; h: number; scale: number }
 export type LogLevel = 'info' | 'warn' | 'error';
 
 export interface ViewRect { x: number; y: number; w: number; h: number }
@@ -148,7 +155,10 @@ export type WebMessage =
   | { t: 'ready'; protocol: number; client: ClientKind; version: string; token: string; fresh: boolean }
   | { t: 'doc'; rev: number; layers: LayerSpec[]; guides: Guides; canvas: { mode: CanvasMode }; brushPresets?: BrushPreset[] }
   | { t: 'requestDoc' }
-  | { t: 'view'; mode: ViewMode; zoom: number; panX: number; panY: number; rect: ViewRect }
+  | { t: 'view'; mode: 'local' }
+  | { t: 'view'; mode: 'td'; quality: ViewQuality; viewport: ViewportReport } // v11
+  | { t: 'viewAck'; frameId: number } // v11: a VIEW_FAST frame was decoded
+  | { t: 'viewExactReset' } // v11: the exact buffer is missing / has another size: send a full exact frame
   | { t: 'takeover' }
   | { t: 'requestBase' }
   | { t: 'listTops'; requestId: string }
@@ -167,7 +177,7 @@ export type TdMessage =
   | { t: 'hello'; protocol: number; doc: { w: number; h: number; mode?: CanvasMode }; hasInput: boolean; maxSendFps: number; active: boolean; clientId: string; hasDocument: boolean; rev: number | null; inputs?: InputItem[] }
   | { t: 'docState'; rev: number; layers: LayerSpec[]; docW: number; docH: number; guides: Guides; canvas: { mode: CanvasMode }; brushPresets?: BrushPreset[] }
   | { t: 'base'; frameId: number; input: number; docW: number; docH: number; x: number; y: number; w: number; h: number }
-  | { t: 'view'; frameId: number; docW: number; docH: number; w: number; h: number; appliedFrameId: number }
+  | { t: 'viewExact'; frameId: number; size: number } // v11: a large exact frame: fetch with GET /view?exact=1&frameId=
   | { t: 'applied'; frameId: number; tdFrame: number }
   | { t: 'docSize'; w: number; h: number; hasInput: boolean; mode: CanvasMode }
   | { t: 'inputs'; items: InputItem[] } // v6: TD inputs (connect / disconnect / resolution)
@@ -298,10 +308,8 @@ export function decodeTdMessage(text: string): TdMessage | null {
       return isNum(o.frameId) && isSize(o.docW) && isSize(o.docH) && isNum(o.x) && isNum(o.y) && isSize(o.w) && isSize(o.h)
         ? { t: 'base', frameId: o.frameId, input: isInputIndex(o.input) ? o.input : 1, docW: o.docW, docH: o.docH, x: o.x, y: o.y, w: o.w, h: o.h }
         : null;
-    case 'view':
-      return isNum(o.frameId) && isSize(o.docW) && isSize(o.docH) && isSize(o.w) && isSize(o.h)
-        ? { t: 'view', frameId: o.frameId, docW: o.docW, docH: o.docH, w: o.w, h: o.h, appliedFrameId: isNum(o.appliedFrameId) ? o.appliedFrameId : -1 }
-        : null;
+    case 'viewExact':
+      return isNum(o.frameId) && isNum(o.size) ? { t: 'viewExact', frameId: o.frameId, size: o.size } : null;
     case 'applied':
       return isNum(o.frameId) ? { t: 'applied', frameId: o.frameId, tdFrame: isNum(o.tdFrame) ? o.tdFrame : 0 } : null;
     case 'docSize':
@@ -367,11 +375,16 @@ export function decodeWebMessage(text: string): WebMessage | null {
     case 'requestDoc':
       return { t: 'requestDoc' };
     case 'view': {
-      const r = o.rect as Record<string, unknown> | undefined;
-      return (o.mode === 'local' || o.mode === 'td') && isNum(o.zoom) && isNum(o.panX) && isNum(o.panY) && r && isNum(r.x) && isNum(r.y) && isNum(r.w) && isNum(r.h)
-        ? { t: 'view', mode: o.mode, zoom: o.zoom, panX: o.panX, panY: o.panY, rect: { x: r.x, y: r.y, w: r.w, h: r.h } }
+      if (o.mode === 'local') return { t: 'view', mode: 'local' };
+      const r = o.viewport as Record<string, unknown> | undefined;
+      return o.mode === 'td' && VIEW_QUALITIES.includes(o.quality as ViewQuality) && r && isNum(r.x) && isNum(r.y) && isNum(r.w) && isNum(r.h) && isNum(r.scale)
+        ? { t: 'view', mode: 'td', quality: o.quality as ViewQuality, viewport: { x: r.x, y: r.y, w: r.w, h: r.h, scale: r.scale } }
         : null;
     }
+    case 'viewAck':
+      return isNum(o.frameId) ? { t: 'viewAck', frameId: o.frameId } : null;
+    case 'viewExactReset':
+      return { t: 'viewExactReset' };
     case 'takeover':
       return { t: 'takeover' };
     case 'requestBase':
@@ -402,4 +415,102 @@ export function decodeWebMessage(text: string): WebMessage | null {
     default:
       return null;
   }
+}
+
+// ---- v11: VIEW_FAST / VIEW_EXACT binary frames (docs/PROTOCOL.md §13) ----
+
+/** Two JPEGs of the visible region: `rgb` = premultiplied colour, `alpha` = greyscale (null = fully opaque). */
+export interface ViewFastFrame {
+  kind: 'fast';
+  frameId: number;
+  appliedFrameId: number; // the newest web SURFACE frame TD had applied when it rendered this (0xFFFFFFFF = none)
+  x: number; y: number; w: number; h: number; // document rect covered
+  pw: number; ph: number; // pixel size of the JPEGs
+  rgb: Uint8Array;
+  alpha: Uint8Array | null;
+}
+
+/** `body` = a zlib stream of straight RGBA8: the whole document (`full`) or an index of `nTiles` × (u16 tx, ty, w, h) followed by the tiles' rows (`tiles`). */
+export interface ViewExactFrame {
+  kind: 'exact';
+  frameId: number;
+  appliedFrameId: number;
+  docW: number; docH: number;
+  full: boolean;
+  tile: number;
+  nTiles: number;
+  body: Uint8Array;
+}
+
+export type ViewFrameError = 'too-short' | 'bad-magic' | 'bad-type' | 'bad-length' | 'bad-header';
+export type DecodedViewFrame = { ok: true; frame: ViewFastFrame | ViewExactFrame } | { ok: false; error: ViewFrameError };
+
+export const NO_FRAME = 0xffffffff;
+/** a ≥ b in u32 sequence order (wrap-safe). */
+export const frameGeq = (a: number, b: number): boolean => ((a - b) >>> 0) < 0x80000000;
+
+const FAST_HEADER = 36;
+const EXACT_HEADER = 16;
+export const EXACT_TILE = 64;
+
+export function decodeViewFrame(data: ArrayBuffer | ArrayBufferView): DecodedViewFrame {
+  const bytes = ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : new Uint8Array(data);
+  if (bytes.length < HEADER_BYTES) return { ok: false, error: 'too-short' };
+  if (MAGIC.some((m, i) => bytes[i] !== m)) return { ok: false, error: 'bad-magic' };
+  const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const type = v.getUint8(4);
+  if (type !== FRAME_VIEW_FAST && type !== FRAME_VIEW_EXACT) return { ok: false, error: 'bad-type' };
+  // frame header of types 8 / 9: slot 0, x = y = w = h = 0 (docW / docH = the document size)
+  if (v.getUint16(6, true) !== 0 || v.getUint16(16, true) !== 0 || v.getUint16(18, true) !== 0 || v.getUint16(20, true) !== 0 || v.getUint16(22, true) !== 0) return { ok: false, error: 'bad-header' };
+  const o = HEADER_BYTES;
+  if (type === FRAME_VIEW_FAST) {
+    if (bytes.length < o + FAST_HEADER) return { ok: false, error: 'too-short' };
+    // sub-header from o: frameId u32, applied u32, x y w h f32, pw ph u16, rgbLen u32, alphaLen u32
+    const rl = v.getUint32(o + 28, true), al = v.getUint32(o + 32, true);
+    if (bytes.length !== o + FAST_HEADER + rl + al) return { ok: false, error: 'bad-length' };
+    const pw = v.getUint16(o + 24, true), ph = v.getUint16(o + 26, true);
+    const f = { x: v.getFloat32(o + 8, true), y: v.getFloat32(o + 12, true), w: v.getFloat32(o + 16, true), h: v.getFloat32(o + 20, true) };
+    if (rl === 0 || pw < 1 || ph < 1 || !(f.w > 0) || !(f.h > 0) || !Number.isFinite(f.x) || !Number.isFinite(f.y)) return { ok: false, error: 'bad-header' };
+    const start = o + FAST_HEADER;
+    return { ok: true, frame: {
+      kind: 'fast', frameId: v.getUint32(o, true), appliedFrameId: v.getUint32(o + 4, true), ...f, pw, ph,
+      rgb: bytes.subarray(start, start + rl), alpha: al ? bytes.subarray(start + rl, start + rl + al) : null,
+    } };
+  }
+  if (bytes.length < o + EXACT_HEADER) return { ok: false, error: 'too-short' };
+  const docW = v.getUint16(12, true), docH = v.getUint16(14, true);
+  const sw = v.getUint16(o + 8, true), sh = v.getUint16(o + 10, true), kind = v.getUint8(o + 12), tile = v.getUint8(o + 13), nTiles = v.getUint16(o + 14, true);
+  if (sw < 1 || sh < 1 || kind > 1 || tile !== EXACT_TILE || (docW !== 0 && (docW !== sw || docH !== sh))) return { ok: false, error: 'bad-header' };
+  return { ok: true, frame: { kind: 'exact', frameId: v.getUint32(o, true), appliedFrameId: v.getUint32(o + 4, true), docW: sw, docH: sh, full: kind === 0, tile, nTiles, body: bytes.subarray(o + EXACT_HEADER) } };
+}
+
+/** Test/fake-TD side of the fast frame. */
+export function encodeViewFast(f: Omit<ViewFastFrame, 'kind'> & { docW?: number; docH?: number }): Uint8Array {
+  const alphaLen = f.alpha ? f.alpha.length : 0;
+  const out = new Uint8Array(HEADER_BYTES + 36 + f.rgb.length + alphaLen);
+  const v = new DataView(out.buffer);
+  out.set(MAGIC, 0);
+  v.setUint8(4, FRAME_VIEW_FAST); v.setUint8(5, FLAG_FRAME_END); v.setUint32(8, f.frameId >>> 0, true);
+  v.setUint16(12, f.docW ?? 0, true); v.setUint16(14, f.docH ?? 0, true);
+  let o = HEADER_BYTES;
+  v.setUint32(o, f.frameId >>> 0, true); v.setUint32(o + 4, f.appliedFrameId >>> 0, true);
+  v.setFloat32(o + 8, f.x, true); v.setFloat32(o + 12, f.y, true); v.setFloat32(o + 16, f.w, true); v.setFloat32(o + 20, f.h, true);
+  v.setUint16(o + 24, f.pw, true); v.setUint16(o + 26, f.ph, true); v.setUint32(o + 28, f.rgb.length, true); v.setUint32(o + 32, alphaLen, true);
+  o += 36;
+  out.set(f.rgb, o); if (f.alpha) out.set(f.alpha, o + f.rgb.length);
+  return out;
+}
+
+/** Test/fake-TD side of the exact frame; `body` is the already deflated stream. */
+export function encodeViewExact(f: Omit<ViewExactFrame, 'kind'>): Uint8Array {
+  const out = new Uint8Array(HEADER_BYTES + EXACT_HEADER + f.body.length);
+  const v = new DataView(out.buffer);
+  out.set(MAGIC, 0);
+  v.setUint8(4, FRAME_VIEW_EXACT); v.setUint8(5, FLAG_FRAME_END); v.setUint32(8, f.frameId >>> 0, true);
+  v.setUint16(12, f.docW, true); v.setUint16(14, f.docH, true);
+  const o = HEADER_BYTES;
+  v.setUint32(o, f.frameId >>> 0, true); v.setUint32(o + 4, f.appliedFrameId >>> 0, true);
+  v.setUint16(o + 8, f.docW, true); v.setUint16(o + 10, f.docH, true); v.setUint8(o + 12, f.full ? 0 : 1); v.setUint8(o + 13, f.tile); v.setUint16(o + 14, f.nTiles, true);
+  out.set(f.body, o + EXACT_HEADER);
+  return out;
 }

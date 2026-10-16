@@ -42,7 +42,7 @@ const spec = (over: Partial<LayerSpec> & { id: string }): LayerSpec => ({
 const tdLayers: LayerSpec[] = [spec({ id: 'base', kind: 'input', input: 1 }), spec({ id: 'p1', slot: 1 })];
 const docState = (rev = 7): TdMessage => ({ t: 'docState', rev, layers: tdLayers, docW: 64, docH: 48, guides: { h: [], v: [] }, canvas: { mode: 'input' } });
 const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({
-  t: 'hello', protocol: 10, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
+  t: 'hello', protocol: 11, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
 });
 const frameBytes = (type: number, slot: number, w: number, h: number, v: number) =>
   encodeBands({ type: type as typeof FRAME_BASE, slot, frameId: 1, docW: w, docH: h, rect: { x: 0, y: 0, w, h }, pixels: new Uint8Array(w * h * 4).fill(v), maxPayload: 1 << 30 }).next().value as Uint8Array;
@@ -93,10 +93,10 @@ describe('v10: editor parameter on the WebSocket URL', () => {
     expect(sock().url).toBe('ws://127.0.0.1:1234/ws?x=1&editor=a+b%26c');
   });
 
-  it('ready: protocol 10, client external; the bridge reports its editor', () => {
+  it('ready: protocol 11, client external; the bridge reports its editor', () => {
     start('ed2');
     sock().open();
-    expect(sock().json()[0]).toEqual({ t: 'ready', protocol: 10, client: 'external', version: '0.1.0', token: 'tok-123', fresh: true });
+    expect(sock().json()[0]).toEqual({ t: 'ready', protocol: 11, client: 'external', version: '0.1.0', token: 'tok-123', fresh: true });
     expect(bridge.editor).toBe('ed2');
   });
 });
@@ -148,13 +148,15 @@ describe('v10: editor parameter on every HTTP route', () => {
     await clear;
   });
 
-  it('/base, /view and /layer', async () => {
+  it('/base, /view?exact=1 and /layer', async () => {
     start('ed2', 'ws://td:9980/ws', (e) => { e.addPixelLayer('A'); e.previewIds.add('L1'); });
     connect();
     await flush();
     sock().tell({ t: 'base', frameId: 5, input: 1, docW: 64, docH: 48, x: 0, y: 0, w: 64, h: 48 });
     sock().tell({ t: 'layerPreview', layerId: 'L1', frameId: 3 });
-    sock().tell({ t: 'view', frameId: 9, docW: 64, docH: 48, w: 64, h: 48, appliedFrameId: -1 });
+    bridge.setView({ mode: 'td', zoom: 1, panX: 0, panY: 0, rect: { x: 0, y: 0, w: 64, h: 48 } }); // frames are only fetched while the TD view is on
+    await vi.advanceTimersByTimeAsync(20);
+    sock().tell({ t: 'viewExact', frameId: 9, size: 5_000_000 });
     await flush();
     for (const path of ['/base', '/layer', '/view']) {
       const c = fm.to(path);
@@ -163,7 +165,7 @@ describe('v10: editor parameter on every HTTP route', () => {
     }
     expect(fm.to('/base')[0].url).toBe('http://td:9980/base?token=tok-123&client=c1&editor=ed2&frameId=5&input=1');
     expect(fm.to('/layer')[0].url).toBe('http://td:9980/layer?token=tok-123&client=c1&editor=ed2&layerId=L1&frameId=3');
-    expect(fm.to('/view')[0].url).toBe('http://td:9980/view?token=tok-123&client=c1&editor=ed2&frameId=9');
+    expect(fm.to('/view')[0].url).toBe('http://td:9980/view?token=tok-123&client=c1&editor=ed2&exact=1&frameId=9');
     void FRAME_LAYER_PREVIEW;
   });
 

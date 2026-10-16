@@ -30,6 +30,34 @@ function ViewToggle() {
   );
 }
 
+const QUALITIES: { id: 'auto' | 'fast' | 'exact'; label: string; title: string }[] = [
+  { id: 'auto', label: 'Auto', title: 'Low-latency frames while anything changes, then one exact frame when it settles' },
+  { id: 'fast', label: 'Low latency', title: 'Always the fast, approximate (JPEG) preview' },
+  { id: 'exact', label: 'Accurate', title: 'Only bit-exact frames at full document resolution (slower)' },
+];
+
+/** v11: Auto / Low latency / Accurate for the TD view, plus a badge for the kind of frame on screen ("≈" fast, "exact"). */
+function ViewQuality() {
+  const q = store.viewQuality.value, ok = store.tdAvailable.value, td = store.viewMode.value === 'td';
+  const shown = td ? store.viewShown.value : null;
+  return (
+    <span style="display:flex;align-items:center;gap:6px">
+      <select data-view-quality aria-label="TouchDesigner view quality" value={q} disabled={!ok}
+        title={QUALITIES.find((o) => o.id === q)!.title}
+        onChange={(e) => store.setViewQuality((e.currentTarget as HTMLSelectElement).value as 'auto' | 'fast' | 'exact')}
+        style="height:20px;background:#1f1f1f;color:#b5b5b5;border:1px solid #3a3a3a;border-radius:4px;font:inherit;padding:0 2px">
+        {QUALITIES.map((o) => <option key={o.id} value={o.id} selected={o.id === q}>{o.label}</option>)}
+      </select>
+      {shown && (
+        <span data-status="view-frame" data-kind={shown} title={shown === 'fast' ? 'Low-latency preview (approximate)' : 'Exact frame (bit-exact, full resolution)'}
+          style={`min-width:34px;text-align:center;padding:0 5px;border-radius:3px;background:#1f1f1f;color:${shown === 'exact' ? '#5cc27a' : '#e0a030'}`}>
+          {shown === 'fast' ? '≈' : 'exact'}
+        </span>
+      )}
+    </span>
+  );
+}
+
 function LatencyReadout() {
   if (store.connection.value !== 'linked') return null;
   const stroke: LatencyStats = store.latency.value, vl = store.viewLatency.value, age = store.viewAge.value;
@@ -61,6 +89,7 @@ export function StatusBar() {
       </span>
       <span>Layer: <b data-status="layer" style="color:#e3e3e3;font-weight:500">{layer ? layer.name : '—'}</b></span>
       <ViewToggle />
+      <ViewQuality />
       <LatencyReadout />
       <span data-status="connection" style="display:flex;align-items:center;gap:6px">
         <span aria-hidden="true" style={`width:7px;height:7px;border-radius:50%;background:${conn.dot}`} />{conn.label}

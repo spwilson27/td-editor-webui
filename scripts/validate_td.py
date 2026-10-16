@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 sys.path.insert(0, os.path.join(ROOT, "td", "raster_editor"))
 import td_call  # noqa: E402
 import protocol as P  # noqa: E402
+import frames as F  # noqa: E402
 
 COMP = "/project1/raster_editor"
 TMP = "/project1/_validate_in"
@@ -196,6 +197,7 @@ class WS:
 
     def __init__(self, port, path="/ws"):
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.send_lock = threading.Lock()   # (a reader thread acks while the main thread sends tiles)
         key = base64.b64encode(os.urandom(16)).decode()
         self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n"
                            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
@@ -218,9 +220,9 @@ class WS:
         hdr += bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n) if n < 65536 \
             else bytes([0x80 | 127]) + struct.pack(">Q", n)
         mask = os.urandom(4)
-        import numpy as np
         masked = (np.frombuffer(raw, np.uint8) ^ np.resize(np.frombuffer(mask, np.uint8), n)).tobytes()
-        self.sock.sendall(hdr + mask + masked)
+        with self.send_lock:
+            self.sock.sendall(hdr + mask + masked)
 
     def _parse(self):
         """One complete message from the buffer (str | bytes), or None; consumes only what it returns."""
@@ -345,7 +347,12 @@ class Editor:
         self.reloads, self.file_results, self.files = [], [], None
         self.bases_by_input = {}
         self.fid = 1000 if kind == "external" else 5000
-        self.ws.send(P.ready(kind, self.token, fresh, "validate", protocol or P.PROTOCOL_VERSION))
+        self.protocol = protocol or P.PROTOCOL_VERSION
+        self.vframes = []           # v11 view frames: {t, kind: fast|exact, info, size, ...} in arrival order
+        self.autoack = True
+        self.exact_buf = None       # the client's persistent exact buffer (h, w, 4)
+        self.exact_resets = 0
+        self.ws.send(P.ready(kind, self.token, fresh, "validate", self.protocol))
 
     def poll(self, timeout=0.0):
         got = []
@@ -356,7 +363,10 @@ class Editor:
                 return got
             now = time.time()
             if isinstance(m, bytes):
-                raise AssertionError("TD sent binary on the WebSocket (protocol v3 forbids it)")
+                if self.protocol < 11:
+                    raise AssertionError("TD sent binary on the WebSocket to a protocol < 11 client")
+                self._on_view_binary(m, now)
+                continue
             msg = json.loads(m)
             self.texts.append(msg)
             got.append(msg)
@@ -397,6 +407,11 @@ class Editor:
                     if st == 200:
                         hdr, payload = P.decode_frame(body)
                         self.preview_frames.setdefault(msg["layerId"], []).append((hdr, bytes(payload)))
+            elif t == "viewExact":
+                self.notices["viewExact"] = self.notices.get("viewExact", 0) + 1
+                st, body = http_get(self.port, f"/view?token={self.token}&client={self.client_id}&exact=1&frameId={msg['frameId']}{self.eq}")
+                if st == 200:
+                    self._on_view_binary(body, now, via_http=True)
             elif t == "view":
                 self.notices["view"] += 1
                 t_notice = now
@@ -404,6 +419,31 @@ class Editor:
                     st, body = http_get(self.port, f"/view?token={self.token}&client={self.client_id}&frameId={msg['frameId']}{self.eq}")
                     if st == 200:
                         self.view_log.append((time.time(), P.decode_frame(body)[0], msg["appliedFrameId"], body, t_notice))
+
+    def _on_view_binary(self, m, now, via_http=False):
+        hdr, _ = P.decode_frame(m)
+        if hdr.type == P.TYPE_VIEW_FAST:
+            info = P.decode_view_fast(m)
+            self.vframes.append({"t": now, "kind": "fast", "info": info, "size": len(m), "raw": bytes(m)})
+        elif hdr.type == P.TYPE_VIEW_EXACT:
+            info = P.decode_view_exact(m)
+            rec = {"t": now, "kind": "exact", "info": info, "size": len(m), "ek": info["kind"], "n": info["nTiles"], "http": via_http}
+            try:
+                self.exact_buf = F.decode_exact_body(info["body"], info["docW"], info["docH"], info["kind"], info["nTiles"], self.exact_buf)
+                rec["ok"] = True
+            except ValueError:
+                rec["ok"] = False
+                self.exact_buf = None
+                self.exact_resets += 1
+                self.send(P.view_exact_reset())
+            self.vframes.append(rec)
+        else:
+            raise AssertionError(f"unexpected binary type {hdr.type}")
+        if self.autoack:
+            self.send(P.view_ack(hdr.frame_id))
+
+    def view11(self, quality="auto", viewport=None):
+        self.send(P.view_td(quality, viewport))
 
     def _set_inputs(self, items):
         self.inputs = {i["input"]: (i["w"], i["h"], i["connected"]) for i in items}
@@ -757,78 +797,338 @@ def s6_masks(args):
         ed.close()
 
 
+def jpeg_size(data):
+    """(w, h) from the first SOF marker of a JPEG, None when it is not one."""
+    b = bytes(data)
+    if b[:2] != b"\xff\xd8" or b[-2:] != b"\xff\xd9":
+        return None
+    i = 2
+    while i + 9 < len(b):
+        if b[i] != 0xFF:
+            return None
+        m = b[i + 1]
+        if m in (0xC0, 0xC1, 0xC2):
+            return struct.unpack(">HH", b[i + 5:i + 9])[::-1]
+        i += 2 + struct.unpack(">H", b[i + 2:i + 4])[0]
+    return None
+
+
+def td_decode(rgb, alpha, points):
+    """Decode the JPEG pair inside TD (OpenCV is not in this venv): RGB and alpha values at ``points`` [(x, y)] of the JPEG."""
+    import base64 as b64
+    code = f"""
+import cv2, numpy as np, base64
+rgb = cv2.imdecode(np.frombuffer(base64.b64decode({b64.b64encode(bytes(rgb)).decode()!r}), np.uint8), cv2.IMREAD_COLOR)
+al = cv2.imdecode(np.frombuffer(base64.b64decode({b64.b64encode(bytes(alpha)).decode()!r}), np.uint8), cv2.IMREAD_GRAYSCALE) if {bool(alpha)!r} else None
+pts = {list(points)!r}
+print(json.dumps({{'shape': list(rgb.shape), 'rgb': [[int(v) for v in rgb[y, x][::-1]] for x, y in pts],
+                   'alpha': [int(al[y, x]) for x, y in pts] if al is not None else None}}))
+"""
+    return td_json(code, 90)
+
+
+def exact_vs_out1(buf):
+    """Bands of 64 rows where the client's exact buffer differs from out1 read back in TD (straight alpha, same rounding as the
+    GET /view shader): [] = byte identical."""
+    import hashlib as hl
+    ref = td_json(f"""
+import numpy as np, hashlib
+a = comp.op('out1').numpyArray()[::-1]
+rgb, al = a[..., :3], a[..., 3:4]
+if comp.par.Premultiplied.eval():
+    rgb = np.where(al > 0, rgb / np.where(al > 0, al, 1), 0).astype(np.float32)
+c = np.clip(np.concatenate([rgb, al], axis=2), 0, 1)
+u8 = np.floor(c * 255 + 0.5).astype(np.uint8)
+print(json.dumps([hashlib.md5(u8[y:y + 64].tobytes()).hexdigest() for y in range(0, u8.shape[0], 64)]))
+""", 120)
+    mine = [hl.md5(buf[y:y + 64].tobytes()).hexdigest() for y in range(0, buf.shape[0], 64)]
+    return [i for i, (a, b) in enumerate(zip(mine, ref)) if a != b] if len(mine) == len(ref) else list(range(max(len(mine), len(ref))))
+
+
+def view_nodes(path=COMP):
+    return td_json(f"print(json.dumps(sorted(c.name for c in op({path!r}).children if c.name.startswith('_view_'))))")
+
+
+def q(xs, f):
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(len(xs) * f))] if xs else float("nan")
+
+
 def s7_view_stream(args):
-    """External client in TD mode: VIEW notices + GET /view; content matches out1; fps and age while the output changes."""
-    p1 = STATE["p1"]
+    """Protocol 11 TD view (DESIGN_V9 section 3): fast JPEG frames (fps, edit -> display, alpha plane), auto -> one exact frame
+    (byte identical to out1) within 500 ms, tile refine size, exact-only / fast-only, reset, unsubscribe frees the GPU nodes,
+    protocol 10 clients keep the old path, a second editor streams independently."""
+    notes, fails = [], []
+    load = os.getloadavg()[0]
+    hot = load > 4.0   # a loaded machine (other apps on the GPU / CPU) stretches every timing: widen the budgets slightly and say so
+    notes.append(f"machine load average {load:.1f}" + (" (high: timing budgets widened)" if hot else ""))
+
+    def check(name, cond, detail=""):
+        if not cond:
+            fails.append(f"{name} {detail}".strip())
+        return cond
+
+    connect_input()
+    wait_for(lambda: out1_size() == [IW, IH], 4)
+    td("comp.par.Maxviewfps = 30")
+    base_rev = STATE.get("rev", 0) + 1
+    p1, p2, mask = scene(IW, IH)
     ed = Editor(args.port)
+    ed2 = leg = None
     try:
         ed.takeover()
-        td("comp.par.Maxviewfps = 30")
-        ed.view("td", 1.0, 0, 0)
-        if not ed.wait(lambda: ed.view_log, 4):
-            return False, f"no VIEW frame: {ed.texts[-3:]}"
-        t_hdr, hdr, applied, body = ed.view_log[0][0], ed.view_log[0][1], ed.view_log[0][2], ed.view_log[0][3]
-        payload = np.frombuffer(P.decode_frame(body)[1], np.uint8).reshape(IH, IW, 4)
-        exp = expected_scene(p1, STATE["p2"], STATE["mask"])
-        vdiff = max(np.abs(payload[y:y + h, x:x + w, :3].astype(np.float64) - exp[y:y + h, x:x + w]).max() for x, y, w, h in CROPS)
-        shape_ok = hdr.type == P.TYPE_VIEW and hdr.slot == 0 and (hdr.doc_w, hdr.doc_h) == (IW, IH) and hdr.frame_end
-        # continuous change: 64x64 tiles at 60 Hz for 4 s; the stream delivers frames as fast as it can
-        ed.view_log.clear()
-        end = time.time() + 4
-        n = 0
+        # --- scene A (opaque: the red input is the background layer)
+        ed.send_doc(SCENE_LAYERS, base_rev)
+        for sl, im in ((1, p1), (2, p2), (3, mask)):
+            fid = ed.send_surface(sl, (0, 0, IW, IH), im)
+        wait_applied(ed, fid, 8)
+        viewport = {"x": 0, "y": 0, "w": IW, "h": IH, "scale": 1280 / IW}
+        ed.view11("fast", viewport)
+        if not ed.wait(lambda: any(f["kind"] == "fast" for f in ed.vframes), 5):
+            return False, f"no VIEW_FAST frame: {ed.texts[-3:]} status={status()!r}"
+        ed.run(0.4)
+        fr = next(f for f in reversed(ed.vframes) if f["kind"] == "fast")["info"]
+        sz = jpeg_size(fr["rgb"])
+        check("fast frame size", (fr["pw"], fr["ph"]) == (1280, 720) and sz == (1280, 720) and (fr["docW"], fr["docH"]) == (IW, IH)
+              and fr["rect"] == (0.0, 0.0, float(IW), float(IH)), f"{(fr['pw'], fr['ph'])} jpeg {sz} rect {fr['rect']}")
+        check("opaque scene has no alpha plane", len(fr["alpha"]) == 0, f"alphaLen {len(fr['alpha'])}")
+        pts = [(100, 100), (900, 100), (500, 500), (300, 600)]   # (frame px) green top half, green, blue block, red bottom-left
+        dec = td_decode(fr["rgb"], b"", pts)
+        want = [(0, 200, 0), (0, 200, 0), (0, 0, 255), (255, 0, 0)]
+        check("fast colours", all(px_near(g, list(w), 8) for g, w in zip(dec["rgb"], want)), f"{dec['rgb']} vs {want}")
+        # --- scene B: no background layer -> real alpha (hard edges at y=540 and the mask edges)
+        ed.send_doc([L("p1", slot=1, size=(IW, IH)), L("p2", slot=2, mask={"slot": 3, "enabled": True}, size=(IW, IH))], base_rev + 1)
+        ed.send_surface(1, (0, 0, 64, 64), p1[:64, :64])   # (any tile makes the new document applied)
+        ed.run(0.5)
+        n0 = len(ed.vframes)
+        ed.wait(lambda: any(f["kind"] == "fast" and f["info"]["alpha"] for f in ed.vframes[n0:]), 4)
+        fa = next((f["info"] for f in reversed(ed.vframes) if f["kind"] == "fast" and f["info"]["alpha"]), None)
+        if check("alpha plane present", fa is not None, "no fast frame with an alpha plane"):
+            apts = [(900, 100), (900, 350), (900, 372), (100, 650), (400, 450)]   # frame px: p1, just above / below p1's bottom edge (y 360), empty, p2 block
+            d = td_decode(fa["rgb"], fa["alpha"], apts)
+            a = d["alpha"]
+            check("alpha plane values (hard edge)", a[0] > 250 and a[1] > 240 and a[2] < 15 and a[3] < 5 and a[4] > 250, f"{a}")
+            check("alpha size", jpeg_size(fa["alpha"]) == (fa["pw"], fa["ph"]), f"{jpeg_size(fa['alpha'])}")
+            notes.append(f"alpha plane {len(fa['alpha'])} B, colour {len(fa['rgb'])} B at {fa['pw']}x{fa['ph']}; alpha samples {a}")
+        # --- fast stream: continuous 64x64 edits at 60 Hz for 4 s
+        clear_stats()
+        ed.vframes.clear()
         tile = np.random.RandomState(7).randint(0, 256, (64, 64, 4), dtype=np.uint8)
         tile[..., 3] = 255
-        fids = []
         stop = threading.Event()
 
-        def pull():   # fetching 8 MB frames must not throttle the 60 Hz tile sender
+        def pull():
             while not stop.is_set():
-                ed.poll(0.02)
+                ed.poll(0.01)
         th = threading.Thread(target=pull, daemon=True)
         th.start()
+        fids, n = [], 0
+        pc0 = int(td("print(comp.ext.RasterEditorExt.pump_count)").strip())
+        tc0 = time.time()
+        end = tc0 + 4
+        nxt = time.perf_counter()
         while time.time() < end:
             fids.append(ed.send_surface(1, ((n * 61) % (IW - 64), (n * 37) % (IH - 64), 64, 64), tile))
             n += 1
-            time.sleep(1 / 60)
-        time.sleep(0.6)
+            nxt += 1 / 60
+            while time.perf_counter() < nxt:   # (a loaded machine stretches time.sleep: spin so the 60 Hz edit rate is real)
+                time.sleep(0)
+        time.sleep(0.5)
         stop.set()
         th.join()
-        frames = ed.view_log
-        fps = len(frames) / 4.0
-        # age: tile sent -> the VIEW frame whose appliedFrameId covers it. TD side = until its notice arrives (readback,
-        # conversion, publish, WebSocket); total adds the client's own 8 MB GET /view.
-        td_ages, tot_ages, fetch_ms = [], [], []
-        for fid in fids[::5]:
-            fr = next((f for f in frames if f[2] >= fid), None)
-            if fr is not None:
-                td_ages.append((fr[4] - ed.sent[fid]) * 1000)
-                tot_ages.append((fr[0] - ed.sent[fid]) * 1000)
-                fetch_ms.append((fr[0] - fr[4]) * 1000)
-
-        def q(xs, f):
-            xs = sorted(xs)
-            return xs[min(len(xs) - 1, int(len(xs) * f))] if xs else float("nan")
-        med, p95 = q(tot_ages, 0.5), q(tot_ages, 0.95)
-        td_med, td_p95, fetch_med = q(td_ages, 0.5), q(td_ages, 0.95), q(fetch_ms, 0.5)
+        pc1 = int(td("print(comp.ext.RasterEditorExt.pump_count)").strip())
+        td_fps = (pc1 - pc0) / (time.time() - tc0)
+        fast = [f for f in ed.vframes if f["kind"] == "fast"]
+        fps = len(fast) / 4.0
+        ages = []
+        for fid in fids[::4]:
+            f = next((f for f in fast if f["info"]["applied"] is not None and f["info"]["applied"] >= fid), None)
+            if f is not None:
+                ages.append((f["t"] - ed.sent[fid]) * 1000)
+        p50, p95 = q(ages, 0.5), q(ages, 0.95)
         st = stats()
-        STATE["view"] = dict(fps=fps, age_med=med, age_p95=p95)
-        restore_p1(ed)
-        # leaving TD mode stops the stream and 404s the endpoint
-        ed.view("local")
+        rate = float(td_json("print(json.dumps(project.cookRate))"))
+        sizes = [f["size"] for f in fast]
+        check("fast fps", fps >= (20 if hot else 25), f"{fps:.1f} fps")
+        check("edit -> display p50", p50 <= (130 if hot else 100), f"{p50:.0f} ms (cook rate {rate:g})")
+        notes.append(f"FAST 720p: {fps:.1f} fps ({len(fast)} frames/4 s), edit->display p50 {p50:.0f} ms p95 {p95:.0f} ms (cook rate {rate:g} fps, {len(ages)} samples, {len(fids)} edits sent), "
+                     f"{statistics_mean(sizes) / 1024:.0f} KB/frame; TD frame rate while streaming {td_fps:.1f} fps; TD main thread per frame: total {fmt(st['vfast'])} | capture {fmt(st['vfastcap'])} | encode {fmt(st['vfastenc'])}; Pump {fmt(st['pump'])}")
+        # restore p1 and let the picture settle
+        fid = ed.send_surface(1, (0, 0, IW, IH), p1)
+        wait_applied(ed, fid, 5)
+        # typical content (solid brush dabs instead of noise): the per-frame main-thread cost without the JPEG noise penalty
+        clear_stats()
+        ed.vframes.clear()
+        dab = np.zeros((64, 64, 4), np.uint8)
+        dab[...] = (230, 120, 20, 255)
+        stop = threading.Event()
+        th = threading.Thread(target=lambda: [ed.poll(0.01) for _ in iter(stop.is_set, True)], daemon=True)
+        th.start()
+        nxt, n2, end2 = time.perf_counter(), 0, time.time() + 2.5
+        while time.time() < end2:
+            ed.send_surface(1, ((n2 * 17) % (IW - 64), 200 + (n2 * 5) % 600, 64, 64), dab)
+            n2 += 1
+            nxt += 1 / 60
+            while time.perf_counter() < nxt:
+                time.sleep(0)
+        time.sleep(0.3)
+        stop.set()
+        th.join()
+        st2 = stats()
+        sz2 = [f["size"] for f in ed.vframes if f["kind"] == "fast"]
+        notes.append(f"FAST 720p, typical content (solid dabs): {len(sz2) / 2.5:.1f} fps, {statistics_mean(sz2) / 1024:.0f} KB/frame; main thread per frame total {fmt(st2['vfast'])} | capture {fmt(st2['vfastcap'])} (readback {fmt(st2['vfastrs'])}) | encode {fmt(st2['vfastenc'])}")
+        fid = ed.send_surface(1, (0, 0, IW, IH), p1)
+        wait_applied(ed, fid, 5)
+        # --- auto: fast while changing, ONE exact frame after the last change, byte identical to out1
+        ed.vframes.clear()
+        ed.view11("auto", viewport)
+        ed.wait(lambda: any(f["kind"] == "exact" for f in ed.vframes), 3)
+        first = next((f for f in ed.vframes if f["kind"] == "exact"), None)
+        check("first exact frame is a full frame", first is not None and first["ek"] == 0, f"{first and first['ek']}")
+        full_size = first["size"] if first is not None else None
         ed.run(0.5)
-        n0 = len(ed.view_log)
+        ed.vframes.clear()
+        t_last = None
+        for i in range(10):
+            ed.send_surface(1, (100 + i * 70, 300, 64, 64), tile)
+            t_last = time.time()
+            time.sleep(1 / 30)
+            ed.poll(0)
+        ed.wait(lambda: any(f["kind"] == "exact" for f in ed.vframes), 2.0)
+        ex = [f for f in ed.vframes if f["kind"] == "exact"]
+        nfast = sum(1 for f in ed.vframes if f["kind"] == "fast")
+        if check("auto sends an exact frame", bool(ex), f"{nfast} fast, no exact; status {status()!r}"):
+            lag = (ex[0]["t"] - t_last) * 1000
+            check("exact within 500 ms of the last change", lag <= (700 if hot else 500), f"{lag:.0f} ms")
+            ed.run(0.8)
+            exn = sum(1 for f in ed.vframes if f["kind"] == "exact")
+            check("one exact frame per rest", exn == 1, f"{exn} exact frames")
+            full_ex = ex[0]
+            bad = exact_vs_out1(ed.exact_buf) if ed.exact_buf is not None else ["no buffer"]
+            check("exact == out1 byte identical", not bad, f"bands differing: {bad[:8]}")
+            notes.append(f"AUTO: {nfast} fast frames while editing, then exact {full_ex['size'] / 1024:.0f} KB ({'full' if full_ex['ek'] == 0 else 'tiles'}) {lag:.0f} ms after the last change; "
+                         f"byte identical to out1: {not bad}; first exact applied={full_ex['info']['applied']}")
+            # tile refine after a small edit (a 50x50 solid block crossing tile borders)
+            blk = np.zeros((50, 50, 4), np.uint8)
+            blk[...] = (200, 40, 220, 255)
+            ed.vframes.clear()
+            ed.send_surface(1, (1000, 700, 50, 50), blk)
+            t_edit = time.time()
+            ed.wait(lambda: any(f["kind"] == "exact" for f in ed.vframes), 2.0)
+            ex2 = [f for f in ed.vframes if f["kind"] == "exact"]
+            if check("tile refine arrives", bool(ex2)):
+                f2 = ex2[0]
+                if full_size is None:   # reset to learn the full size
+                    ed.vframes.clear()
+                    ed.send(P.view_exact_reset())
+                    ed.wait(lambda: any(f["kind"] == "exact" for f in ed.vframes), 2.0)
+                    full_size = next((f["size"] for f in ed.vframes if f["kind"] == "exact" and f["ek"] == 0), None)
+                check("tile frame kind", f2["ek"] == 1 and 1 <= f2["n"] <= 4, f"kind {f2['ek']} n {f2['n']}")
+                if full_size:
+                    check("tile refine < 10 % of full", f2["size"] < 0.10 * full_size, f"{f2['size']} B vs full {full_size} B")
+                bad = exact_vs_out1(ed.exact_buf) if ed.exact_buf is not None else ["no buffer"]
+                check("exact after tile patch == out1", not bad, f"bands {bad[:8]}")
+                notes.append(f"TILE refine: {f2['n']} tiles, {f2['size']} B vs full frame {full_size} B ({100.0 * f2['size'] / (full_size or 1):.1f} %), "
+                             f"{(f2['t'] - t_edit) * 1000:.0f} ms after the edit; identical to out1: {not bad}")
+        # exact main-thread cost + worker time (the full frames above)
+        st = stats()
+        notes.append(f"EXACT 1080p main thread {fmt(st['vxmain'])} (read {fmt(st['vxreadback'])} | convert {fmt(st['vxconvert'])}); worker encode {fmt(st['vxenc'])}")
+        # --- reset -> a full frame
+        ed.vframes.clear()
+        ed.send(P.view_exact_reset())
+        ed.wait(lambda: any(f["kind"] == "exact" for f in ed.vframes), 2.0)
+        check("reset gives a full frame", any(f["kind"] == "exact" and f["ek"] == 0 for f in ed.vframes))
+        # --- exact only: edits give exact frames and no fast frames
+        ed.view11("exact", viewport)
+        ed.run(0.6)
+        ed.vframes.clear()
+        ed.send_surface(1, (300, 300, 50, 50), blk)
+        ed.wait(lambda: any(f["kind"] == "exact" for f in ed.vframes), 2.0)
+        ed.run(0.3)
+        check("exact-only", any(f["kind"] == "exact" for f in ed.vframes) and not any(f["kind"] == "fast" for f in ed.vframes),
+              f"{[f['kind'] for f in ed.vframes]}")
+        # --- fast only: frames while editing, never an exact frame
+        ed.view11("fast", viewport)
+        ed.run(0.5)
+        ed.vframes.clear()
+        ed.send_surface(1, (400, 400, 50, 50), blk)
+        ed.run(1.0)
+        check("fast-only", any(f["kind"] == "fast" for f in ed.vframes) and not any(f["kind"] == "exact" for f in ed.vframes),
+              f"{[f['kind'] for f in ed.vframes]}")
+        # --- viewport crop: zoomed in on a 640x360 region at 1:1 -> a 640x360 frame covering that rect
+        ed.view11("fast", {"x": 700.4, "y": 300.2, "w": 640, "h": 360, "scale": 2.0})
+        ed.vframes.clear()
+        ed.wait(lambda: any(f["kind"] == "fast" for f in ed.vframes), 3)
+        ed.run(0.3)
+        fz = next((f["info"] for f in reversed(ed.vframes) if f["kind"] == "fast"), None)
+        if check("crop frame", fz is not None):
+            check("crop geometry", fz["rect"] == (700.0, 300.0, 641.0, 361.0) and (fz["pw"], fz["ph"]) == (641, 361) and jpeg_size(fz["rgb"]) == (641, 361),
+                  f"rect {fz['rect']} px {(fz['pw'], fz['ph'])} jpeg {jpeg_size(fz['rgb'])}")
+        nodes = view_nodes()
+        check("view nodes exist while subscribed", len(nodes) >= 3, f"{nodes}")
+        # --- unsubscribe: no frames, nodes destroyed, exact fetch refused
+        ed.send(P.view("local", 1.0, 0, 0, {"x": 0, "y": 0, "w": 10, "h": 10}))
+        ed.run(0.5)
+        ed.vframes.clear()
         ed.send_surface(1, (0, 0, 64, 64), tile)
         ed.run(0.8)
-        stopped = len(ed.view_log) == n0
-        gone = http_get(args.port, f"/view?token={ed.token}&client={ed.client_id}")[0] == 404
-        ok = vdiff <= 3 and shape_ok and fps >= 20 and stopped and gone   # fps is the pass criterion; ages are reported
-        return ok, (f"first VIEW frame: type/slot/size ok={shape_ok}, worst diff vs out1 {vdiff:.1f}; stream {fps:.1f} fps "
-                    f"(budget >= 20), age tile -> TD notice (TD side) median {td_med:.0f} ms p95 {td_p95:.0f} ms, + client GET /view {fetch_med:.0f} ms "
-                    f"= total median {med:.0f} ms p95 {p95:.0f} ms (budget <= 120 total, reported only), "
-                    f"{len(frames)} frames; view convert {fmt(st['vconvert'])} | publish {fmt(st['vpublish'])} | readback {fmt(st['vreadback'])}; "
-                    f"stops after mode local: {stopped}, GET /view -> 404: {gone}")
+        nodes = view_nodes()
+        check("unsubscribe stops the stream", not ed.vframes, f"{len(ed.vframes)} frames")
+        check("view nodes destroyed", not nodes, f"{nodes}")
+        check("GET /view?exact=1 after unsubscribe", http_get(args.port, f"/view?token={ed.token}&client={ed.client_id}&exact=1&frameId=1")[0] == 404)
+        # --- a protocol 10 client keeps the v3 path (notice + GET /view, type 5)
+        leg = Editor(args.port, protocol=10)
+        leg.send(P.view("td", 1.0, 0, 0, {"x": 0, "y": 0, "w": 1280, "h": 800}))
+        got = leg.wait(lambda: leg.view_log, 5)
+        check("protocol 10 client", bool(got) and leg.hello["protocol"] == 10 and leg.view_log[0][1].type == P.TYPE_VIEW and not leg.vframes,
+              f"view_log {len(leg.view_log)} hello {leg.hello and leg.hello.get('protocol')}")
+        leg.send(P.view("local", 1.0, 0, 0, {"x": 0, "y": 0, "w": 10, "h": 10}))
+        leg.close()
+        leg = None
+        # --- two editors streaming (the second is a temporary editor with its own document)
+        id2 = mk_editor("_v8_ed2", 640, 360)
+        ed2 = Editor(args.port, editor=id2)
+        if check("second editor", bool(id2) and ed_scene(ed2, "pa", (255, 0, 0, 255))):
+            ed2.view11("auto", {"x": 0, "y": 0, "w": 640, "h": 360, "scale": 1.0})
+            ed.view11("fast", viewport)
+            ed2.wait(lambda: any(f["kind"] == "exact" for f in ed2.vframes), 4)
+            ed.send_surface(1, (0, 0, 64, 64), tile)
+            ed.run(0.6)
+            f2 = [f for f in ed2.vframes if f["kind"] == "fast"]
+            e2 = [f for f in ed2.vframes if f["kind"] == "exact"]
+            check("editor 2 fast+exact", bool(f2) and bool(e2) and (f2[0]["info"]["docW"], f2[0]["info"]["docH"]) == (640, 360), f"{len(f2)} fast {len(e2)} exact")
+            if e2 and ed2.exact_buf is not None:
+                check("editor 2 exact content", ed2.exact_buf.shape == (360, 640, 4) and tuple(ed2.exact_buf[100, 100]) == (255, 0, 0, 255), f"{ed2.exact_buf[100, 100]}")
+            check("editor 1 still streaming", any(f["kind"] == "fast" for f in ed.vframes))
+            nodes2 = view_nodes("/project1/_v8_ed2")
+            nodes1 = view_nodes()
+            check("view nodes per editor", len(nodes2) >= 3 and len(nodes1) >= 3, f"{nodes1} {nodes2}")
+            ed2.view11("exact")
+            ed2.send(P.view("local", 1.0, 0, 0, {"x": 0, "y": 0, "w": 10, "h": 10}))
+            ed2.run(0.4)
+            check("editor 2 nodes destroyed after unsubscribe", not view_nodes("/project1/_v8_ed2"), f"{view_nodes('/project1/_v8_ed2')}")
+            notes.append(f"EDITORS: ed2 {len(f2)} fast / {len(e2)} exact frames; nodes ed1 {len(nodes1)}, ed2 {len(nodes2)}")
+        ed.send(P.view("local", 1.0, 0, 0, {"x": 0, "y": 0, "w": 10, "h": 10}))
+        ed.run(0.3)
+        # leave the scene as step 5 does
+        ed.send_doc(SCENE_LAYERS, base_rev + 2)
+        STATE.update(p1=p1, p2=p2, mask=mask, rev=base_rev + 2)
+        fid = ed.send_surface(1, (0, 0, IW, IH), p1)
+        wait_applied(ed, fid, 5)
+        return not fails, "; ".join(fails) + ("\n        " if fails else "") + "\n        ".join(notes)
     finally:
-        ed.close()
+        for c in (ed, ed2, leg):
+            if c is not None:
+                try:
+                    c.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        # leave nothing behind: the view mode is local again (clients are closed) and no fast-view node survives
+        td("t = op('/project1/_v8_ed2')\nif t: t.destroy()\nfor n in [c.name for c in comp.children if c.name.startswith('_view_')]:\n    comp.op(n).destroy()", 60)
+
+
+def statistics_mean(xs):
+    return sum(xs) / len(xs) if xs else 0.0
 
 
 def s8_latency(args):

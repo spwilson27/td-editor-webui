@@ -2,9 +2,11 @@ import { readFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { resolve } from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
+import { deflateSync } from 'node:zlib';
+import { SOLID_ALPHA, SOLID_RGB } from '../helpers/jpegs';
 import {
-  FRAME_BASE, FRAME_LAYER_PREVIEW, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, FRAME_VIEW, decodeFrame, decodeWebMessage, encodeFrame, encodeMessage, isStale,
-  type EditorInfo, type EditorList, type Frame, type TdMessage, type WebMessage,
+  FRAME_BASE, FRAME_LAYER_PREVIEW, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, decodeFrame, decodeWebMessage, encodeFrame, encodeMessage, encodeViewExact, encodeViewFast, isStale,
+  type EditorInfo, type ViewQuality, type ViewportReport, type EditorList, type Frame, type TdMessage, type WebMessage,
 } from '../../src/bridge/codec';
 import type { BrushPreset, CanvasMode, Guides, LayerSpec } from '../../src/engine/types';
 
@@ -104,11 +106,33 @@ export class FakeTd {
   topFetches: string[] = [];
   /** Hold topReady for this long (a slow readback). */
   topDelayMs = 0;
-  viewFetches: { frameId: number; status: number }[] = [];
+  // ---- v11 view stream ----
   viewSubscribed = false;
   lastView: Extract<WebMessage, { t: 'view' }> | null = null;
-  private viewStored: { id: number; bytes: Uint8Array; applied: number } | null = null;
-  private viewPending = false;
+  viewMessages: Extract<WebMessage, { t: 'view' }>[] = [];
+  viewQuality: ViewQuality = 'auto';
+  viewport: ViewportReport | null = null;
+  /** SOLID_RGB / SOLID_ALPHA keys of the fast frames' two JPEGs. */
+  fastColor = 'red';
+  fastAlpha: string | null = null;
+  fastSent: { frameId: number; applied: number; viewport: ViewportReport | null }[] = [];
+  acks: number[] = [];
+  exactResets = 0;
+  exactSent: { frameId: number; kind: 'full' | 'tiles'; nTiles: number; bytes: number; viaHttp: boolean }[] = [];
+  exactFetches: { frameId: number; status: number }[] = [];
+  /** Exact image override (document sized, straight RGBA); default: surface slot 1. */
+  exactImage: Uint8Array | null = null;
+  exactDelayMs = 200;
+  /** Frames > this go through viewExact + GET /view?exact=1 (the protocol says 4 MB). */
+  exactSocketLimit = 4 * 1024 * 1024;
+  private unacked = new Set<number>(); // fast AND exact frames: TD keeps at most 2 un-acked
+  private fastPending = false;
+  private exactTimer: ReturnType<typeof setTimeout> | null = null;
+  private exactClient: Uint8Array | null = null; // what the client's exact buffer holds (the last exact frame sent)
+  private exactClientSize = { w: 0, h: 0 };
+  private needFullExact = true;
+  private fastSinceExact = false;
+  private exactStored = new Map<number, Uint8Array>();
   private nextViewId = 1;
   private lastSurfaceFrameId = -1;
   private tdFrame = 0;
@@ -329,12 +353,11 @@ export class FakeTd {
         send(200, encodeFrame({ type: FRAME_SURFACE_DUMP, frameEnd: true, slot, frameId: 1, docW: sz.w, docH: sz.h, x: 0, y: 0, w: sz.w, h: sz.h }, buf));
         return;
       }
-      this.viewFetches.push({ frameId: Number(q.get('frameId')), status: this.viewStored ? 200 : 404 });
-      this.viewPending = false;
-      if (!this.viewStored) { send(404); return; }
-      const served = this.viewStored;
-      send(200, served.bytes);
-      if (this.viewStored.id > served.id) this.announceView();
+      const fid = Number(q.get('frameId'));
+      const stored = q.get('exact') === '1' ? this.exactStored.get(fid) : undefined;
+      this.exactFetches.push({ frameId: fid, status: stored ? 200 : 404 });
+      if (!stored) { send(404); return; }
+      send(200, stored);
       return;
     }
     if (u.pathname !== '/base') { res.writeHead(404, cors).end(); return; }
@@ -423,9 +446,10 @@ export class FakeTd {
     this.connections++;
     this.awaitingRequestDoc = false;
     for (const i of this.inputs.values()) i.pending = false;
-    this.viewPending = false;
     this.layerPending.clear();
     this.viewSubscribed = false;
+    this.unacked.clear(); this.fastPending = false; this.needFullExact = true; this.exactClient = null;
+    if (this.exactTimer) { clearTimeout(this.exactTimer); this.exactTimer = null; }
     this.clientId = `client-${++this.clientSeq}`;
     ws.on('message', (data, isBinary) => {
       if (!isBinary) {
@@ -471,9 +495,12 @@ export class FakeTd {
         }
         if (m.t === 'view') {
           this.lastView = m;
+          this.viewMessages.push(m);
           this.viewSubscribed = m.mode === 'td';
-          if (this.viewSubscribed) { this.viewPending = false; this.announceView(); }
+          if (m.mode === 'td') { this.viewQuality = m.quality; this.viewport = m.viewport; this.viewChanged(); } else { this.viewport = null; if (this.exactTimer) { clearTimeout(this.exactTimer); this.exactTimer = null; } }
         }
+        if (m.t === 'viewAck') { this.acks.push(m.frameId); this.unacked.delete(m.frameId); if (this.fastPending) { this.fastPending = false; this.sendFast(); } }
+        if (m.t === 'viewExactReset') { this.exactResets++; this.needFullExact = true; this.scheduleExact(0); }
         if (m.t === 'takeover') { this.active = true; this.send({ t: 'active', active: true }); }
         return;
       }
@@ -493,6 +520,7 @@ export class FakeTd {
       if (f.frameEnd) {
         this.frameEnds++;
         this.lastSurfaceFrameId = f.frameId;
+        this.viewChanged();
         if (this.autoApplied) this.send({ t: 'applied', frameId: f.frameId, tdFrame: ++this.tdFrame });
       }
     });
@@ -501,7 +529,7 @@ export class FakeTd {
 
   hello(): TdMessage {
     return {
-      t: 'hello', protocol: 10, doc: { w: this.w, h: this.h, mode: this.mode }, hasInput: this.opts.hasInput ?? false, maxSendFps: this.opts.maxSendFps ?? 30,
+      t: 'hello', protocol: 11, doc: { w: this.w, h: this.h, mode: this.mode }, hasInput: this.opts.hasInput ?? false, maxSendFps: this.opts.maxSendFps ?? 30,
       inputs: this.inputList(),
       active: this.active, clientId: this.clientId, hasDocument: this.doc !== null, rev: this.doc?.rev ?? null,
     };
@@ -634,18 +662,90 @@ export class FakeTd {
     return Array.from(this.surfaces.get(slot)!.subarray(i, i + 4));
   }
 
-  /** Store a whole-document TD output image; announced as a `view` notice to subscribed (external TD-mode) clients. */
-  setViewImage(rgba: Uint8Array) {
-    const id = this.nextViewId++;
-    const bytes = encodeFrame({ type: FRAME_VIEW, frameEnd: true, slot: 0, frameId: id, docW: this.w, docH: this.h, x: 0, y: 0, w: this.w, h: this.h }, rgba);
-    this.viewStored = { id, bytes, applied: this.lastSurfaceFrameId };
-    this.announceView();
+  /** TD's output changed (a surface was applied, the viewport moved, a test set the image): fast frames now, an exact one after idle. */
+  viewChanged() {
+    if (!this.client || !this.viewSubscribed) return;
+    if (this.viewQuality !== 'exact') this.sendFast();
+    if (this.viewQuality !== 'fast') this.scheduleExact(this.exactDelayMs);
   }
 
-  private announceView() {
-    if (!this.client || !this.viewStored || !this.viewSubscribed || this.viewPending) return;
-    this.viewPending = true;
-    this.send({ t: 'view', frameId: this.viewStored.id, docW: this.w, docH: this.h, w: this.w, h: this.h, appliedFrameId: this.viewStored.applied });
+  /** A test sets the exact output image (document sized, straight RGBA). */
+  setOutput(rgba: Uint8Array | null) { this.exactImage = rgba; this.viewChanged(); }
+
+  private scheduleExact(ms: number) {
+    if (this.exactTimer) clearTimeout(this.exactTimer);
+    this.exactTimer = setTimeout(() => { this.exactTimer = null; this.sendExact(); }, ms);
+  }
+
+  sendFast() {
+    if (!this.client || !this.viewSubscribed) return;
+    if (this.unacked.size >= 2) { this.fastPending = true; return; }
+    const id = this.nextViewId++;
+    this.unacked.add(id);
+    const vp = this.viewport;
+    this.fastSinceExact = true;
+    this.fastSent.push({ frameId: id, applied: this.lastSurfaceFrameId, viewport: vp });
+    const rect = vp ?? { x: 0, y: 0, w: this.w, h: this.h, scale: 1 };
+    this.client.send(encodeViewFast({
+      frameId: id, appliedFrameId: this.lastSurfaceFrameId >>> 0, x: rect.x, y: rect.y, w: rect.w, h: rect.h, pw: 16, ph: 16,
+      rgb: SOLID_RGB[this.fastColor], alpha: this.fastAlpha ? SOLID_ALPHA[this.fastAlpha] : null,
+    }));
+  }
+
+  /** The document-sized image an exact frame carries. */
+  exactSource(): Uint8Array {
+    if (this.exactImage) return this.exactImage;
+    // the lowest pixel slot of document size stands in for "TD's composite"
+    for (const slot of [...this.surfaces.keys()].sort((a, b) => a - b)) {
+      const s = this.surfaces.get(slot)!, sz = this.slotSizes.get(slot);
+      if (sz && sz.w === this.w && sz.h === this.h) return new Uint8Array(s.buffer, s.byteOffset, s.byteLength);
+    }
+    return new Uint8Array(this.w * this.h * 4);
+  }
+
+  sendExact() {
+    if (!this.client || !this.viewSubscribed || this.viewQuality === 'fast') return;
+    const img = this.exactSource();
+    const { w, h } = this;
+    const id = this.nextViewId++;
+    const prev = this.exactClient;
+    let full = this.needFullExact || !prev || this.exactClientSize.w !== w || this.exactClientSize.h !== h;
+    const tiles: { tx: number; ty: number; tw: number; th: number }[] = [];
+    if (!full) {
+      for (let ty = 0; ty * 64 < h; ty++) {
+        for (let tx = 0; tx * 64 < w; tx++) {
+          const tw = Math.min(64, w - tx * 64), th = Math.min(64, h - ty * 64);
+          let changed = false;
+          for (let r = 0; r < th && !changed; r++) {
+            const o = ((ty * 64 + r) * w + tx * 64) * 4;
+            for (let k = 0; k < tw * 4; k++) if (img[o + k] !== prev![o + k]) { changed = true; break; }
+          }
+          if (changed) tiles.push({ tx, ty, tw, th });
+        }
+      }
+      if (!tiles.length && !this.fastSinceExact) return; // nothing changed since the last exact frame (a zero-tile frame re-announces it after fast frames)
+      if (tiles.length > 0.3 * Math.ceil(w / 64) * Math.ceil(h / 64)) full = true;
+    }
+    let raw: Uint8Array;
+    if (full) raw = img;
+    else {
+      const idx = new Uint8Array(tiles.length * 8), dv = new DataView(idx.buffer);
+      tiles.forEach((t, i) => { dv.setUint16(i * 8, t.tx, true); dv.setUint16(i * 8 + 2, t.ty, true); dv.setUint16(i * 8 + 4, t.tw, true); dv.setUint16(i * 8 + 6, t.th, true); });
+      const rows: Uint8Array[] = [idx];
+      for (const t of tiles) for (let r = 0; r < t.th; r++) rows.push(img.subarray(((t.ty * 64 + r) * w + t.tx * 64) * 4, ((t.ty * 64 + r) * w + t.tx * 64 + t.tw) * 4));
+      raw = new Uint8Array(rows.reduce((n, a) => n + a.length, 0));
+      let o = 0;
+      for (const a of rows) { raw.set(a, o); o += a.length; }
+    }
+    const bytes = encodeViewExact({ frameId: id, appliedFrameId: this.lastSurfaceFrameId >>> 0, docW: w, docH: h, full, tile: 64, nTiles: full ? 0 : tiles.length, body: new Uint8Array(deflateSync(raw, { level: 1 })) });
+    this.exactClient = new Uint8Array(img);
+    this.exactClientSize = { w, h };
+    this.needFullExact = false;
+    const viaHttp = bytes.length > this.exactSocketLimit;
+    this.unacked.add(id);
+    this.fastSinceExact = false;
+    this.exactSent.push({ frameId: id, kind: full ? 'full' : 'tiles', nTiles: full ? 0 : tiles.length, bytes: bytes.length, viaHttp });
+    if (viaHttp) { this.exactStored.set(id, bytes); this.send({ t: 'viewExact', frameId: id, size: bytes.length }); } else this.client.send(bytes);
   }
 
   send(m: TdMessage) { this.client?.send(encodeMessage(m)); }

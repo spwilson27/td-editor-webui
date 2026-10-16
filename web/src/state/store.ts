@@ -16,12 +16,20 @@ import { createInputsSlice } from './inputsSlice';
 import { createBrushesSlice } from './brushesSlice';
 import { CLIP_MARKER, createLayersSlice } from './layersSlice';
 import { BIG_DOC_KEY } from './brushes';
+import { peekTdViewGl, sharedTdViewGl } from '../ui/tdViewGl';
+import type { ViewSink } from '../bridge/tdViewClient';
 import { defaultEffect, effectLabel } from './effectDefaults';
 
 /** Per-viewer view toggles (v4). Guides themselves live in the document. */
 export const RULERS_KEY = 'raster-editor.view.rulers';
 export const GUIDES_KEY = 'raster-editor.view.guides';
 export const SNAP_KEY = 'raster-editor.view.snap';
+/** v11: Auto / Low latency / Accurate, per viewer. */
+export const VIEW_QUALITY_KEY = 'raster-editor.view.quality';
+export type ViewQualityChoice = 'auto' | 'fast' | 'exact';
+export function loadViewQuality(): ViewQualityChoice {
+  try { const v = localStorage.getItem(VIEW_QUALITY_KEY); return v === 'fast' || v === 'exact' ? v : 'auto'; } catch { return 'auto'; }
+}
 export const SNAP_THRESHOLD = 6; // screen px
 /** One-time "try the TD view" notice above this many pixels (v6; never an automatic switch). */
 export const BIG_DOC_PIXELS = 8_000_000;
@@ -37,7 +45,7 @@ function saveFlag(key: string, on: boolean) {
 export interface GuideDrag { axis: 'h' | 'v'; index: number | null; pos: number; remove: boolean }
 
 /** What the store needs from the bridge; everything but TOP import is optional (standalone, tests). */
-export type StoreBridge = Pick<Bridge, 'listTops' | 'importTop'> & Partial<Pick<Bridge, 'renderLayer' | 'renderLayers' | 'setCanvas' | 'saveProject' | 'openProject' | 'exportPng' | 'clearStoredHistory'>>;
+export type StoreBridge = Pick<Bridge, 'listTops' | 'importTop'> & Partial<Pick<Bridge, 'renderLayer' | 'renderLayers' | 'refreshView' | 'setCanvas' | 'saveProject' | 'openProject' | 'exportPng' | 'clearStoredHistory'>>;
 
 export const SHAPE_RENDERER_KEY = 'raster-editor.shapeRenderer';
 export type ShapeRenderer = 'sdf' | 'canvas';
@@ -108,8 +116,10 @@ export function createStore() {
   const viewLatency = signal<LatencyStats>(NO_LATENCY);
   const viewAge = signal<number | null>(null);
   const tdViewTick = signal(0);
+  const viewQuality = signal<ViewQualityChoice>(loadViewQuality());
+  /** v11: which kind of TD frame is on screen (null = none yet / Local view). */
+  const viewShown = signal<'fast' | 'exact' | null>(null);
   const loadingDoc = signal(false);
-  let tdViewSource: HTMLCanvasElement | null = null;
   let lastActiveId: string | null = null;
   let autoFx: string | null = null; // the adjustment layer whose activation switched the panel to Effects
 
@@ -168,6 +178,32 @@ export function createStore() {
 
   const layers = createLayersSlice(ctx);
 
+  const tdGl = () => {
+    const g = sharedTdViewGl();
+    g.onChange ??= () => { tdViewTick.value++; };
+    g.onLostChange ??= (lost) => {
+      // while the context is lost nothing is drawn, so the badge must not claim a frame
+      viewShown.value = lost ? null : g.kind;
+      if (!lost) store.bridge?.refreshView?.(); // ask TD for a fresh frame
+      tdViewTick.value++;
+    };
+    return g;
+  };
+  const GL_NOTICE = 'The TouchDesigner view needs WebGL 2, which is not available in this browser - using the Local view';
+  /** No WebGL2 / broken shaders: one notice and back to Local (setViewMode refuses TD from then on, so there is no loop). */
+  const glBroken = (g: ReturnType<typeof tdGl>) => {
+    if (g.usable) return false;
+    store.setNotice(g.failure ? `${GL_NOTICE} (${g.failure})` : GL_NOTICE);
+    if (viewMode.peek() === 'td') store.setViewMode('local');
+    return true;
+  };
+  const tdSink: ViewSink = {
+    fast: (i) => { const g = tdGl(); if (glBroken(g)) { i.rgb.close(); i.alpha?.close(); return false; } return g.fast(i); },
+    exact: (b, d) => { const g = tdGl(); return glBroken(g) ? false : g.exact(b, d); },
+    show: (k) => tdGl().show(k),
+    clear: () => peekTdViewGl()?.clear(),
+    maxExactDim: () => tdGl().maxExactDim(),
+  };
   const store = {
     ...createToolsSlice(ctx), ...createEffectsSlice(ctx), ...createFilesSlice(ctx), ...createInputsSlice(ctx),
     ...layers,
@@ -190,7 +226,7 @@ export function createStore() {
     snapOptions(): SnapOptions { return { enabled: snapOn.value, guides: true, canvas: true, layers: true, threshold: SNAP_THRESHOLD }; },
     /** Set by the App: opens the Place Image file chooser. */
     openPlace: null as (() => void) | null,
-    colorTab, layerTab, viewMode, viewRect, latency, viewLatency, viewAge, tdViewTick, loadingDoc,
+    colorTab, layerTab, viewMode, viewRect, latency, viewLatency, viewAge, tdViewTick, viewQuality, viewShown, loadingDoc,
     view, zoom, spaceHeld, docSize, docName, editors, editorMaster, editorId, editorSwitching, switchTarget, discardAsk, sessionEpoch, connection, active, notice, fatal, layerPreviews,
     docVersion, historyVersion, selectionVersion, thumbTick,
     takeover: null as (() => void) | null,
@@ -213,7 +249,8 @@ export function createStore() {
     setEditorList(list: EditorList) { editors.value = list.editors; editorMaster.value = list.master; },
     /** TD view is only possible while linked to TouchDesigner. */
     tdAvailable: computed(() => connection.value === 'linked'),
-    tdViewSource: () => tdViewSource,
+    /** v11: the TD view compositor as the bridge's frame sink. */
+    tdViewSink: tdSink,
     /** Time of the last Space keydown (incl. auto-repeat); lets a missing keyup be detected. */
     spaceSeenAt: 0,
 
@@ -395,16 +432,19 @@ export function createStore() {
     // v2 view mode, masks, adjustments
     setViewMode(m: 'local' | 'td') {
       if (m === 'td' && connection.peek() !== 'linked') return;
+      if (m === 'td' && typeof document !== 'undefined' && glBroken(tdGl())) return;
       viewMode.value = m;
       engine?.setPreviewEnabled(m === 'local');
     },
     toggleViewMode: () => store.setViewMode(viewMode.peek() === 'local' ? 'td' : 'local'),
-    /** Image of TD's output for the external TD view (straight RGBA, document sized). */
-    setViewFrame(w: number, h: number, rgba: Uint8ClampedArray, ageMs: number) {
-      if (!tdViewSource) tdViewSource = document.createElement('canvas');
-      if (tdViewSource.width !== w || tdViewSource.height !== h) { tdViewSource.width = w; tdViewSource.height = h; }
-      tdViewSource.getContext('2d')!.putImageData(new ImageData(rgba as Uint8ClampedArray<ArrayBuffer>, w, h), 0, 0);
-      viewAge.value = Math.round(ageMs);
+    setViewQuality(q: ViewQualityChoice) {
+      viewQuality.value = q;
+      try { localStorage.setItem(VIEW_QUALITY_KEY, q); } catch { /* storage may be blocked */ }
+    },
+    /** v11: the bridge reports which TD frame kind is composited (`ageMs` = arrival -> composited). */
+    setViewShown(kind: 'fast' | 'exact' | null, ageMs: number) {
+      viewShown.value = kind && !peekTdViewGl()?.isLost ? kind : null; // nothing is drawn while the GPU context is lost
+      if (kind) viewAge.value = Math.round(ageMs);
       tdViewTick.value++;
     },
     setLoading: (b: boolean) => { loadingDoc.value = b; },
@@ -735,6 +775,8 @@ export function createStore() {
       latency.value = NO_LATENCY;
       viewLatency.value = NO_LATENCY;
       viewAge.value = null;
+      viewShown.value = null;
+      peekTdViewGl()?.clear();
       loadingDoc.value = false;
     },
 

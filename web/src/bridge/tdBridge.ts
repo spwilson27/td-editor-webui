@@ -4,9 +4,11 @@ import type { InputItem } from '../state/inputsSlice';
 import { layerBelow } from '../state/layerDrop';
 import { RENDER_STALE_MESSAGE } from '../state/layersSlice';
 import {
-  FRAME_BASE, FRAME_LAYER_PREVIEW, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, FRAME_VIEW, MAX_BAND_PAYLOAD, PROTOCOL_VERSION,
-  decodeFrame, decodeTdMessage, encodeBands, encodeMessage, isStale, type ChoosePurpose, type EditorList, type TdMessage, type TopItem, type ViewMode, type ViewRect, type RenderMode, type WebMessage,
+  FRAME_BASE, FRAME_LAYER_PREVIEW, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, MAX_BAND_PAYLOAD, PROTOCOL_VERSION,
+  decodeFrame, decodeTdMessage, encodeBands, encodeMessage, isStale, type ChoosePurpose, type EditorList, type TdMessage, type TopItem, type ViewQuality, type ViewRect, type RenderMode, type WebMessage,
 } from './codec';
+import { TdViewClient, type ViewSink } from './tdViewClient';
+import { visibleDocRect } from './viewMath';
 import { parseHash, requestQuery, withEditor } from './urls';
 
 /** v10: what `Bridge.flush` achieved. 'dropped' = unsent edits could not be sent (not linked); 'timeout' is added by the session controller. */
@@ -28,8 +30,10 @@ export interface BridgeStatus {
   setLatency?(s: LatencyStats): void;
   /** stroke → TD output visible in the external view stream (from view.appliedFrameId). */
   setViewLatency?(s: LatencyStats): void;
-  /** An image of TD's output for the external TD view: straight RGBA, document sized; `ageMs` = notice to display. */
-  setViewFrame?(w: number, h: number, rgba: Uint8ClampedArray, ageMs: number): void;
+  /** v11: where decoded TD view frames (VIEW_FAST / VIEW_EXACT) are composited. */
+  viewSink?: ViewSink;
+  /** v11: which kind of TD frame is on screen now (`null` = none); `ageMs` = frame arrival to composited. */
+  setViewShown?(kind: 'fast' | 'exact' | null, ageMs: number): void;
   /** v4: TD's font family list (sent after hello). */
   setFonts?(families: string[]): void;
   /** v6: TD's input list (`inputs` message / `hello.inputs`) for the Add Input Layer menu. The bridge itself calls engine.setInputs. */
@@ -50,7 +54,10 @@ export interface BridgeStatus {
 export type { FileResult, FileOp } from '../state/filesSlice';
 export type { InputItem } from '../state/inputsSlice';
 
-export interface ViewState { mode: ViewMode; zoom: number; panX: number; panY: number; rect: ViewRect }
+/** The page's view: `zoom` / `panX` / `panY` place the document inside the viewport element (`rect`, CSS px). */
+export interface ViewState { mode: 'local' | 'td'; quality?: ViewQuality; zoom: number; panX: number; panY: number; rect: ViewRect }
+/** v11: at most this often a changed viewport is sent (mode / quality changes go out at once). */
+export const VIEW_SEND_INTERVAL_MS = 100;
 
 export interface Bridge {
   takeover(): void;
@@ -61,6 +68,8 @@ export interface Bridge {
   hasUnsent?(): boolean;
   /** v10: the editor this session is bound to ('' = the master's own editor). */
   readonly editor?: string;
+  /** v11: send the current view again (TD then streams a fresh frame). */
+  refreshView?(): void;
   /** Report viewport state; sent to TD at most once per animation frame. */
   setView(v: ViewState): void;
   /** v4: the importable TOPs of the TD project. Rejects when not linked, on a timeout or when TD answers with an error. */
@@ -94,6 +103,10 @@ export interface TdBridgeOptions {
   now?: () => number;
   fetch?: typeof fetch;
   raf?: (cb: () => void) => unknown;
+  /** v11: device pixel ratio for the viewport report. */
+  dpr?: () => number;
+  /** v11: JPEG decoder (default createImageBitmap). */
+  decodeJpeg?: (bytes: Uint8Array) => Promise<ImageBitmap>;
 }
 
 export const BACKPRESSURE_BYTES = 8 * 1024 * 1024;
@@ -225,7 +238,23 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   let docPending = false, docQueued = false, lastDocRev = -1;
   // view
   let viewState: ViewState | null = null, viewQueued = false, viewDirty = false;
-  let viewFetching = false, viewRefetch = false, viewNotice: { frameId: number; applied: number; at: number } | null = null;
+  let lastViewKey = '', lastViewSent = -Infinity, viewTimer: ReturnType<typeof setTimeout> | null = null;
+  const nullSink: ViewSink = { fast: (i) => { i.rgb.close(); i.alpha?.close(); return false; }, exact: () => false, show() {}, clear() {} };
+  const viewClient = new TdViewClient({
+    send: (m) => sendJson(m),
+    sink: status.viewSink ?? nullSink,
+    fetchExact: (id) => fetchExactFrame(id),
+    decodeJpeg: opts.decodeJpeg,
+    now,
+    onDisplayed: (_kind, applied) => {
+      const sent = takeSent(applied);
+      if (sent !== undefined) recordLatency(viewSamples, now() - sent, (x) => status.setViewLatency?.(x));
+    },
+    onShown: (kind, age) => status.setViewShown?.(kind, age),
+    onError: (msg) => sendJson({ t: 'log', level: 'warn', msg }),
+    onNotice: (msg) => status.setNotice(msg),
+  });
+  viewClient.setActive(false); // Local until a td `view` is sent: frames that arrive meanwhile are acked and dropped
   // v7: layer previews (per layer single flight, newest notice wins), active layer, history persistence
   interface PreviewState { frameId: number; fetching: boolean; refetch: boolean; attempts: number }
   const previews = new Map<string, PreviewState>();
@@ -755,10 +784,58 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
 
   // ---- viewport state ----
 
-  function sendView() {
+  /** The wire form of the page's view (protocol 11): local = unsubscribed; td = quality + the visible document rect. null = nothing to say yet. */
+  function wireView(v: ViewState): Extract<WebMessage, { t: 'view' }> | null {
+    if (v.mode === 'local') return { t: 'view', mode: 'local' };
+    const dpr = opts.dpr?.() ?? (typeof devicePixelRatio === 'number' ? devicePixelRatio : 1);
+    const viewport = visibleDocRect({ zoom: v.zoom, x: v.panX, y: v.panY }, v.rect.w, v.rect.h, engine.width, engine.height, dpr);
+    return viewport ? { t: 'view', mode: 'td', quality: v.quality ?? 'auto', viewport } : null;
+  }
+
+  /** `force`: send even when unchanged / too soon (reconnect, load end). Viewport-only changes are throttled to VIEW_SEND_INTERVAL_MS. */
+  function sendView(force = true) {
     viewDirty = false;
     if (!viewState || !isOpen()) return;
-    sendJson({ t: 'view', ...viewState });
+    const m = wireView(viewState);
+    if (!m) return;
+    const key = JSON.stringify(m);
+    if (!force && key === lastViewKey) return;
+    if (!force) {
+      let last: Extract<WebMessage, { t: 'view' }> | null = null;
+      try { last = lastViewKey ? JSON.parse(lastViewKey) : null; } catch { last = null; }
+      const viewportOnly = m.mode === 'td' && last?.mode === 'td' && last.quality === m.quality;
+      const wait = lastViewSent + VIEW_SEND_INTERVAL_MS - now();
+      if (viewportOnly && wait > 0) {
+        viewDirty = true;
+        if (!viewTimer) viewTimer = setTimeout(() => { viewTimer = null; if (!disposed && viewDirty) sendView(false); }, wait);
+        return;
+      }
+    }
+    if (viewTimer) { clearTimeout(viewTimer); viewTimer = null; }
+    viewClient.setActive(m.mode === 'td'); // leaving TD mode drops the frames, the exact buffer and the GPU picture
+    lastViewKey = key;
+    lastViewSent = now();
+    sendJson(m);
+  }
+
+  /** GET /view?exact=1&frameId=N: a VIEW_EXACT frame too large for the socket (the same bytes as a socket message). */
+  async function fetchExactFrame(id: number): Promise<ArrayBuffer | null> {
+    const sock = ws;
+    const ctrl = new AbortController();
+    aborts.add(ctrl);
+    const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const res = await doFetch(`${httpBase}/view?${query(`&exact=1&frameId=${id}`)}`, { cache: 'no-store', signal: ctrl.signal });
+      if (res.status === 403) { rejectToken(); return null; }
+      if (!res.ok) return null;
+      const buf = await res.arrayBuffer();
+      return disposed || ws !== sock ? null : buf;
+    } catch {
+      return null; // the client treats a failed fetch as a lost exact frame: it invalidates its buffer and sends viewExactReset
+    } finally {
+      clearTimeout(timeout);
+      aborts.delete(ctrl);
+    }
   }
 
   function onJson(text: string) {
@@ -837,9 +914,8 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       case 'layerPreview':
         pullPreview(m.layerId, m.frameId);
         break;
-      case 'view':
-        viewNotice = { frameId: m.frameId, applied: m.appliedFrameId, at: now() };
-        pullView();
+      case 'viewExact':
+        viewClient.handleExactNotice(m.frameId);
         break;
       case 'applied': {
         for (const [slot, id] of unacked) if (((m.frameId - id) >>> 0) < 0x80000000) unacked.delete(slot);
@@ -1169,47 +1245,6 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     }
   }
 
-  /** VIEW frames (TD's output, external clients in TD mode): same single-flight, newest-wins pull as BASE. */
-  function pullView() {
-    if (viewFetching) { viewRefetch = true; return; }
-    viewFetching = true;
-    void fetchView().finally(() => {
-      viewFetching = false;
-      if (viewRefetch && !disposed) { viewRefetch = false; pullView(); }
-    });
-  }
-
-  async function fetchView(): Promise<void> {
-    const sock = ws, epoch = docEpoch, notice = viewNotice;
-    if (!notice) return;
-    const ctrl = new AbortController();
-    aborts.add(ctrl);
-    const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await doFetch(`${httpBase}/view?${query(`&frameId=${notice.frameId}`)}`, { cache: 'no-store', signal: ctrl.signal });
-      if (res.status === 404) return;
-      if (res.status === 403) { rejectToken(); return; }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const buf = await res.arrayBuffer();
-      if (disposed || ws !== sock || epoch !== docEpoch) return;
-      const r = decodeFrame(buf);
-      if (!r.ok || r.frame.type !== FRAME_VIEW || isStale(r.frame, engine.width, engine.height)) return;
-      const t = now();
-      status.setViewFrame?.(r.frame.w, r.frame.h, new Uint8ClampedArray(r.frame.payload.buffer, r.frame.payload.byteOffset, r.frame.payload.byteLength), t - notice.at);
-      if (notice.applied >= 0) {
-        const sent = takeSent(notice.applied);
-        if (sent !== undefined) recordLatency(viewSamples, t - sent, (x) => status.setViewLatency?.(x));
-      }
-    } catch {
-      if (disposed || ws !== sock) return;
-      // A failed fetch leaves the notice un-fetched; re-subscribing makes TD announce the newest frame again.
-      requestTimer = setTimeout(() => { requestTimer = null; if (viewState?.mode === 'td') sendView(); }, REQUEST_BASE_MS);
-    } finally {
-      clearTimeout(timeout);
-      aborts.delete(ctrl);
-    }
-  }
-
   const dbg: Record<string, unknown> = { connects: 0, closes: 0, sched: 0, skipped: '', lastClose: null, url: '' };
   (globalThis as { __bridgeDbg?: unknown }).__bridgeDbg = dbg;   // diagnostics for the live validation (read through the test hook)
   function scheduleReconnect() {
@@ -1247,6 +1282,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     sock.onmessage = (ev) => {
       if (ws !== sock) return;
       if (typeof ev.data === 'string') onJson(ev.data);
+      else if (ev.data instanceof ArrayBuffer || ArrayBuffer.isView(ev.data)) viewClient.handleBinary(ev.data); // v11: VIEW_FAST / VIEW_EXACT; other frame types are ignored
     };
     sock.onclose = (ev) => {
       if (ws !== sock) return;
@@ -1274,7 +1310,9 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       docEpoch++;
       for (const c of aborts) c.abort();
       failPending('Disconnected from TouchDesigner');
-      viewFetching = viewRefetch = false;
+      viewClient.reset();
+      lastViewKey = '';
+      if (viewTimer) { clearTimeout(viewTimer); viewTimer = null; }
       if (sendTimer) { clearTimeout(sendTimer); sendTimer = null; }
       status.setConnection('reconnecting');
       status.setActive(true); // offline: keep editing locally, no standby overlay
@@ -1326,6 +1364,9 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       if (isOpen()) sendJson({ t: 'takeover' });
       else status.setNotice('Not connected to TouchDesigner');
     },
+    refreshView() {
+      if (viewState && isOpen()) sendView(true); // re-subscribe: TD answers with a fresh frame (after a GPU context restore)
+    },
     setView(v) {
       if (!(v.rect.w > 0 && v.rect.h > 0)) return; // layout not measured yet
       viewState = v;
@@ -1334,7 +1375,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       viewQueued = true;
       raf(() => {
         viewQueued = false;
-        if (!disposed && viewDirty) sendView();
+        if (!disposed && viewDirty) sendView(false);
       });
     },
     listTops,
@@ -1349,6 +1390,8 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     chooseFile,
     dispose() {
       disposed = true;
+      viewClient.dispose();
+      if (viewTimer) clearTimeout(viewTimer);
       failPending('Bridge closed');
       offEngine();
       stopLogs();

@@ -1,4 +1,4 @@
-"""TD <-> web wire protocol (docs/PROTOCOL.md, version 10). Pure python, no TD or numpy needed.
+"""TD <-> web wire protocol (docs/PROTOCOL.md, version 11). Pure python, no TD or numpy needed.
 
 Binary frames: 24-byte little-endian header + RGBA8 straight-alpha payload (top row first).
 JSON messages: text frames with a string field ``t``.
@@ -10,7 +10,8 @@ import re
 import struct
 from typing import Iterator, NamedTuple, Optional, Tuple
 
-PROTOCOL_VERSION = 10
+PROTOCOL_VERSION = 11
+MIN_PROTOCOL = 10  # oldest client protocol TD still serves (a v10 client keeps the v3 `view` notice + GET /view path)
 APP_VERSION = "0.5.0"  # written to .redoc meta.json
 MAGIC = b"REF1"
 HEADER_SIZE = 24
@@ -21,7 +22,9 @@ TYPE_SURFACE_DUMP = 4  # TD -> web, GET /surface
 TYPE_VIEW = 5  # TD -> web, GET /view
 TYPE_TOP_IMAGE = 6  # TD -> web, GET /top (docW/docH = the TOP's own size; the document size for renderLayer)
 TYPE_LAYER_PREVIEW = 7  # TD -> web, GET /layer (v7): one tdPreview layer's content after its effects, doc-sized, slot 0
-VALID_TYPES = (TYPE_BASE, TYPE_SURFACE, TYPE_SURFACE_DUMP, TYPE_VIEW, TYPE_TOP_IMAGE, TYPE_LAYER_PREVIEW)
+TYPE_VIEW_FAST = 8  # TD -> web, WebSocket binary (v11): JPEG colour (premultiplied) + JPEG alpha of the viewport region
+TYPE_VIEW_EXACT = 9  # TD -> web, WebSocket binary or GET /view?exact=1 (v11): zlib RGBA8 straight alpha, full frame or 64 px tiles
+VALID_TYPES = (TYPE_BASE, TYPE_SURFACE, TYPE_SURFACE_DUMP, TYPE_VIEW, TYPE_TOP_IMAGE, TYPE_LAYER_PREVIEW, TYPE_VIEW_FAST, TYPE_VIEW_EXACT)
 MAX_TOPS = 2000  # `tops` list length
 MAX_TOP_DIM = 8192  # importTop: width and height limit
 MAX_TOP_PIXELS = 32_000_000  # importTop result: total pixels after the GPU downscale
@@ -98,6 +101,10 @@ def validate_header(h: Header) -> None:
         raise ProtocolError(f"bad slot {h.slot} (LAYER_PREVIEW slot = 0)")
     if h.doc_w < 1 or h.doc_h < 1:
         raise ProtocolError(f"bad document size {h.doc_w}x{h.doc_h}")
+    if h.type in (TYPE_VIEW_FAST, TYPE_VIEW_EXACT):
+        if h.slot != 0 or (h.x, h.y, h.w, h.h) != (0, 0, 0, 0):
+            raise ProtocolError("VIEW_FAST / VIEW_EXACT frames have slot 0 and a zero rect")
+        return
     if h.w < 1 or h.h < 1:
         raise ProtocolError(f"empty rect {h.w}x{h.h}")
     if h.x + h.w > h.doc_w or h.y + h.h > h.doc_h:
@@ -146,6 +153,8 @@ def decode_frame(data) -> Tuple[Header, memoryview]:
     hdr = Header(typ, flags, frame_id, dw, dh, x, y, w, h, slot)
     validate_header(hdr)
     payload = mv[HEADER_SIZE:]
+    if typ in (TYPE_VIEW_FAST, TYPE_VIEW_EXACT):
+        return hdr, payload  # v11 view frames carry their own sub-header: decode_view_fast / decode_view_exact
     if len(payload) != hdr.payload_size:
         raise ProtocolError(f"payload is {len(payload)} bytes, expected {hdr.payload_size}")
     return hdr, payload
@@ -184,6 +193,82 @@ def encode_frames(frame_type: int, frame_id: int, doc_w: int, doc_h: int,
         yield encode_message(hdr, pixels[by - y: by - y + bh])
 
 
+# --------------------------------------------------------------------------- v11 view frames (types 8 / 9)
+#
+# Both start with the usual 24-byte frame header (flags = FRAME_END, slot 0, frameId, docW / docH = the document size,
+# x = y = w = h = 0) followed by a type specific sub-header and the body. ``appliedFrameId`` = the newest SURFACE frameId of
+# the receiving client that is part of the picture (0xFFFFFFFF = none yet).
+
+NO_APPLIED = 0xFFFFFFFF
+VIEW_FAST_HEADER = struct.Struct("<IIffffHHII")  # frameId appliedFrameId x y w h pw ph rgbLen alphaLen
+VIEW_EXACT_HEADER = struct.Struct("<IIHHBBH")  # frameId appliedFrameId docW docH kind tile nTiles
+assert VIEW_FAST_HEADER.size == 36 and VIEW_EXACT_HEADER.size == 16
+EXACT_FULL = 0
+EXACT_TILES = 1
+EXACT_TILE = 64
+EXACT_TILE_ENTRY = struct.Struct("<HHHH")  # tx ty w h (tx / ty in tile units; w / h in pixels, edge tiles are clipped)
+MAX_EXACT_INLINE = 4 * 1024 * 1024  # larger exact messages are announced with `viewExact` and fetched with GET /view?exact=1
+
+
+def _view_frame_header(typ: int, frame_id: int, doc_w: int, doc_h: int) -> bytes:
+    if not (1 <= doc_w <= MAX_DIM and 1 <= doc_h <= MAX_DIM):
+        raise ProtocolError(f"bad document size {doc_w}x{doc_h}")
+    return _HEADER.pack(MAGIC, typ, FLAG_FRAME_END, 0, frame_id & 0xFFFFFFFF, doc_w, doc_h, 0, 0, 0, 0)
+
+
+def encode_view_fast(frame_id: int, applied: int, doc_w: int, doc_h: int, rect, pw: int, ph: int, rgb, alpha=b"") -> bytes:
+    """VIEW_FAST message: ``rect`` = (x, y, w, h) document rectangle covered (floats), ``pw`` x ``ph`` = pixel size of the
+    JPEGs, ``rgb`` = JPEG of the premultiplied colour, ``alpha`` = greyscale JPEG ( b"" = fully opaque)."""
+    if not (1 <= pw <= MAX_DIM and 1 <= ph <= MAX_DIM):
+        raise ProtocolError(f"bad pixel size {pw}x{ph}")
+    x, y, w, h = rect
+    sub = VIEW_FAST_HEADER.pack(frame_id & 0xFFFFFFFF, applied & 0xFFFFFFFF, x, y, w, h, pw, ph, len(rgb), len(alpha))
+    return b"".join((_view_frame_header(TYPE_VIEW_FAST, frame_id, doc_w, doc_h), sub, rgb, alpha))
+
+
+def decode_view_fast(data) -> dict:
+    """-> {frameId, applied (None = none), docW, docH, rect (x, y, w, h), pw, ph, rgb, alpha (memoryviews)}."""
+    hdr, payload = decode_frame(data)
+    if hdr.type != TYPE_VIEW_FAST:
+        raise ProtocolError(f"not a VIEW_FAST frame (type {hdr.type})")
+    if len(payload) < VIEW_FAST_HEADER.size:
+        raise ProtocolError("VIEW_FAST header too short")
+    fid, applied, x, y, w, h, pw, ph, rl, al = VIEW_FAST_HEADER.unpack_from(payload, 0)
+    if fid != hdr.frame_id:
+        raise ProtocolError("VIEW_FAST frameId mismatch")
+    if pw < 1 or ph < 1 or rl < 1:
+        raise ProtocolError("empty VIEW_FAST image")
+    if len(payload) != VIEW_FAST_HEADER.size + rl + al:
+        raise ProtocolError(f"VIEW_FAST body is {len(payload) - VIEW_FAST_HEADER.size} bytes, expected {rl + al}")
+    body = payload[VIEW_FAST_HEADER.size:]
+    return {"frameId": fid, "applied": None if applied == NO_APPLIED else applied, "docW": hdr.doc_w, "docH": hdr.doc_h,
+            "rect": (x, y, w, h), "pw": pw, "ph": ph, "rgb": body[:rl], "alpha": body[rl:]}
+
+
+def encode_view_exact(frame_id: int, applied: int, doc_w: int, doc_h: int, kind: int, n_tiles: int, body) -> bytes:
+    """VIEW_EXACT message; ``body`` = the zlib stream (see ``frames.encode_exact_body``)."""
+    if kind not in (EXACT_FULL, EXACT_TILES) or not 0 <= n_tiles <= 0xFFFF or (kind == EXACT_FULL and n_tiles):
+        raise ProtocolError(f"bad exact kind {kind} / tiles {n_tiles}")
+    sub = VIEW_EXACT_HEADER.pack(frame_id & 0xFFFFFFFF, applied & 0xFFFFFFFF, doc_w, doc_h, kind, EXACT_TILE, n_tiles)
+    return b"".join((_view_frame_header(TYPE_VIEW_EXACT, frame_id, doc_w, doc_h), sub, body))
+
+
+def decode_view_exact(data) -> dict:
+    """-> {frameId, applied (None = none), docW, docH, kind, tile, nTiles, body (memoryview of the zlib stream)}."""
+    hdr, payload = decode_frame(data)
+    if hdr.type != TYPE_VIEW_EXACT:
+        raise ProtocolError(f"not a VIEW_EXACT frame (type {hdr.type})")
+    if len(payload) <= VIEW_EXACT_HEADER.size:
+        raise ProtocolError("VIEW_EXACT header / body too short")
+    fid, applied, dw, dh, kind, tile, n = VIEW_EXACT_HEADER.unpack_from(payload, 0)
+    if fid != hdr.frame_id or (dw, dh) != (hdr.doc_w, hdr.doc_h):
+        raise ProtocolError("VIEW_EXACT header mismatch")
+    if kind not in (EXACT_FULL, EXACT_TILES) or tile != EXACT_TILE or (kind == EXACT_FULL and n):
+        raise ProtocolError(f"bad VIEW_EXACT kind {kind} / tile {tile} / tiles {n}")
+    return {"frameId": fid, "applied": None if applied == NO_APPLIED else applied, "docW": dw, "docH": dh,
+            "kind": kind, "tile": tile, "nTiles": n, "body": payload[VIEW_EXACT_HEADER.size:]}
+
+
 # --------------------------------------------------------------------------- JSON
 
 
@@ -203,10 +288,10 @@ def decode_json(text) -> dict:
 
 
 def hello(doc_w: int, doc_h: int, has_input: bool, max_send_fps: float, active: bool, client_id: str = "",
-          has_document: bool = False, rev=None, mode: str = "input", inputs=None) -> str:
+          has_document: bool = False, rev=None, mode: str = "input", inputs=None, protocol: int = PROTOCOL_VERSION) -> str:
     """``doc`` also carries the canvas ``mode``; ``inputs`` (v6, replaces ``baseSize``) is the list of
     ``{input, w, h, connected}`` (see ``inputs_msg``). ``hasInput`` = TD input 1 is connected (it drives Follow Input)."""
-    return encode_json({"t": "hello", "protocol": PROTOCOL_VERSION, "doc": {"w": doc_w, "h": doc_h, "mode": mode},
+    return encode_json({"t": "hello", "protocol": protocol, "doc": {"w": doc_w, "h": doc_h, "mode": mode},
                         "inputs": input_items(inputs or []),
                         "hasInput": bool(has_input), "maxSendFps": max_send_fps, "active": bool(active),
                         "clientId": client_id, "hasDocument": bool(has_document),
@@ -239,6 +324,11 @@ def view_notice(frame_id: int, doc_w: int, doc_h: int, applied_frame_id: int) ->
     """A newer TD output frame can be fetched with GET /view (external clients in TD mode)."""
     return encode_json({"t": "view", "frameId": frame_id, "docW": doc_w, "docH": doc_h,
                         "w": doc_w, "h": doc_h, "appliedFrameId": applied_frame_id})
+
+
+def view_exact_notice(frame_id: int, size: int) -> str:
+    """v11: an exact frame larger than MAX_EXACT_INLINE can be fetched with GET /view?exact=1&frameId=N (``size`` = message bytes)."""
+    return encode_json({"t": "viewExact", "frameId": frame_id, "size": int(size)})
 
 
 def layer_preview_notice(layer_id: str, frame_id: int, doc_w: int, doc_h: int) -> str:
@@ -405,6 +495,21 @@ def file_chosen(request_id, path, text=None, error=None) -> str:
 
 def request_doc() -> str:
     return encode_json({"t": "requestDoc"})
+
+
+def view_td(quality: str = "auto", viewport=None) -> str:
+    """web -> TD (v11): subscribe to the TD view. ``viewport`` = {x, y, w, h, scale}: the visible document rectangle and the
+    device pixels per document pixel."""
+    return encode_json({"t": "view", "mode": "td", "quality": quality,
+                        "viewport": viewport or {"x": 0, "y": 0, "w": 1280, "h": 720, "scale": 1}})
+
+
+def view_ack(frame_id: int) -> str:
+    return encode_json({"t": "viewAck", "frameId": frame_id})
+
+
+def view_exact_reset() -> str:
+    return encode_json({"t": "viewExactReset"})
 
 
 def view(mode: str, zoom: float, pan_x: float, pan_y: float, rect: dict) -> str:
@@ -937,6 +1042,39 @@ def parse_view(msg: dict) -> dict:
         raise ProtocolError("bad view message")
     return {"mode": msg["mode"], "zoom": msg["zoom"], "panX": msg["panX"], "panY": msg["panY"],
             "rect": {k: r[k] for k in ("x", "y", "w", "h")}}
+
+
+VIEW_QUALITIES = ("auto", "fast", "exact")
+
+
+def parse_view11(msg: dict) -> dict:
+    """Validate a v11 ``view`` message -> {mode, quality, viewport: {x, y, w, h, scale} | None}. ``local`` needs nothing else; for
+    ``td`` the viewport is optional (absent = the whole document at scale 1) but must be sane when given."""
+    mode = msg.get("mode")
+    if mode not in ("local", "td"):
+        raise ProtocolError("bad view message")
+    q = msg.get("quality", "auto")
+    if q not in VIEW_QUALITIES:
+        raise ProtocolError(f"bad view quality {q!r}")
+    vp = msg.get("viewport")
+    if vp is not None:
+        if not isinstance(vp, dict) or not all(_num(vp.get(k)) for k in ("x", "y", "w", "h", "scale")) \
+                or vp["w"] <= 0 or vp["h"] <= 0 or vp["scale"] <= 0:
+            raise ProtocolError("bad view viewport")
+        try:
+            float(vp["x"]), float(vp["y"]), float(vp["w"]), float(vp["h"]), float(vp["scale"])
+        except OverflowError:
+            raise ProtocolError("bad view viewport") from None
+        lim = {"x": (-1e7, 1e7), "y": (-1e7, 1e7), "w": (1e-3, 1e6), "h": (1e-3, 1e6), "scale": (1e-3, 64.0)}
+        vp = {k: min(lim[k][1], max(lim[k][0], float(vp[k]))) for k in lim}
+    return {"mode": mode, "quality": q, "viewport": vp}
+
+
+def parse_view_ack(msg: dict) -> int:
+    fid = msg.get("frameId")
+    if not isinstance(fid, int) or isinstance(fid, bool) or not 0 <= fid <= 0xFFFFFFFF:
+        raise ProtocolError("bad viewAck")
+    return fid
 
 
 def layer_slots(layers: list) -> list:
