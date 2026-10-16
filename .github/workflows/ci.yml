@@ -72,6 +72,6 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
-          cache-dependency-path: .github/workflows/ci.yml
-      - run: python -m pip install pytest numpy
+          cache-dependency-path: requirements-dev.txt
+      - run: python -m pip install -r requirements-dev.txt
       - run: python -m pytest td/tests -q

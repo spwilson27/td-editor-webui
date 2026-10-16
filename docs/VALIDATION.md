@@ -38,8 +38,9 @@ Options: `--workers N`, `--tier smoke|affected|full`, `--only 5,7`, `--no-timing
 **How it works**
 
 1. `scripts/make_validate_toe.py` generates `.validate/validate.toe` (gitignored): `/project1/td_python_debug` (the td-mcp debug server)
-   and nothing else. It runs in a scratch TD launched on its own port from a seed tox (`.validate/td_python_debug.tox`; the first time
-   `--seed-from-attached` saves it read-only from the open TD's `/project1/td_python_debug`). The user's project is never modified or saved.
+   and nothing else. It runs in a scratch TD launched on its own port from the committed seed tox `tests/td/td_python_debug.tox`
+   (self-contained, see `tests/td/README.md`); no other TD and no td-mcp checkout are needed. `--seed-from-attached` (optional) saves the
+   seed read-only from the open TD's `/project1/td_python_debug` instead. The user's project is never modified or saved.
    The raster editor is built fresh from `dist/raster_editor.tox` by validation step 1 in every worker.
 2. `td_workers.py` launches N processes (`TouchDesigner <copy of validate.toe>`, new session/process group) with
    `TD_MCP_PORT=<18770+i>` and `TD_MCP_CONNECTION=.validate/w<i>/connection.json` in their environment, waits until td-mcp answers

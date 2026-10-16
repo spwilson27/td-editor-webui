@@ -6,10 +6,11 @@ The project holds /project1/td_python_debug (the td-mcp debug server) and nothin
 dist/raster_editor.tox by validation step 1 in every worker. Generated in a scratch TouchDesigner instance launched here (its own
 td-mcp port + connection file): the user's project is never modified or saved.
 
-How: TouchDesigner opens a .tox given on the command line as a new project, so the td-mcp component is saved once as a seed tox
-(.validate/td_python_debug.tox), opened in a scratch instance, copied under /project1 and the project saved as validate.toe.
-The seed tox is taken from the running TD on 8765 only with --seed-from-attached (a read-only `COMP.save(tox)` of
-/project1/td_python_debug; the user's project is not changed); once cached it is reused.
+How: TouchDesigner opens a .tox given on the command line as a new project, so the committed self-contained component
+tests/td/td_python_debug.tox (td-mcp's tox, modules embedded; refresh: tests/td/README.md) is opened in a scratch instance, copied
+under /project1 and the project saved as validate.toe. No td-mcp checkout and no other TouchDesigner is needed.
+--seed-from-attached (optional) uses the component of the TD on 8765 instead (read-only `COMP.save(tox)`; e.g. to test a td-mcp
+development install); that temporary file holds that TD's token and is deleted afterwards.
 """
 
 from __future__ import annotations
@@ -24,14 +25,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import td_workers as W  # noqa: E402
 
-SEED_TOX = os.path.join(W.VDIR, "td_python_debug.tox")
-TD_MCP = "/Users/mrwilson/software/td-mcp"
+COMMITTED_TOX = os.path.join(ROOT, "tests", "td", "td_python_debug.tox")
+ATTACHED_SEED = os.path.join(W.VDIR, "td_python_debug.attached.tox")
 DEFAULT_PORT = 18765   # the port stored in the toe: never 8765, so opening it by hand cannot collide with the user's server
 
 
-def build_code(out_toe, port, clean_seed, module_path=TD_MCP):
+def build_code(out_toe, port):
     """Python run inside the scratch instance (opened from the seed tox: the component is /td_python_debug). The Token parameter is
-    blanked everywhere that is kept (the clean seed tox, the toe): every worker then generates its own random token at start."""
+    blanked in the saved toe: every worker then generates its own random token at start. Module Path is left as the seed has it
+    (blank in the committed tox: the embedded modules are used)."""
     return f"""from td import *
 root = op('/')
 p = root.op('project1') or root.create(baseCOMP, 'project1')
@@ -41,15 +43,13 @@ dbg.nodeX, dbg.nodeY = 0, 0
 dbg.par.Port = {port}
 dbg.par.Token = ''
 dbg.par.Autostart = 1
-dbg.par.Modulepath = {module_path!r}
-dbg.save({clean_seed!r})
 src.destroy()
 project.save({out_toe!r})
 print('saved', [c.name for c in p.children])
 """
 
 
-def seed_from_attached(seed=SEED_TOX, port=W.USER_PORT):
+def seed_from_attached(seed=ATTACHED_SEED, port=W.USER_PORT):
     """Read-only: save the attached TD's td_python_debug component as a tox file."""
     import td_call
     os.makedirs(os.path.dirname(seed), exist_ok=True)
@@ -57,27 +57,25 @@ def seed_from_attached(seed=SEED_TOX, port=W.USER_PORT):
     res = td_call.run(f"c = op('/project1/td_python_debug')\nc.save({seed!r})\nprint(c.path)", 30, conn)
     if not res.get("ok"):
         raise RuntimeError(f"could not save the seed tox from the attached TD: {str(res.get('error') or res.get('traceback'))[-300:]}")
-    os.chmod(seed, 0o600)   # it holds the attached TD's token until generate() replaces it with a blank-token copy
+    os.chmod(seed, 0o600)   # it holds the attached TD's token: the caller deletes it
     return seed
 
 
 MIN_TOE_BYTES = 1000
 
 
-def generate(out=W.VALIDATE_TOE, seed=SEED_TOX, port=None, td_bin=W.TD_BIN, timeout=120, log=print, check=True):
+def generate(out=W.VALIDATE_TOE, seed=COMMITTED_TOX, port=None, td_bin=W.TD_BIN, timeout=120, log=print, check=True):
     """Build `out` atomically: saved to a temp path, size-checked, opened once in a scratch instance (it must hold td_python_debug), then
-    renamed over `out`. The seed tox is replaced by a blank-token copy; the scratch work dir (connection file with a token) is deleted."""
+    renamed over `out`. The scratch work dir (connection file with a token) is deleted."""
     if not os.path.exists(seed):
-        raise FileNotFoundError(f"{seed} missing: run with --seed-from-attached (saves it from the TD on {W.USER_PORT}, read-only)")
+        raise FileNotFoundError(f"{seed} missing (committed with the repo; see tests/td/README.md)")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     workdir = os.path.join(W.VDIR, "gen")
     mcp = W.pick_ports(1, base=W.BASE_MCP_PORT + 90)[0]
     protected = W.td_pids() | W.listener_pid(W.USER_PORT)
     tmp = out[:-4] + ".new.toe" if out.endswith(".toe") else out + ".new.toe"
-    clean = os.path.join(os.path.dirname(out), "td_python_debug.clean.tox")
-    for f in (tmp, clean):
-        if os.path.exists(f):
-            os.remove(f)
+    if os.path.exists(tmp):
+        os.remove(tmp)
     try:
         with W.Fleet(protected=protected) as fleet:
             inst = fleet.add(W.Instance(0, seed, workdir, mcp, td_bin))
@@ -92,24 +90,20 @@ def generate(out=W.VALIDATE_TOE, seed=SEED_TOX, port=None, td_bin=W.TD_BIN, time
             if not os.path.exists(inst.conn_file):
                 raise TimeoutError(f"scratch TouchDesigner not ready in {timeout}s (a dialog? see {inst.log})")
             log(f"scratch instance pid {inst.pid} ready in {time.time() - t0:.1f}s")
-            res = inst.rpc(build_code(tmp, DEFAULT_PORT, clean), 60)
+            res = inst.rpc(build_code(tmp, DEFAULT_PORT), 60)
             if not res.get("ok"):
                 raise RuntimeError(f"building the project failed: {str(res.get('error') or res.get('traceback'))[-300:]}")
             log(res.get("stdout", "").strip())
-        for f in (tmp, clean):
-            if not os.path.exists(f) or os.path.getsize(f) < MIN_TOE_BYTES // 2:
-                raise RuntimeError(f"generated file {f} is missing or too small")
+        if not os.path.exists(tmp):
+            raise RuntimeError(f"generated file {tmp} is missing")
         if os.path.getsize(tmp) < MIN_TOE_BYTES:
             raise RuntimeError(f"generated project {tmp} is only {os.path.getsize(tmp)} bytes")
         if check and not verify(tmp, log=log):
             raise RuntimeError("the generated project does not open with td_python_debug under /project1")
         os.replace(tmp, out)
-        os.replace(clean, seed)   # blank Token: never keeps the attached TD's token
-        os.chmod(seed, 0o600)
     finally:
-        for f in (tmp, clean):
-            if os.path.exists(f):
-                os.remove(f)
+        if os.path.exists(tmp):
+            os.remove(tmp)
         shutil.rmtree(workdir, ignore_errors=True)   # its connection file holds the scratch instance's token
     log(f"wrote {out} ({os.path.getsize(out)} bytes)")
     return out
@@ -135,12 +129,15 @@ def main(argv=None):
     ap.add_argument("--seed-from-attached", action="store_true", help=f"(re)create the seed tox from the TD on {W.USER_PORT} (read-only)")
     ap.add_argument("--no-verify", action="store_true")
     args = ap.parse_args(argv)
-    if args.seed_from_attached or not os.path.exists(SEED_TOX):
-        if not args.seed_from_attached:
-            print(f"{SEED_TOX} missing; pass --seed-from-attached", file=sys.stderr)
-            return 2
-        print("seed:", seed_from_attached())
-    generate(args.out, check=not args.no_verify)
+    seed = COMMITTED_TOX
+    try:
+        if args.seed_from_attached:
+            seed = seed_from_attached()
+            print("seed:", seed)
+        generate(args.out, seed=seed, check=not args.no_verify)
+    finally:
+        if os.path.exists(ATTACHED_SEED):
+            os.remove(ATTACHED_SEED)   # holds the attached TD's token
     print("ok")
     return 0
 

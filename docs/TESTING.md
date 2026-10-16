@@ -1,5 +1,18 @@
 # Testing, validation and review
 
+## 0. Setup
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt     # pytest + numpy (pinned)
+(cd web && npm ci && npx playwright install chromium)                      # web unit / browser / e2e tests
+.venv/bin/python -m pytest td/tests -q                                      # pure Python tests (no TouchDesigner needed)
+```
+
+Live validation additionally needs TouchDesigner (a free non-commercial licence is enough). It is found in the standard install
+location of your OS, or set `TD_BIN` to the executable. The td-mcp debug component is shipped in `tests/td/td_python_debug.tox`; no
+td-mcp checkout is required (`scripts/td_client.py` is a small built-in client). Quick check:
+`.venv/bin/python scripts/td_workers.py --workers 1 --tier smoke`.
+
 ## 1. Test layers
 
 | Layer | Tool | Location | Runs |

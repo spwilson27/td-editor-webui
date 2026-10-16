@@ -32,7 +32,39 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
-TD_BIN = "/Applications/TouchDesigner.app/Contents/MacOS/TouchDesigner"
+
+
+def find_td_bin(env=None, exists=os.path.exists, platform=sys.platform):
+    """The TouchDesigner executable: $TD_BIN, else the standard install locations of this OS (newest of TouchDesigner*.app /
+    Derivative\\TouchDesigner*). None when nothing is found."""
+    env = os.environ if env is None else env
+    explicit = env.get("TD_BIN")
+    if explicit:
+        return explicit
+    import glob
+    if platform == "darwin":
+        candidates = ["/Applications/TouchDesigner.app/Contents/MacOS/TouchDesigner"]
+        candidates += sorted(glob.glob("/Applications/TouchDesigner*.app/Contents/MacOS/TouchDesigner"), reverse=True)
+    elif platform.startswith("win"):
+        candidates = []
+        for base in dict.fromkeys(filter(None, (env.get("ProgramFiles"), r"C:\Program Files"))):
+            candidates += sorted(glob.glob(os.path.join(base, "Derivative", "TouchDesigner*", "bin", "TouchDesigner.exe")), reverse=True)
+    else:
+        candidates = []
+    return next((c for c in candidates if exists(c)), None)
+
+
+TD_BIN = find_td_bin() or "TouchDesigner"   # a bare name when not installed: launching then fails with a clear error (require_td_bin)
+
+
+def require_td_bin(path=None):
+    path = path or TD_BIN
+    if not os.path.exists(path):
+        raise RuntimeError("TouchDesigner not found: install it in the standard location or set TD_BIN to the TouchDesigner executable "
+                           "(macOS: /Applications/TouchDesigner.app/Contents/MacOS/TouchDesigner).")
+    return path
+
+
 VDIR = os.path.join(ROOT, ".validate")
 VALIDATE_TOE = os.path.join(VDIR, "validate.toe")
 PIDS_FILE = os.path.join(VDIR, "pids")
@@ -334,6 +366,8 @@ class Instance:
         self.samples = []   # (t, rss_bytes, cpu_percent) of the whole process group
 
     def launch(self, protected=frozenset()):
+        if self.popen is subprocess.Popen:
+            require_td_bin(self.td_bin)
         os.makedirs(self.workdir, exist_ok=True)
         if os.path.exists(self.conn_file):
             os.remove(self.conn_file)

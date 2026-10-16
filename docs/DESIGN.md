@@ -68,7 +68,7 @@ raster-editor/
       ext.py                RasterEditorExt extension class (TD glue, thin)
     build_component.py      builds the COMP inside a running TD, saves dist/raster_editor.tox
     tests/                  pytest with fake TD objects
-  scripts/                  td_call.py (td-mcp client wrapper), validate_td.py
+  scripts/                  td_call.py + td_client.py (td-mcp client wrapper, self-contained), validate_td.py
   dist/                     build outputs (ui single-file html, .tox)
 ```
 

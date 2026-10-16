@@ -1,6 +1,6 @@
 """Run python inside the live TouchDesigner via the td-mcp debug plugin.
 
-Usage:
+Usage (the endpoint: --td-conn / --td-port, else $TD_MCP_CONNECTION, else ~/.td-mcp/connection.json):
     .venv/bin/python scripts/td_call.py --exec path/to/file.py   # run a file
     echo "print(op('/project1'))" | .venv/bin/python scripts/td_call.py   # run stdin
 
@@ -17,8 +17,8 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, "/Users/mrwilson/software/td-mcp/src")
-from td_mcp.client import Connection, call, load_connection  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from td_client import Connection, call, load_connection  # noqa: E402  (self-contained: no td-mcp checkout needed)
 
 
 def connection(host: str = "127.0.0.1", port: int | None = None, conn_file: str | None = None) -> Connection | None:

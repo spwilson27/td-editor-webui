@@ -34,7 +34,8 @@ sys.path.insert(0, os.path.join(ROOT, "td", "raster_editor"))
 import td_call  # noqa: E402
 import validate_td as vt  # noqa: E402  (fake web client)
 
-SCRATCH = "/private/tmp/claude-501/-Users-mrwilson-software-blender/3070a8a3-e01a-473e-81f2-17fa61880009/scratchpad"
+SCRATCH = os.path.join(ROOT, ".validate", "tmp")   # repo-local, git-ignored
+os.makedirs(SCRATCH, exist_ok=True)
 BOX = "/project1/_upg_box"
 OLD, NEW, NEWER = BOX + "/_upg_old", BOX + "/_upg_new", BOX + "/_upg_newer"
 MASTER = BOX + "/_upg_slave"      # a v8 (tagged) editor routed through the live master's server
