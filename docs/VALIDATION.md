@@ -1,8 +1,9 @@
-# Live validation — faster and isolated (plan)
+# Live validation: tiers, headless page driver and isolated parallel TouchDesigner workers
 
-`scripts/validate_td.py` drives a running TouchDesigner (via the td-mcp debug server) through ~60 steps. Today a full
-run takes ~15–20 min in the user's open project; steps 50–53 (real page driven through a temporary Web Render TOP,
-~11 min) dominate, plus ~100 fixed sleeps.
+Status: both options below are implemented and are how validation is run today (`scripts/td_workers.py` is the entry point; see
+`docs/TESTING.md` section 3 for the quick reference). `scripts/validate_td.py` drives a running TouchDesigner (via the td-mcp debug
+server) through ~60 steps. The original problem: a full run took ~15–20 min in the user's open project, dominated by steps driving
+the page through a temporary Web Render TOP (~11 min) plus ~100 fixed sleeps. The text below is the design and the measurements.
 
 ## Option 1 — cheaper runs (implemented)
 

@@ -3,6 +3,11 @@
 Target: TouchDesigner 2025.32820 (Python 3.11, numpy available). Verified API notes are
 at the end; check anything else against the live TD through `scripts/td_call.py`.
 
+**Status: current as of tag v0.9.0 (protocol 11).** Sections 1–4 describe the current component (v8 layout: multiple editors,
+master/slave, no in-TD panel; v11 view stream in §3/§13). Section 4 build commands: `td/build_component.py [--dev]`. Sections 5
+onwards are an append-only record per protocol version (API notes, v3–v11 additions): where they mention the Web Render panel,
+`Panelquery` or `Reloadui`, the v8 rules in sections 1–3 win. How to build, test and release: `DEVELOPMENT.md`; index of all docs: `docs/README.md`.
+
 ## 1. Network inside the COMP (v8)
 
 `raster_editor` is a **containerCOMP** with one TOP input (more spare ones appear as you connect) and one TOP output. It carries the
@@ -100,8 +105,9 @@ Keep TD glue thin. All pixel math lives in `frames.py`, all byte layout in `prot
    removes them afterwards).
 4. Saves `dist/raster_editor.tox`.
 
-Run it with `.venv/bin/python td/build_component.py [--dev]` (forwards itself to TD) or
-`scripts/td_call.py --exec /absolute/path/td/build_component.py`.
+Run it with `.venv/bin/python td/build_component.py [--dev]` (forwards itself to the TD named by `$TD_MCP_CONNECTION` or
+`~/.td-mcp/connection.json`) or `scripts/td_call.py --exec <path>/td/build_component.py`. Use an isolated instance (`scripts/td_workers.py --keep`)
+rather than a TD with a project you care about.
 
 `--dev` mode: DATs use `file` + `syncfile` pointing at the repo instead of embedding, so
 python edits reload live.

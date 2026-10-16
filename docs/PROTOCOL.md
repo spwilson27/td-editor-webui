@@ -1,4 +1,4 @@
-# TD ⇄ Web protocol (version 6; see §6–8 for the v4/v5/v6 additions)
+# TD ⇄ Web protocol (current: version 11; sections 6–13 list the additions of each version)
 
 One WebSocket per browser client, served by the COMP's Web Server DAT at
 `ws://127.0.0.1:<Port>/ws`. Text messages are JSON; binary WebSocket messages are SURFACE tiles
