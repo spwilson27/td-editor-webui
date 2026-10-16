@@ -111,11 +111,9 @@ describe('marching ants for arbitrary selections', () => {
     await new Promise((r) => setTimeout(r, 400));
     expect(frame()).not.toBe(a); // dash offset moved
     store.viewMode.value = 'td';
-    store.clientKind.value = 'panel';
     await settle();
     expect(px(30, 10)).toBe(true);
     store.viewMode.value = 'local';
-    store.clientKind.value = 'external';
   });
 
   it('shows the in-progress lasso outline while dragging and forwards the pointer stream to the engine', async () => {

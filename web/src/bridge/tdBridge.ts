@@ -5,8 +5,12 @@ import { layerBelow } from '../state/layerDrop';
 import { RENDER_STALE_MESSAGE } from '../state/layersSlice';
 import {
   FRAME_BASE, FRAME_LAYER_PREVIEW, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, FRAME_VIEW, MAX_BAND_PAYLOAD, PROTOCOL_VERSION,
-  decodeFrame, decodeTdMessage, encodeBands, encodeMessage, isStale, type ChoosePurpose, type TdMessage, type TopItem, type ViewMode, type ViewRect, type RenderMode, type WebMessage,
+  decodeFrame, decodeTdMessage, encodeBands, encodeMessage, isStale, type ChoosePurpose, type EditorList, type TdMessage, type TopItem, type ViewMode, type ViewRect, type RenderMode, type WebMessage,
 } from './codec';
+import { parseHash, requestQuery, withEditor } from './urls';
+
+/** v10: what `Bridge.flush` achieved. 'dropped' = unsent edits could not be sent (not linked); 'timeout' is added by the session controller. */
+export type FlushResult = 'ok' | 'dropped' | 'timeout';
 
 export type Connection = 'linked' | 'standalone' | 'reconnecting';
 
@@ -38,6 +42,10 @@ export interface BridgeStatus {
   setLayerPreview?(layerId: string, state: 'pending' | 'ready'): void;
   /** v7: all TD layer renders are void (document reload). */
   clearLayerPreviews?(): void;
+  /** v10: the project's editor list (`editors` message). */
+  setEditors?(list: EditorList): void;
+  /** v10: TD closed the socket with 4404 (this session's editor does not exist (any more)); the bridge does not reconnect. */
+  onEditorGone?(): void;
 }
 export type { FileResult, FileOp } from '../state/filesSlice';
 export type { InputItem } from '../state/inputsSlice';
@@ -47,6 +55,12 @@ export interface ViewState { mode: ViewMode; zoom: number; panX: number; panY: n
 export interface Bridge {
   takeover(): void;
   dispose(): void;
+  /** v10: send everything that is pending (document, dirty surfaces, active layer) and upload the undo history, so the session can be closed without losing edits. Resolves when done (never rejects); 'dropped' when edits were made offline and nothing could be sent. */
+  flush?(): Promise<FlushResult>;
+  /** v10: edits exist that TD does not have yet (made while disconnected, or still queued). */
+  hasUnsent?(): boolean;
+  /** v10: the editor this session is bound to ('' = the master's own editor). */
+  readonly editor?: string;
   /** Report viewport state; sent to TD at most once per animation frame. */
   setView(v: ViewState): void;
   /** v4: the importable TOPs of the TD project. Rejects when not linked, on a timeout or when TD answers with an error. */
@@ -65,17 +79,14 @@ export interface Bridge {
   clearStoredHistory(): Promise<void>;
   openProject(path?: string): Promise<FileResult>;
   exportPng(path?: string): Promise<FileResult>;
-  /** v6: TD shows a file chooser (panel clients have no file input). Resolves with the chosen path, null when cancelled. */
-  chooseFile(purpose: Exclude<ChoosePurpose, 'placeImage' | 'readText'>): Promise<string | null>;
-  /** v7: TD shows a file chooser and reads the picked file as UTF-8 text (.cube LUTs in panel clients). null = cancelled; rejects with TD's reason (too large, binary, unreadable). */
-  readTextFile(fileTypes?: string[]): Promise<{ path: string; text: string } | null>;
-  /** v6 Place Image through TD's chooser: resolves the new layer id (named after the file), null when cancelled. Rejects on topError / disconnect / 5 min timeout. */
-  placeImageViaTd(): Promise<string | null>;
+  /** v6: TD shows a file chooser (no UI uses it since the in-TD panel is gone; the protocol still has it). Resolves with the chosen path, null when cancelled. */
+  chooseFile(purpose: ChoosePurpose): Promise<string | null>;
 }
 
 export interface TdBridgeOptions {
   url?: string;
-  client?: 'panel' | 'external';
+  /** v10: the editor id sent as `editor=` on the WebSocket URL and every HTTP request ('' / absent = the master's own editor). */
+  editor?: string;
   token?: string;
   version?: string;
   WebSocketCtor?: typeof WebSocket;
@@ -89,11 +100,16 @@ export const BACKPRESSURE_BYTES = 8 * 1024 * 1024;
 export const SURFACE_FETCH_CONCURRENCY = 4;
 const FETCH_TIMEOUT_MS = 10000, FETCH_RETRY_MS = 500, REQUEST_BASE_MS = 2000;
 const BACKOFF_MIN = 500, BACKOFF_MAX = 5000, DEFAULT_FPS = 30;
+/** A WebSocket still CONNECTING after this long is abandoned and retried (a browser serialises handshakes to one address: one that hangs, e.g. against a server that was just restarted, would block every later attempt). */
+const CONNECT_TIMEOUT_MS = 4000;
+/** An open socket that gets no `hello` after `ready` within this long is dead (e.g. accepted by a server that was just stopped and never serves it): closed and retried. */
+const HELLO_TIMEOUT_MS = 8000;
 const LOAD_RETRY_MIN = 2000, LOAD_RETRY_MAX = 10000, NO_DOC_FALLBACK_MS = 10000;
 const LATENCY_WINDOW = 60, SENT_KEEP = 512;
 export const RENDER_LAYER_TIMEOUT_MS = 30000;
 export const FILE_OP_TIMEOUT_MS = 60000;
-export const CHOOSE_FILE_TIMEOUT_MS = 300000, PLACE_IMAGE_TIMEOUT_MS = 300000; // the user is picking a file
+export const CHOOSE_FILE_TIMEOUT_MS = 300000; // the user is picking a file
+export const INFLIGHT_WAIT_MS = 8000; // v10: how long a tab switch waits for running TOP imports / renders
 export const HISTORY_UPLOAD_DELAY_MS = 2000; // v7: debounce after the last history change
 export const HISTORY_MAX_FAILURES = 3; // consecutive failed uploads before TD's stored history is cleared
 export const HISTORY_MAX_STEPS = 50, HISTORY_MAX_BYTES = 256 * 1024 * 1024;
@@ -105,8 +121,9 @@ export function resolveWsUrl(search: string, loc: { protocol: string; host: stri
   return `${loc.protocol === 'https:' ? 'wss:' : 'ws:'}//${loc.host}/ws`;
 }
 
-export function resolveToken(search: string): string {
-  return new URLSearchParams(search).get('token') ?? '';
+/** v10: the token comes from the URL hash (`#token=…&e=…`); a `?token=` query is still honoured (dev / tests). */
+export function resolveToken(search: string, hash = ''): string {
+  return parseHash(hash).token || (new URLSearchParams(search).get('token') ?? '');
 }
 
 export const TOKEN_EXPIRED_MESSAGE = 'Reopen from TouchDesigner — session expired';
@@ -115,10 +132,6 @@ export const TOKEN_EXPIRED_MESSAGE = 'Reopen from TouchDesigner — session expi
 export function httpOrigin(wsUrl: string): string {
   const u = new URL(wsUrl);
   return `${u.protocol === 'wss:' ? 'https:' : 'http:'}//${u.host}`;
-}
-
-export function resolveClient(search: string): 'panel' | 'external' {
-  return new URLSearchParams(search).get('client') === 'panel' ? 'panel' : 'external';
 }
 
 /** slot → surface size from a spec: a pixel layer's surface; a mask has the size of its layer's surface (document size when the layer has none). */
@@ -146,9 +159,9 @@ export function latencyStats(samples: number[]): LatencyStats {
 }
 
 export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: TdBridgeOptions = {}): Bridge {
-  const url = opts.url ?? resolveWsUrl(location.search, location);
-  const client = opts.client ?? resolveClient(location.search);
-  const token = opts.token ?? resolveToken(location.search);
+  const editor = opts.editor ?? '';
+  const url = withEditor(opts.url ?? resolveWsUrl(location.search, location), editor);
+  const token = opts.token ?? resolveToken(location.search, location.hash);
   const WS = opts.WebSocketCtor ?? WebSocket;
   const doFetch = opts.fetch ?? ((...a: Parameters<typeof fetch>) => fetch(...a));
   const httpBase = httpOrigin(url);
@@ -165,6 +178,8 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   let ws: WebSocket | null = null;
   let disposed = false;
   let rejected = false; // TD refused the token; only a reload with a fresh URL can fix it
+  let goneSeen = false; // v10: TD said `gone` / `no such editor` on the current socket (its close code is not 4404)
+  let gone404 = false; // v10: TD closed the socket with 4404 (no such editor): no reconnect
   let active = false;
   let backoff = BACKOFF_MIN;
   let maxFps = DEFAULT_FPS;
@@ -176,6 +191,8 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   let reapplyInputs = false; // after `reload`: re-apply knownInputs once the reload's load completes
   let knownInputs: InputItem[] = []; // the list as last announced (hello.inputs / inputs), sizes corrected by BASE frames
   let docEpoch = 0; // bumped by docSize/reconnect/doc load: results fetched before are void
+  let offlineEdits = false; // v10: the page was edited while disconnected (TD does not have it)
+  const inflight = new Set<Promise<unknown>>(); // v10: TOP imports / renders / file ops that a tab switch waits for
   let synced = false; // the page has loaded or pushed a document; false = `fresh`
   let loading = false; // loading TD's document: engine events are not echoed back
   let loadToken = 0;
@@ -196,6 +213,8 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   let lastSend = -Infinity;
   let sendTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let connectTimer: ReturnType<typeof setTimeout> | null = null;
+  let helloTimer: ReturnType<typeof setTimeout> | null = null;
   let scratch = new Uint8ClampedArray(0);
 
   // canvas as TD knows it (last received from / sent to TD): engine changes of any other origin (undo, redo, jumpTo) are sent
@@ -221,14 +240,9 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   const pendingImports = new Map<string, { resolve: (w: number, h: number) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   const pendingFiles = new Map<string, { resolve: (r: FileResult) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   const pendingChoose = new Map<string, { resolve: (p: string | null) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
-  const pendingRead = new Map<string, { resolve: (r: { path: string; text: string } | null) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
-  const placeWatch = new Map<string, (path: string | null) => void>(); // placeImageViaTd: fileChosen listeners
   const failPending = (msg: string) => {
     for (const p of pendingChoose.values()) { clearTimeout(p.timer); p.reject(new Error(msg)); }
     pendingChoose.clear();
-    for (const p of pendingRead.values()) { clearTimeout(p.timer); p.reject(new Error(msg)); }
-    pendingRead.clear();
-    placeWatch.clear();
     for (const p of pendingFiles.values()) { clearTimeout(p.timer); p.reject(new Error(msg)); }
     pendingFiles.clear();
     for (const p of pendingTops.values()) { clearTimeout(p.timer); p.reject(new Error(msg)); }
@@ -323,6 +337,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
 
   const offEngine = engine.on((e) => {
     if (loading) return;
+    if (!isOpen() && synced && !adopting && !restoring && (e.type === 'surface' || e.type === 'docspec' || e.type === 'history' || e.type === 'resize')) offlineEdits = true;
     switch (e.type) {
       case 'surface':
         if (canSend() && !unsafe.has(e.slot)) { dirty.set(e.slot, unionRect(dirty.get(e.slot), e.rect)); schedule(); }
@@ -552,6 +567,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   }
 
   function pushAll() {
+    offlineEdits = false;
     endLoadState();
     authoritative = true;
     synced = true;
@@ -687,6 +703,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         lastDocRev = revLoaded;
         if (complete) {
           loadIncomplete = false;
+          offlineEdits = false;
           synced = true;
           authoritative = true;
           tdRev = m.rev;
@@ -734,7 +751,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     return false;
   }
 
-  const query = (extra = '') => `token=${encodeURIComponent(token)}&client=${encodeURIComponent(clientId)}${extra}`;
+  const query = (extra = '') => requestQuery({ token, client: clientId, editor }, extra);
 
   // ---- viewport state ----
 
@@ -749,6 +766,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     if (!m) return;
     switch (m.t) {
       case 'hello': {
+        if (helloTimer) { clearTimeout(helloTimer); helloTimer = null; }
         if (m.protocol !== PROTOCOL_VERSION) { status.setNotice(m.protocol < PROTOCOL_VERSION
           ? `Protocol mismatch: this page speaks protocol ${PROTOCOL_VERSION} but the TouchDesigner component speaks ${m.protocol} - update the component (.tox)`
           : `Protocol mismatch: the TouchDesigner component speaks protocol ${m.protocol}, this page ${PROTOCOL_VERSION} - reload the page`); return; }
@@ -803,19 +821,8 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         onReload();
         break;
       case 'fileChosen': {
-        const r = pendingRead.get(m.requestId);
-        if (r) {
-          pendingRead.delete(m.requestId);
-          clearTimeout(r.timer);
-          if (m.error !== undefined) r.reject(new Error(m.error));
-          else if (m.path === null) r.resolve(null);
-          else if (m.text !== undefined) r.resolve({ path: m.path, text: m.text });
-          else r.reject(new Error('TouchDesigner returned no file contents'));
-          break;
-        }
         const c = pendingChoose.get(m.requestId);
-        if (c) { pendingChoose.delete(m.requestId); clearTimeout(c.timer); c.resolve(m.path); break; }
-        placeWatch.get(m.requestId)?.(m.path);
+        if (c) { pendingChoose.delete(m.requestId); clearTimeout(c.timer); c.resolve(m.path); }
         break;
       }
       case 'files':
@@ -846,12 +853,19 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         if (gained) beginLoad(); // takeover: TD's document is the truth
         break;
       }
+      case 'gone': // v10: TD cannot close with 4404: it says so, then closes
+        goneSeen = true;
+        break;
       case 'error':
         if (/token/i.test(m.msg)) rejectToken();
+        else if (/no such editor/i.test(m.msg)) goneSeen = true; // (older TD builds: the error text, then the close)
         else status.setNotice(m.msg);
         break;
       case 'fonts':
         status.setFonts?.(m.families);
+        break;
+      case 'editors':
+        status.setEditors?.({ master: m.master, editors: m.editors });
         break;
       case 'tops': {
         const p = pendingTops.get(m.requestId);
@@ -941,7 +955,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     flush(true);
   }
 
-  function chooseFile(purpose: Exclude<ChoosePurpose, 'placeImage' | 'readText'>): Promise<string | null> {
+  function chooseFile(purpose: ChoosePurpose): Promise<string | null> {
     if (!isOpen() || !clientId) return Promise.reject(new Error('Not connected to TouchDesigner'));
     const requestId = `c${++requestSeq}`;
     return new Promise<string | null>((resolve, reject) => {
@@ -949,41 +963,6 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       pendingChoose.set(requestId, { resolve, reject, timer });
       sendJson({ t: 'chooseFile', requestId, purpose });
     });
-  }
-
-  function readTextFile(fileTypes?: string[]): Promise<{ path: string; text: string } | null> {
-    if (!isOpen() || !clientId) return Promise.reject(new Error('Not connected to TouchDesigner'));
-    const requestId = `x${++requestSeq}`;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { pendingRead.delete(requestId); reject(new Error('TouchDesigner did not answer')); }, CHOOSE_FILE_TIMEOUT_MS);
-      pendingRead.set(requestId, { resolve, reject, timer });
-      sendJson({ t: 'chooseFile', requestId, purpose: 'readText', ...(fileTypes ? { fileTypes } : {}) });
-    });
-  }
-
-  async function placeImageViaTd(): Promise<string | null> {
-    if (!isOpen() || !clientId) throw new Error('Not connected to TouchDesigner');
-    const requestId = `p${++requestSeq}`;
-    const sock = ws, epoch = docEpoch;
-    let name = 'Image';
-    let sized: { w: number; h: number } | null;
-    try {
-      sized = await new Promise<{ w: number; h: number } | null>((resolve, reject) => {
-        const timer = setTimeout(() => { pendingImports.delete(requestId); reject(new Error('TouchDesigner did not answer')); }, PLACE_IMAGE_TIMEOUT_MS);
-        pendingImports.set(requestId, { resolve: (w, h) => resolve({ w, h }), reject, timer });
-        placeWatch.set(requestId, (path) => {
-          if (path === null) { pendingImports.delete(requestId); clearTimeout(timer); resolve(null); return; }
-          name = path.split(/[\\/]/).filter(Boolean).pop() ?? 'Image';
-        });
-        sendJson({ t: 'chooseFile', requestId, purpose: 'placeImage' });
-      });
-    } finally {
-      placeWatch.delete(requestId);
-    }
-    if (!sized) return null;
-    const frame = await fetchTop(requestId, sock);
-    if (disposed || epoch !== docEpoch) throw new Error('The document changed during the import');
-    return engine.importImage(frame.payload, frame.w, frame.h, name);
   }
 
   function fileOp(op: FileResult['op'], path?: string, opts?: { includeHistory?: boolean }): Promise<FileResult> {
@@ -1042,7 +1021,8 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       sendJson({ t: 'importTop', requestId, path });
     });
     const frame = await fetchTop(requestId, sock);
-    if (disposed || epoch !== docEpoch) throw new Error('The document changed during the import');
+    if (disposed) throw new Error('Bridge closed'); // the session ended (tab switch): the store ignores this one
+    if (epoch !== docEpoch) throw new Error('The document changed during the import');
     const name = path.split('/').filter(Boolean).pop() ?? 'TOP';
     return engine.importImage(frame.payload, frame.w, frame.h, name);
   }
@@ -1121,7 +1101,8 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         if (res.status === 404) throw new Error('The TOP snapshot expired');
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const buf = await res.arrayBuffer();
-        if (disposed || ws !== sock) throw new Error('Disconnected from TouchDesigner');
+        if (disposed) throw new Error('Bridge closed');
+        if (ws !== sock) throw new Error('Disconnected from TouchDesigner');
         const r = decodeFrame(buf);
         if (!r.ok || r.frame.type !== FRAME_TOP) throw new Error('Invalid TOP image from TouchDesigner');
         return { w: r.frame.w, h: r.frame.h, payload: r.frame.payload };
@@ -1134,6 +1115,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
         aborts.delete(ctrl);
       }
     }
+    if (disposed) throw new Error('Bridge closed');
     status.setNotice(`TOP fetch failed: ${lastErr}`);
     throw new Error(lastErr);
   }
@@ -1228,8 +1210,11 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     }
   }
 
+  const dbg: Record<string, unknown> = { connects: 0, closes: 0, sched: 0, skipped: '', lastClose: null, url: '' };
+  (globalThis as { __bridgeDbg?: unknown }).__bridgeDbg = dbg;   // diagnostics for the live validation (read through the test hook)
   function scheduleReconnect() {
-    if (disposed || rejected || reconnectTimer) return;
+    dbg.sched = (dbg.sched as number) + 1;
+    if (disposed || rejected || gone404 || reconnectTimer) { dbg.skipped = `disposed=${disposed} rejected=${rejected} gone404=${gone404} timer=${!!reconnectTimer}`; return; }
     reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, backoff);
     backoff = Math.min(BACKOFF_MAX, backoff * 2);
   }
@@ -1245,17 +1230,32 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       return;
     }
     ws = sock;
+    dbg.connects = (dbg.connects as number) + 1;
+    dbg.url = url;
     sock.binaryType = 'arraybuffer';
+    if (connectTimer) clearTimeout(connectTimer);
+    connectTimer = setTimeout(() => {
+      connectTimer = null;
+      if (ws === sock && sock.readyState === 0) { try { sock.close(); } catch { /* already closing */ } }   // onclose schedules the retry
+    }, CONNECT_TIMEOUT_MS);
     sock.onopen = () => {
-      if (ws === sock) sendJson({ t: 'ready', protocol: PROTOCOL_VERSION, client, version: '0.1.0', token, fresh: !synced });
+      if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
+      if (helloTimer) clearTimeout(helloTimer);
+      helloTimer = setTimeout(() => { helloTimer = null; if (ws === sock) { try { sock.close(); } catch { /* already closing */ } } }, HELLO_TIMEOUT_MS);
+      if (ws === sock) sendJson({ t: 'ready', protocol: PROTOCOL_VERSION, client: 'external', version: '0.1.0', token, fresh: !synced });
     };
     sock.onmessage = (ev) => {
       if (ws !== sock) return;
       if (typeof ev.data === 'string') onJson(ev.data);
     };
-    sock.onclose = () => {
+    sock.onclose = (ev) => {
       if (ws !== sock) return;
       ws = null;
+      if (helloTimer) { clearTimeout(helloTimer); helloTimer = null; }
+      dbg.closes = (dbg.closes as number) + 1;
+      dbg.lastClose = (ev as CloseEvent | undefined)?.code ?? null;
+      const gone = (ev as CloseEvent | undefined)?.code === 4404 || goneSeen; // v10: no such editor
+      goneSeen = false;
       active = false;
       dirty.clear();
       loading = false;
@@ -1278,8 +1278,40 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       if (sendTimer) { clearTimeout(sendTimer); sendTimer = null; }
       status.setConnection('reconnecting');
       status.setActive(true); // offline: keep editing locally, no standby overlay
+      if (gone) { gone404 = true; status.onEditorGone?.(); return; }
       scheduleReconnect();
     };
+  }
+
+  /** v10: make TD current before this session is closed (tab switch): pending doc + dirty surfaces + active layer go out, then the history upload completes. */
+  const waitInflight = (ms: number) => (inflight.size
+    ? Promise.race([Promise.allSettled([...inflight]), new Promise<void>((r) => setTimeout(r, ms))])
+    : Promise.resolve());
+  const track = <T,>(p: Promise<T>): Promise<T> => { inflight.add(p); const done = () => { inflight.delete(p); }; p.then(done, done); return p; };
+
+  const hasUnsent = () => offlineEdits || (canSend() && isOpen() && (dirty.size > 0 || docPending || historyDirty || lastDocRev !== engine.docSpec().rev));
+
+  async function flushPending(): Promise<FlushResult> {
+    if (disposed) return 'ok';
+    try {
+      if (inflight.size) await waitInflight(INFLIGHT_WAIT_MS); // a Flatten / Merge / TOP import that is still running lands in the document first
+      if (!isOpen()) return offlineEdits ? 'dropped' : 'ok';
+      // the document may change while the history upload is awaited: flush again until nothing is pending (bounded)
+      for (let round = 0; round < 3; round++) {
+        if (sendTimer) { clearTimeout(sendTimer); sendTimer = null; }
+        if (canSend() && isOpen()) {
+          if (docPending || lastDocRev !== engine.docSpec().rev) sendDocNow();
+          if (dirty.size) flush(true);
+          const id = engine.activeLayerId();
+          if (id !== activeSent && !(id === null && activeSent === undefined)) { activeSent = id; sendJson({ t: 'activeLayer', id }); }
+        }
+        if (historyTimer) { clearTimeout(historyTimer); historyTimer = null; }
+        if (needsHistoryUpload(true)) await uploadHistory(true);
+        else await historyChain;
+        if (!(canSend() && isOpen() && (dirty.size > 0 || docPending || lastDocRev !== engine.docSpec().rev))) break;
+      }
+      return isOpen() ? 'ok' : offlineEdits ? 'dropped' : 'ok';
+    } catch { return 'ok'; /* best effort */ }
   }
 
   status.setConnection('reconnecting');
@@ -1287,6 +1319,9 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
   const stopLogs = opts.forwardLogs === false ? () => {} : installLogForwarding(sendJson);
 
   return {
+    editor,
+    flush: flushPending,
+    hasUnsent,
     takeover: () => {
       if (isOpen()) sendJson({ t: 'takeover' });
       else status.setNotice('Not connected to TouchDesigner');
@@ -1303,17 +1338,15 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       });
     },
     listTops,
-    importTop,
-    renderLayer,
-    renderLayers,
+    importTop: (path) => track(importTop(path)),
+    renderLayer: (id, mode) => track(renderLayer(id, mode)),
+    renderLayers: (ids) => track(renderLayers(ids)),
     setCanvas,
     saveProject: (path, opts) => fileOp('saveProject', path, opts),
     clearStoredHistory,
     openProject: (path) => fileOp('openProject', path),
     exportPng: (path) => fileOp('exportPng', path),
     chooseFile,
-    readTextFile,
-    placeImageViaTd,
     dispose() {
       disposed = true;
       failPending('Bridge closed');
@@ -1321,6 +1354,8 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       stopLogs();
       if (sendTimer) clearTimeout(sendTimer);
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (connectTimer) clearTimeout(connectTimer);
+      if (helloTimer) clearTimeout(helloTimer);
       for (const c of aborts) c.abort();
       if (loadRetry) clearTimeout(loadRetry);
       if (retryTimer) clearTimeout(retryTimer);

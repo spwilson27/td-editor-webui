@@ -28,7 +28,6 @@ beforeEach(async () => {
   calls = [];
   chosen = [];
   chooseResult = () => '/picked/p.rproj';
-  store.clientKind.value = 'external';
   pending = null;
   respond = (op, path) => ({ op, ok: true, path: path ?? '' });
   store.connection.value = 'linked';
@@ -37,7 +36,7 @@ beforeEach(async () => {
   store.closeFileDialog();
   await mount(<><TopBar /><FileDialog /></>, 'width:1200px');
 });
-afterEach(() => { store.clientKind.value = 'external'; store.closeFileDialog(); store.bridge = null; store.connection.value = 'standalone'; unmount(); });
+afterEach(() => { store.closeFileDialog(); store.bridge = null; store.connection.value = 'standalone'; unmount(); });
 
 describe('File dialogs', () => {
   it('prefills the path from the files message: project for save/open, png for export', async () => {
@@ -145,30 +144,11 @@ describe('File dialogs', () => {
     expect(dlg()).toBeNull();
   });
 
-  it('Browse is shown for the TD panel only; it fills the path, cancel keeps it, rejection shows an error', async () => {
+  it('v10: there is no Browse button (the in-TD panel is gone); the path is typed', async () => {
     await openMenu();
     menuItem('Save Project').click();
     await settle();
     expect(document.querySelector('[data-file-browse]')).toBeNull();
-    store.clientKind.value = 'panel';
-    await settle();
-    const browse = () => q<HTMLButtonElement>('[data-file-browse]');
-    expect(browse().disabled).toBe(false);
-    browse().click();
-    await settle();
-    expect(chosen).toEqual(['saveProject']);
-    expect(q<HTMLInputElement>('[data-file-path]').value).toBe('/picked/p.rproj');
-    chooseResult = () => null;
-    browse().click();
-    await settle();
-    expect(q<HTMLInputElement>('[data-file-path]').value).toBe('/picked/p.rproj');
-    chooseResult = () => Promise.reject(new Error('no picker'));
-    browse().click();
-    await settle();
-    expect(q('[data-file-result=error]').textContent).toBe('no picker');
-    expect(store.canBrowse()).toBe(true);
-    store.bridge = null; // the bridge is not a signal: check the slice directly
-    expect(store.canBrowse()).toBe(false);
   });
 
   it('a dropped connection closes the dialog and releases the keyboard block', async () => {

@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { store } from '../../src/state/store';
-import { App } from '../../src/ui/App';
 import { StatusBar } from '../../src/ui/StatusBar';
 import { TopBar } from '../../src/ui/TopBar';
 import { Viewport } from '../../src/ui/Viewport';
@@ -13,7 +12,6 @@ const seg = (id: string) => q<HTMLButtonElement>(`[data-view-mode=${id}]`);
 function reset() {
   store.setConnection('reconnecting');
   store.viewMode.value = 'local';
-  store.clientKind.value = 'external';
   store.latency.value = { n: 0, last: 0, median: 0, p95: 0 };
   store.viewLatency.value = { n: 0, last: 0, median: 0, p95: 0 };
   store.viewAge.value = null;
@@ -114,30 +112,7 @@ describe('viewport in TD mode', () => {
     await settle();
   });
 
-  it('panel client: the document rect is transparent, the surround and shadow are drawn', async () => {
-    const [cx, cy] = centre();
-    expect(px(cx, cy)).toEqual([0x33, 0x66, 0x99, 255]); // local preview
-    store.clientKind.value = 'panel';
-    store.setViewMode('td');
-    await settle();
-    expect(px(cx, cy)[3]).toBe(0);
-    expect(px(3, 3)).toEqual([0x1c, 0x1c, 0x1c, 255]); // surround stays opaque
-    const v = store.view.value;
-    expect(px(v.x - 4, cy)[3]).toBeGreaterThan(0); // soft shadow next to the document
-    expect(px(v.x - 4, cy)[0]).toBeLessThan(0x1c);
-    expect(q('[data-viewport]').dataset.tdPanel).toBe('true');
-    expect(getComputedStyle(q('[data-viewport]')).backgroundColor).toBe('rgba(0, 0, 0, 0)');
-  });
 
-  it('panel client: back to Local paints the preview again', async () => {
-    store.clientKind.value = 'panel';
-    store.setViewMode('td');
-    await settle();
-    store.setViewMode('local');
-    await settle();
-    const [cx, cy] = centre();
-    expect(px(cx, cy)).toEqual([0x33, 0x66, 0x99, 255]);
-  });
 
   it('external client: shows the fetched TD view image instead of the local preview', async () => {
     store.setViewMode('td');
@@ -169,20 +144,3 @@ describe('viewport in TD mode', () => {
   });
 });
 
-describe('page background in panel TD mode', () => {
-  it('the app root and html become transparent only for panel + TD', async () => {
-    store.setConnection('linked');
-    await mount(<App />, 'width:1200px;height:700px');
-    const root = q('[data-app-root]');
-    expect(getComputedStyle(root).backgroundColor).not.toBe('rgba(0, 0, 0, 0)');
-    store.clientKind.value = 'panel';
-    store.setViewMode('td');
-    document.documentElement.toggleAttribute('data-td-panel', store.tdPanel.value); // main.tsx does this in an effect
-    await settle();
-    expect(getComputedStyle(root).backgroundColor).toBe('rgba(0, 0, 0, 0)');
-    expect(getComputedStyle(document.body).backgroundColor).toBe('rgba(0, 0, 0, 0)');
-    expect(getComputedStyle(document.documentElement).backgroundColor).toBe('rgba(0, 0, 0, 0)');
-    // the side panels stay opaque
-    expect(getComputedStyle(q('[aria-label="Layer panels"]').parentElement!.parentElement!).backgroundColor).not.toBe('rgba(0, 0, 0, 0)');
-  });
-});

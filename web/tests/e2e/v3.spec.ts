@@ -6,11 +6,11 @@ import { FakeTd } from './fakeTd';
 let td: FakeTd;
 test.afterEach(async () => { await td.close(); });
 
-const open = async (page: Page, opts: { client?: 'panel' | 'external'; fonts?: string[]; tops?: boolean } = {}) => {
+const open = async (page: Page, opts: { fonts?: string[]; tops?: boolean } = {}) => {
   td = await FakeTd.start({ w: 160, h: 90, fonts: opts.fonts });
   if (opts.tops) td.tops = [solidTop('/project1/red1', 100, 50, [220, 20, 30, 255]), solidTop('/project1/big1', 400, 300, [10, 200, 30, 255]), solidTop('/lib/blue1', 20, 20, [20, 30, 220, 255])];
   page.on('pageerror', (e) => { throw e; });
-  await page.goto(`/?test=1&client=${opts.client ?? 'panel'}&ws=${encodeURIComponent(td.url)}&token=${td.token}`);
+  await page.goto(`/?test=1&ws=${encodeURIComponent(td.url)}#token=${td.token}`);
   await expect(page.locator('[data-tool]').first()).toBeVisible();
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   await td.waitFor(() => td.doc !== null);
@@ -111,7 +111,7 @@ test('Import from TouchDesigner: a TOP larger than the document is scaled to fit
 });
 
 test('Place Image… uses a file chooser; the image becomes a layer and is sent to TD (external browser)', async ({ page }) => {
-  await open(page, { client: 'external' });
+  await open(page);
   await page.getByRole('button', { name: 'File', exact: true }).click();
   const chooser = page.waitForEvent('filechooser');
   await page.getByRole('menuitem', { name: /Place Image/ }).click();
@@ -150,7 +150,7 @@ test('paste and drag-and-drop of an image (synthetic events)', async ({ page }) 
 });
 
 test('lasso and wand selections clip painting; the clipped pixels are what TD stores', async ({ page }) => {
-  await open(page, { client: 'external' });
+  await open(page);
   const layers = await hook<any[]>(page, 'layers');
   const paint = layers.find((l) => l.kind === 'pixel');
   const slot = paint.slot as number;
@@ -306,7 +306,7 @@ test('a fresh page loading TD\'s document: text layers own no slot, nothing is f
     { ...base, id: 'tx', kind: 'text', input: null, name: 'AB', slot: null, text: text as never },
   ], 5);
   page.on('pageerror', (e) => { throw e; });
-  await page.goto(`/?test=1&client=panel&ws=${encodeURIComponent(td.url)}&token=${td.token}`);
+  await page.goto(`/?test=1&ws=${encodeURIComponent(td.url)}#token=${td.token}`);
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   await expect(page.locator('[data-layer] [data-name]')).toHaveText(['AB', 'TD Input']);
   await page.waitForTimeout(300);

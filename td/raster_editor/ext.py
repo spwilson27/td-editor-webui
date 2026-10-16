@@ -18,6 +18,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import tempfile
 import threading
 import time
@@ -26,11 +27,18 @@ from urllib.parse import parse_qs
 
 import numpy as np
 
-CLIENT_KINDS = ("panel", "external")
-MODIFIER_KEYS = frozenset((
-    "shift", "lshift", "rshift", "ctrl", "lctrl", "rctrl", "alt", "lalt", "ralt",
-    "cmd", "lcmd", "rcmd", "meta", "win", "capslock",
-))
+CLIENT_KINDS = ("external",)  # v10: no in-TD panel; every client is an external browser
+VERSION_FALLBACK = "0.8.0"
+RECORD_KEY = "rasterEditorMaster"  # root storage: {path, id, port, token, orphan} of the project master
+PORT_FALLBACK = 50  # a busy master port: try the next ones up to +50
+SCAN_PERIOD_S = 5.0  # master: editor list poll (renames have no callback; create / delete / Active / Start are event driven)
+HEALTH_PERIOD_S = 2.0  # master server check / slave check that the master is alive
+START_GRACE_S = 5.0  # a slave does not judge the master before it has run this long (project load order)
+TAKEOVER_WAIT_S = 3.0  # a failover waits this long for the old master to release the port, then falls back
+BLOCK_S = 10.0  # no free port: no new attempt for this long (BLOCK_MAX attempts, then only an explicit Open in Browser)
+BLOCK_MAX = 3
+UPGRADE_HOLD_S = 15.0  # an editor being upgraded keeps its role (master record, token) this long
+SERVER_FAILS_MAX = 3  # master server not running after this many restart attempts -> hand over
 MAX_TEST_BODY = 64 * 1024
 MODULE_CHECK_S = 1.0
 LOOPBACK_ORIGIN = re.compile(r"^http://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$")
@@ -202,6 +210,34 @@ class RasterEditorExt:
         self._file_replace = os.replace  # test seam for the project / PNG writers
         self._file_results = collections.deque()  # results from worker threads, handled by the pump
         self._sync_file_ops = False  # tests: run file workers inline
+        # v8 router / identity state (see "identity, master election, router")
+        self.ws_log = collections.deque(maxlen=40)   # (time, client, wanted editor, routed to, known editors): diagnostics
+        self.is_master = False
+        self.editor_id = ""
+        self.copied = False
+        self._copied_from = ""
+        self.port_used = None
+        self._ws = None            # server DAT this session sends through (the master's); None = our own
+        self._tok = secrets.token_urlsafe(16)   # the project token (the master's; adopted from the master record)
+        self._root_op = None       # test seam: replaces op('/')
+        self._peers = {}           # test seam: path -> COMP
+        self._local_record = None  # master record when there is no root (unit tests)
+        self._route = {}           # master: client -> session
+        self._by_id = {}           # master: editorId -> (COMP, extension)
+        self._editors_sig = None
+        self._editors_payload = None
+        self._scan_at = 0.0
+        self._health_at = 0.0
+        self._miss_at = -1e9
+        self._takeover = None      # deadline while waiting for the old master's port
+        self._retry_at = 0.0       # next attempt while waiting
+        self._blocked_until = 0.0
+        self._blocked_n = 0
+        self.was_copied = False
+        self._wall = time.time     # test seam (the master record's hold is wall-clock: it outlives a process)
+        self._server_fails = 0
+        self._started_at = self._now()
+        self.registry = None
         self._load_modules()
         self._reset_state()
         self.stats = {k: collections.deque(maxlen=STAT_WINDOW) for k in (
@@ -213,6 +249,12 @@ class RasterEditorExt:
     def _load_modules(self):
         self.protocol = self.o.op("protocol").module
         self.frames = self.o.op("frames").module
+        reg = self._opt("registry")
+        if reg is not None:
+            self.registry = reg.module
+        elif self.registry is None:
+            import registry as _registry  # unit tests (the COMP embeds registry.py as the `registry` DAT)
+            self.registry = _registry
         self.converter = self.frames.WireConverter()
         self.out.type = self.protocol.TYPE_VIEW
         for pipe in self.bases.values():
@@ -229,11 +271,9 @@ class RasterEditorExt:
         return pipe
 
     def _reset_state(self):
-        self.token = secrets.token_urlsafe(16)  # per start; required in `ready`, carried in the panel URL
         self.clients = {}
         self.active_id = None
         self._seq = 0
-        self._panel_seen = False
         self.doc_w = 0  # document / canvas size
         self.doc_h = 0
         self.has_input = False  # TD input 1 is connected (it drives Follow Input)
@@ -298,13 +338,7 @@ class RasterEditorExt:
             pipe.reset()
         self.out.reset()
         self._carry = {}
-        self._panel_key = None
-        self._panel_top = "webrender"
         self._module_check_at = 0.0
-        self._move_pending = False
-        self._buttons = {"lselect": False, "mselect": False, "rselect": False}
-        self._reload_at = None
-        self._wr_cooks = None
         self._status_at = 0.0
         self._status = None
         self._out_times = collections.deque(maxlen=64)
@@ -343,14 +377,21 @@ class RasterEditorExt:
             return
         if self._doc_state_dirty:
             self._flush_doc_state()
-        carry = self.surfaces  # a restart in a live session: Script TOPs are not locked, keep our pixels
-        carry_stale = set(self._stale_enc)  # ...and which of them still wait for a Premultiplied re-encode
-        self._close_all_sockets()
+        carry = {} if self._restore_pending else self.surfaces  # a restart in a live session: Script TOPs are not locked, keep our pixels
+        # (while a restore is pending the buffers are blank placeholders: the pixels are still in the locked TOPs / the undo cache)
+        carry_stale = set() if self._restore_pending else set(self._stale_enc)  # ...and which of them still wait for a Premultiplied re-encode
+        self._close_own_sockets()
         self._load_modules()
         self._reset_state()
         self._carry = carry
         self._carry_stale = carry_stale
         self._started = True
+        self._started_at = self._now()
+        self._identity()
+        if self.copied and not self._carry:
+            self._carry, self._carry_stale = self._pixels_of_original()
+            if not self._carry and self._has_pixel_slots():
+                self._flash_status("copied without pixels (the original editor is not running)", 60.0)
         self._apply_active()
         if self._p("Active"):
             self._make_network()
@@ -363,17 +404,25 @@ class RasterEditorExt:
         if not self._restore_pending:
             self._carry, self._carry_stale = {}, set()
         self._prune_undo_caches()
+        if not self._restore_pending:
+            self._copy_done()
+        self._resume_master()
+        self._registry_changed()
 
     @_guard
     def Stop(self):
         if self._doc_state_dirty:
             self._flush_doc_state()
-        self._close_all_sockets()
+        self._close_own_sockets()
         self._drop_all_tops()
         self.clients.clear()
         self.active_id = None
         self._started = False
-        self._op("webserver").par.active = 0
+        if self.is_master:  # (the master record stays: a restart of this editor resumes as master with the same port / token)
+            rec = self._record() or {}
+            rec["hold"] = self._wall() + UPGRADE_HOLD_S
+            self._set_record(rec)
+            self._stop_server()
 
     def _superseded(self):
         """True when the COMP already runs a NEWER extension instance (initializeExtensions, a re-saved extension DAT, a module
@@ -389,26 +438,596 @@ class RasterEditorExt:
         """TD calls this on the extension when the COMP is deleted (verified: before its children are destroyed, the COMP still
         valid; Execute DAT onExit / onDestroy are NOT called) -- and also on the OLD instance when the extension is re-initialised,
         which must not touch the server the new instance owns (``_superseded``). Quiet everything that talks to the outside so the
-        destruction has nothing to wait for: close the WebSocket clients, stop the server, stop the panel's browser, drop imports
-        and temporaries. TD's undo snapshot of the delete is taken BEFORE this hook (verified: a lock taken here is not in it), so
+        destruction has nothing to wait for: close the WebSocket clients, stop the server (the next active editor takes over as
+        master on the same port with the same token: failover), drop imports and temporaries. TD's undo snapshot of the delete is taken BEFORE this hook (verified: a lock taken here is not in it), so
         the surface pixels would come back blank after Ctrl+Z; they are therefore saved to a temp-folder side cache that the
         recreated instance's Restore() picks up (``_save_undo_cache``). While a restore is pending the locked images already
         are the document (and in the snapshot): nothing is written. Every step is independent and never raises."""
         if self._superseded():
             return
+        if self._hold_active():
+            rec = self._record() or {}
+            rec.pop("hold", None)   # (deleted while upgrading: normal failover below)
+            self._set_record(rec)
         self._destroyed = True
         self._started = False
         for name, step in (
                 ("undo cache", lambda: None if self._restore_pending else self._save_undo_cache()),
-                ("sockets", self._close_all_sockets),
+                ("sockets", self._close_own_sockets),
                 ("server", lambda: setattr(self._op("webserver").par, "active", 0)),
-                ("panel", lambda: setattr(self._op("webrender").par, "active", 0)),
+                ("handover", self._on_destroy_router),
                 ("clients", self.clients.clear)):
             try:
                 step()
             except Exception as e:  # noqa: BLE001 - the COMP is going away; nothing may escape into TD
                 print(f"[raster_editor] onDestroyTD/{name}: {type(e).__name__}: {e}")
         self.active_id = None
+
+    # ------------------------------------------------------------------ identity, master election, router (v8)
+    #
+    # Every editor is complete and can be the project master. Only the master's Web Server DAT is active: it serves the
+    # page once and routes `editor=<id>` HTTP requests and WebSocket connections to the target editor's session (this
+    # class: the per-editor protocol state) with plain Python calls. A slave costs nothing per frame beyond its own
+    # work (`_router_tick` compares one timestamp). The master record (path / id / port / token) lives in the root's
+    # storage so that failover, project load and `Open in Browser` can find / validate it.
+
+    def _root(self):
+        """The project root operator (it holds the master record); None outside TD (unit tests keep a local record)."""
+        if self._root_op is not None:
+            return self._root_op
+        try:
+            return op("/")  # noqa: F821 - TD global
+        except NameError:
+            return None
+
+    def _record(self):
+        r = self._root()
+        if r is None:
+            return dict(self._local_record) if self._local_record else None
+        try:
+            rec = r.fetch(RECORD_KEY, None)
+        except Exception:  # noqa: BLE001
+            rec = None
+        return dict(rec) if isinstance(rec, dict) else None
+
+    def _set_record(self, rec):
+        r = self._root()
+        if r is None:
+            self._local_record = dict(rec)
+        else:
+            r.store(RECORD_KEY, dict(rec))
+
+    def _comp_at(self, path):
+        if not path:
+            return None
+        if path == str(self.o.path):
+            return self.o
+        if path in self._peers:
+            return self._peers[path]
+        try:
+            return op(path)  # noqa: F821 - TD global
+        except NameError:
+            return None
+
+    def _ext_of(self, comp):
+        """The editor extension of ``comp`` (this one for our own COMP), or None."""
+        if comp is None:
+            return None
+        if comp is self.o:
+            return self
+        try:
+            holder = comp.ext
+            e = getattr(holder, "RasterEditorExt", None)
+            if e is None and hasattr(holder, "is_master"):
+                e = holder  # (unit tests hand the extension itself)
+        except Exception:  # noqa: BLE001
+            return None
+        return e if e is not None and hasattr(e, "is_master") else None
+
+    def _server_running(self):
+        try:
+            return bool(self._op("webserver").par.active.eval())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _live_master(self):
+        """The running master's extension in this TD process (record validated: the COMP exists, is a started master with a
+        running server), or None."""
+        rec = self._record()
+        if not rec or not rec.get("path"):
+            return None
+        m = self._ext_of(self._comp_at(rec["path"]))
+        if m is None or m._destroyed or not m.is_master or not m._started or not m._server_running():
+            return None
+        return m
+
+    def _hold_active(self, rec=None):
+        rec = rec if rec is not None else (self._record() or {})
+        return float(rec.get("hold") or 0.0) > self._wall()
+
+    def _pending_master(self):
+        """The editor the record names as master that is NOT serving yet but is about to be: being upgraded in place (the record's
+        `hold`, written by PrepareUpgrade and honoured by the NEW extension instance too) or waiting for its port (failover /
+        resume). Nobody else takes over, and Open in Browser joins it instead of starting a second server."""
+        rec = self._record()
+        if not rec or not rec.get("path"):
+            return None
+        m = self._ext_of(self._comp_at(rec["path"]))
+        if m is None or m._destroyed or (m.is_master and m._server_running()):
+            return None
+        if m._takeover is not None or self._hold_active(rec):
+            return m
+        return None
+
+    def _find_editors(self):
+        root = self._root()
+        if root is None:
+            return [self.o]
+        out = self.registry.find_editors(root, legacy=False)
+        if not any(c is self.o for c in out) and not self._destroyed:
+            out.append(self.o)
+            out.sort(key=lambda c: str(c.path))
+        return out
+
+    def _identity(self):
+        """Stable editorId, kept in COMP storage. It survives everything that keeps the storage with no second editor owning the
+        id (undo of a delete, cut / paste, save / load of a .tox, project load). A copy / paste / duplicate / loaded .tox of a LIVE
+        editor carries the same id while the original still exists: the newcomer takes a new id (its document came along with
+        the children and its pixels are adopted from the original while that runs)."""
+        eid = str(self.o.fetch("editorId", "") or "")
+        if eid and self._id_in_use_elsewhere(eid):
+            self.copied = self.was_copied = True
+            self._copied_from = eid
+            print(f"[raster_editor] {self.o.path} is a copy of editor {eid}: new editor id (the document was copied)")
+            eid = ""
+        if not eid:
+            eid = "e" + secrets.token_hex(4)
+            self.o.store("editorId", eid)
+        self.editor_id = eid
+
+    def _id_in_use_elsewhere(self, eid):
+        try:
+            for comp in self._find_editors():
+                if comp is not self.o and self.registry.editor_id(comp) == eid:
+                    return True
+        except Exception as e:  # noqa: BLE001
+            self._report("identity", e)
+        return False
+
+    def _pixels_of_original(self):
+        """A copy of a live editor: its surface Script TOPs are blank (the pixels are only in the running extension's buffers
+        unless the project was saved), so take them from the editor it was copied from and let Restore use them like a
+        restart's carried buffers. Nothing to adopt (the original is inactive / not running) -> {} and a Status notice."""
+        if not self._copied_from:
+            return {}, set()
+        for comp in self._find_editors():
+            if comp is self.o:
+                continue
+            ext = self._ext_of(comp)
+            if ext is not None and ext.editor_id == self._copied_from and ext._started and ext.surfaces:
+                return {sl: b.copy() for sl, b in ext.surfaces.items()}, set(ext._stale_enc)
+        return {}, set()
+
+    def _port_free(self, port):
+        """True when nothing listens on 127.0.0.1:port (a connect is refused). Not a bind test: that would also trip over the
+        TIME_WAIT sockets of a server that was just stopped (failover on the same port)."""
+        try:
+            with socket.create_connection(("127.0.0.1", int(port)), timeout=0.25):
+                return False
+        except OSError:
+            return True
+
+    def _pick_port(self, ports, wait):
+        """The first free port of ``ports`` (a list: the preferred ones in order). None while ``wait`` and the old master has not
+        released them yet (up to TAKEOVER_WAIT_S; the caller retries); after that / without waiting the next free ports above the
+        first one, up to +PORT_FALLBACK. RuntimeError when nothing is free."""
+        for p in ports:
+            if self._port_free(p):
+                return p
+        if wait:
+            now = self._now()
+            if self._takeover is None:
+                self._takeover = now + TAKEOVER_WAIT_S
+            if now < self._takeover:
+                self._retry_at = now + 0.25
+                return None
+        base = ports[0]
+        for p in range(base + 1, min(base + PORT_FALLBACK, 65535) + 1):
+            if self._port_free(p):
+                return p
+        raise RuntimeError(f"no free port from {base} to {base + PORT_FALLBACK}")
+
+    def BecomeMaster(self, takeover=False, resume=False, user=False):
+        """Make this editor the project master: start its Web Server DAT. ``takeover`` (failover): the record's port and token,
+        waiting briefly for the old server to release the port. ``resume`` (project load): the configured `Port` first, then the
+        record's. Otherwise (election) the `Port` parameter, falling back to the next free port (up to +50); a project with no free
+        port is retried a few times, spaced BLOCK_S apart, unless ``user`` (an explicit Open in Browser / Promote). Returns True when
+        serving (False: not active, another live or pending master exists, still waiting for the port, or failed). Every exit
+        other than "waiting for the port" clears the takeover wait."""
+        self._wait_port = False
+        try:
+            ok = self._become_master(takeover, resume, user)
+        except Exception as e:  # noqa: BLE001
+            self._blocked_n += 1
+            self._blocked_until = self._now() + BLOCK_S
+            self._report("BecomeMaster", e)
+            ok = False
+        if not self._wait_port:
+            self._takeover = None
+        return ok
+
+    def _become_master(self, takeover, resume, user):
+        if self._destroyed or not self._p("Active"):
+            return False
+        if user:
+            self._blocked_n, self._blocked_until = 0, 0.0
+        elif self._blocked_n >= BLOCK_MAX or self._now() < self._blocked_until:
+            return False
+        cur = self._live_master()
+        if cur is not None and cur is not self:
+            return False
+        pend = self._pending_master()
+        if pend is not None and pend is not self and not user:
+            return False
+        if self.is_master and self._server_running():
+            return True
+        rec = self._record() or {}
+        token = rec.get("token") or secrets.token_urlsafe(16)
+        mine = int(self._p("Port"))
+        if resume:
+            ports = [mine] + ([int(rec["port"])] if rec.get("port") and int(rec["port"]) != mine else [])
+        elif takeover and rec.get("port"):
+            ports = [int(rec["port"])]
+        else:
+            ports = [mine]
+        port = self._pick_port(ports, takeover and not resume)
+        if port is None:
+            self._wait_port = True
+            return False  # `_router_tick` retries until the old master released the port (then falls back)
+        ws = self._op("webserver")
+        ws.par.active = 0
+        ws.par.port = port
+        ws.par.active = 1
+        self.is_master = True
+        self._ws = None
+        self._tok = token
+        self._route = {}
+        self._blocked_n, self._blocked_until = 0, 0.0
+        self._set_record({"path": str(self.o.path), "id": self.editor_id, "port": port, "token": token, "orphan": False,
+                          "failed": [] if user else list(rec.get("failed") or [])})
+        self.port_used = port
+        self._rescan(force=True)
+        busy = f" (port {ports[0]} busy)" if port != ports[0] else ""
+        self._flash_status(f"master · http://127.0.0.1:{port}/{busy}")
+        return True
+
+    @_guard
+    def Promote(self):
+        """Take the master role from the current master (validation / manual hand-over): it stops serving, this editor serves on
+        the same port with the same token; open pages reconnect."""
+        cur = self._live_master()
+        if cur is not None and cur is not self:
+            cur._stop_server()
+        self._takeover = None
+        return self.BecomeMaster(takeover=True, user=True)
+
+    def _stop_server(self):
+        """Stop serving (resign / deactivate / delete): every session routed through this server forgets its clients, the Web
+        Server DAT is switched off. The master record is left to the caller."""
+        self.is_master = False
+        sessions = {id(e): e for _, e in self._by_id.values()}
+        sessions[id(self)] = self
+        for e in sessions.values():
+            e._forget_clients()
+        self._route = {}
+        self._by_id = {}
+        self._editors_sig = None
+        self._editors_payload = None   # never publish a list from a master that has not rescanned since it (re)started
+        try:
+            ws = self._op("webserver")
+            for cid in list(ws.webSocketConnections):   # (switching the DAT off does not reliably close live sockets: pages would never notice)
+                try:
+                    ws.webSocketClose(cid)
+                except Exception:  # noqa: BLE001
+                    pass
+            ws.par.active = 0
+        except Exception as e:  # noqa: BLE001
+            print(f"[raster_editor] stop server: {type(e).__name__}: {e}")
+
+    def _forget_clients(self):
+        """Drop this editor's clients without talking to them (their server is gone)."""
+        for cid in list(self.clients):
+            self._ws_close(cid)
+        self._ws = None
+
+    def _successor(self, exclude=None, skip_ids=()):
+        """The next active, started editor in path order (not ``exclude`` / ``skip_ids``), or None."""
+        for comp in self._find_editors():
+            if comp is exclude:
+                continue
+            ext = self._ext_of(comp)
+            if ext is None or ext._destroyed or not ext._started or ext.editor_id in skip_ids:
+                continue
+            try:
+                if not comp.par.Active.eval():
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+            return ext
+        return None
+
+    def _hand_over(self, failed=False):
+        """This master stops serving; the next active editor takes over on the same port with the same token. No active
+        editor left -> the server stays off and the record is marked `orphan` (the first editor activated again resumes).
+        ``failed``: this editor's server could not run; it is remembered in the record so a successor with the same error is
+        not handed back to (no flapping)."""
+        rec = self._record() or {}
+        bad = list(rec.get("failed") or [])
+        if failed and self.editor_id not in bad:
+            bad.append(self.editor_id)
+        self._stop_server()
+        succ = self._successor(exclude=self.o, skip_ids=bad)
+        if succ is None:
+            rec.update(path="", id="", orphan=True, failed=bad)
+            self._set_record(rec)
+            return None
+        rec["failed"] = bad
+        self._set_record(rec)
+        succ._takeover = None
+        succ.BecomeMaster(takeover=True)
+        return succ
+
+    def _resume_master(self):
+        """Project load / restart: the editor that was master when the project was saved serves again (the configured Port
+        first, then the record's; an upgrade / rebuild in place keeps the record's port); no other editor starts a server."""
+        if not self._p("Active") or self.is_master:
+            return
+        rec = self._record()
+        if rec and rec.get("id") == self.editor_id and rec.get("path") is not None and self._live_master() is None:
+            if self._hold_active(rec):
+                self.BecomeMaster(takeover=True)
+            else:
+                self.BecomeMaster(resume=True)
+
+    def _registry_changed(self, exclude=None):
+        """An editor was created / started / deleted / (de)activated: the master refreshes its list (and pushes it)."""
+        m = self if self.is_master else self._live_master()
+        if m is not None:
+            m._rescan(force=True, exclude=exclude)
+
+    def _rescan(self, force=False, exclude=None):
+        """Master: rebuild the id -> editor map and the editor list; push `editors` to the open pages when it changed."""
+        now = self._now()
+        if not force and now < self._scan_at:
+            return
+        self._scan_at = now + SCAN_PERIOD_S
+        by_id, items = {}, []
+        ws = self._op("webserver")
+        for comp in self._find_editors():
+            if exclude is not None and comp is exclude:
+                continue
+            ext = self._ext_of(comp)
+            eid = self.editor_id if comp is self.o else self.registry.editor_id(comp)
+            if ext is None or not eid or ext._destroyed or not ext._started:
+                continue   # not (yet) running: not routable, not listed
+            if eid in by_id:
+                continue   # a duplicate id (a copy before its first Start re-ided it): the first started one keeps it
+            try:
+                active = bool(comp.par.Active.eval())
+            except Exception:  # noqa: BLE001
+                active = False
+            by_id[eid] = (comp, ext)
+            items.append({"id": eid, "name": str(comp.name), "path": str(comp.path), "version": self.registry.editor_version(comp),
+                          "active": active})
+            if ext is not self:
+                ext._ws, ext._tok = ws, self._tok
+                if ext.is_master:  # an earlier master that lost the election (e.g. its server failed)
+                    ext._stop_server()
+        self._by_id = by_id
+        rec = self._record()
+        if rec and rec.get("id") == self.editor_id and rec.get("path") != str(self.o.path):
+            rec["path"] = str(self.o.path)  # the master was renamed / moved
+            self._set_record(rec)
+        payload = {"master": self.editor_id, "editors": items}
+        sig = json.dumps(payload, sort_keys=True)
+        if sig != self._editors_sig:
+            self._editors_sig = sig
+            self._editors_payload = payload
+            text = self.protocol.editors_msg(self.editor_id, items)
+            try:
+                for cid in list(ws.webSocketConnections):
+                    ws.webSocketSendText(cid, text)
+            except Exception as e:  # noqa: BLE001
+                self._report("editors push", e)
+
+    def _send_editors(self, client):
+        m = self if self.is_master else self._live_master()
+        if m is None or m._editors_payload is None:
+            return
+        m.ws_log.append((round(m._now(), 2), client, "editors", [e["name"] for e in m._editors_payload["editors"]], m._editors_payload["master"]))
+        m._op("webserver").webSocketSendText(client, self.protocol.editors_msg(m._editors_payload["master"], m._editors_payload["editors"]))
+
+    def _target(self, eid):
+        """The session for ``editor=<eid>`` (missing -> this master's own editor), or None for an unknown / inactive editor.
+        O(1) per message: a dict lookup."""
+        if not eid or eid == self.editor_id:
+            return self if self._p("Active") else None
+        ent = self._by_id.get(eid)
+        if ent is None:
+            now = self._now()
+            if now - self._miss_at > 0.5:  # a just created editor the periodic scan has not seen yet
+                self._miss_at = now
+                self._rescan(force=True)
+                ent = self._by_id.get(eid)
+            if ent is None:
+                return None
+        ext = ent[1]
+        if ext._destroyed or not ext._started or not ext._p("Active"):
+            return None
+        ext._tok = self._tok
+        return ext
+
+    def _router_tick(self, now):
+        """Once per pump, a timestamp compare unless something is due. Master: refresh the list, check the server. Slave: is
+        the master alive? (failover) -- only the candidate (next active editor in path order) acts."""
+        if self._takeover is not None and now >= self._retry_at:
+            self.BecomeMaster(takeover=True)
+        if self.is_master:
+            if now >= self._scan_at:
+                self._rescan(force=True)
+            if now >= self._health_at:
+                self._health_at = now + HEALTH_PERIOD_S
+                self._check_server()
+            return
+        if now < self._health_at or now - self._started_at < START_GRACE_S:
+            return
+        self._health_at = now + HEALTH_PERIOD_S
+        rec = self._record()
+        if not rec or not self._p("Active"):
+            return
+        if rec.get("path") and rec.get("id") != self.editor_id:
+            if self._live_master() is not None or self._pending_master() is not None:
+                return  # alive, or starting up again (upgrade / project load / port release): not dead
+            comp = self._comp_at(rec["path"])
+            cand = self._successor(exclude=comp if comp is not None and self._ext_of(comp) is not None else None,
+                                   skip_ids=rec.get("failed") or ())
+            if cand is self:
+                self.BecomeMaster(takeover=True)
+        elif rec.get("orphan") and not rec.get("path"):
+            cand = self._successor(skip_ids=rec.get("failed") or ())
+            if cand is self:
+                self.BecomeMaster(takeover=True)
+
+    BIND_ERROR = re.compile(r"bind|address already in use|in use|eaddrinuse|cannot assign|permission denied", re.I)
+
+    def _check_server(self):
+        """Master health. A failure is only "the Web Server DAT is not active" or a bind-class error (port taken). A stopped server
+        is restarted on its port if that is free (else on the next free one); one that keeps failing hands the role over, and the
+        failing editor is remembered in the record so the successor is not handed back to (no flapping)."""
+        if not self._p("Active"):
+            return
+        ws = self._op("webserver")
+        err = ""
+        try:
+            err = str(ws.errors() or "")
+        except Exception:  # noqa: BLE001
+            pass
+        bad = (not self._server_running()) or bool(self.BIND_ERROR.search(err))
+        if not bad:
+            self._server_fails = 0
+            return
+        self._server_fails += 1
+        if self._server_fails > SERVER_FAILS_MAX:
+            self._server_fails = 0
+            self._report("server", RuntimeError(f"web server failed ({err or 'not running'}); handing over"))
+            self._hand_over(failed=True)
+            return
+        rec = self._record() or {}
+        port = int(rec.get("port") or self._p("Port"))
+        ws.par.active = 0
+        if not self._port_free(port):
+            nxt = self._pick_port([port], False)   # taken by someone else: the next free port (the record follows)
+            port = nxt
+            rec["port"] = port
+            self._set_record(rec)
+            self.port_used = port
+        ws.par.port = port
+        ws.par.active = 1
+
+    def OpenInBrowser(self):
+        """`Openbrowser` pulse: open the project master's page with this editor's tab selected. If no live master exists in this
+        TD process this editor becomes the master first. A master that is just starting again (upgrade / failover waiting for its
+        port) is joined: the page opens at the record's port and retries until it is up; no second server is started.
+        Returns the URL (None: could not serve)."""
+        m = self._live_master()
+        if m is None:
+            pend = self._pending_master()
+            if pend is not None and pend is not self:
+                m = pend
+            else:
+                if not self.BecomeMaster(user=True):
+                    self._flash_status("cannot open: this editor is inactive or the server did not start")
+                    return None
+                m = self
+        url = m._page_url(self.editor_id, self._p("Devurl"), self._test_enabled())
+        self._view_url(url)
+        return url
+
+    def _page_url(self, eid, devurl="", test=False):
+        """URL of the master's page for editor ``eid`` (the token travels in the fragment: it never reaches a server log)."""
+        rec = self._record() or {}
+        port = rec.get("port") or self.port_used or self._p("Port")
+        token = rec.get("token") or self._tok
+        frag = f"#token={token}&e={eid}"
+        dev = (devurl or "").strip()
+        if dev:
+            return dev + ("&" if "?" in dev else "?") + f"ws=ws://127.0.0.1:{port}/ws" + ("&test=1" if test else "") + frag
+        return f"http://127.0.0.1:{port}/" + ("?test=1" if test else "") + frag
+
+    def _upgrade_all(self):
+        """`Upgradeall` pulse: replace every OLDER editor in the project with this editor's build (upgrade.py scans the whole
+        project); the report goes to `Status`."""
+        mod = self._opt("upgrade")
+        if mod is None:
+            text = "upgrade module not available in this build"
+        else:
+            try:
+                import sys
+                sys.modules.setdefault("registry", self.registry)  # (upgrade.py does `import registry`)
+                report = mod.module.upgrade_all(self.o)
+            except ImportError:
+                text = "upgrade module not available in this build"
+            except Exception as e:  # noqa: BLE001
+                self._report("upgrade", e)
+                text = f"upgrade failed: {type(e).__name__}: {e}"
+            else:
+                if isinstance(report, dict):
+                    if report.get("done") is False:
+                        text = f"upgrading {len(report.get('pending', []))} editor(s) ..."   # OnUpgradeDone shows the result
+                    else:
+                        text = self._upgrade_summary(report)
+                else:
+                    text = report if isinstance(report, str) else "; ".join(str(x) for x in (report or [])) or "nothing to upgrade"
+        print(f"[raster_editor] upgrade all: {text}")
+        self._flash_status(text, 60.0)
+
+    @staticmethod
+    def _upgrade_summary(report):
+        text = (f"upgraded {len(report.get('upgraded', []))}, skipped newer {len(report.get('skipped_newer', []))}, "
+                f"linked {len(report.get('skipped_linked', []))}, failed {len(report.get('failed', []))}")
+        if report.get("warning"):
+            text += " · " + str(report["warning"])
+        return text
+
+    def OnUpgradeDone(self, report):
+        """Hook for upgrade.py (the paced upgrade is through): the final summary goes to `Status`."""
+        text = self._upgrade_summary(report if isinstance(report, dict) else {})
+        print(f"[raster_editor] upgrade all: {text}")
+        self._flash_status(text, 60.0)
+
+    def PrepareUpgrade(self):
+        """Hook for upgrade.py, called on a target before it is frozen and stopped: store the pending document state and drop
+        imports so nothing is in flight when the extension is replaced."""
+        if self._doc_state_dirty:
+            self._flush_doc_state()
+        self._drop_all_tops()
+        if self.is_master:   # the NEW extension instance honours this too: it lives in the record, not in this object
+            rec = self._record() or {}
+            rec["hold"] = self._wall() + UPGRADE_HOLD_S
+            self._set_record(rec)
+
+    def OnEditorsChanged(self):
+        """Hook for upgrade.py (called on the source after all targets): refresh the registry / list and master election."""
+        self._registry_changed()
+        m = self if self.is_master else self._live_master()
+        if m is None:
+            self._resume_master()
+
+    def _on_destroy_router(self):
+        if self.is_master:
+            self._hand_over()
+        else:
+            self._registry_changed(exclude=self.o)
 
     # --- undo of a delete: surface pixels in a temp-folder side cache
 
@@ -513,9 +1132,11 @@ class RasterEditorExt:
         that was deleted with exactly the document ``Restore()`` just read (hash of the doc_state text and the layer behind each
         slot must match), then remove it. Any mismatch or damage removes the cache."""
         doc_hash = getattr(self, "_restore_doc_hash", None)
+        self.undo_trace = ["called", doc_hash, sorted(skip)]
         if not doc_hash:
             return set()
         d = self._undo_cache_dir(doc_hash)
+        self.undo_trace.append(os.path.isdir(d))
         t = self._undo_writers.get(d)
         if t is not None:
             t.join(10.0)  # an undo right after the delete: wait for the writer
@@ -567,18 +1188,20 @@ class RasterEditorExt:
             except OSError:
                 pass
 
-    def _close_all_sockets(self):
+    def _close_own_sockets(self):
+        """Close this editor's WebSocket clients (through the server they connected to: the master's)."""
         self._drop_all_tops()
-        ws = self._op("webserver")
-        try:
-            conns = list(ws.webSocketConnections)
-        except Exception:  # noqa: BLE001 - server may be down
-            conns = []
-        for c in conns:
+        ws = self._server()
+        for cid in list(self.clients):
             try:
-                ws.webSocketClose(c)
-            except Exception:  # noqa: BLE001
+                ws.webSocketClose(cid)
+            except Exception:  # noqa: BLE001 - server may be down
                 pass
+
+    _close_all_sockets = _close_own_sockets
+
+    def _server(self):
+        return self._ws if self._ws is not None else self._op("webserver")
 
     def _make_network(self):
         """Create the DocNetwork (network.py) over the COMP's `doc` container. Failure leaves network None:
@@ -638,50 +1261,30 @@ class RasterEditorExt:
             self._finish_restore()
 
     def _apply_active(self):
-        ws = self._op("webserver")
-        wr = self._op("webrender")
-        if self._p("Active"):
-            ws.par.port = self._p("Port")
-            ws.par.active = 1
-            wr.par.active = 1
-            self._set_panel_url()
-            self._reload_at = self._now() + 0.5
-        else:
-            ws.par.active = 0
-            wr.par.active = 0
+        """Active off: the output is the input passed through, clients are dropped. (The server belongs to the master only.)"""
+        if not self._p("Active"):
             self._drop_all_tops()
             self.clients.clear()
             self.active_id = None
             self._op("out_switch").par.index = 0  # passthrough while the editor is off
-            self._sync_panel_view()
+            if not self.is_master:
+                self._op("webserver").par.active = 0
         self._status_at = 0.0
 
-    def _panel_url(self):
-        port = self._p("Port")
-        dev = (self._p("Devurl") or "").strip()
-        extra = (self._p("Panelquery") or "").strip().lstrip("?&")
-        if dev:
-            url = dev + ("&" if "?" in dev else "?") + f"ws=ws://127.0.0.1:{port}/ws&client=panel"
-        else:
-            url = f"http://127.0.0.1:{port}/?client=panel"
-        url += f"&token={self.token}"
-        return url + ("&" + extra if extra else "")
-
-    def _browser_url(self):
-        """URL for an external browser tab (same token, client=external)."""
-        port = self._p("Port")
-        extra = (self._p("Panelquery") or "").strip().lstrip("?&")
-        return f"http://127.0.0.1:{port}/?client=external&token={self.token}" + ("&" + extra if extra else "")
+    @property
+    def token(self):
+        """The project token (the master's; one for all editors)."""
+        return self._tok
 
     def _token_ok(self, tok):
-        return isinstance(tok, str) and hmac.compare_digest(tok.encode(), self.token.encode())
+        return isinstance(tok, str) and hmac.compare_digest(tok.encode(), self._tok.encode())
 
     def _test_enabled(self):
-        q = parse_qs((self._p("Panelquery") or "").strip().lstrip("?&"))
-        return q.get("test") == ["1"]
-
-    def _set_panel_url(self):
-        self._op("webrender").par.url = self._panel_url()
+        """Validation back-channel (`POST /__test`, `testPath`): only when COMP storage `reTest` is set on this editor."""
+        try:
+            return bool(self.o.fetch("reTest", 0))
+        except Exception:  # noqa: BLE001
+            return False
 
     # ------------------------------------------------------------------ parameters
 
@@ -691,25 +1294,27 @@ class RasterEditorExt:
         if name == "Active":
             if self._p("Active"):
                 self.Start()
+                rec = self._record()
+                if rec and rec.get("orphan") and not rec.get("path") and self._successor() is self:
+                    self.BecomeMaster(takeover=True)  # the project's server was stopped for lack of an active editor
             else:
-                self._close_all_sockets()
+                self._close_own_sockets()
                 self._apply_active()
-        elif name in ("Port",):
-            self._close_all_sockets()
-            self.clients.clear()
-            self.active_id = None
-            ws = self._op("webserver")
-            ws.par.port = self._p("Port")
-            ws.par.restart.pulse()
-            self._set_panel_url()
-            self._reload_at = self._now() + 0.5
-        elif name in ("Devurl", "Panelquery"):
-            self._set_panel_url()
-            self._reload_at = self._now()
-        elif name == "Reloadui":
-            self._op("webrender").par.reloadsrc.pulse()
+                if self.is_master:
+                    self._hand_over()
+            self._registry_changed()
+        elif name == "Port":
+            if self.is_master:  # a slave's Port is ignored
+                self._close_own_sockets()
+                self._stop_server()
+                rec = self._record() or {}
+                rec["port"] = None
+                self._set_record(rec)
+                self.BecomeMaster()
         elif name == "Openbrowser":
-            self._view_url(self._browser_url())
+            self.OpenInBrowser()
+        elif name == "Upgradeall":
+            self._upgrade_all()
         elif name == "Exportdoc":
             self.ExportDoc()
         elif name in ("Projectfile", "Pngfile"):
@@ -815,10 +1420,26 @@ class RasterEditorExt:
 
     @_guard
     def OnHTTPRequest(self, request, response):
+        """Master router: the page and `/editors` are served here, every per-editor route goes to the session named by
+        ``editor=<id>`` (none: this master's own editor)."""
         if not self._is_loopback(request.get("clientAddress")) or not self._host_ok(request):
             return self._reply(response, 403, "Forbidden", "forbidden")
         path = request.get("uri", "/")
         method = request.get("method")
+        pars = request.get("pars") or {}
+        if method == "GET" and path == "/editors":
+            if not self._token_ok(pars.get("token")):
+                return self._cors(request, self._reply(response, 403, "Forbidden", "bad token"))
+            self._rescan(force=False)
+            payload = self._editors_payload if self._editors_payload is not None else {"master": self.editor_id, "editors": []}
+            response["Cache-Control"] = "no-store"
+            return self._cors(request, self._reply(response, 200, "OK", json.dumps(payload), "application/json; charset=utf-8"))
+        if method == "GET" and path in ("/", "/index.html"):
+            html = self._op("ui_html").text
+            if html:
+                response["Cache-Control"] = "no-store"
+                return self._reply(response, 200, "OK", html, "text/html; charset=utf-8")
+            return self._reply(response, 404, "Not Found", "not found")
         if method == "POST" and path == "/__test" and self._test_enabled() \
                 and self._token_ok((request.get("pars") or {}).get("token")):
             # Validation back-channel: the page (with ?test=1) posts values it cannot return
@@ -828,6 +1449,15 @@ class RasterEditorExt:
                 return self._reply(response, 413, "Payload Too Large", "too large")
             self.test_result = data.decode("utf-8", "replace") if isinstance(data, (bytes, bytearray)) else str(data)
             return self._reply(response, 204, "No Content")
+        target = self._target(pars.get("editor"))
+        if target is None:
+            return self._cors(request, self._reply(response, 404, "Not Found", '{"error":"no such editor"}',
+                                                   "application/json; charset=utf-8"))
+        return target._session_http(request, response, path, method)
+
+    @_guard
+    def _session_http(self, request, response, path, method):
+        """The per-editor HTTP routes (the master routed the request here)."""
         if method == "GET" and path == "/base":
             return self._serve_pipe(self.base, "base", request, response, subscribed_only=False)
         if method == "GET" and path == "/view":
@@ -840,23 +1470,54 @@ class RasterEditorExt:
             return self._serve_pipe(None, "layer", request, response, subscribed_only=True)
         if path == "/history" and method in ("GET", "POST", "OPTIONS"):
             return self._serve_history(method, request, response)
-        if method == "GET" and path in ("/", "/index.html"):
-            html = self._op("ui_html").text
-            if html:
-                response["Cache-Control"] = "no-store"
-                return self._reply(response, 200, "OK", html, "text/html; charset=utf-8")
         return self._reply(response, 404, "Not Found", "not found")
 
     @_guard
     def OnWebSocketOpen(self, client, uri=""):
-        path = uri.split("?", 1)[0]
+        """Master router: the connection belongs to the editor named by ``?editor=<id>`` (none: this master's own editor)."""
+        path, _, query = uri.partition("?")
         if path != "/ws" or not self._is_loopback(client):
             self._op("webserver").webSocketClose(client)
             return
-        self.clients[client] = _Client(client)
+        want = (parse_qs(query).get("editor") or [""])[0]
+        target = self._target(want)
+        self.ws_log.append((round(self._now(), 2), client, want, target.editor_id if target is not None else None, len(self._by_id)))
+        if target is None:
+            ws = self._op("webserver")
+            try:  # (the Web Server DAT cannot close with code 4404: the page gets `gone` first, then the close)
+                ws.webSocketSendText(client, self.protocol.gone())
+            finally:
+                ws.webSocketClose(client)
+            return
+        self._route[client] = target
+        if target is not self:
+            target._ws = self._op("webserver")
+        target._ws_open(client)
 
     @_guard
     def OnWebSocketClose(self, client):
+        target = self._route.pop(client, None)
+        if target is not None:
+            target._ws_close(client)
+
+    @_guard
+    def OnWebSocketText(self, client, text):
+        target = self._route.get(client)
+        if target is not None:
+            target._ws_text(client, text)
+
+    @_guard
+    def OnWebSocketBinary(self, client, data):
+        target = self._route.get(client)
+        if target is not None:
+            target._ws_binary(client, data)
+
+    # --- the session side (one editor's clients; transport-agnostic)
+
+    def _ws_open(self, client):
+        self.clients[client] = _Client(client)
+
+    def _ws_close(self, client):
         c = self.clients.pop(client, None)
         if c is None:
             return
@@ -866,13 +1527,11 @@ class RasterEditorExt:
             ready = [x for x in self.clients.values() if x.ready]
             if ready:
                 self._set_active(max(ready, key=lambda x: x.seq).id)
-        if c.kind == "panel":
-            self._sync_panel_view()
         self._sync_viewmode()
         self._status_at = 0.0
 
     @_guard
-    def OnWebSocketText(self, client, text):
+    def _ws_text(self, client, text):
         c = self.clients.get(client)
         if c is None:
             return
@@ -923,7 +1582,7 @@ class RasterEditorExt:
         # unknown message types are ignored (PROTOCOL.md)
 
     @_guard
-    def OnWebSocketBinary(self, client, data, _replay=False):
+    def _ws_binary(self, client, data, _replay=False):
         c = self.clients.get(client)
         if self._destroyed or c is None or not c.ready or not c.active or c.reloading:
             return  # only the active editor may write surfaces (not while it still holds the document an Open replaced)
@@ -962,28 +1621,20 @@ class RasterEditorExt:
             self._sync_doc_size()
         if not self._token_ok(msg.get("token")):
             self._send(c.id, P.error("bad or missing token (open the editor from the COMP's Open in Browser button)"))
-            self._op("webserver").webSocketClose(c.id)
+            self._server().webSocketClose(c.id)
             self.clients.pop(c.id, None)
             return
         if msg.get("protocol") != P.PROTOCOL_VERSION:
             self._send(c.id, P.error(f"unsupported protocol {msg.get('protocol')!r}, server speaks {P.PROTOCOL_VERSION}"))
-            self._op("webserver").webSocketClose(c.id)
+            self._server().webSocketClose(c.id)
             self.clients.pop(c.id, None)
             return
-        kind = msg.get("client")
-        c.kind = kind if kind in CLIENT_KINDS else "external"
+        c.kind = "external"  # (v10: the in-TD panel is gone)
         c.fresh = bool(msg.get("fresh"))
         self._seq += 1
         c.seq = self._seq
         c.ready = True
-        take = False
-        if c.kind == "panel" and not self._panel_seen:
-            take = True  # panel wins on first connect after a (re)start
-        elif self.active_id is None:
-            take = True
-        if c.kind == "panel":
-            self._panel_seen = True
-        if take:
+        if self.active_id is None:
             self._demote_active()
             c.active = True
             self.active_id = c.id
@@ -993,6 +1644,7 @@ class RasterEditorExt:
         self._send(c.id, P.inputs_msg(items))  # (also in hello.inputs: for pages that only read one of them)
         self._send(c.id, P.files_msg(*self._files_values()))
         self._send(c.id, P.fonts(self._font_families()))
+        self._send_editors(c.id)
         self._sync_viewmode()
         self._status_at = 0.0
 
@@ -1018,7 +1670,7 @@ class RasterEditorExt:
         self._status_at = 0.0
 
     def _send(self, client, text):
-        self._op("webserver").webSocketSendText(client, text)
+        self._server().webSocketSendText(client, text)
 
     def _send_to_active(self, text):
         if self.active_id is not None:
@@ -1121,7 +1773,7 @@ class RasterEditorExt:
             return
         for slot, lst in early.items():
             for data in lst:
-                self.OnWebSocketBinary(c.id, data, _replay=True)
+                self._ws_binary(c.id, data, _replay=True)
 
     def _surface_sizes(self, layers):
         """{slot: (w, h)} for a layer stack (protocol.slot_sizes; a surface without a size in the spec keeps its buffer's)."""
@@ -1398,8 +2050,8 @@ class RasterEditorExt:
             self._saving = False
         return path
 
-    def _flash_status(self, text):
-        self._flash = (text, self._now() + EXPORT_FLASH_S)
+    def _flash_status(self, text, seconds=None):
+        self._flash = (text, self._now() + (seconds or EXPORT_FLASH_S))
         self._status_at = 0.0
 
     def ExportDoc(self):
@@ -1469,6 +2121,18 @@ class RasterEditorExt:
         self._doc_state_dirty = False
         return True
 
+    def _copy_done(self):
+        """The first successful Start / Restore after a copy is through: a later Start must not re-adopt the original's pixels."""
+        self.copied = False
+        self._copied_from = ""
+
+    def _has_pixel_slots(self):
+        try:
+            stored = self._read_doc_state()
+            return bool(stored and self.protocol.layer_slots(stored[1]))
+        except Exception:  # noqa: BLE001
+            return False
+
     def _finish_restore(self):
         """Pixels from the locked Script TOPs into the buffers (or from the pre-restart buffers), then unlock.
         A failed read keeps everything locked and is retried (the locked images are the only copy)."""
@@ -1507,6 +2171,7 @@ class RasterEditorExt:
             self.frozen = False
             self._restore_pending = False
         self._carry, self._carry_stale = {}, set()
+        self._copy_done()
         self._replay_step()
 
     def _replay_step(self):
@@ -1523,7 +2188,7 @@ class RasterEditorExt:
                     self._on_doc(c, payload, _replay=True)
             else:
                 self._held_bytes -= len(payload)
-                self.OnWebSocketBinary(cid, payload, _replay=True)
+                self._ws_binary(cid, payload, _replay=True)
             if self._now() - t >= REPLAY_BUDGET_S:
                 return
         self._held_bytes = 0
@@ -1883,6 +2548,7 @@ class RasterEditorExt:
 
     def _make_movie(self, path, tag):  # pragma: no cover - needs TD (test seam)
         t = self.o.create("moviefileinTOP", f"_imp_mov{tag}")
+        t.tags.add("reRuntime")
         t.par.file = path
         return t
 
@@ -1893,7 +2559,7 @@ class RasterEditorExt:
         except P.ProtocolError as e:
             self._send(c.id, P.error(f"bad chooseFile: {e}"))
             return
-        test = msg.get("testPath") if self._test_enabled() and "testPath" in msg else False   # validation stub (Panelquery test=1)
+        test = msg.get("testPath") if self._test_enabled() and "testPath" in msg else False   # validation stub (storage reTest)
         if len(self._choose_queue) >= 4 or any(q[0] == c.id for q in self._choose_queue):
             self._send(c.id, P.file_chosen(rid, None))   # one dialog per client at a time
             return
@@ -2237,15 +2903,12 @@ class RasterEditorExt:
             self._send(c.id, self.protocol.error(f"bad view: {e}"))
             return
         c.view_msg = view
-        if c.kind == "panel":
-            self._sync_panel_view()
-        elif c.kind == "external":
-            sub = view["mode"] == "td"
-            if sub and not c.view_td:
-                c.view.clear()  # re-announce the stored frame (if any), clear any stall
-                if self.out.msg is None:
-                    self.out.pending = True
-            c.view_td = sub
+        sub = view["mode"] == "td"
+        if sub and not c.view_td:
+            c.view.clear()  # re-announce the stored frame (if any), clear any stall
+            if self.out.msg is None:
+                self.out.pending = True
+        c.view_td = sub
         self._sync_viewmode()
         self._status_at = 0.0
 
@@ -2254,28 +2917,6 @@ class RasterEditorExt:
         mode = act.view_msg["mode"] if act is not None and act.view_msg else "local"
         if self._p("Viewmode") != mode:
             self.o.par.Viewmode = mode
-
-    def _panel_client(self):
-        panels = [c for c in self.clients.values() if c.ready and c.kind == "panel"]
-        return max(panels, key=lambda c: c.seq) if panels else None
-
-    def _sync_panel_view(self):
-        """The panel client's TD-view overlay: DocNetwork.set_view + the COMP background switch."""
-        pc = self._panel_client()
-        view = pc.view_msg if pc is not None and pc.view_msg and pc.view_msg["mode"] == "td" else None
-        if view is not None and not self._p("Active"):
-            view = None
-        pw, ph = int(self.o.par.w.eval()), int(self.o.par.h.eval())
-        key = (json.dumps(view, sort_keys=True), pw, ph, self.doc_w, self.doc_h)
-        if key == self._panel_key or self.network is None:
-            return
-        self.network.set_view(view, pw, ph)
-        top = self._rel_path(self.network.panel_view()) if view is not None else "./webrender"
-        if top != self._panel_top:
-            self.o.par.top = top
-            self._panel_top = top
-        # (webrender.transparent stays on permanently: toggling it makes the Web Render TOP reload its page)
-        self._panel_key = key  # only after everything worked: a failure is retried by the next pump
 
     def _rel_path(self, top):
         p, base = str(top.path), str(self.o.path) + "/"
@@ -2308,10 +2949,8 @@ class RasterEditorExt:
         # Order matters: the output readback is issued before this pump's uploads, so the `appliedFrameId`
         # snapshot taken with it only names frames that were already uploaded.
         for name, step in (
-                ("modules", lambda: self._check_modules(now)), ("reload", lambda: self._maybe_reload_panel(now)),
-                ("panel", self._keep_panel_cooking), ("mouse", self._flush_mouse),
-                ("doc", self._sync_doc_size), ("panelview", self._sync_panel_view),
-                ("hints", self._sync_hints),
+                ("modules", lambda: self._check_modules(now)), ("router", lambda: self._router_tick(now)),
+                ("doc", self._sync_doc_size), ("hints", self._sync_hints),
                 ("input", lambda: self._poll_base(now)), ("output", lambda: self._poll_view(now)),
                 ("layers", lambda: self._poll_layer_previews(now)),
                 ("notify", lambda: self._notify_clients(now)), ("tops", lambda: self._tick_tops(now)),
@@ -2338,12 +2977,6 @@ class RasterEditorExt:
                 self._net_applied = False
                 self._apply_network()
                 self._dirty.update(self.surfaces)
-                self._panel_key = None
-
-    def _maybe_reload_panel(self, now):
-        if self._reload_at is not None and now >= self._reload_at:
-            self._reload_at = None
-            self._op("webrender").par.reloadsrc.pulse()
 
     def _tick_network(self, now):
         if self._restore_pending and self._net_applied and now >= self._restore_retry_at:
@@ -2366,15 +2999,6 @@ class RasterEditorExt:
         want = 1 if (self.network is not None and self._net_applied) else 0
         if sw.par.index.eval() != want:
             sw.par.index = want
-
-    def _keep_panel_cooking(self):
-        """A Web Render TOP that nothing pulls never loads its page or cooks again, so the
-        editor would be dead whenever no viewer shows this COMP. If it did not cook since the
-        last pump, force one (cheap: it only copies the latest browser frame)."""
-        wr = self._op("webrender")
-        if wr.totalCooks == self._wr_cooks:
-            wr.cook(force=True)
-        self._wr_cooks = wr.totalCooks
 
     def _mode(self):
         """Canvas size mode: "input" (Follow Input) or "fixed" (Docw x Doch)."""
@@ -2522,7 +3146,6 @@ class RasterEditorExt:
         if size_changed or first:
             self._invalidate(self.out)
             self._invalidate_previews()
-            self._panel_key = None
         for n in set(old_sizes) | set(sizes):  # a changed / (dis)connected input starts a fresh BASE stream
             if first or old_sizes.get(n) != sizes.get(n):
                 pipe = self._base_pipe(n)
@@ -2642,6 +3265,7 @@ class RasterEditorExt:
             par = probe.par.font
             return list(par.menuNames), list(par.menuLabels)
         tmp = self.o.create("textTOP", "_font_probe_tmp")  # pragma: no cover - needs TD
+        tmp.tags.add("reRuntime")
         try:
             return list(tmp.par.font.menuNames), list(tmp.par.font.menuLabels)
         finally:
@@ -2663,10 +3287,12 @@ class RasterEditorExt:
         """GPU downscale before the readback: Select TOP -> Resolution TOP (tw x th) inside this COMP. Returns
         (output TOP, [temporary operators]). Test seam."""
         sel = self.o.create("selectTOP", f"_imp_sel{tag}")
+        sel.tags.add("reRuntime")
         res = None
         try:
             sel.par.top = top.path
             res = self.o.create("resolutionTOP", f"_imp_res{tag}")
+            res.tags.add("reRuntime")
             res.inputConnectors[0].connect(sel)
             res.par.outputresolution = "custom"
             res.par.resolutionw, res.par.resolutionh = tw, th
@@ -3325,54 +3951,6 @@ class RasterEditorExt:
                 response["Vary"] = "Origin"
         return response
 
-    # ------------------------------------------------------------------ mouse / keyboard
-
-    @_guard
-    def OnPanelValue(self, panelValue, edge=None):
-        """Panel Execute DAT -> Web Render TOP. ``edge`` is 1/0 for a button press/release
-        (onOffToOn/onOnToOff) and None for plain value changes. Button state is tracked here
-        from the edges because a fast click can change a button twice within one frame, when
-        reading the panel's current value would miss the press. Pointer moves (u and v change
-        separately) are coalesced into one interactMouse per frame; button edges first flush
-        a pending move so ordering is preserved."""
-        if not self._p("Active"):
-            return
-        name = panelValue.name
-        if name in self._buttons:
-            if edge is None:
-                return  # handled through the edge callbacks
-            self._flush_mouse()
-            self._buttons[name] = bool(edge)
-            self._send_mouse()
-        elif name == "wheel":
-            if panelValue.val:
-                self._flush_mouse()
-                p = self.o.panel
-                self._op("webrender").interactMouse(p.u.val, p.v.val, wheel=panelValue.val)
-        else:
-            self._move_pending = True
-
-    def _flush_mouse(self):
-        if self._move_pending:
-            self._send_mouse()
-
-    def _send_mouse(self):
-        self._move_pending = False
-        p = self.o.panel
-        self._op("webrender").interactMouse(p.u.val, p.v.val, left=self._buttons["lselect"],
-                                            middle=self._buttons["mselect"], right=self._buttons["rselect"])
-
-    @_guard
-    def OnKey(self, keyInfo):
-        if not self._p("Active") or not keyInfo.state:
-            return
-        key = keyInfo.key
-        if key is None or str(key).lower() in MODIFIER_KEYS:
-            return
-        self._op("webrender").sendKey(key, char=keyInfo.character or None, shift=bool(keyInfo.shift),
-                                      alt=bool(keyInfo.alt), ctrl=bool(keyInfo.ctrl), cmd=bool(keyInfo.cmd))
-
-
     # ------------------------------------------------------------------ status / diagnostics
 
     def _out_fps(self, now):
@@ -3400,6 +3978,15 @@ class RasterEditorExt:
                 stalled = sum(1 for c in ready if c.view.stalled or any(nt.stalled for nt in c.bases.values()))
                 if stalled:
                     text += f" · {stalled} stalled"
+        if self._p("Active"):
+            if self.is_master:
+                text = f"master :{self.port_used} · {text}"
+            else:
+                rec = self._record()
+                if rec and rec.get("path"):
+                    text = f"slave of {str(rec['path']).rsplit('/', 1)[-1]} · {text}"
+                else:
+                    text = f"not served · {text}"
         fx_err = getattr(self.network, "fx_error", None) if self._p("Active") else None
         if fx_err:
             text += f" · effects unavailable: {fx_err}"

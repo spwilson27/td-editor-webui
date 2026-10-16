@@ -168,7 +168,7 @@ def test_v7_builders_and_parsers():
     st = json.loads(P.doc_state(1, [], 2, 3, brush_presets=[preset()]))
     assert st["brushPresets"] == [preset()] and "brushPresets" not in json.loads(P.doc_state(1, [], 2, 3))
     assert json.loads(P.doc(1, [], brush_presets=[])) ["brushPresets"] == []
-    assert P.PROTOCOL_VERSION == 9
+    assert P.PROTOCOL_VERSION == 10
 
 
 def test_layer_preview_fixtures_match_the_generator():

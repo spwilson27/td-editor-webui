@@ -31,6 +31,9 @@ export function installTestHook(store: Store, win: Window = window): void {
     setViewMode: (m: 'local' | 'td') => { store.setViewMode(m); return store.viewMode.peek(); },
     latency: () => ({ strokeToTd: store.latency.peek(), strokeToView: store.viewLatency.peek(), viewAgeMs: store.viewAge.peek(), mode: store.viewMode.peek() }),
     docSpec: () => store.engine.docSpec(),
+    // v10: editor tabs
+    editor: () => ({ id: store.editorId.peek(), master: store.editorMaster.peek(), list: store.editors.peek(), switching: store.editorSwitching.peek() }),
+    switchEditor: (id: string) => store.switchEditor?.(id),
     loadState: () => ({ docSpec: store.engine.docSpec(), slots: store.engine.surfaceSlots(), paintTarget: store.engine.paintTarget(), connection: store.connection.peek(), active: store.active.peek(), viewMode: store.viewMode.peek(), loadingDoc: store.loadingDoc.peek() }),
     // v3: selections, text / shape layers, import
     setSelectionOptions: (o: Partial<SelectionOptions>) => { store.setSelOpts(o); return store.selOpts.peek(); },
@@ -154,8 +157,6 @@ export function installTestHook(store: Store, win: Window = window): void {
     bigDocNotice: () => store.bigDocNotice.peek(),
     /** The live engine, for instrumentation in validation scripts. */
     engine: () => store.engine,
-    placeImageViaTd: () => (store.bridge?.placeImageViaTd ? store.bridge.placeImageViaTd() : Promise.reject(new Error('standalone'))),
-    chooseFile: (purpose: 'saveProject' | 'openProject' | 'exportPng') => (store.bridge?.chooseFile ? store.bridge.chooseFile(purpose) : Promise.reject(new Error('standalone'))),
     readPixel: (x: number, y: number) => Array.from(store.engine.readComposite({ x, y, w: 1, h: 1 })),
     /** Screen (client) coordinates of a document point, for synthesising mouse drags. */
     docToScreen: (x: number, y: number) => {

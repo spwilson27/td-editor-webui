@@ -6,7 +6,7 @@ import { FakeTd } from './fakeTd';
 let td: FakeTd;
 test.afterEach(async () => { await (td as FakeTd | undefined)?.close(); });
 
-const url = () => `/?test=1&client=panel&ws=${encodeURIComponent(td.url)}&token=${td.token}`;
+const url = () => `/?test=1&ws=${encodeURIComponent(td.url)}#token=${td.token}`;
 const open = async (page: Page) => {
   td = await FakeTd.start({ w: 160, h: 90, hasInput: true });
   page.on('pageerror', (e) => { throw e; });
@@ -22,7 +22,7 @@ const row = (page: Page, id: string) => page.locator(`[data-layer="${id}"]`);
 
 test('fake TD speaks protocol 9: ready carries 9 and no mismatch notice appears', async ({ page }) => {
   await open(page);
-  expect(td.messages.find((m) => m.t === 'ready')).toMatchObject({ protocol: 9 });
+  expect(td.messages.find((m) => m.t === 'ready')).toMatchObject({ protocol: 10 });
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
 });
 

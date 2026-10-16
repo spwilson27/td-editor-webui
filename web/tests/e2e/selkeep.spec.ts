@@ -40,11 +40,11 @@ test('the selection also stays when the adjustment is added from the menus', asy
   expect((await hook<any>(page, 'state')).selection).not.toBeNull();
 });
 
-test('linked to TD (panel): the selection stays after adding adjustments, also once TD has echoed the document', async ({ page }) => {
+test('linked to TD: the selection stays after adding adjustments, also once TD has echoed the document', async ({ page }) => {
   const { FakeTd } = await import('./fakeTd');
   const td = await FakeTd.start({ w: 160, h: 90 });
   try {
-    await page.goto(`/?test=1&client=panel&ws=${encodeURIComponent(td.url)}&token=${td.token}`);
+    await page.goto(`/?test=1&ws=${encodeURIComponent(td.url)}#token=${td.token}`);
     await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
     await td.waitFor(() => td.doc !== null);
     await hook(page, 'addLayer');

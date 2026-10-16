@@ -221,7 +221,7 @@ def test_json_decode_rejects(bad):
 
 def test_json_builders():
     assert json.loads(P.hello(10, 20, True, 30, False, "abc")) == {
-        "t": "hello", "protocol": 9, "doc": {"w": 10, "h": 20, "mode": "input"}, "inputs": [],
+        "t": "hello", "protocol": 10, "doc": {"w": 10, "h": 20, "mode": "input"}, "inputs": [],
         "hasInput": True, "maxSendFps": 30, "active": False, "clientId": "abc", "hasDocument": False, "rev": None}
     items = [{"input": 2, "w": 5, "h": 6, "connected": True}, {"input": 1, "w": 640, "h": 480, "connected": True},
              {"input": 3, "w": 9, "h": 9, "connected": False}]
@@ -255,7 +255,7 @@ def test_json_builders():
 
 def test_web_side_builders_roundtrip_through_decode():
     m = P.decode_json(P.ready("panel", "tok", True, "v1"))
-    assert (m["t"], m["protocol"], m["client"], m["token"], m["fresh"]) == ("ready", 9, "panel", "tok", True)
+    assert (m["t"], m["protocol"], m["client"], m["token"], m["fresh"]) == ("ready", 10, "panel", "tok", True)
     assert P.decode_json(P.request_doc()) == {"t": "requestDoc"}
     d = P.decode_json(P.doc(4, [LAYER]))
     assert P.parse_doc(d) == (4, [LAYER])
@@ -388,7 +388,7 @@ def parse(*layers):
 
 
 def test_version_and_new_frame_type():
-    assert P.PROTOCOL_VERSION == 9 and P.TYPE_TOP_IMAGE == 6 and 6 in P.VALID_TYPES and P.TYPE_LAYER_PREVIEW == 7
+    assert P.PROTOCOL_VERSION == 10 and P.TYPE_TOP_IMAGE == 6 and 6 in P.VALID_TYPES and P.TYPE_LAYER_PREVIEW == 7
 
 
 def test_top_image_frame_uses_the_tops_own_size_as_doc_size():

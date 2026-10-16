@@ -403,15 +403,6 @@ describe('.cube LUT loader', () => {
     expect(lastFx()[0].cube).toBe('');
   });
 
-  it('a panel client has no file button (TD shows its own chooser elsewhere): paste only', async () => {
-    store.clientKind.value = 'panel';
-    await settle();
-    expect(document.querySelector('[data-lut-file]')).toBeNull();
-    expect(document.querySelector('input[data-lut-input]')).toBeNull();
-    expect(q('[data-lut]').textContent).toContain('Panel');
-    expect(q('[data-lut-paste]')).toBeTruthy();
-    store.clientKind.value = 'external';
-  });
 });
 
 describe('LUT limits and panel loading', () => {
@@ -447,36 +438,6 @@ describe('LUT limits and panel loading', () => {
     expect(q('[data-lut-warn]').textContent).toMatch(/Large LUT/);
   });
 
-  it('panel client: "Load .cube…" asks TouchDesigner (readText) and applies the text; errors are shown; offline it is disabled', async () => {
-    store.clientKind.value = 'panel';
-    const text = `TITLE "TD"\nLUT_3D_SIZE 2\n${Array.from({ length: 8 }, () => '0.1 0.2 0.3').join('\n')}\n`;
-    let answer: { path: string; text: string } | null | Error = { path: '/a/b/grade.cube', text };
-    const calls: Array<string[] | undefined> = [];
-    store.bridge = { readTextFile: async (t?: string[]) => { calls.push(t); if (answer instanceof Error) throw answer; return answer; } } as never;
-    store.setConnection('linked');
-    await flush();
-    q('[data-lut-td]').click();
-    await new Promise((r) => setTimeout(r, 20));
-    await flush();
-    expect(calls).toEqual([['cube']]);
-    expect(lastFx()[0].cube).toBe(text);
-    expect(q('[data-lut-status]').textContent).toBe('TD · 2×2×2');
-    expect(store.notice.value).toContain('grade.cube');
-    answer = new Error('file is larger than 12 MB');
-    q('[data-lut-td]').click();
-    await new Promise((r) => setTimeout(r, 20));
-    await flush();
-    expect(q('[data-lut-error]').textContent).toBe('file is larger than 12 MB');
-    answer = null;
-    q('[data-lut-td]').click();
-    await new Promise((r) => setTimeout(r, 20));
-    expect(calls.length).toBe(3);
-    store.setConnection('reconnecting');
-    await flush();
-    expect(q('[data-lut-td]').getAttribute('aria-disabled')).toBe('true');
-    store.bridge = null;
-    store.clientKind.value = 'external';
-  });
 });
 
 describe('curve drawing matches the filter (PCHIP table)', () => {

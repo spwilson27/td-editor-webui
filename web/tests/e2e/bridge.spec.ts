@@ -7,22 +7,22 @@ test.beforeEach(async () => { td = await FakeTd.start({ w: 160, h: 90 }); });
 test.afterEach(async () => { await td.close(); });
 
 const open = async (page: Page, extra = '') => {
-  await page.goto(`/?test=1&client=panel&ws=${encodeURIComponent(td.url)}&token=${td.token}${extra}`);
+  await page.goto(`/?test=1&ws=${encodeURIComponent(td.url)}${extra}#token=${td.token}`);
   await expect(page.locator('[data-tool]').first()).toBeVisible();
 };
 const hook = <T,>(page: Page, fn: string, ...args: unknown[]) =>
   page.evaluate(([f, a]) => (window as any).__editorTest[f as string](...(a as unknown[])), [fn, args] as const) as Promise<T>;
 
-test('connects, says ready as the panel client and shows the linked state', async ({ page }) => {
+test('connects, says ready as the external client (protocol 10) and shows the linked state', async ({ page }) => {
   await open(page);
   await td.waitFor(() => td.messages.length > 0);
-  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 9, client: 'panel', token: td.token, fresh: true });
+  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 10, client: 'external', token: td.token, fresh: true });
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   expect((await hook<any>(page, 'state')).doc).toEqual({ w: 160, h: 90 });
 });
 
-test('defaults to the external client', async ({ page }) => {
-  await page.goto(`/?ws=${encodeURIComponent(td.url)}&token=${td.token}`);
+test('the client is always external', async ({ page }) => {
+  await page.goto(`/?ws=${encodeURIComponent(td.url)}#token=${td.token}`);
   await td.waitFor(() => td.messages.length > 0);
   expect(td.messages[0]).toMatchObject({ t: 'ready', client: 'external' });
 });
@@ -185,7 +185,7 @@ test('forwards page errors to TD as log messages', async ({ page }) => {
 });
 
 test('a missing or wrong token is rejected and the status bar says to reopen from TouchDesigner', async ({ page }) => {
-  await page.goto(`/?test=1&ws=${encodeURIComponent(td.url)}&token=wrong`);
+  await page.goto(`/?test=1&ws=${encodeURIComponent(td.url)}#token=wrong`);
   await expect(page.locator('[data-status=fatal]')).toHaveText('Reopen from TouchDesigner — session expired');
   await page.waitForTimeout(1500);
   expect(td.rejected).toBe(1); // no reconnect storm
@@ -197,7 +197,7 @@ test('a missing or wrong token is rejected and the status bar says to reopen fro
 });
 
 test('same-origin page served by TD fetches /base without any CORS headers or Origin', async ({ page }) => {
-  await page.goto(`http://127.0.0.1:${td.port}/?test=1&client=panel&token=${td.token}`);
+  await page.goto(`http://127.0.0.1:${td.port}/?test=1#token=${td.token}`);
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   td.sendSolidBase(12, 34, 56);
   await expect.poll(() => hook<number[]>(page, 'readPixel', 10, 10)).toEqual([12, 34, 56, 255]);

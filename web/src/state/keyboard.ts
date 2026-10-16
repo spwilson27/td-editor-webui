@@ -41,6 +41,7 @@ const toolKeys = new Map<string, ToolId[]>();
 for (const t of TOOLS) toolKeys.set(t.key.toLowerCase(), [...(toolKeys.get(t.key.toLowerCase()) || []), t.id]);
 
 export function onKeyDown(store: Store, e: KeyLike): void {
+  if (store.editorSwitching.peek()) return; // v10: editing is blocked while the editor switch is pending
   if (store.textEdit.peek()) { // forwarded TD keys arrive as normal key events: the inline text editor owns them
     if (e.key === 'Escape') { store.commitText(); e.preventDefault(); }
     return;

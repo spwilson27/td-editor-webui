@@ -1,4 +1,4 @@
-// Pure encode/decode of docs/PROTOCOL.md (version 8). No sockets here.
+// Pure encode/decode of docs/PROTOCOL.md (version 10). No sockets here.
 import type { BrushPreset, CanvasMode, Guides, LayerSpec } from '../engine/types';
 import type { FileOp, FileResult } from '../state/filesSlice';
 import type { InputItem } from '../state/inputsSlice';
@@ -7,7 +7,7 @@ export const MAGIC = [0x52, 0x45, 0x46, 0x31]; // "REF1"
 export const HEADER_BYTES = 24;
 export const MAX_BAND_PAYLOAD = 2 * 1024 * 1024;
 export type RenderMode = 'flatten' | 'mergeDown';
-export const PROTOCOL_VERSION = 9;
+export const PROTOCOL_VERSION = 10;
 export const FRAME_BASE = 1;
 export const FRAME_SURFACE = 3;
 export const FRAME_SURFACE_DUMP = 4;
@@ -131,9 +131,14 @@ export function isStale(f: FrameHeader, docW: number, docH: number): boolean {
 
 // ---- JSON messages ----
 
-export type ClientKind = 'panel' | 'external';
-export type ChoosePurpose = 'placeImage' | 'saveProject' | 'openProject' | 'exportPng' | 'readText';
-const PURPOSES: readonly string[] = ['placeImage', 'saveProject', 'openProject', 'exportPng', 'readText'];
+/** v10: the in-TD panel is gone; every client is an external browser. */
+export type ClientKind = 'external';
+
+/** v10: one raster editor COMP of the project (GET /editors, `editors` message). */
+export interface EditorInfo { id: string; name: string; path: string; version: string; active: boolean }
+export interface EditorList { master: string; editors: EditorInfo[] }
+export type ChoosePurpose = 'saveProject' | 'openProject' | 'exportPng';
+const PURPOSES: readonly string[] = ['saveProject', 'openProject', 'exportPng'];
 export type ViewMode = 'local' | 'td';
 export type LogLevel = 'info' | 'warn' | 'error';
 
@@ -154,7 +159,7 @@ export type WebMessage =
   | { t: 'saveProject'; requestId: string; path?: string; includeHistory?: boolean } // v6; v7 includeHistory (default true): false = TD writes no history.bin
   | { t: 'openProject'; requestId: string; path?: string }
   | { t: 'exportPng'; requestId: string; path?: string }
-  | { t: 'chooseFile'; requestId: string; purpose: ChoosePurpose; fileTypes?: string[] } // v6: TD shows a file chooser (panel clients have no file input)
+  | { t: 'chooseFile'; requestId: string; purpose: ChoosePurpose } // v6: TD shows a file chooser
   | { t: 'activeLayer'; id: string | null } // v7: the active client's active layer (drives TD's set_active_layer)
   | { t: 'log'; level: LogLevel; msg: string };
 
@@ -167,15 +172,17 @@ export type TdMessage =
   | { t: 'docSize'; w: number; h: number; hasInput: boolean; mode: CanvasMode }
   | { t: 'inputs'; items: InputItem[] } // v6: TD inputs (connect / disconnect / resolution)
   | { t: 'fileResult'; requestId?: string; op: FileOp; ok: boolean; path: string; msg?: string } // v6
-  | { t: 'fileChosen'; requestId: string; path: string | null; text?: string; error?: string } // null = cancelled; v7 readText: text = the file's UTF-8 contents, error = why it could not be read
+  | { t: 'fileChosen'; requestId: string; path: string | null } // null = cancelled
   | { t: 'reload'; rev: number } // v6: TD replaced its document (Open Project)
   | { t: 'files'; projectFile: string; pngFile: string } // v6
   | { t: 'active'; active: boolean }
   | { t: 'error'; msg: string }
+  | { t: 'gone' } // v10: this socket's editor does not exist (any more); TD closes right after (it cannot send close code 4404)
   | { t: 'fonts'; families: string[] }
   | { t: 'tops'; requestId: string; items: TopItem[] }
   | { t: 'topReady'; requestId: string; w: number; h: number }
   | { t: 'layerPreview'; layerId: string; frameId: number } // v7: fetch with GET /layer
+  | { t: 'editors'; master: string; editors: EditorInfo[] } // v10: the project's editors (on connect and on every change)
   | { t: 'topError'; requestId: string; msg: string };
 
 export type { FileOp, FileResult, InputItem };
@@ -252,6 +259,23 @@ export const normalizeLayers = (layers: LayerSpec[]): LayerSpec[] => layers.map(
 const isLayers = (v: unknown): v is LayerSpec[] =>
   Array.isArray(v) && v.every((l) => l !== null && typeof l === 'object' && isStr((l as LayerSpec).id) && isStr((l as LayerSpec).kind));
 
+/** v10: `{master, editors:[{id,name,path,version,active}]}` (GET /editors body, `editors` message); null when malformed. Entries without an id are dropped. */
+export function readEditorList(o: unknown): EditorList | null {
+  if (!o || typeof o !== 'object') return null;
+  const r = o as Record<string, unknown>;
+  if (!isStr(r.master) || !Array.isArray(r.editors)) return null;
+  const editors: EditorInfo[] = [];
+  for (const e of r.editors as Record<string, unknown>[]) {
+    if (!e || typeof e !== 'object' || !isStr(e.id) || e.id === '') continue;
+    editors.push({ id: e.id, name: isStr(e.name) && e.name ? e.name : e.id, path: isStr(e.path) ? e.path : '', version: isStr(e.version) ? e.version : '', active: e.active !== false });
+  }
+  return { master: r.master, editors };
+}
+
+export function decodeEditorList(text: string): EditorList | null {
+  return readEditorList(parseObject(text));
+}
+
 /** Parse a TD → web message. Unknown types, unknown fields and malformed messages yield null / are dropped. */
 export function decodeTdMessage(text: string): TdMessage | null {
   const o = parseObject(text);
@@ -292,7 +316,7 @@ export function decodeTdMessage(text: string): TdMessage | null {
         : null;
     case 'fileChosen':
       return isStr(o.requestId) && (o.path === null || isStr(o.path))
-        ? { t: 'fileChosen', requestId: o.requestId, path: o.path, ...(isStr(o.text) ? { text: o.text } : {}), ...(isStr(o.error) ? { error: o.error } : {}) }
+        ? { t: 'fileChosen', requestId: o.requestId, path: o.path }
         : null;
     case 'reload':
       return isNum(o.rev) ? { t: 'reload', rev: o.rev } : null;
@@ -302,6 +326,8 @@ export function decodeTdMessage(text: string): TdMessage | null {
       return isBool(o.active) ? { t: 'active', active: o.active } : null;
     case 'error':
       return isStr(o.msg) ? { t: 'error', msg: o.msg } : null;
+    case 'gone':
+      return { t: 'gone' };
     case 'fonts':
       return Array.isArray(o.families) ? { t: 'fonts', families: o.families.filter(isStr) } : null;
     case 'tops': {
@@ -316,6 +342,10 @@ export function decodeTdMessage(text: string): TdMessage | null {
       return isStr(o.requestId) && isSize(o.w) && isSize(o.h) ? { t: 'topReady', requestId: o.requestId, w: o.w, h: o.h } : null;
     case 'layerPreview':
       return isStr(o.layerId) && isNum(o.frameId) ? { t: 'layerPreview', layerId: o.layerId, frameId: o.frameId } : null;
+    case 'editors': {
+      const l = readEditorList(o);
+      return l ? { t: 'editors', master: l.master, editors: l.editors } : null;
+    }
     case 'topError':
       return isStr(o.requestId) ? { t: 'topError', requestId: o.requestId, msg: isStr(o.msg) ? o.msg : 'TouchDesigner import failed' } : null;
     default:
@@ -329,7 +359,7 @@ export function decodeWebMessage(text: string): WebMessage | null {
   if (!o) return null;
   switch (o.t) {
     case 'ready':
-      return isNum(o.protocol) && (o.client === 'panel' || o.client === 'external') && isStr(o.version)
+      return isNum(o.protocol) && o.client === 'external' && isStr(o.version)
         ? { t: 'ready', protocol: o.protocol, client: o.client, version: o.version, token: isStr(o.token) ? o.token : '', fresh: o.fresh === true }
         : null;
     case 'doc':
@@ -363,7 +393,7 @@ export function decodeWebMessage(text: string): WebMessage | null {
       return isStr(o.requestId) ? { t: o.t, requestId: o.requestId, ...(isStr(o.path) ? { path: o.path } : {}), ...(o.t === 'saveProject' && isBool(o.includeHistory) ? { includeHistory: o.includeHistory } : {}) } as WebMessage : null;
     case 'chooseFile':
       return isStr(o.requestId) && isStr(o.purpose) && PURPOSES.includes(o.purpose)
-        ? { t: 'chooseFile', requestId: o.requestId, purpose: o.purpose as ChoosePurpose, ...(Array.isArray(o.fileTypes) ? { fileTypes: o.fileTypes.filter(isStr) } : {}) }
+        ? { t: 'chooseFile', requestId: o.requestId, purpose: o.purpose as ChoosePurpose }
         : null;
     case 'activeLayer':
       return isStr(o.id) || o.id === null ? { t: 'activeLayer', id: o.id } : null;

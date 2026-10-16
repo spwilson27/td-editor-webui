@@ -1,4 +1,4 @@
-"""Live validation of the raster_editor COMP (protocol v9) against a running TouchDesigner
+"""Live validation of the raster_editor COMP (protocol v10, multiple editors per project: DESIGN_V8) against a running TouchDesigner
 (docs/TESTING.md section 3, docs/DESIGN_V2.md section 7).
 
     .venv/bin/python scripts/validate_td.py                  # every step (the real UI drives the UI steps)
@@ -6,11 +6,15 @@
     .venv/bin/python scripts/validate_td.py --fake-client    # same, but keeps the UI steps that tolerate it
     .venv/bin/python scripts/validate_td.py --only 5,7,9     # run chosen steps (numbers below)
 
-The fake client speaks protocol v9 over a stdlib WebSocket: it sends `doc` + SURFACE tiles like the web
+The fake client speaks protocol v10 over a stdlib WebSocket: it sends `doc` + SURFACE tiles like the web
 app, pulls BASE / VIEW / SURFACE over HTTP and measures `applied` latency.
 
+v8: there is no panel inside TD. The real page is driven through a TEMPORARY Web Render TOP this script creates
+(/project1/_validate_page, with a small Execute DAT that keeps it cooking) pointed at the master's URL with the editor id; both
+are destroyed at the end. Steps 54-59 create temporary editors (/project1/_v8_ed2, _v8_ed3, ...) from dist/raster_editor.tox.
+
 Flags: --no-build (reuse the COMP that exists), --port N, --only. Only operators inside
-/project1/raster_editor and the temporary /project1/_validate_in, /project1/_validate_load, _validate_tops are
+/project1/raster_editor and the temporary /project1/_validate_page, _v8_*, /project1/_validate_in, /project1/_validate_load, _validate_tops are
 touched (destroyed again at the end); the user's .toe is never saved: persistence uses the Exportdoc pulse to dist/validate.
 """
 
@@ -40,6 +44,10 @@ COMP = "/project1/raster_editor"
 TMP = "/project1/_validate_in"
 OUT_DIR = os.path.join(ROOT, "dist", "validate")
 IW, IH = 1920, 1080  # input size used by step 5 (several 2 MB bands)
+PAGE = "/project1/_validate_page"
+PAGE_EXEC = "/project1/_validate_page_exec"
+TOX = os.path.join(ROOT, "dist", "raster_editor.tox")
+ARGS = None
 PRELUDE = f"from td import *\nimport json\ncomp = op({COMP!r})\n"
 
 results = []
@@ -72,15 +80,75 @@ def wait_for(fn, timeout, period=0.1):
     return last
 
 
+def master_info():
+    """{id, path, port, token} of the project master (root storage record), None when there is none."""
+    return td_json("rec = op('/').fetch('rasterEditorMaster', None); print(json.dumps(rec))")
+
+
+def ensure_master():
+    """raster_editor is the project's master (an earlier step / the failover test may have moved the role)."""
+    td("x = comp.ext.RasterEditorExt\nif not (x.is_master and x._server_running()):\n    x.Promote()")
+    wait_for(lambda: td("x = comp.ext.RasterEditorExt; print(x.is_master and x._server_running())").strip() == "True", 12)
+    rec = master_info()
+    if rec and ARGS is not None:
+        ARGS.port = rec["port"]
+    return rec
+
+
+def page_url():
+    rec = master_info()
+    eid = td("print(comp.fetch('editorId', ''))").strip()
+    return f"http://127.0.0.1:{rec['port']}/?test=1#token={rec['token']}&e={eid}"
+
+
+def ensure_page():
+    """The temporary Web Render TOP (and its keep-cooking Execute DAT) exist and point at the master's page for raster_editor."""
+    url = page_url()
+    td(f"""
+p = op('/project1')
+w = op({PAGE!r})
+if w is None:
+    w = p.create(webrenderTOP, '_validate_page')
+    w.nodeX, w.nodeY = 1500, -1500
+    w.par.source = 'urlorfile'
+    w.par.outputresolution = 'custom'
+    w.par.resolutionw, w.par.resolutionh = 1280, 800
+    w.par.dpiscale = 1
+    w.par.alwayscook = 1
+    w.par.maxrenderrate = 60
+    w.par.transparent = 1
+    w.par.active = 1
+if op({PAGE_EXEC!r}) is None:
+    e = p.create(executeDAT, '_validate_page_exec')
+    e.nodeX, e.nodeY = 1500, -1650
+    e.text = "def onFrameStart(frame):\\n    w = op('_validate_page')\\n    if w is not None:\\n        w.cook(force=True)\\n"
+    e.par.framestart = 1
+    e.par.active = 1
+if w.par.url.eval() != {url!r}:
+    w.par.url = {url!r}
+""")
+
+
+def drop_page():
+    td(f"""
+for n in ({PAGE_EXEC!r}, {PAGE!r}):
+    t = op(n)
+    if t: t.destroy()
+""")
+
+
 def baseline():
-    """Between steps: the editor is on (a step such as the export one switches it off and on) and the server answers, so a
+    """Between steps: raster_editor is the master and on, the server answers and (UI runs) the temporary page is connected, so a
     step never starts against a half-restarted component. Steps reset the rest (inputs, canvas) themselves."""
     try:
-        td("comp.par.Active = 1")
-        wait_for(lambda: td("print(comp.ext.RasterEditorExt._started and comp.op('webserver').par.active.eval())").strip() in ("1", "True"), 10)
-        # The panel's page reconnects a few seconds after an Active off/on or a rebuild and, being the first panel after a (re)start,
-        # takes over as the active editor: a step that took over earlier would silently lose it (its doc / tiles ignored). Wait for it.
-        wait_for(lambda: td("x = comp.ext.RasterEditorExt; print(any(c.kind == 'panel' and c.ready for c in x.clients.values()))").strip() == "True", 25)
+        td("comp.par.Active = 1\ncomp.store('reTest', 1)")
+        wait_for(lambda: td("print(comp.ext.RasterEditorExt._started)").strip() in ("1", "True"), 10)
+        ensure_master()
+        if ARGS is not None and not ARGS.skip_ui:
+            ensure_page()
+            # The page connects a few seconds after it is created / the master moved, and as the first client takes over as the
+            # active editor: a step that took over earlier would silently lose it (its doc / tiles ignored). Wait for it.
+            wait_for(lambda: td("x = comp.ext.RasterEditorExt; print(any(c.ready for c in x.clients.values()))").strip() == "True", 25)
     except Exception:  # noqa: BLE001 - the step reports its own problems
         pass
 
@@ -223,7 +291,8 @@ class WS:
 
 
 def token():
-    return td("print(comp.ext.RasterEditorExt.token)").strip()
+    rec = master_info()
+    return rec["token"] if rec else td("print(comp.ext.RasterEditorExt.token)").strip()
 
 
 def http_get(port, path, timeout=10):
@@ -235,9 +304,9 @@ def http_get(port, path, timeout=10):
     return r.status, body
 
 
-def get_base(port, tok, client_id, frame_id=0, input=1):
+def get_base(port, tok, client_id, frame_id=0, input=1, eq=""):
     """GET /base?input=N (PROTOCOL.md section 4): the newest BASE frame message of that TD input, or None on 404."""
-    st, body = http_get(port, f"/base?token={tok}&client={client_id}&input={input}&frameId={frame_id}")
+    st, body = http_get(port, f"/base?token={tok}&client={client_id}&input={input}&frameId={frame_id}{eq}")
     return body if st == 200 else None
 
 
@@ -253,10 +322,12 @@ def L(id, kind="pixel", slot=None, mask=None, size=None, **kw):
 class Editor:
     """A fake web client speaking protocol v5: doc + SURFACE tiles out, notices + HTTP pulls in."""
 
-    def __init__(self, port, kind="external", fresh=False, autofetch=True):
+    def __init__(self, port, kind="external", fresh=False, autofetch=True, editor="", tok=None, protocol=None):
         self.port, self.kind, self.autofetch = port, kind, autofetch
-        self.ws = WS(port)
-        self.token = token()
+        self.editor = editor          # v10: editorId ('' = the master's own editor)
+        self.eq = f"&editor={editor}" if editor else ""
+        self.ws = WS(port, f"/ws?editor={editor}" if editor else "/ws")
+        self.token = tok or token()
         self.client_id = None
         self.hello = None
         self.active = None
@@ -274,7 +345,7 @@ class Editor:
         self.reloads, self.file_results, self.files = [], [], None
         self.bases_by_input = {}
         self.fid = 1000 if kind == "external" else 5000
-        self.ws.send(P.ready(kind, self.token, fresh, "validate"))
+        self.ws.send(P.ready(kind, self.token, fresh, "validate", protocol or P.PROTOCOL_VERSION))
 
     def poll(self, timeout=0.0):
         got = []
@@ -315,14 +386,14 @@ class Editor:
             elif t == "base":
                 self.notices["base"] += 1
                 if self.autofetch:
-                    body = get_base(self.port, self.token, self.client_id, msg["frameId"], msg.get("input", 1))
+                    body = get_base(self.port, self.token, self.client_id, msg["frameId"], msg.get("input", 1), self.eq)
                     if body is not None:
                         self.bases.append(body)
                         self.bases_by_input.setdefault(msg.get("input", 1), []).append(body)
             elif t == "layerPreview":
                 self.previews.append(msg)
                 if self.autofetch:
-                    st, body = http_get(self.port, f"/layer?token={self.token}&client={self.client_id}&layerId={msg['layerId']}&frameId={msg['frameId']}")
+                    st, body = http_get(self.port, f"/layer?token={self.token}&client={self.client_id}&layerId={msg['layerId']}&frameId={msg['frameId']}{self.eq}")
                     if st == 200:
                         hdr, payload = P.decode_frame(body)
                         self.preview_frames.setdefault(msg["layerId"], []).append((hdr, bytes(payload)))
@@ -330,7 +401,7 @@ class Editor:
                 self.notices["view"] += 1
                 t_notice = now
                 if self.autofetch:
-                    st, body = http_get(self.port, f"/view?token={self.token}&client={self.client_id}&frameId={msg['frameId']}")
+                    st, body = http_get(self.port, f"/view?token={self.token}&client={self.client_id}&frameId={msg['frameId']}{self.eq}")
                     if st == 200:
                         self.view_log.append((time.time(), P.decode_frame(body)[0], msg["appliedFrameId"], body, t_notice))
 
@@ -379,7 +450,7 @@ class Editor:
         self.send(P.view(mode, zoom, pan_x, pan_y, rect or {"x": 0, "y": 0, "w": 1280, "h": 800}))
 
     def dump(self, slot):
-        st, body = http_get(self.port, f"/surface?token={self.token}&client={self.client_id}&slot={slot}")
+        st, body = http_get(self.port, f"/surface?token={self.token}&client={self.client_id}&slot={slot}{self.eq}")
         if st != 200:
             return None
         hdr, payload = P.decode_frame(body)
@@ -390,7 +461,7 @@ class Editor:
 
     def history_post(self, blob, rev):
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=300)
-        c.request("POST", f"/history?token={self.token}&client={self.client_id}&rev={rev}", blob, {"Content-Type": "application/octet-stream"})
+        c.request("POST", f"/history?token={self.token}&client={self.client_id}&rev={rev}{self.eq}", blob, {"Content-Type": "application/octet-stream"})
         r = c.getresponse()
         r.read()
         c.close()
@@ -398,7 +469,7 @@ class Editor:
 
     def history_get(self):
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=300)
-        c.request("GET", f"/history?token={self.token}&client={self.client_id}")
+        c.request("GET", f"/history?token={self.token}&client={self.client_id}{self.eq}")
         r = c.getresponse()
         body = r.read()
         rev = r.getheader("X-Doc-Rev")
@@ -541,11 +612,9 @@ print(json.dumps({'state': t, 'kids': sorted(x.name for x in d.children if x.nam
                            capture_output=True, text=True, timeout=180)
         if r.returncode != 0:
             return False, (r.stdout + r.stderr)[-1500:]
-    ORIG.update(td_json("print(json.dumps({'Port': int(comp.par.Port), 'Docw': int(comp.par.Docw), 'Doch': int(comp.par.Doch), 'Panelquery': comp.par.Panelquery.eval(), 'Docsizemode': comp.par.Docsizemode.eval(), 'Exportpath': comp.par.Exportpath.eval()}))"))
-    if not args.skip_ui:
-        td("comp.par.Panelquery = 'test=1'")
-    if args.port != 9980:
-        td(f"comp.par.Port = {args.port}")
+    ORIG.update(td_json("print(json.dumps({'Docw': int(comp.par.Docw), 'Doch': int(comp.par.Doch), 'Docsizemode': comp.par.Docsizemode.eval(), 'Exportpath': comp.par.Exportpath.eval()}))"))
+    td("comp.store('reTest', 1)")
+    ensure_master()
     info = td_json("""
 bad = [(c.path, c.errors()) for c in comp.findChildren(depth=3) if c.errors()]
 print(json.dumps({'exists': comp is not None, 'bad': bad, 'ext': bool(comp.ext.RasterEditorExt._started)}))
@@ -555,7 +624,8 @@ d = comp.op('doc')
 print(json.dumps({'state': comp.op('doc_state').text, 'kids': sorted(x.name for x in d.children if x.name.startswith('s'))}))
 """)
     kept = post["state"] == pre["state"] and set(pre["kids"]) <= set(post["kids"])
-    ok = info["exists"] and not info["bad"] and info["ext"] and kept
+    vers = td("print(comp.par.Version.eval(), 'rasterEditor' in comp.tags, comp.op('webrender') is None, comp.par.top.eval())").split()
+    ok = info["exists"] and not info["bad"] and info["ext"] and kept and vers[0] == "0.8.0" and vers[1] == "True" and vers[2] == "True"
     note = (f"doc_state ({len(pre['state'])} chars) and {len(pre['kids'])} surface TOPs preserved across the rebuild: {kept}"
             if pre["state"] or pre["kids"] else "no document to preserve (first build)")
     return ok, note if ok else json.dumps(info) + " " + note
@@ -575,18 +645,22 @@ def s2_server(args):
 
 
 def s3_panel(args):
-    loaded = wait_for(lambda: td_json("print(json.dumps(bool(comp.op('webrender').loaded)))"), 10)
+    """The page (served by the master, shown in the temporary Web Render TOP) loads, is not blank and connects to this editor."""
+    if args.skip_ui:
+        return None, "skipped (--skip-ui)"
+    ensure_page()
+    loaded = wait_for(lambda: td_json("print(json.dumps(bool(op('/project1/_validate_page').loaded)))"), 15)
     os.makedirs(OUT_DIR, exist_ok=True)
     png = os.path.join(OUT_DIR, "ui.png")
+    connected = wait_for(lambda: "active" in status(), 25)
+    time.sleep(1.0)
     stats = td_json(f"""
-w = comp.op('webrender'); w.save({png!r})
+w = op('/project1/_validate_page'); w.save({png!r})
 a = w.numpyArray()[..., :3]
 print(json.dumps({{'std': float(a.std()), 'rng': float(a.max() - a.min()), 'size': [w.width, w.height]}}))
 """)
-    ok = bool(loaded) and stats["std"] > 0.01 and stats["rng"] > 0.2
-    connected = wait_for(lambda: "active" in status(), 5)
-    return ok, f"loaded={loaded} std={stats['std']:.3f} range={stats['rng']:.2f} -> {png}; status={status()!r}" + \
-        ("" if connected or args.skip_ui else "  (WARNING: UI did not connect)")
+    ok = bool(loaded) and stats["std"] > 0.01 and stats["rng"] > 0.2 and bool(connected)
+    return ok, f"loaded={loaded} std={stats['std']:.3f} range={stats['rng']:.2f} -> {png}; status={status()!r}"
 
 
 def s4_no_input(args):
@@ -796,34 +870,8 @@ def s8_latency(args):
 
 
 def s9_panel_overlay(args):
-    """A panel client in TD mode: DocNetwork.set_view + background switch + the overlay shows the document."""
-    ed = Editor(args.port, kind="panel")   # a second panel connection is standby, but its `view` still drives the overlay
-    try:
-        ed.run(0.5)
-        # document origin at panel (100, 50), zoom 0.5, canvas rect = the whole 1280x800 panel
-        ed.view("td", 0.5, 100.0, 50.0, {"x": 0, "y": 0, "w": 1280, "h": 800})
-        ok = wait_for(lambda: td("print(comp.par.top.val)").strip().endswith("panel_view"), 3)
-        info = td_json("""
-w = comp.op('webrender')
-print(json.dumps({'top': comp.par.top.val, 'transparent': bool(w.par.transparent.eval()), 'mode': comp.par.Viewmode.eval(),
-                  'pv': [comp.op('panel_view').width, comp.op('panel_view').height] if comp.op('panel_view') else None}))
-""")
-        time.sleep(0.3)
-        # doc (600, 700) is base red; doc (1000, 350) is p1 green; doc (500, 500) is masked p2 blue? (p1 green top half y<540)
-        def at(dx, dy):
-            px, py = int(100 + dx * 0.5), int(50 + dy * 0.5)
-            a = td_rect("/project1/raster_editor/panel_view", px, py, 1, 1)[0, 0]
-            return a.tolist()
-        red, green = at(1700, 900), at(1000, 350)
-        good = (red[0] > 220 and red[1] < 40 and green[1] > 150 and green[0] < 40)
-        ed.view("local")
-        back = wait_for(lambda: td("print(comp.par.top.val)").strip().endswith("webrender"), 3)
-        transp_off = True  # transparent stays on: toggling it reloads the page (and drops the connection)
-        return bool(ok and good and back and info["transparent"]), (
-            f"td mode: top={info['top']} transparent={info['transparent']} panel_view={info['pv']} Viewmode(active client)={info['mode']}; "
-            f"overlay pixels doc(1700,900)={red} (red base) doc(1000,350)={green} (p1 green); back to webrender: {back}, transparent off: {transp_off}")
-    finally:
-        ed.close()
+    """Removed in v8 (the in-TD panel and its TD-view overlay are gone)."""
+    return None, "skipped: no panel in v8"
 
 
 def s10_persistence(args):
@@ -864,9 +912,7 @@ print(json.dumps(hashlib.md5((o * 255 + .5).astype(np.uint8).tobytes()).hexdiges
     exported_msg = bool(wait_for(lambda: "exported with document" in status(), 5))
     size = os.path.getsize(path) if os.path.exists(path) else 0
     td("comp.par.Exportpath = ''")
-    # Load the exported file into a temporary container. The primary editor is switched off meanwhile (one port).
-    td("comp.par.Active = 0")
-    time.sleep(0.5)
+    # Load the exported file into a temporary container (a slave: it runs no server).
     td(f"""
 old = op('/project1/_validate_load')
 if old: old.destroy()
@@ -1128,12 +1174,12 @@ def s13_stalled_client(args):
 # --------------------------------------------------------------------------- real UI steps (need the built v3 page)
 
 
-UI_JS_POST = ("fetch('/__test?token='+encodeURIComponent(new URLSearchParams(location.search).get('token')),"
+UI_JS_POST = ("fetch('/__test?token='+encodeURIComponent(new URLSearchParams(location.hash.slice(1)).get('token')),"
               "{method:'POST',body:JSON.stringify(%s)})")
 
 
 def js(expr):
-    td(f"comp.op('webrender').executeJavaScript({expr!r})")
+    td(f"op('/project1/_validate_page').executeJavaScript({expr!r})")
 
 
 def js_result(expr, timeout=3):
@@ -1144,7 +1190,7 @@ def js_result(expr, timeout=3):
 
 
 def mouse(u, v, left=False):
-    td(f"comp.op('webrender').interactMouse({u!r}, {v!r}, left={left!r})")
+    td(f"op('/project1/_validate_page').interactMouse({u!r}, {v!r}, left={left!r})")
 
 
 def drag_doc(doc_pts, panel=(1280, 800), perf=False):
@@ -1178,10 +1224,9 @@ def ui_ready(timeout=10):
 
 
 def ensure_test_hook():
-    """Panel URL carries ?test=1 (installs window.__editorTest); reloads the page when that changes."""
-    if td("print(comp.par.Panelquery.eval())").strip() != "test=1":
-        td("comp.par.Panelquery = 'test=1'")
-        time.sleep(3.0)
+    """The temporary page URL carries ?test=1 (installs window.__editorTest) and the master allows the /__test back channel."""
+    td("comp.store('reTest', 1)")
+    ensure_page()
     return bool(wait_for(lambda: js_result("window.__editorTest.state()"), 8))
 
 
@@ -1210,7 +1255,7 @@ def s14_ui_paint(args):
     js("window.__editorTest.addLayer()")
     time.sleep(0.2)
     js("window.__editorTest.setPrimary('#0000ff')")
-    td("comp.op('webrender').sendKey('b', char='b')")
+    td("op('/project1/_validate_page').sendKey('b', char='b')")
     time.sleep(0.2)
     st = js_result("window.__editorTest.state()")
     if not st or st["tool"] != "brush":
@@ -1220,7 +1265,7 @@ def s14_ui_paint(args):
         return False, "could not resolve doc coordinates"
     blue = centre_is((0, 0, 255, 255))
     corner = pixel(COMP + "/out1", 0.03, 0.97)
-    td("comp.op('webrender').sendKey('z', char='z', cmd=True)")
+    td("op('/project1/_validate_page').sendKey('z', char='z', cmd=True)")
     undone = centre_is((255, 0, 0, 255), 3)
     lat = js_result("window.__editorTest.latency()")
     return bool(blue and px_near(corner, (255, 0, 0, 255), 3) and undone), (
@@ -1388,10 +1433,10 @@ def s16_ui_view_mode(args):
     if not ui_ready():
         return None, "page is not the active editor (skipped)"
     js("window.__editorTest.setViewMode('td')")
-    ok = wait_for(lambda: td("print(comp.par.top.val)").strip().endswith("panel_view") and td("print(comp.par.Viewmode.eval())").strip() == "td", 4)
+    ok = wait_for(lambda: td("print(comp.par.Viewmode.eval())").strip() == "td", 4)
     js("window.__editorTest.addLayer()")
     js("window.__editorTest.setPrimary('#ff8800')")
-    td("comp.op('webrender').sendKey('b', char='b')")
+    td("op('/project1/_validate_page').sendKey('b', char='b')")
     doc = (js_result("window.__editorTest.state().doc") or {"w": IW, "h": IH})
     sx, sy = doc["w"] / 640, doc["h"] / 360
     pts = [(100 * sx, 60 * sy), (540 * sx, 120 * sy), (100 * sx, 180 * sy), (540 * sx, 240 * sy), (100 * sx, 300 * sy)]
@@ -1399,10 +1444,9 @@ def s16_ui_view_mode(args):
         drag_doc(pts, perf=True)
     time.sleep(0.5)
     lat = js_result("window.__editorTest.latency()")
-    pv = pixel(COMP + "/panel_view", 0.5, 0.5)
     js("window.__editorTest.setViewMode('local')")
-    back = wait_for(lambda: td("print(comp.par.top.val)").strip().endswith("webrender"), 4)
-    return bool(ok and back), f"TD mode switched the panel background: {ok}, centre of panel_view {pv}, back to local: {back}; latency readout {lat}"
+    back = wait_for(lambda: td("print(comp.par.Viewmode.eval())").strip() == "local", 4)
+    return bool(ok and back), f"TD mode reported in Viewmode: {ok}, back to local: {back}; latency readout {lat}"
 
 
 # --------------------------------------------------------------------------- v4 steps (DESIGN_V3 section 4)
@@ -1856,7 +1900,7 @@ def edge_dist(poly, pts):
 def paint_all(W, H, hex_color):
     """Brush serpentine over the whole document (the selection must clip it); rows are spaced by 0.6 x the brush size."""
     hook_call(f"setPrimary({hex_color!r})")
-    td("comp.op('webrender').sendKey('b', char='b')")
+    td("op('/project1/_validate_page').sendKey('b', char='b')")
     time.sleep(0.2)
     size = float(((hook_call("state()") or {}).get("brush") or {}).get("size", 20))
     pts, step, flip = [], max(3, int(size * 0.6)), False
@@ -2147,7 +2191,7 @@ def s25_ui_paint_scaled(args):
     if not wait_for(lambda: (td_layer(lid) or {}).get("sx") == 2, 5):
         return False, f"TD did not receive the transform: {td_layer(lid)}"
     hook_call("setPrimary('#0000ff')")
-    td("comp.op('webrender').sendKey('b', char='b')")
+    td("op('/project1/_validate_page').sendKey('b', char='b')")
     time.sleep(0.3)
     bs = float(((hook_call("state()") or {}).get("brush") or {}).get("size", 20))
     y0, xa, xb = 110.0, 200.0, 300.0
@@ -2996,9 +3040,7 @@ print(json.dumps({'sig': {str(s): hashlib.md5(b.tobytes()).hexdigest() for s, b 
         chk("Status reports the export and the old error is gone", "exported with document" in status() and "export failed" not in status(), status()[-110:])
         locked = td_json("x = comp.ext.RasterEditorExt; print(json.dumps([x.frozen, [s for s in x.network.slots() if x.network.surface_top(s).lock]]))")
         chk("thawed afterwards", locked == [False, []], str(locked))
-        # load it into a temp COMP (the live editor is switched off meanwhile: one port)
-        td("comp.par.Active = 0")
-        time.sleep(0.5)
+        # load it into a temp COMP (a slave: it runs no server)
         td(f"""
 old = op('/project1/_validate_load')
 if old: old.destroy()
@@ -3046,30 +3088,29 @@ print(json.dumps({'help': (p.help or ''), 'style': p.style, 'ft': str(getattr(p,
 def s30_delete_component(args):
     """Deleting the COMP while clients are connected must not freeze TD (the Web Server DAT's destructor waits for idle HTTP
     keep-alive connections, 10 s each), and undoing the delete must bring the document back with its pixels.
-    A throwaway copy (the exported .tox, loaded into a temp container; the live editor is switched off meanwhile: one port)
-    with a browser-like keep-alive HTTP client, a WebSocket client and its own panel page connected is deleted (inside an undo
-    block): the delete must return quickly, TD must stay responsive and the port must be free; then ui.undo.undo() recreates it
-    and its surfaces must be identical to before. Run last."""
+    A throwaway copy (the exported .tox, loaded into a temp container) is made the project MASTER, a browser-like keep-alive HTTP
+    client and a WebSocket client are connected to it, then it is deleted (inside an undo block): the delete must return quickly, TD
+    must stay responsive and another editor must serve on the same port at once (failover); then ui.undo.undo() recreates it and its
+    surfaces AND its editorId must be identical to before. Run last."""
     path = os.path.join(ROOT, "dist", "raster_editor.tox")
     was_active = td_json("print(json.dumps(int(comp.par.Active)))")
     notes, ok_all = [], True
     conns, ws = [], None
     try:
-        td("comp.par.Active = 0")
-        time.sleep(0.5)
         td(f"""
 old = op('/project1/_validate_load')
 if old: old.destroy()
 box = op('/project1').create(baseCOMP, '_validate_load')
 box.loadTox({path!r})
 """, 120)
-        time.sleep(2.0)   # the copy starts its server on the port and its panel page connects
-        info = td_json("""
-box = op('/project1/_validate_load'); c = box.children[0]
-x = c.ext.RasterEditorExt
-print(json.dumps({'name': c.name, 'started': x._started, 'token': x.token, 'port': int(c.op('webserver').par.port)}))
-""")
+        wait_for(lambda: td("print(op('/project1/_validate_load').children[0].ext.RasterEditorExt._started)").strip() == "True", 10)
+        td("op('/project1/_validate_load').children[0].ext.RasterEditorExt.Promote()")
+        info = wait_for(lambda: (lambda r, i: {**r, "eid": i} if r and r["id"] == i else None)(master_info(), td(
+            "print(op('/project1/_validate_load').children[0].fetch('editorId', ''))").strip()), 10)
+        if not info:
+            return False, f"the copy did not become the master: {master_info()}"
         port = info["port"]
+        eid_before = info["eid"]
         for _ in range(3):   # browser-like: HTTP/1.1 keep-alive connections left open
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
             c.request("GET", "/")
@@ -3078,7 +3119,7 @@ print(json.dumps({'name': c.name, 'started': x._started, 'token': x.token, 'port
             notes.append(f"GET / -> {r.status}, Connection: {r.getheader('connection')}")
             ok_all &= (r.getheader("connection") or "").lower() == "close"
             conns.append(c)
-        ws = WS(port)
+        ws = WS(port, f"/ws?editor={eid_before}")
         ws.send(P.ready("external", info["token"], False, "validate"))
         hello = None
         for _ in range(5):
@@ -3104,8 +3145,8 @@ print(json.dumps({'sig': {str(s): hashlib.md5(b.tobytes()).hexdigest() for s, b 
 """
         before = wait_for(lambda: (lambda d: d if d["nonblank"] else None)(td_json(sig_code)), 5) or td_json(sig_code)
         clients = before["clients"]
-        ok_all &= clients >= 2 and before["nonblank"]
-        notes.append(f"clients connected to the copy (its own panel page + ours): {clients} (>= 2 required); surfaces {list(before['sig'])}, pixels sent: {before['nonblank']}")
+        ok_all &= clients >= 1 and before["nonblank"]
+        notes.append(f"clients connected to the copy (master): {clients}; surfaces {list(before['sig'])}, pixels sent: {before['nonblank']}")
         t0 = time.time()
         td("""
 c = op('/project1/_validate_load').children[0]
@@ -3120,20 +3161,19 @@ ui.undo.endBlock()
         alive = td_json("print(json.dumps(1))", 10) == 1
         ok_all &= alive and time.time() - t1 < 2
         notes.append(f"TD responsive afterwards: {alive}")
-        probe = socket.socket()
-        try:
-            free = bool(wait_for(lambda: probe.connect_ex(("127.0.0.1", port)) != 0, 5))
-        finally:
-            probe.close()
-        notes.append(f"port {port} released: {free}")
-        ok_all &= free
+        free = bool(wait_for(lambda: http_get(port, "/")[0] == 200, 8))   # failover: another editor serves the same port
+        rec_now = master_info()
+        notes.append(f"port {port} served again by {rec_now and rec_now['path']} (same port {rec_now and rec_now['port'] == port}, same token {rec_now and rec_now['token'] == info['token']}): {free}")
+        ok_all &= free and rec_now["port"] == port and rec_now["token"] == info["token"]
         # undo of the delete: TD recreates the COMP from its snapshot; the pixels come back from the side cache
         td("ui.undo.undo()")
         time.sleep(1.5)
         after = wait_for(lambda: (lambda d: d if d and d["nonblank"] else None)(td_json(sig_code.replace("children[-1]", "children[0]"))), 10)
         same = bool(after) and after["sig"] == before["sig"]
         ok_all &= same
-        notes.append(f"undo of the delete: COMP recreated with surfaces {list(after['sig']) if after else None}, pixels identical to before: {same}")
+        eid_after = td("print(op('/project1/_validate_load').children[0].fetch('editorId', ''))").strip()
+        ok_all &= eid_after == eid_before
+        notes.append(f"undo of the delete: COMP recreated with surfaces {list(after['sig']) if after else None}, pixels identical to before: {same}; editorId kept: {eid_after == eid_before}")
     finally:
         for c in conns:
             try:
@@ -3150,6 +3190,7 @@ box = op('/project1/_validate_load')
 if box: box.destroy()
 comp.par.Active = {was_active}
 """)
+        ensure_master()
     return ok_all, "\n        ".join(notes)
 
 
@@ -3635,15 +3676,14 @@ def s36_ui_tools(args):
 
 
 def s37_choose_file(args):
-    """chooseFile plumbing with the test stub (`testPath`, Panelquery test=1; the native dialog cannot be automated):
+    """chooseFile plumbing with the test stub (`testPath`, storage reTest; the native dialog cannot be automated):
     fileChosen for project / PNG purposes, placeImage -> a picked PNG arrives as topReady + GET /top, errors."""
     os.makedirs(OUT_DIR, exist_ok=True)
     img = np.random.RandomState(2).randint(0, 256, (24, 40, 4), np.uint8)
     img[..., 3] = 255
     pic = os.path.join(OUT_DIR, "place_me.png")
     open(pic, "wb").write(FR.encode_png(img))
-    old_q = td("print(comp.par.Panelquery.eval())").strip()
-    td("comp.par.Panelquery = 'test=1'")
+    td("comp.store('reTest', 1)")
     notes, ok_all = [], True
 
     def chk(label, cond, extra=""):
@@ -3684,7 +3724,6 @@ def s37_choose_file(args):
         chk("non-image refused with topError", ok and "not a supported image" in msgs(ed, "topError", "bad")[0]["msg"])
     finally:
         ed.close()
-        td(f"comp.par.Panelquery = {old_q!r}")
     return ok_all, "\n        ".join(notes)
 
 
@@ -3949,7 +3988,7 @@ def s42_ui_brush_tips_presets(args):
     hook_call(f"renameBrushPreset({key!r}, 'v7 renamed')") if key else None
     renamed = wait_for(lambda: any(q[0] == "v7 renamed" for q in (td_json("p = comp.ext.RasterEditorExt.brush_presets; print(json.dumps([[q['name']] for q in p]))") or [])), 8)
     chk("rename reaches TD", renamed)
-    td("comp.op('webrender').par.reloadsrc.pulse()")
+    td("op('/project1/_validate_page').par.reloadsrc.pulse()")
     time.sleep(2.0)
     if ui_ready(30):
         lst2 = hook_call("brushPresets()") or []
@@ -4085,7 +4124,7 @@ def s44_ui_history_reload(args):
     rt = hook_call("historyRoundTrip()") or {}
     # (restoreHistory refuses a non-empty history by design, so `ok` is False here: only the serialisation is checked)
     chk("the page serialises its history", rt.get("bytes", 0) > 1000 and rt["before"] == rt["after"], f"{rt}")
-    td("comp.op('webrender').par.reloadsrc.pulse()")
+    td("op('/project1/_validate_page').par.reloadsrc.pulse()")
     time.sleep(2.5)
     if not ui_ready(40) or not settle_page(40):
         return False, "page did not come back after the reload\n        " + "\n        ".join(notes)
@@ -4107,7 +4146,7 @@ def s44_ui_history_reload(args):
         ed.close()
     chk("POST/GET /history with an explicit rev", st == 204 and got[0] == 200 and got[1] == "1" and len(got[2]) == 1000, f"post {st}, get {got[0]} rev {got[1]}")
     time.sleep(1.0)
-    td("comp.op('webrender').par.reloadsrc.pulse()")
+    td("op('/project1/_validate_page').par.reloadsrc.pulse()")
     time.sleep(2.5)
     if ui_ready(40):
         h2 = hook_call("history()") or {}
@@ -4353,12 +4392,12 @@ def s52_ui_scrub(args):
 
     # (a) a click opens a usable list in the panel
     h0 = hist().get("index", 0)
-    snap = "import numpy as np\ncomp.store('scrub_snap', np.array(comp.op('webrender').numpyArray()))\nprint(1)"
+    snap = "import numpy as np\ncomp.store('scrub_snap', np.array(op('/project1/_validate_page').numpyArray()))\nprint(1)"
     td(snap)
     real_click(cx, cy)
     time.sleep(0.6)
     opened = js_result("document.querySelector(%s).getAttribute('data-scrub-opened')" % json.dumps(sel))
-    box = td_json("import numpy as np\na = np.array(comp.op('webrender').numpyArray()); b = comp.fetch('scrub_snap')\n"
+    box = td_json("import numpy as np\na = np.array(op('/project1/_validate_page').numpyArray()); b = comp.fetch('scrub_snap')\n"
                   "d = (np.abs(a[..., :3] - b[..., :3]).max(axis=2) > 0.3)[:, %d:%d]   # the popup is painted in the select's column\n"
                   "ys = np.where(d.any(axis=1))[0]\nH = a.shape[0]\n"
                   "print(json.dumps(None if len(ys) < 40 else [int(H - 1 - ys.max()), int(H - 1 - ys.min())]))" % (int(r[0]), int(r[0] + r[2])))
@@ -4406,7 +4445,7 @@ def s52_ui_scrub(args):
     for dy in range(6, 31, 6):
         real_move(cx, cy + dy)
     moved = page_layer(top).get("blend") != "normal"
-    td("comp.op('webrender').sendKey('esc')")
+    td("op('/project1/_validate_page').sendKey('esc')")
     ok_esc = wait_for(lambda: page_layer(top).get("blend") == "normal", 3)
     real_release(cx, cy + 30)
     chk("Escape mid-drag reverts the blend (no step left)", moved and ok_esc and hist().get("index") == h1, f"moved={moved} index {h1} -> {hist().get('index')}")
@@ -4452,16 +4491,452 @@ def s52_ui_scrub(args):
     return ok_all, "\n        ".join(notes)
 
 
+# --------------------------------------------------------------------------- v8: multiple editors per project (steps 54-59)
+
+V8_NAMES = ("_v8_ed2", "_v8_ed3", "_v8_ed2c", "_v8_old", "_v8_src", "_v8_newer", "_v8_mst")
+
+
+def mk_editor(name, w=320, h=200, tox=None, start=True):
+    """A temporary editor under /project1 (loaded from dist/raster_editor.tox); returns its editorId ('' for a v0.x component)."""
+    td(f"""
+p = op('/project1')
+old = p.op({name!r})
+if old: old.destroy()
+e = p.loadTox({tox or TOX!r})
+e.name = {name!r}
+e.nodeX, e.nodeY = 1800, -1200 - 150 * {len(name)}
+e.par.Docw = {w}; e.par.Doch = {h}
+""", 120)
+    if tox:
+        return ""
+    return wait_for(lambda: td(f"print(op('/project1/{name}').fetch('editorId', ''))").strip(), 15)
+
+
+def drop_v8():
+    td("for n in %r:\n    t = op('/project1/' + n)\n    if t: t.destroy()\n" % (V8_NAMES,), 60)
+
+
+def editors_json(args):
+    rec = master_info()
+    st, body = http_get(rec["port"], f"/editors?token={rec['token']}")
+    return st, (json.loads(body) if st == 200 else None)
+
+
+def solid(w, h, rgba):
+    a = np.zeros((h, w, 4), np.uint8)
+    a[...] = rgba
+    return a
+
+
+def ed_scene(ed, lid, rgba, rev=1):
+    """Fake client: take over its editor, one solid pixel layer."""
+    if not ed.takeover():
+        return False
+    ed.send_doc([L(lid, "pixel", slot=1)], rev)
+    fid = ed.send_surface(1, (0, 0, ed.doc_w, ed.doc_h), solid(ed.doc_w, ed.doc_h, rgba))
+    return wait_applied(ed, fid, 6)
+
+
+def out_px(name):
+    return pixel(f"/project1/{name}/out1", 0.5, 0.5)
+
+
+def s54_two_three_editors(args):
+    """Two temporary editors next to raster_editor: the master's /editors lists all three (path order, live), each has its own
+    document and output, nothing leaks between them, and slaves run no server."""
+    notes = []
+    clients = []
+    try:
+        id2, id3 = mk_editor("_v8_ed2"), mk_editor("_v8_ed3")
+        if not (id2 and id3 and id2 != id3):
+            return False, f"editor ids: {id2!r} {id3!r}"
+        my = td("print(comp.fetch('editorId', ''))").strip()
+        before = out1_size(), pixel(COMP + "/out1", 0.5, 0.5)
+        ok = wait_for(lambda: {"_v8_ed2", "_v8_ed3"} <= {e["name"] for e in (editors_json(args)[1] or {"editors": []})["editors"]}
+                      and {id2, id3, my} <= {e["id"] for e in editors_json(args)[1]["editors"]}, 8)
+        st, lst = editors_json(args)
+        names = [e["name"] for e in lst["editors"]] if lst else []
+        paths = [e["path"] for e in lst["editors"]] if lst else []
+        ok = ok and st == 200 and paths == sorted(paths) and lst["master"] == my and "_v8_ed2" in names and "_v8_ed3" in names
+        notes.append(f"/editors -> {st} master={lst and lst['master'] == my} names={names}")
+        servers = td_json("print(json.dumps({c.path: int(c.op('webserver').par.active.eval()) for c in op('/').findChildren(tags=['rasterEditor'])}))")
+        slaves_off = all(v == 0 for k, v in servers.items() if k != COMP) and servers[COMP] == 1
+        notes.append(f"web servers active: {servers}")
+        a = Editor(args.port, editor=id2)
+        clients.append(a)
+        b = Editor(args.port, editor=id3)
+        clients.append(b)
+        okA = ed_scene(a, "pa", (255, 0, 0, 255))
+        okB = ed_scene(b, "pb", (0, 255, 0, 255))
+        time.sleep(0.3)
+        pa, pb = out_px("_v8_ed2"), out_px("_v8_ed3")
+        ids = td_json("""print(json.dumps([[l['id'] for l in (op('/project1/%s').ext.RasterEditorExt.doc_layers or [])] for n in ()] if False else
+  {n: [l['id'] for l in (op('/project1/' + n).ext.RasterEditorExt.doc_layers or [])] for n in ('_v8_ed2', '_v8_ed3')}))""")
+        da, db = a.dump(1), b.dump(1)
+        indep = ids == {"_v8_ed2": ["pa"], "_v8_ed3": ["pb"]}
+        px = px_near(pa, [255, 0, 0, 255], 3) and px_near(pb, [0, 255, 0, 255], 3)
+        dump_ok = da is not None and db is not None and tuple(da[1][5, 5]) == (255, 0, 0, 255) and tuple(db[1][5, 5]) == (0, 255, 0, 255)
+        same = (out1_size(), pixel(COMP + "/out1", 0.5, 0.5)) == before
+        notes.append(f"docs {ids}; outputs ed2={pa} ed3={pb}; /surface per editor ok={dump_ok}; raster_editor unchanged={same}")
+        # a third editor id the master does not know -> 404 json
+        st404, body404 = http_get(args.port, f"/base?token={token()}&client=x&editor=nope")
+        notes.append(f"unknown editor -> {st404} {body404[:40]!r}")
+        return bool(ok and slaves_off and okA and okB and indep and px and dump_ok and same and st404 == 404), "\n        ".join(notes)
+    finally:
+        for c in clients:
+            try:
+                c.close()
+            except Exception:  # noqa: BLE001
+                pass
+        drop_v8()
+
+
+def s55_election(args):
+    """Open in Browser on a slave while the master lives: no second server, the browser is pointed at the master's page with this
+    editor's id (the launch is stubbed); the page URL really serves the UI and an editor connection with that id works."""
+    clients = []
+    try:
+        id2 = mk_editor("_v8_ed2")
+        rec = master_info()
+        td("""
+x = op('/project1/_v8_ed2').ext.RasterEditorExt
+comp.unstore('v8_opened')
+x._open_url = lambda u: comp.store('v8_opened', u)
+op('/project1/_v8_ed2').par.Openbrowser.pulse()
+""")
+        url = wait_for(lambda: td("print(comp.fetch('v8_opened', ''))").strip(), 6)
+        want = f"http://127.0.0.1:{rec['port']}/#token={rec['token']}&e={id2}"
+        servers = td_json("print(json.dumps({c.path: int(c.op('webserver').par.active.eval()) for c in op('/').findChildren(tags=['rasterEditor'])}))")
+        one = sum(servers.values()) == 1 and servers[COMP] == 1
+        st, body = http_get(rec["port"], "/")
+        a = Editor(rec["port"], editor=id2)
+        clients.append(a)
+        ok_conn = a.takeover()
+        still_master = master_info()["id"] == rec["id"] and master_info()["port"] == rec["port"]
+        return bool(url == want and one and st == 200 and ok_conn and still_master), \
+            f"opened {url!r} (want {want!r}); active servers {servers}; GET / -> {st}; editor connection takeover {ok_conn}; master unchanged {still_master}"
+    finally:
+        for c in clients:
+            c.close()
+        drop_v8()
+
+
+def page_probe():
+    """What the real page thinks (its URL hash and the current editor / list), asked through the test hook of whichever editor is master."""
+    try:
+        rec = master_info()
+        td(f"m = op({rec['path']!r}); m.store('reTest', 1); m.ext.RasterEditorExt.test_result = None")
+        js(UI_JS_POST % "({hash: location.hash, conn: window.__editorTest.loadState().connection, dbg: window.__bridgeDbg, active: window.__editorTest.loadState().active, ed: (function(){var e = window.__editorTest.editor(); return {id: e.id, master: e.master, n: e.list.length, switching: e.switching};})()})")
+        raw = wait_for(lambda: td(f"print(op({rec['path']!r}).ext.RasterEditorExt.test_result or '')").strip(), 4)
+        return raw or "(no answer)"
+    except Exception as e:  # noqa: BLE001
+        return f"(probe failed: {e})"
+
+
+def page_ws_test():
+    """Open a fresh WebSocket from inside the page to the master and report what happens (open / error / close code)."""
+    try:
+        rec = master_info()
+        td(f"m = op({rec['path']!r}); m.ext.RasterEditorExt.test_result = None")
+        js("(function(){var t0=Date.now(),ev=[];function post(){fetch('/__test?token='+encodeURIComponent(new URLSearchParams(location.hash.slice(1)).get('token')),{method:'POST',body:JSON.stringify(ev)});}"
+           "var w=new WebSocket('ws://127.0.0.1:%d/ws');w.onopen=function(){ev.push(['open',Date.now()-t0]);post();w.close();};"
+           "w.onerror=function(){ev.push(['error',Date.now()-t0]);post();};w.onclose=function(e){ev.push(['close',e.code,Date.now()-t0]);post();};"
+           "setTimeout(post,6000);})()" % rec["port"])
+        return wait_for(lambda: td(f"print(op({rec['path']!r}).ext.RasterEditorExt.test_result or '')").strip(), 9) or "(no answer)"
+    except Exception as e:  # noqa: BLE001
+        return f"(ws test failed: {e})"
+
+
+def reconnect_editor(args, editor, timeout=15):
+    """A page-like client: keeps retrying the same URL until the (new) master answers; returns the connected Editor or None."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            rec = master_info()
+            ed = Editor(rec["port"], editor=editor)
+            if ed.takeover():
+                return ed
+            ed.close()
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(0.4)
+    return None
+
+
+def s56_failover(args):
+    """The master moves to a temporary editor, which is then deleted while pages are connected: another editor serves on the same
+    port with the same token, pages reconnect to THEIR editor and the documents are intact."""
+    notes = []
+    clients = []
+    try:
+        id2, id3 = mk_editor("_v8_ed2"), mk_editor("_v8_ed3")
+        td("op('/project1/_v8_ed2').ext.RasterEditorExt.Promote()")
+        rec = wait_for(lambda: (lambda r: r if r and r["id"] == id2 else None)(master_info()), 8)
+        if not rec:
+            return False, f"ed2 did not become master: {master_info()}"
+        port, tok = rec["port"], rec["token"]
+        b = reconnect_editor(args, id3)
+        clients.append(b)
+        if not b or not ed_scene(b, "pb", (0, 0, 255, 255)):
+            return False, "could not set up the document of ed3 on the new master"
+        page_ok = True
+        if not args.skip_ui:
+            page_ok = bool(wait_for(lambda: td("x = comp.ext.RasterEditorExt; print(any(c.ready for c in x.clients.values()))").strip() == "True", 20))
+            notes.append(f"page reconnected to raster_editor through the promoted master: {page_ok}")
+        # delete the master (temporary ed2) with pages connected
+        t0 = time.time()
+        td("op('/project1/_v8_ed2').destroy()", 60)
+        dt = time.time() - t0
+        new = wait_for(lambda: (lambda r: r if r and r["id"] != id2 and r.get("path") else None)(master_info()), 10)
+        if not new:
+            return False, f"no new master after the delete: {master_info()}"
+        served = wait_for(lambda: http_get(port, "/")[0] == 200, 10)
+        notes.append(f"delete took {dt * 1000:.0f} ms; new master {new['path']} port {new['port']} (was {port}), token kept {new['token'] == tok}")
+        # the old connection died with the old server: the page retries the same URL
+        try:
+            b.close()
+        except Exception:  # noqa: BLE001
+            pass
+        b2 = reconnect_editor(args, id3)
+        clients.append(b2)
+        doc_kept = bool(b2) and td_json("print(json.dumps([l['id'] for l in (op('/project1/_v8_ed3').ext.RasterEditorExt.doc_layers or [])]))") == ["pb"]
+        px = px_near(out_px("_v8_ed3"), [0, 0, 255, 255], 3)
+        if not args.skip_ui:
+            page_ok = bool(wait_for(lambda: td("x = comp.ext.RasterEditorExt; print(any(c.ready for c in x.clients.values()))").strip() == "True", 25))
+            notes.append(f"page reconnected to raster_editor after the failover: {page_ok}")
+            if not page_ok:
+                notes.append("PAGE PROBE " + page_probe())
+        ok = new["port"] == port and new["token"] == tok and bool(served) and doc_kept and px and page_ok and dt < 8
+        notes.append(f"ed3 reconnected {bool(b2)}, document kept {doc_kept}, output kept {px}")
+        return bool(ok), "\n        ".join(notes)
+    finally:
+        for c in clients:
+            try:
+                c.close()
+            except Exception:  # noqa: BLE001
+                pass
+        drop_v8()
+        ensure_master()
+
+
+def s57_copy_paste(args):
+    """Copying an editor (copy/paste/duplicate): the copy takes a new editorId, keeps the document and its pixels, appears in the
+    list, and the original is unchanged."""
+    clients = []
+    try:
+        id2 = mk_editor("_v8_ed2")
+        a = Editor(master_info()["port"], editor=id2)
+        clients.append(a)
+        if not ed_scene(a, "pa", (255, 128, 0, 255)):
+            return False, "could not build the source document"
+        a.close()
+        before = td_json("o = op('/project1/_v8_ed2'); print(json.dumps({'state': o.op('doc_state').text, 'id': o.fetch('editorId')}))")
+        td("op('/project1').copy(op('/project1/_v8_ed2'), name='_v8_ed2c')")
+        id2c = wait_for(lambda: (lambda v: v if v and v != id2 else None)(td("print(op('/project1/_v8_ed2c').fetch('editorId', ''))").strip()), 10)
+        info = wait_for(lambda: td_json("""
+c = op('/project1/_v8_ed2c'); x = c.ext.RasterEditorExt
+print(json.dumps({'state': c.op('doc_state').text, 'copied': x.was_copied, 'started': x._started and not x._restore_pending, 'master': x.is_master,
+                  'layers': [l['id'] for l in (x.doc_layers or [])]}))""") if td("print(op('/project1/_v8_ed2c') is not None)").strip() == "True" else None, 10)
+        px = wait_for(lambda: px_near(out_px("_v8_ed2c"), [255, 128, 0, 255], 3), 8)
+        orig_id = td("print(op('/project1/_v8_ed2').fetch('editorId', ''))").strip()
+        lst = wait_for(lambda: (lambda l: l if l and {id2, id2c} <= {e["id"] for e in l["editors"]} else None)(editors_json(args)[1]), 8)
+        ok = bool(id2c and id2c != id2 and orig_id == id2 and info and info["state"] == before["state"] and info["copied"] and not info["master"]
+                  and px and lst)
+        return ok, f"ids original {orig_id} copy {id2c}; copy detected={info and info['copied']}, doc_state identical={info and info['state'] == before['state']}, layers {info and info['layers']}; copy output {out_px('_v8_ed2c')}; both listed {bool(lst)}"
+    finally:
+        for c in clients:
+            c.close()
+        drop_v8()
+
+
+def s58_project_load_resume(args):
+    """Project load: the editor that was master resumes as master (same port + token) when its extension restarts over the stored
+    record; no other editor starts a server. Simulated by re-initialising the extensions (what a load does) of a temporary master."""
+    try:
+        id2, id3 = mk_editor("_v8_ed2"), mk_editor("_v8_ed3")
+        td("op('/project1/_v8_ed2').ext.RasterEditorExt.Promote()")
+        rec = wait_for(lambda: (lambda r: r if r and r["id"] == id2 else None)(master_info()), 8)
+        if not rec:
+            return False, f"ed2 not master: {master_info()}"
+        # a project load: new extension instances start over the same storage; server DATs keep their saved active/port state
+        td("""
+for n in ('_v8_ed3', '_v8_ed2'):
+    c = op('/project1/' + n)
+    c.ext.RasterEditorExt.Stop()
+    c.initializeExtensions()
+for n in ('_v8_ed3', '_v8_ed2'):
+    op('/project1/' + n).Start()
+""", 60)
+        ok_res = wait_for(lambda: td("x = op('/project1/_v8_ed2').ext.RasterEditorExt; print(x.is_master and x._server_running())").strip() == "True", 15)
+        now = master_info()
+        serving = http_get(rec["port"], "/")[0] == 200 if ok_res else False
+        servers = td_json("print(json.dumps({c.path: int(c.op('webserver').par.active.eval()) for c in op('/').findChildren(tags=['rasterEditor'])}))")
+        only = sum(servers.values()) == 1 and servers.get("/project1/_v8_ed2") == 1
+        ids_kept = td("print(op('/project1/_v8_ed2').fetch('editorId'), op('/project1/_v8_ed3').fetch('editorId'))").split() == [id2, id3]
+        ok = bool(ok_res and now["id"] == id2 and now["port"] == rec["port"] and now["token"] == rec["token"] and serving and only and ids_kept)
+        return ok, f"record {now}; serving {serving}; active servers {servers}; editor ids stable {ids_kept}"
+    finally:
+        drop_v8()
+        ensure_master()
+
+
+def snapshot_ed(path):
+    return td_json(f"""
+import hashlib
+c = op({path!r}); x = c.ext.RasterEditorExt
+o = c.op('out1').numpyArray()
+print(json.dumps({{'doc_state': hashlib.md5(c.op('doc_state').text.encode()).hexdigest(), 'rev': x.doc_rev,
+  'layers': [l['id'] for l in (x.doc_layers or [])],
+  'surfaces': {{str(s): hashlib.md5(b.tobytes()).hexdigest() for s, b in sorted(x.surfaces.items())}},
+  'out': hashlib.md5((o * 255 + .5).astype('uint8').tobytes()).hexdigest(),
+  'version': c.par.Version.eval() if hasattr(c.par, 'Version') else None, 'started': bool(x._started and not x._restore_pending)}}))
+""")
+
+
+def s59_upgrade_all(args):
+    """Upgrade All Editors through the real pulse: a v0.7.3 component with a document is replaced by this build (document, surfaces
+    and output identical, Version 0.8.0) while a newer (9.0.0) editor is skipped and named in the warning."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    old_tox = os.path.join(OUT_DIR, "v0.7.3.tox")
+    r = subprocess.run(["git", "show", "v0.7.3:dist/raster_editor.tox"], cwd=ROOT, capture_output=True)
+    if r.returncode != 0:
+        return None, "skipped: git tag v0.7.3 not available"
+    open(old_tox, "wb").write(r.stdout)
+    ed = None
+    try:
+        mk_editor("_v8_old", tox=old_tox)
+        td("""
+o = op('/project1/_v8_old')
+o.par.Port = 9971; o.par.Docw = 320; o.par.Doch = 200; o.par.Active = 1
+o.Start()
+""")
+        otok = wait_for(lambda: td("print(op('/project1/_v8_old').ext.RasterEditorExt.token)").strip(), 10)
+        wait_for(lambda: td("x = op('/project1/_v8_old').ext.RasterEditorExt; print(x._started and x.network is not None)").strip() == "True", 10)
+        ed = Editor(9971, tok=otok, protocol=9)
+        applied = False
+        for attempt in range(4):   # (the v0.7.3 editor may still be settling: ask again)
+            ed.takeover()
+            ed.send_doc([L("base", "input", input=1), L("pa", "pixel", slot=1)], 1 + attempt)
+            fid = ed.send_surface(1, (0, 0, ed.doc_w, ed.doc_h), solid(ed.doc_w, ed.doc_h, (200, 30, 60, 255)))
+            if wait_applied(ed, fid, 6):
+                applied = True
+                break
+        if not applied:
+            return False, "could not put a document into the v0.7.3 editor"
+        time.sleep(0.4)
+        ed.close()
+        ed = None
+        before = snapshot_ed("/project1/_v8_old")
+        id_src = mk_editor("_v8_src")
+        mk_editor("_v8_newer")
+        # a MASTER that is older than the source (a v8 component stamped 0.7.9) with a document and a connected client
+        idm = mk_editor("_v8_mst")
+        td("n = op('/project1/_v8_mst'); n.par.Version.readOnly = False; n.par.Version = '0.7.9'; n.par.Version.readOnly = True\nn.ext.RasterEditorExt.Promote()")
+        mrec = wait_for(lambda: (lambda r: r if r and r["id"] == idm else None)(master_info()), 8)
+        if not mrec:
+            return False, f"the temporary master did not take the role: {master_info()}"
+        em = Editor(mrec["port"], editor=idm)
+        if not ed_scene(em, "pm", (10, 200, 90, 255)):
+            em.close()
+            return False, "could not put a document into the temporary master"
+        em.close()
+        time.sleep(0.3)
+        mbefore = snapshot_ed("/project1/_v8_mst")
+        td("n = op('/project1/_v8_newer'); n.par.Version.readOnly = False; n.par.Version = '9.0.0'; n.par.Version.readOnly = True")
+        wait_for(lambda: td("print(op('/project1/_v8_src').ext.RasterEditorExt._started)").strip() == "True", 10)
+        td("op('/project1/_v8_src').par.Upgradeall.pulse()")
+        seen = []   # the summary stays in Status for a limited time: collect it while waiting
+        def upgraded_old():
+            t = td("print(op('/project1/_v8_src').par.Status.eval())").strip()
+            if "newer" in t and t not in seen:
+                seen.append(t)
+            return (lambda s: s and s["version"] == "0.8.0" and s["started"])(snapshot_ed("/project1/_v8_old"))
+        done = wait_for(upgraded_old, 40, 0.5)
+        mdone = wait_for(lambda: (lambda s: s and s["version"] == "0.8.0" and s["started"])(snapshot_ed("/project1/_v8_mst")), 40, 0.5)
+        mst_info = wait_for(lambda: td_json("x = op('/project1/_v8_mst').ext.RasterEditorExt; print(json.dumps({'master': x.is_master, 'run': x._server_running(), 'err': x.last_error and x.last_error[0]}))"), 15)
+        mafter = snapshot_ed("/project1/_v8_mst")
+        mrec2 = master_info()
+        em2 = reconnect_editor(args, idm, 20)
+        m_same = bool(mafter) and all(mafter[k] == mbefore[k] for k in ("doc_state", "layers", "surfaces", "out"))
+        m_role = bool(mst_info and mst_info["master"] and mst_info["run"] and mrec2["id"] == idm and mrec2["port"] == mrec["port"]
+                      and mrec2["token"] == mrec["token"])
+        page_ok = True
+        if not args.skip_ui:
+            # strict: the page must end on its ORIGINAL editor (raster_editor), not on a fallback tab
+            page_ok = bool(wait_for(lambda: td("x = comp.ext.RasterEditorExt; print(any(c.ready for c in x.clients.values()))").strip() == "True", 40))
+        if not page_ok:
+            print("PAGE PROBE", page_probe())
+            print("PAGE WS TEST", page_ws_test())
+            print("PAGE DIAG", td("""
+x = comp.ext.RasterEditorExt
+m = op('/').fetch('rasterEditorMaster')
+mx = op(m['path']).ext.RasterEditorExt if m and op(m['path']) else None
+w = op('/project1/_validate_page')
+print(list(mx.ws_log)[-12:], m, [ (c.ready, c.kind) for c in x.clients.values()], mx and {k: v.editor_id for k, v in mx._route.items()}, mx and list(mx._by_id), x.editor_id, w and w.par.url.eval(), w and w.loaded)
+"""))
+        if em2:
+            em2.close()
+        after = snapshot_ed("/project1/_v8_old")
+        status_txt = seen[0] if seen else wait_for(lambda: (lambda t: t if "newer" in t else "")(td("print(op('/project1/_v8_src').par.Status.eval())").strip()), 20)
+        newer_ver = td("print(op('/project1/_v8_newer').par.Version.eval())").strip()
+        same_doc = bool(after) and all(after[k] == before[k] for k in ("doc_state", "layers", "surfaces", "out"))
+        tagged = td("print('rasterEditor' in op('/project1/_v8_old').tags, op('/project1/_v8_old').ext.RasterEditorExt.is_master)").split()
+        own = td("print(comp.par.Version.eval(), comp.ext.RasterEditorExt._started)").split()
+        ok = bool(done and same_doc and newer_ver == "9.0.0" and status_txt and tagged[0] == "True" and tagged[1] == "False" and own[0] == "0.8.0"
+                  and mdone and m_same and m_role and em2 and page_ok)
+        return ok, (f"MASTER target: upgraded {bool(mdone)} still master on same port/token {m_role} {mst_info}, document identical {m_same}, "
+                    f"a client reconnected {bool(em2)}, page reconnected {page_ok}\n        old before {before['version']} -> after {after and after['version']}; document/surfaces/output identical: {same_doc}; "
+                    f"newer stays {newer_ver}; src Status: {status_txt!r}; raster_editor untouched {own}")
+    finally:
+        if ed is not None:
+            ed.close()
+        drop_v8()
+        ensure_master()
+
+
+def s60_identity_stability(args):
+    """The editorId is stable: it survives undo of a delete, a cut/paste (save, delete, load into ANOTHER COMP) and a .tox saved and
+    loaded after the original is gone; a .tox of a LIVE editor loaded next to it is a copy and gets a new id."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    tox = os.path.join(OUT_DIR, "identity.tox")
+    notes = []
+    try:
+        id2 = mk_editor("_v8_ed2")
+        td(f"op('/project1/_v8_ed2').save({tox!r})")
+        mk_editor("_v8_ed3", tox=tox)
+        id3 = wait_for(lambda: (lambda v: v if v and v != id2 else None)(td("print(op('/project1/_v8_ed3').fetch('editorId', ''))").strip()), 10)
+        copy_ok = bool(id3) and id3 != id2
+        notes.append(f"a .tox of a live editor loaded next to it: new id {id3} (original {id2}): {copy_ok}")
+        td("op('/project1/_v8_ed3').destroy()\nop('/project1/_v8_ed2').destroy()")
+        # cut/paste: the original is gone when the clipboard content is pasted -- into another COMP
+        td("b = op('/project1/_v8_box')\nif b: b.destroy()\nop('/project1').create(baseCOMP, '_v8_box')")
+        td(f"b = op('/project1/_v8_box'); e = b.loadTox({tox!r}); e.name = '_v8_ed2'")
+        pasted = wait_for(lambda: td("print(op('/project1/_v8_box/_v8_ed2').fetch('editorId', ''), op('/project1/_v8_box/_v8_ed2').ext.RasterEditorExt._started)").split() == [id2, "True"], 10)
+        notes.append(f"cut / paste into another COMP (original gone): id kept {id2}: {bool(pasted)}")
+        # undo of a delete
+        td("ui.undo.startBlock('v8 identity delete')\nop('/project1/_v8_box/_v8_ed2').destroy()\nui.undo.endBlock()")
+        td("ui.undo.undo()")
+        undone = wait_for(lambda: td("c = op('/project1/_v8_box/_v8_ed2'); print(c.fetch('editorId', '') if c else '', c.ext.RasterEditorExt._started if c else '')").split() == [id2, "True"], 10)
+        notes.append(f"undo of a delete: id kept: {bool(undone)}")
+        lst = editors_json(args)[1]
+        listed = lst is not None and sum(1 for e in lst["editors"] if e["id"] == id2) == 1
+        notes.append(f"listed once: {listed}")
+        return bool(copy_ok and pasted and undone and listed), "\n        ".join(notes)
+    finally:
+        td("b = op('/project1/_v8_box')\nif b: b.destroy()")
+        drop_v8()
+
+
 STEPS = [
     (1, "build component, no operator errors, document survives a rebuild", "build", False),
     (2, "web server serves the UI", "server", False),
-    (3, "web render panel loaded and not blank", "panel", False),
+    (3, "page (temporary Web Render TOP at the master URL) loaded, not blank, connected to this editor", "panel", False),
     (4, "no input: out1 is Docw x Doch", "noinput", False),
     (5, "fake client v3: doc + SURFACE tiles -> out1 pixels, BASE pull, applied", "scene", False),
     (6, "painted mask hides exactly the masked pixels; /surface round trip", "masks", False),
     (7, "TD VIEW stream for an external client: content, fps, age", "view", False),
     (8, "stroke -> TD latency (applied) and per-frame upload cost", "latency", False),
-    (9, "panel TD-view overlay: view message -> panel_view background", "overlay", False),
+    (9, "(removed in v8: panel TD-view overlay)", "overlay", False),
     (10, "persistence: Freeze/Thaw, Exportdoc -> loadTox identical", "persist", False),
     (11, "fresh load, reconnect re-send, takeover", "reconnect", False),
     (12, "network + apply budgets (20 layers @1080p)", "perf", False),
@@ -4505,6 +4980,13 @@ STEPS = [
     (51, "real UI: copy/paste a pixel layer with effects + a group via the page test hook -- page equals TD, new surfaces present", "uicopy", True),
     (52, "real UI: scrub the blend mode dropdown + font size with real pointer events -- click still opens a list, drag is live, page equals TD, one undo", "uiscrub", True),
     (53, "real UI: masks on a TD input layer and on a group (add, paint, transform, effects, flatten, undo) -- page equals TD", "uimasks", True),
+    (54, "two/three editors: /editors tabs list, independent documents + outputs, no cross-talk, slaves run no server", "ed23", False),
+    (55, "master election: Open in Browser on a slave opens the master URL with its editor id, no second server", "elect", False),
+    (56, "failover: delete the master with pages connected -> another editor serves on the same port + token, pages reconnect", "failover", False),
+    (57, "copy-paste an editor: new editorId, same document + pixels, listed", "copy", False),
+    (58, "project load: the saved master resumes (same port + token), no other editor serves", "resume", False),
+    (59, "Upgrade All Editors (real pulse): v0.7.3 editor upgraded with document intact, newer skipped and listed", "upgrade", False),
+    (60, "editorId stable: undo of a delete, cut/paste into another COMP, tox after the original is gone; a live copy gets a new id", "identity", False),
     (99, "deleting the COMP with clients connected does not freeze TD; undo of the delete restores the pixels (run last)", "delete", False),
 ]
 FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinput": "s4_no_input", "scene": "s5_scene",
@@ -4520,7 +5002,9 @@ FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinp
          "uifilters": "s39_ui_filters_parity", "uigroupfx": "s40_ui_filter_adjust_group_fx", "uiselectadj": "s41_ui_selection_adjustment",
          "uibrush": "s42_ui_brush_tips_presets", "layerpreview": "s43_layer_preview", "uihistory": "s44_ui_history_reload",
          "uiredoc": "s45_ui_redoc_history", "ttc": "s46_ttc_fonts", "active": "s47_active_layer_hint",
-         "migrate": "s48_migration_v6_docs", "renderreq": "s49_render_requests", "uimulti": "s50_ui_flatten_merge_multiselect", "uicopy": "s51_ui_copy_paste", "uiscrub": "s52_ui_scrub", "uimasks": "s53_ui_group_input_masks"}
+         "migrate": "s48_migration_v6_docs", "renderreq": "s49_render_requests", "uimulti": "s50_ui_flatten_merge_multiselect", "uicopy": "s51_ui_copy_paste", "uiscrub": "s52_ui_scrub", "uimasks": "s53_ui_group_input_masks",
+         "ed23": "s54_two_three_editors", "elect": "s55_election", "failover": "s56_failover", "copy": "s57_copy_paste",
+         "resume": "s58_project_load_resume", "upgrade": "s59_upgrade_all", "identity": "s60_identity_stability"}
 
 
 def main():
@@ -4528,12 +5012,17 @@ def main():
     ap.add_argument("--skip-ui", action="store_true", help="skip the steps that need the real web page")
     ap.add_argument("--fake-client", action="store_true", help="python WebSocket client acts as the web app (the default for steps 5-12, 16)")
     ap.add_argument("--no-build", action="store_true")
-    ap.add_argument("--port", type=int, default=9980)
+    ap.add_argument("--port", type=int, default=9980, help="(v8: ignored; the master's port is read from the project record)")
     ap.add_argument("--only", default="", help="comma separated step numbers")
     args = ap.parse_args()
     only = {int(x) for x in args.only.split(",") if x.strip()}
     g = globals()
+    global ARGS
+    ARGS = args
     try:
+        rec = master_info() if op_exists() else None
+        if rec:
+            args.port = rec["port"]
         for num, name, key, ui in STEPS:
             if only and num not in only:
                 continue
@@ -4552,7 +5041,11 @@ for p in ['/project1/_validate_in' + ('' if n == 1 else str(n)) for n in range(1
     t = op(p)
     if t: t.destroy()
 comp.par.Active = 1
+comp.unstore('reTest')
 """)
+            drop_v8()
+            drop_page()
+            ensure_master()
         except Exception as e:  # noqa: BLE001
             print("cleanup failed:", e)
     failed = [r for r in results if r is False]

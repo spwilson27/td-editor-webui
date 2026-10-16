@@ -1,8 +1,7 @@
 """DocNetwork: the generated compositing network of the raster editor COMP (docs/DESIGN_V2.md 4).
 
 Everything inside ``<comp>/doc`` is owned and generated here; ``apply()`` diff-applies the layer
-stack of the web client (PROTOCOL.md 3).  The TD-view overlay (``view_*``, ``doc_view``,
-``panel_view`` next to ``doc``) is owned here too.  The module is pure python: TD objects are only
+stack of the web client (PROTOCOL.md 3).  The module is pure python: TD objects are only
 reached through ``comp.op / doc.create / node.par / node.inputConnectors / ...`` so the diff logic is
 unit-tested against fake TD objects (``td/tests/test_network*.py``).
 
@@ -129,45 +128,11 @@ ADJ_MERGED_CODE = 8           # blend.glsl uAdjust of a merged pass
 RESERVED = ("blend_glsl", "shape_glsl", "text_measure", "surface_callbacks", "blank", "out", "warm_in")
 EMPTY_HINT = ()               # set_content_bounds(): the layer has no visible pixels
 MAX_INPUTS = 8
-VIEW_NODES = ("view_doc", "view_glsl", "doc_view", "panel_view")
 
 SURFACE_CALLBACKS = (
     "def onCook(scriptOp):\n"
     "    parent.RasterEditor.OnSurfaceCook(scriptOp)\n"
 )
-
-# TD-view overlay shader: document rect placed in panel pixels, web checkerboard underneath,
-# transparent outside the (clipped) document rect.  Matches web/src/ui/viewportDraw.ts.
-VIEW_GLSL = """\
-// uView vec4: x,y = document origin in panel px (top-left origin), z = zoom, w = 1 if downscaling
-// uClip vec4: x0,y0,x1,y1 = visible rect in panel px (canvas rect, top-left origin)
-uniform vec4 uView;
-uniform vec4 uClip;
-out vec4 fragColor;
-void main() {
-    vec2 res = uTDOutputInfo.res.zw;
-    vec2 pt = vec2(gl_FragCoord.x, res.y - gl_FragCoord.y);       // pixel centre, top-left origin
-    ivec2 dsz = textureSize(sTD2DInputs[0], 0);
-    vec2 local = pt - uView.xy;
-    vec2 docPx = local / uView.z;
-    vec4 outc = vec4(0.0);
-    bool inClip = pt.x >= uClip.x && pt.y >= uClip.y && pt.x < uClip.z && pt.y < uClip.w;
-    if (inClip && docPx.x >= 0.0 && docPx.y >= 0.0 && docPx.x < float(dsz.x) && docPx.y < float(dsz.y)) {
-        ivec2 cell = ivec2(floor(local / 8.0));
-        float chk = (((cell.x + cell.y) & 1) == 0) ? 0.811764706 : 1.0;
-        vec4 c;
-        if (uView.w > 0.5) {
-            c = texture(sTD2DInputs[0], vec2(docPx.x / float(dsz.x), 1.0 - docPx.y / float(dsz.y)));
-        } else {
-            ivec2 ip = ivec2(floor(docPx));
-            c = texelFetch(sTD2DInputs[0], ivec2(ip.x, dsz.y - 1 - ip.y), 0);
-        }
-        outc = vec4(c.rgb + vec3(chk) * (1.0 - c.a), 1.0);
-    }
-    fragColor = TDOutputSwizzle(outc);
-}
-"""
-
 
 def sanitize(name):
     """TD operator-name-safe form of a layer id."""
@@ -178,26 +143,6 @@ def sanitize(name):
 
 
 # --------------------------------------------------------------------------- pure helpers
-
-
-def view_uniforms(view, panel_w, panel_h, doc_w, doc_h):
-    """Shader inputs for the TD-view overlay from a PROTOCOL ``view`` message.
-
-    ``rect`` is the canvas element rect in panel px (top-left origin); ``panX/panY`` the document
-    origin inside that rect.  Returns ``(origin_x, origin_y, zoom, downscale, x0, y0, x1, y1)`` where the
-    clip rect is the canvas rect intersected with the panel.  The TD texture origin is bottom-left; the
-    shader flips, so all values here are top-left panel px."""
-    rect = view.get("rect") or {}
-    rx, ry = float(rect.get("x", 0)), float(rect.get("y", 0))
-    rw, rh = float(rect.get("w", panel_w)), float(rect.get("h", panel_h))
-    zoom = float(view.get("zoom", 1.0))
-    if not zoom > 0:
-        zoom = 1.0
-    ox = rx + float(view.get("panX", 0))
-    oy = ry + float(view.get("panY", 0))
-    x0, y0 = max(0.0, rx), max(0.0, ry)
-    x1, y1 = min(float(panel_w), rx + rw), min(float(panel_h), ry + rh)
-    return (ox, oy, zoom, 1.0 if zoom < 1.0 else 0.0, x0, y0, max(x0, x1), max(y0, y1))
 
 
 IDENTITY_XF = (0.0, 0.0, 1.0, 1.0)
@@ -963,8 +908,6 @@ class DocNetwork:
         self._input_connected = None   # {input: bool} of the last apply()
         self._declared = {}            # set_inputs(): fallback for inputs whose COMP connector is not readable
         self._scanned = False
-        self._view = None
-        self._view_state = {}
         self._counters = {"created": 0, "destroyed": 0, "par_sets": 0, "connects": 0,
                           "disconnects": 0, "recycled": 0, "applies": 0, "unknown": 0, "forced": 0}
         self._last = {}
@@ -1392,40 +1335,9 @@ class DocNetwork:
             "nodes": len(self._ops), "surfaces": len(self._slots), "pending_destroy": len(self._pending),
             "pool": len(self._pool), "mpool": len(self._mpool), "plan": dict(self._plan_info), "garbage": len(self._garbage), "junk": len(self._junk), "by_type": types, "last_apply_ms": self._last_ms,
             "last": dict(self._last), "totals": dict(self._counters),
-            "view": self._view is not None, "fx_chains": len(self._chains),
+            "fx_chains": len(self._chains),
             "fx_nodes": sum(c.node_count for c in self._chains.values()), "fx_error": self.fx_error,
         }
-
-    # ---- TD-view overlay -----------------------------------------------------------------
-
-    def set_view(self, view, panel_w, panel_h):
-        if view is None:
-            self._view = None
-            return
-        self._ensure_view_nodes()
-        doc_w, doc_h = self._prev_size or (int(panel_w), int(panel_h))
-        u = view_uniforms(view, panel_w, panel_h, doc_w, doc_h)
-        self._view = (view, int(panel_w), int(panel_h))
-        st = self._view_state
-        node = self.comp.op("doc_view")
-        if node is None:
-            return
-        vals = {
-            "outputresolution": "custom", "resolutionw": int(panel_w), "resolutionh": int(panel_h),
-            "inputfiltertype": "mipmap" if u[3] else "nearest",
-            "vec0valuex": u[0], "vec0valuey": u[1], "vec0valuez": u[2], "vec0valuew": u[3],
-            "vec1valuex": u[4], "vec1valuey": u[5], "vec1valuez": u[6], "vec1valuew": u[7],
-        }
-        for k, v in vals.items():
-            if st.get(k) != v:
-                setattr(node.par, k, v)
-                self._counters["par_sets"] += 1
-                st[k] = v
-
-    def panel_view(self):
-        if self._view is None and self.comp.op("panel_view") is None:
-            self._ensure_view_nodes()
-        return self.comp.op("panel_view")
 
     # ------------------------------------------------------------------ node plumbing
 
@@ -2729,40 +2641,6 @@ class DocNetwork:
             self._destroy_op(op)
         else:
             self._garbage.append((op, cache))
-
-    # ------------------------------------------------------------------ view nodes
-
-    def _ensure_view_nodes(self):
-        comp = self.comp
-        if comp.op("view_doc") is None:
-            sel = comp.create("selectTOP", "view_doc")
-            sel.par.top = "doc/out"
-            sel.nodeX, sel.nodeY = -300, -500
-        if comp.op("view_glsl") is None:
-            dat = comp.create("textDAT", "view_glsl")
-            dat.text = VIEW_GLSL
-            dat.nodeX, dat.nodeY = -300, -600
-        if comp.op("doc_view") is None:
-            g = comp.create("glslTOP", "doc_view")
-            g.par.pixeldat = "view_glsl"
-            g.par.vec0name = "uView"
-            g.par.vec1name = "uClip"
-            g.par.format = "rgba8fixed"
-            g.inputConnectors[0].connect(comp.op("view_doc"))
-            g.nodeX, g.nodeY = -100, -500
-            self._view_state = {}
-        if comp.op("panel_view") is None:
-            ov = comp.create("overTOP", "panel_view")
-            web = comp.op("webrender")
-            if web is not None:
-                ov.inputConnectors[0].connect(web)
-            ov.inputConnectors[1].connect(comp.op("doc_view"))
-            ov.nodeX, ov.nodeY = 100, -500
-        ov = comp.op("panel_view")
-        web = comp.op("webrender")
-        if web is not None and not ov.inputConnectors[0].connections:
-            ov.inputConnectors[0].connect(web)
-
 
 _MISSING = object()
 _SPARE_NAME = re.compile(r"^g\d+$")

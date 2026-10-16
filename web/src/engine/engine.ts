@@ -99,6 +99,8 @@ interface ClipNode {
   surface: Surface | null; mask: { surface: Surface; enabled: boolean } | null; spec: TextSpec | ShapeSpec | null; children: ClipNode[] | null;
 }
 
+let epochSeq = 0;
+
 class LayerClipImpl implements LayerClip {
   readonly kind = 'layer-clip' as const;
   released = false;
@@ -209,7 +211,9 @@ export class Engine implements EditorEngine, Host {
   thumbStats = { fx: 0, ms: 0 };
   private rev = 0;
   private liveSpec = false; // a move drag already announced its offsets
-  private docEpoch = 0; // bumped by loadDocument: layer clips remember the document they came from
+  // bumped by loadDocument: layer clips remember the document they came from. Every engine starts in its own range, so a clip made in one
+  // engine (editor tab) is "foreign" in every other one: aux references to layers that were not copied are dropped on paste (DESIGN_V7 §6).
+  private docEpoch = (++epochSeq) * 1_000_000;
   private knownSlots = new Map<number, Surface>(); // slot -> surface last announced
   private freshSlots = new Set<number>(); // slots of just-created empty layers: no 'surface' event needed
   private maskTargetLayer: string | null = null; // layer whose mask is the paint target

@@ -6,10 +6,10 @@ let td: FakeTd;
 test.beforeEach(async () => { td = await FakeTd.start({ w: 160, h: 90 }); });
 test.afterEach(async () => { await td.close(); });
 
-const open = async (page: Page, client: 'panel' | 'external' = 'panel') => {
+const open = async (page: Page) => {
   page.on('console', (m) => { if (process.env.DEBUG_E2E) console.log('[page]', m.type(), m.text()); });
   page.on('pageerror', (e) => { if (process.env.DEBUG_E2E) console.log('[pageerror]', e.message); });
-  await page.goto(`/?test=1&client=${client}&ws=${encodeURIComponent(td.url)}&token=${td.token}`);
+  await page.goto(`/?test=1&ws=${encodeURIComponent(td.url)}#token=${td.token}`);
   await expect(page.locator('[data-tool]').first()).toBeVisible();
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
 };
@@ -112,7 +112,7 @@ test('latency readout fills in from TD applied replies', async ({ page }) => {
 });
 
 test('external client: TD view shows the image served by TD, Local restores the preview', async ({ page }) => {
-  await open(page, 'external');
+  await open(page);
   await td.waitFor(() => td.doc !== null);
   expect(await mainPixel(page, 0.5, 0.5)).not.toEqual([10, 200, 30, 255]);
   await page.locator('[data-view-mode=td]').click();
@@ -134,18 +134,13 @@ test('external client: TD view shows the image served by TD, Local restores the 
   await expect.poll(() => mainPixel(page, 0.5, 0.5)).not.toEqual([250, 200, 30, 255]);
 });
 
-test('panel client: TD view leaves the document rect transparent and reports the viewport to TD', async ({ page }) => {
-  await open(page, 'panel');
+test('TD view reports the viewport to TD and forwards zoom changes', async ({ page }) => {
+  await open(page);
   await td.waitFor(() => td.doc !== null);
   await page.locator('[data-view-mode=td]').click();
   await td.waitFor(() => td.lastView?.mode === 'td');
   expect(td.lastView!.zoom).toBeGreaterThan(0);
   expect(td.lastView!.rect.w).toBeGreaterThan(300);
-  expect(td.viewFetches).toEqual([]); // the panel never pulls /view
-  await expect.poll(() => mainPixel(page, 0.5, 0.5).then((p) => p[3])).toBe(0);
-  const bg = await page.evaluate(() => [getComputedStyle(document.documentElement).backgroundColor, getComputedStyle(document.body).backgroundColor, getComputedStyle(document.querySelector('[data-app-root]')!).backgroundColor]);
-  expect(bg).toEqual(['rgba(0, 0, 0, 0)', 'rgba(0, 0, 0, 0)', 'rgba(0, 0, 0, 0)']);
-  // zoom changes are forwarded
   const z0 = td.lastView!.zoom;
   await page.keyboard.press('1');
   await td.waitFor(() => td.lastView!.zoom !== z0);

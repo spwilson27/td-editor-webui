@@ -17,7 +17,7 @@ const MENUS: MenuDef[] = [
     { label: 'Open Project…', run: (s) => s.openFileDialog('openProject'), enabled: (s) => s.canUseFiles(), title: (s) => s.fileTitle() },
     { label: 'Export PNG…', run: (s) => s.openFileDialog('exportPng'), enabled: (s) => s.canUseFiles(), title: (s) => s.fileTitle() },
     { label: 'Clear stored undo history', run: (s) => void s.clearStoredHistory(), enabled: (s) => s.canUseFiles(), title: (s) => s.fileTitle() ?? 'Removes the undo history TouchDesigner keeps with the document' }, 'sep',
-    { label: 'Place Image…', run: (s) => s.placeImage(), title: (s) => s.placeImageTitle() },
+    { label: 'Place Image…', run: (s) => s.placeImage() },
     { label: 'Import from TouchDesigner…', run: (s) => { s.topDialog.value = true; }, enabled: (s) => s.connection.value === 'linked' }, 'sep',
     { label: 'New layer', run: (s) => s.addLayer() }, { label: 'Flatten to new layer', run: (s) => s.flatten() }] },
   { label: 'Edit', items: [{ label: 'Undo', hint: 'Ctrl+Z', run: (s) => s.undo() }, { label: 'Redo', hint: 'Ctrl+Shift+Z', run: (s) => s.redo() },

@@ -58,9 +58,9 @@ export function Viewport() {
       const e = store.engine;
       setScale(mainCtx);
       const td = store.viewMode.peek() === 'td';
-      // Local: the engine's preview. TD + panel: transparent document rect (TD draws underneath). TD + external: TD's image.
-      const source = !td ? e.compositeSource() : store.clientKind.peek() === 'external' ? store.tdViewSource() : null;
-      drawDocument(mainCtx, backdrop, vw, vh, store.view.peek(), e.width, e.height, source, td && store.clientKind.peek() === 'panel');
+      // Local: the engine's preview. TD: TD's image.
+      const source = !td ? e.compositeSource() : store.tdViewSource();
+      drawDocument(mainCtx, backdrop, vw, vh, store.view.peek(), e.width, e.height, source, false);
     };
     const paintOver = () => {
       overQueued = false;
@@ -198,7 +198,7 @@ export function Viewport() {
     const stopWant = effect(() => { if (store.wantMove.value) { store.setTool('move'); store.wantMove.value = false; } });
     const stopSync = effect(() => { store.syncTool(store.tool.value); });
     const stopFx = effect(() => {
-      store.view.value; store.viewMode.value; store.clientKind.value; store.tdViewTick.value; store.tool.value; store.brush.value; store.spaceHeld.value; store.selectionVersion.value; store.cropBox.value; store.floatVersion.value;
+      store.view.value; store.viewMode.value; store.tdViewTick.value; store.tool.value; store.brush.value; store.spaceHeld.value; store.selectionVersion.value; store.cropBox.value; store.floatVersion.value;
       queueMain(); queueOver();
     });
     // v4 overlay-only inputs: guides, snap lines, the transform box follows the document spec
@@ -537,9 +537,8 @@ export function Viewport() {
   }, []);
 
   const layer = 'position:absolute;left:0;top:0;width:100%;height:100%;display:block';
-  const clear = store.tdPanel.value;
   return (
-    <div ref={host} data-viewport data-td-panel={clear} style={`flex:1 1 auto;min-height:0;position:relative;overflow:hidden;background:${clear ? 'transparent' : '#1c1c1c'};touch-action:none`}>
+    <div ref={host} data-viewport style="flex:1 1 auto;min-height:0;position:relative;overflow:hidden;background:#1c1c1c;touch-action:none">
       <canvas ref={main} style={layer} />
       <canvas ref={over} style={layer + ';pointer-events:none'} />
       {store.textEdit.value && <TextEditor />}

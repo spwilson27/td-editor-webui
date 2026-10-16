@@ -48,7 +48,6 @@ beforeEach(async () => {
   engine = freshEngine(200, 100);
   store.textEdit.value = null;
   store.viewMode.value = 'local';
-  store.clientKind.value = 'external';
   store.setTool('text');
   await mount(<Viewport />, 'display:flex;flex-direction:column;width:600px;height:400px');
 });
@@ -165,7 +164,6 @@ describe('text tool: inline editor', () => {
     await click(10, 10);
     expect(getComputedStyle(editor()!).color).toBe('rgba(0, 0, 0, 0)'); // local view: engine renders the glyphs
     store.setConnection('linked');
-    store.clientKind.value = 'panel';
     store.setViewMode('td');
     await settle();
     expect(editor()).toBeTruthy();

@@ -10,7 +10,7 @@ const open = async (page: Page, opts: Parameters<typeof FakeTd.start>[0] = { w: 
   td = await FakeTd.start(opts);
   prep?.(td);
   page.on('pageerror', (e) => { throw e; });
-  await page.goto(`/?test=1&client=panel&ws=${encodeURIComponent(td.url)}&token=${td.token}`);
+  await page.goto(`/?test=1&ws=${encodeURIComponent(td.url)}#token=${td.token}`);
   await expect(page.locator('[data-tool]').first()).toBeVisible();
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   await td.waitFor(() => td.doc !== null);
@@ -126,42 +126,6 @@ test('rotation and skew round trip through the stored document', async ({ page }
   await page.reload();
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   await expect.poll(async () => (await layers(page)).find((l) => l.id === id)?.transform).toMatchObject({ x: 5, y: 6, sx: 1.5, rot: 30, kx: 10, ky: -5 });
-});
-
-// Panel clients have no file input: TD shows the chooser (chooseFile / fileChosen). Needs the testHook methods
-// `placeImageViaTd` and `chooseFile` (store.bridge.placeImageViaTd / chooseFile).
-test.describe('panel-mode file chooser through TD', () => {
-  test('Place Image: the chosen file arrives as a pixel layer named after it; cancel adds nothing', async ({ page }) => {
-    await open(page);
-    const before = (await layers(page)).length;
-    const id = await hook<string | null>(page, 'placeImageViaTd');
-    expect(id).toBeTruthy();
-    expect(td.chooseRequests[td.chooseRequests.length - 1]).toMatchObject({ t: 'chooseFile', purpose: 'placeImage' });
-    const added = (await layers(page)).find((l) => l.id === id);
-    expect(added).toMatchObject({ name: expect.stringContaining('picked-photo.png') });
-    expect((await layers(page)).length).toBe(before + 1);
-    expect(td.topFetches.length).toBe(1);
-
-    td.choice.placeImage = null;
-    expect(await hook<string | null>(page, 'placeImageViaTd')).toBeNull();
-    expect((await layers(page)).length).toBe(before + 1);
-    expect(td.topFetches.length).toBe(1);
-  });
-
-  test('Place Image rejects with the topError text', async ({ page }) => {
-    await open(page);
-    td.placeFails = 'Cannot read image';
-    const msg = await page.evaluate(() => (window as any).__editorTest.placeImageViaTd().then(() => 'ok', (e: Error) => e.message));
-    expect(msg).toBe('Cannot read image');
-  });
-
-  test('chooseFile returns the picked path or null', async ({ page }) => {
-    await open(page);
-    expect(await hook<string | null>(page, 'chooseFile', 'openProject')).toBe('/tmp/chosen.redoc');
-    td.choice.exportPng = null;
-    expect(await hook<string | null>(page, 'chooseFile', 'exportPng')).toBeNull();
-    expect(td.chooseRequests.map((r) => r.purpose)).toEqual(['openProject', 'exportPng']);
-  });
 });
 
 test('a hello input missing from TD\'s stored document: the layer the page creates at load completion reaches TD (real engine)', async ({ page }) => {

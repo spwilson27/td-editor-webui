@@ -3,106 +3,91 @@
 Target: TouchDesigner 2025.32820 (Python 3.11, numpy available). Verified API notes are
 at the end; check anything else against the live TD through `scripts/td_call.py`.
 
-## 1. Network inside the COMP
+## 1. Network inside the COMP (v8)
 
-`raster_editor` is a **containerCOMP** with one TOP input and one TOP output.
+`raster_editor` is a **containerCOMP** with one TOP input (more spare ones appear as you connect) and one TOP output. It carries the
+tag `rasterEditor`. **The COMP's viewer shows its output TOP** (`par.top = ./out1`); there is no editor UI inside TD: editing happens in an
+external browser (**Open in Browser**). Every editor is complete and can be the project master (docs/DESIGN_V8.md).
 
 | Operator | Type | Role |
 | --- | --- | --- |
-| `in1` | inTOP | the COMP's single input. May be unconnected. |
-| `out1` | outTOP | the COMP's single output, fed by `out_switch` |
-| `out_switch` | switchTOP | index 0 = `in1` passthrough (until the first composite arrives, or when `Active` is off); index 1 = `composite` |
-| `composite` | scriptTOP | receives the flattened document from the web app; callbacks DAT `composite_callbacks` copies the extension's numpy buffer when dirty |
-| `webserver` | webserverDAT | binds 127.0.0.1:`Port`, serves `ui_html` at `/` and `/index.html`, `404` elsewhere, hosts WebSocket at `/ws`; callbacks DAT `webserver_callbacks` delegate to the extension |
-| `webrender` | webrenderTOP | loads `http://127.0.0.1:<Port>/?client=panel` (or `Devurl`), resolution = COMP `w`×`h`, DPI 1, `alwayscook` on; it is the COMP's **background TOP** so the panel shows the UI |
-| `panel_exec` | panelexecuteDAT | watches panel values `u v lselect mselect rselect wheel` (`panelvalue` par) and forwards them to `webrender.interactMouse`; button state comes from the on/off *edges* (a fast click flips a button twice in one frame) |
-| `keyboard` + `keyboard_callbacks` | keyboardinDAT + its callbacks | forwards keys to `webrender.sendKey` only while this COMP's panel has focus |
-| `frame_exec` | executeDAT | `onFrameStart` → `ext.Pump()`; `onStart/onCreate` → `ext.Start()`; `onExit` → `ext.Stop()` |
-| `par_exec` | parameterexecuteDAT | reacts to the custom parameters below (its `op` par must point at the COMP; callbacks arrive a frame later, not synchronously) |
-| `RasterEditorExt` | textDAT | extension class (from `td/raster_editor/ext.py`) |
-| `protocol`, `frames` | textDAT | python modules (from `td/raster_editor/*.py`), imported by the extension via `op('protocol').module` |
-| `ui_html` | textDAT | the built single-file web app (`dist/ui/index.html`) |
+| `in1`..`in8` | inTOP | the COMP's inputs (names are kept by Upgrade All Editors) |
+| `out1` | outTOP | the COMP's output, fed by `out_switch` |
+| `out_switch` | switchTOP | index 0 = `in1` passthrough (inactive / nothing applied), index 1 = `doc_out` |
+| `doc`, `doc_state` | baseCOMP, textDAT | the generated document network (locked surface Script TOPs) and the stored document: **data children**, survive a rebuild / upgrade (`registry.DATA_CHILDREN`) |
+| `webserver` | webserverDAT | **active only on the master editor** (port from `Port`, falling back to the next free one up to +50); callbacks delegate to the extension, which routes by `editor=<id>` |
+| `frame_exec` | executeDAT | `onFrameStart` -> `ext.Pump()`; `onStart/onCreate` -> `ext.Start()`; `onExit` -> `ext.Stop()`; project pre/post save -> Freeze/Thaw |
+| `par_exec` | parameterexecuteDAT | custom parameters -> `ext.OnParChange` (callbacks arrive a frame later) |
+| `RasterEditorExt` | textDAT | extension (`td/raster_editor/ext.py`): per-editor session + master router |
+| `protocol`, `frames`, `registry`, `upgrade`, `network`, `effects` | textDAT | python modules (`op('registry').module` ...) |
+| `ui_html` | textDAT | the built single-file web app, served by the master |
 
-The extension class is `RasterEditorExt` and is promoted, so other networks call e.g.
-`op('raster_editor').GetStatus()`, `.GetStats()`, `.Pump()` (or `op(...).ext.RasterEditorExt`).
-Callback DATs delegate with `parent().OnHTTPRequest(...)`, `.OnWebSocketText(...)` etc.
+The Web Render TOP, the panel mouse / keyboard forwarding (`panel_exec`, `keyboard`) and the panel TD-view overlay of v0.7 are gone.
 
-The container's panel shows the Web Render TOP as its background (`par.top = './webrender'`).
-**The panel background is not enough to keep it alive**: a Web Render TOP that nothing pulls
-never loads its page (the editor would not even connect), and `alwayscook` does not change
-that. When no pane shows the COMP, `Pump` therefore forces a cook of `webrender` whenever its
-`totalCooks` did not advance since the last frame (`_keep_panel_cooking`); when a viewer
-pulls it, nothing extra is done. A forced cook with no new browser frame costs ~3 µs.
-(Careful when debugging: reading `.width`/`.numpyArray()` of an unpulled TOP cooks it and
-hides the problem; compare `cookAbsFrame` with `absTime.frame` instead.)
+**Runtime-created child operators** (anything the extension creates while running, e.g. `_imp_sel*`, `_imp_res*`, `_imp_mov*`,
+`_font_probe_tmp`) must (1) start with `_` and (2) be tagged `reRuntime`: Upgrade All Editors never copies such operators into
+a target. `doc` and `doc_state` are preserved, `in<N>` / `out<N>` keep their names.
 
 ## 2. Custom parameters (page "Raster Editor")
 
 | Name | Type | Default | Behaviour |
 | --- | --- | --- | --- |
-| `Active` | toggle | on | off → server stopped, output = input passthrough |
-| `Port` | int | 9980 | Web Server DAT port; changing restarts the server and reloads `webrender` |
-| `Docsizemode` | menu | Follow Input | `input` (Follow Input): document = input size (`Docw`x`Doch` with no input); `fixed`: always `Docw`x`Doch` (§8) |
-| `Docw`, `Doch` | int | 1920, 1080 | document size when `Docsizemode` is Fixed, or Follow Input with no input |
-| `Premultiplied` | toggle | on | treat TD TOP data as premultiplied alpha (unpremultiply input, premultiply output) |
-| `Maxsendfps` | int | 30 | sent to the web app in `hello` |
-| `Maxinputfps` | int | 30 | max BASE frame rate for time-dependent inputs |
-| `Devurl` | str | "" | when set, `webrender` loads this URL with `?ws=ws://127.0.0.1:<Port>/ws&client=panel` (Vite dev server workflow) |
-| `Panelquery` | str | "" | extra query string appended to the panel URL, e.g. `test=1` (installs `window.__editorTest`; it also enables the test-only `POST /__test` back-channel, see §5) |
-| `Exportpath` | file | "" | target of `Exportdoc`; empty = `raster_editor_export.tox` in the project folder (§8) |
-| `Exportdoc` | pulse | | **Export with Document** (§8); replaces the old `Savetox` |
-| `Openbrowser` | pulse | | opens `http://127.0.0.1:<Port>/?client=external&token=<token>` in the system browser |
-| `Reloadui` | pulse | | reloads `webrender` |
-| `Status` | str (read-only) | | e.g. `panel active · 1920×1080 · 24 fps out` |
+| `Version` | str (read-only) | build | semver of the build, stamped by `build_component.py` (`VERSION`) |
+| `Active` | toggle | on | off: this editor's browser tabs are disconnected, output = input passthrough; if it was the master another active editor takes over the server |
+| `Port` | int | 9980 | **master only**: the project web server's port; busy -> next free (up to +50, shown in `Status`); a slave ignores it; changing it on the master restarts the server |
+| `Docsizemode` | menu | Follow Input | `input` / `fixed` (§8) |
+| `Docw`, `Doch` | int | 1920, 1080 | document size when Fixed, or Follow Input with no input |
+| `Premultiplied` | toggle | on | TD data is premultiplied alpha |
+| `Maxsendfps`, `Maxinputfps`, `Maxviewfps` | int | 30 | rate limits (§3) |
+| `Viewmode` | menu (read-only) | Local | the active browser tab's view mode |
+| `Devurl` | str | "" | developer: Open in Browser opens this URL (a Vite dev server) with `ws=ws://127.0.0.1:<Port>/ws` instead of the built-in page |
+| `Openbrowser` | pulse | | **Open in Browser**: with a live master the browser opens the master's page with this editor's tab (`http://127.0.0.1:<Port>/#token=<token>&e=<editorId>`); otherwise this editor becomes the master first |
+| `Upgradeall` | pulse | | **Upgrade All Editors** (`upgrade.upgrade_all`): replaces every older editor of the project with this build; summary in `Status` |
+| `Exportpath`, `Exportdoc` | file, pulse | | Export with Document (§8) |
+| `Projectfile`, `Saveproject`, `Openproject`, `Pngfile`, `Exportpng` | | | project / PNG files (§9) |
+| `Status` | str (read-only) | | e.g. `master :9980 · external active · 1920x1080 ...` or `slave of raster_editor · ...` |
 
-COMP `w`/`h` (Layout page) define the UI resolution; default 1280×800.
+Removed in v8: `Panelquery` (the validation back channel `POST /__test` / `testPath` is enabled by COMP storage `reTest`, and the
+test page URL carries `?test=1`) and `Reloadui` (it reloaded the in-TD panel; an external browser tab reloads itself).
 
 ## 3. Extension behaviour (`RasterEditorExt`)
 
-Keep TD glue thin. All pixel math lives in `frames.py`, all byte layout in
-`protocol.py`; both are pure python + numpy and fully unit tested without TD.
+Keep TD glue thin. All pixel math lives in `frames.py`, all byte layout in `protocol.py`.
 
-- **Security**: the Web Server DAT has no bind-address parameter (it listens on all interfaces), so the
-  extension refuses non-loopback peers (`clientAddress`, WebSocket peer) and HTTP requests whose `Host`
-  is not loopback (DNS rebinding). Every `ready` must carry the per-start `token` that is put in the
-  panel URL and in the **Open in Browser** URL (docs/PROTOCOL.md). `POST /__test` exists only when
-  `Panelquery` has the exact parameter `test=1`; bodies are capped at 64 KB.
-- **State**: clients `{id: {kind, active}}`, active client id, `doc_w/doc_h/has_input`,
-  output buffer `np.uint8[h, w, 4]` in **TD order** (bottom row first, premultiplied if
-  `Premultiplied`), `dirty` flag, `got_composite` flag, last input signature, timing stats.
-- **Web server callbacks**: HTTP GET `/` → `ui_html.text` (or 404), `GET /base` → the stored BASE frame; WS open → register;
-  WS text → JSON dispatch (`ready`, `takeover`, `requestBase`, `log`); WS binary →
-  `protocol.decode_frame` → `frames.paste_band(buffer, x, y, w, h, payload, premultiply)` →
-  on `FRAME_END` set `dirty`, `got_composite` (the Pump then does one `composite.cook(force=True)`
-  per frame, so several FRAME_ENDs in one frame cost a single 8 MB upload);
-  WS close → unregister; if it was active, promote the most recent remaining client.
-- **Script TOP `onCook`**: always `scriptOp.copyNumpyArray(buffer)` (the Script TOP only cooks when
-  forced by the Pump or on first load) and clear `dirty`. The buffer is reused, never reallocated
-  except on resize.
-- **Pump (each frame start)**:
-  - doc size = `in1` size if connected else `Docw×Doch`; if changed → reallocate buffer,
-    `docSize` to all clients, mark base resend.
-  - input change detection: connected and `in1.totalCooks` advanced (`in1.cook()` first, which
-    is a no-op when clean); rate-limit by `Maxinputfps` (trailing edge is never lost); no
-    readback while no client is ready. Readback is the two-step `in1.numpyArray(delayed=True)`
-    (first call issues the GPU read and returns None, the next returns it: no stall).
-    `frames.WireConverter.convert_rows` then converts ≤ 4 ms of rows per pump (flip to
-    top-left, float→uint8, unpremultiply; 1080p ≈ 27 ms total). The finished image is published as
-    one immutable `bytes` BASE message (`protocol.encode_message`, one copy, ~3 ms for 1080p) that
-    `GET /base` serves, and each client gets a tiny `base` notice (at most one un-fetched notice per
-    client; no fetch for 10 s → stalled, no more notices; docs/PROTOCOL.md §4). Nothing large is ever
-    written to a WebSocket. New clients, `requestBase` and resizes re-notify from the stored frame.
-  - each Pump step (module check, panel keep-alive, mouse flush, doc size, input, notify, cook, switch) is
-    isolated: one failing step is reported and the others still run;
-  - update `Status`, `out_switch.par.index` (`Active` off → index 0, composite forgotten).
-- **Mouse**: `interactMouse(u, v, left=..., middle=..., right=..., wheel=...)` with the
-  panel's `u`,`v` **unchanged** — both the panel and `interactMouse` use a bottom-left
-  origin (verified with `comp.click()` on a tool button; passing `1 - v` mirrors clicks).
-- **Keyboard**: `keyboard` (Keyboard In DAT, `panels` = this COMP so it only fires while the panel has
-  focus) → `onKey(dat, keyInfo)` → `sendKey(key, char=, shift=, alt=, ctrl=, cmd=)`; key-down only,
-  modifier-only keys skipped.
-- Exceptions inside callbacks are caught, printed once per distinct message, and
-  shown in `Status`; they never escape into TD's callback machinery repeatedly per frame.
+- **Session** (every editor): the per-editor protocol state (clients, document, surfaces, TOP requests, notices, history) is transport
+  agnostic: `_ws_open/_ws_text/_ws_binary/_ws_close` and `_session_http`. It sends through the master's Web Server DAT.
+- **Master router** (`OnHTTPRequest`, `OnWebSocket*`; only the master's callbacks fire): serves `/` and `GET /editors?token=` and routes
+  everything else by `editor=<id>` (missing = the master's own editor) with a dict lookup (O(1) per message). An unknown / inactive
+  editor: HTTP 404 `{"error":"no such editor"}`; a WebSocket gets `{"t":"gone"}` and is closed (the Web Server DAT cannot close with
+  code 4404; the page treats `gone` plus the close like 4404). `editors` is pushed to every open page when the list changes.
+- **Master record** (root storage `rasterEditorMaster`: path, id, port, token, orphan, failed, hold): found and validated (`_live_master`) by Open in
+  Browser, the failover and project load. The project token belongs to the master and is inherited by the next master.
+- **Election**: Open in Browser on any editor: live master -> open its page; else this editor becomes master (`BecomeMaster`).
+  **Project load**: only the editor named in the record resumes as master (same port, same token). **Failover** (delete -> `onDestroyTD`,
+  `Active` off, server failing in `_check_server`, or a slave's health check every 2 s): the next active editor in path order takes over
+  on the same port (it waits up to 3 s for the old server to release it). No active editor left -> the server stops and the record is
+  marked `orphan`; the first editor activated again resumes. A slave costs one timestamp compare per frame.
+  Ports: an election uses `Port` (then +1 .. +50); **project-load resume tries the configured `Port` first, then the record's**; a
+  failover or an in-place upgrade / rebuild keeps the record's port (the record's `hold`, written by `PrepareUpgrade()` / `Stop()`,
+  tells everybody - also the NEW extension instance - that the master is only restarting). Open in Browser during such a takeover joins
+  it (opens the record's port) instead of starting a second server. A project with no free port backs off (10 s, three tries) instead
+  of retrying every frame. `_check_server` counts only "not active" and bind-class errors as failures, restarts on the record's port
+  if it is free (else the next free one) and, after three failures, hands over; the failed editor is remembered in the record
+  (`failed`) so a successor with the same error is not handed back to. The master's editor list is polled every 5 s (renames); create /
+  delete / Active / Start are event driven; an editor that is not started is neither listed nor routable, and no list is published by a
+  master that has not rescanned since it (re)started. Stopping a server closes its WebSockets first (switching the DAT off does not
+  reliably close them).
+- **Identity**: the `editorId` is kept in COMP storage and survives undo of a delete, cut / paste, a .tox saved and loaded after the
+  original is gone, and project load. A copy / paste / duplicate / loaded .tox of a LIVE editor carries the id of a second live editor:
+  the newcomer takes a new id (`was_copied`), adopts the original's pixels while it runs and otherwise shows "copied without pixels".
+- **Upgrade hooks** (called by `upgrade.py`): `PrepareUpgrade()` (flush the document, keep the master role for 15 s), `Freeze()`, `Stop()`,
+  `Start()` (idempotent; a master resumes with the same port / token), `OnEditorsChanged()` (refresh list + election).
+- **Pump (each frame start)**: module check, router tick, doc size, hints, input / output / layer previews, notices, TOP requests,
+  surfaces, files, replay, network, doc state, switch.
+- Exceptions inside callbacks are caught, printed once per distinct message and shown in `Status`.
+
+*Sections 5 onwards describe earlier protocol versions; wherever they mention the panel, the Web Render TOP, `Panelquery` or
+`Reloadui`, read the v8 rules above.*
 
 ## 4. Build & install
 

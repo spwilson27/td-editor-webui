@@ -5,7 +5,7 @@ import { FakeTd } from './fakeTd';
 let td: FakeTd;
 test.afterEach(async () => { await td.close(); });
 
-const url = (td: FakeTd) => `/?test=1&client=panel&ws=${encodeURIComponent(td.url)}&token=${td.token}`;
+const url = (td: FakeTd) => `/?test=1&ws=${encodeURIComponent(td.url)}#token=${td.token}`;
 const open = async (page: Page, opts: Parameters<typeof FakeTd.start>[0] = { w: 160, h: 90 }, prep?: (t: FakeTd) => void) => {
   td = await FakeTd.start(opts);
   prep?.(td);
@@ -22,7 +22,7 @@ const pixelLayer = async (page: Page) => (await layers(page)).find((l) => l.kind
 
 test('protocol 7 hello, activeLayer follows the active layer', async ({ page }) => {
   await open(page);
-  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 9 });
+  expect(td.messages[0]).toMatchObject({ t: 'ready', protocol: 10 });
   const id = await hook<string>(page, 'addLayer');
   await td.waitFor(() => td.activeLayers.includes(id));
   const other = (await layers(page)).find((l) => l.id !== id)!.id;
@@ -40,7 +40,7 @@ test('filter effect round trip: TD stores it verbatim and a fresh page gets it b
   const stored = td.doc!.layers.find((l) => l.id === id)!.effects as any[];
   expect(stored[0]).toMatchObject({ type: 'unsharp', enabled: true, amount: 180, radius: 7, threshold: 0 });
   expect(stored[1].stops).toEqual([{ pos: 0, color: { r: 0, g: 0, b: 0, a: 255 } }, { pos: 1, color: { r: 255, g: 255, b: 255, a: 255 } }]);
-  await page.goto(url(td));
+  await page.reload();
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   await expect.poll(async () => ((await layers(page)).find((l) => l.id === id)?.effects ?? []).map((e: any) => e.type)).toEqual(['unsharp', 'gradientMap']);
   expect(((await layers(page)).find((l) => l.id === id)!.effects[0] as any).amount).toBe(180);
@@ -51,7 +51,7 @@ test('adjustment layer reaches TD as an FX stack (effects[]) and survives a relo
   const id = await hook<string>(page, 'addFilterAdjustment', 'posterize', { levels: 5 });
   await td.waitFor(() => !!td.doc?.layers.find((l) => l.id === id && l.kind === 'adjustment' && (l.effects as any[])[0]?.type === 'posterize'));
   expect(td.doc!.layers.find((l) => l.id === id)!.effects).toMatchObject([{ type: 'posterize', enabled: true, levels: 5 }]); // v8: the FX stack is the adjustment
-  await page.goto(url(td));
+  await page.reload();
   await expect.poll(async () => (await layers(page)).find((l) => l.id === id)?.effects?.[0]?.levels).toBe(5);
   await expect(page.locator(`[data-layer="${id}"]`)).toBeVisible();
 });
@@ -80,7 +80,7 @@ test('undo history is uploaded to TD (rev of the stored document) and persists a
   const px = await hook<number[]>(page, 'readPixel', 60, 20);
   expect(px[0]).toBeGreaterThan(200);
 
-  await page.goto(url(td));
+  await page.reload();
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   await td.waitFor(() => td.historyGets.some((g) => g.status === 200));
   await expect.poll(async () => (await hook<{ length: number }>(page, 'history')).length, { timeout: 8000 }).toBe(before.length);
@@ -96,7 +96,7 @@ test('history is not restored for a different revision of the document (empty hi
   await hook(page, 'addLayer');
   await td.waitFor(() => td.historyBlob !== null, 8000);
   td.historyBlob = { ...td.historyBlob!, rev: td.historyBlob!.rev + 100 };
-  await page.goto(url(td));
+  await page.reload();
   await td.waitFor(() => td.historyGets.length > 0);
   await page.waitForTimeout(500);
   expect((await hook<{ length: number }>(page, 'history')).length).toBeLessThanOrEqual(1);
@@ -165,7 +165,7 @@ test('brush presets saved in the document reach TD and come back after a reload'
   expect(key).toMatch(/^doc:/);
   await td.waitFor(() => (td.doc?.brushPresets?.length ?? 0) === 1);
   expect(td.doc!.brushPresets![0]).toMatchObject({ name: 'Stars in file', tip: 'star', dynamics: { scatter: 1.5, scatterCount: 3, seed: 5 } });
-  await page.goto(url(td));
+  await page.reload();
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   await expect.poll(async () => (await hook<any[]>(page, 'brushPresets')).filter((p) => p.source === 'document').map((p) => p.name)).toEqual(['Stars in file']);
   await page.locator('[role=tab]', { hasText: 'Brushes' }).click();
@@ -177,7 +177,7 @@ test('user presets live in this browser only (localStorage), not in TD', async (
   await hook(page, 'saveBrushPreset', 'Only mine', 'user');
   await page.waitForTimeout(300);
   expect(td.doc?.brushPresets ?? []).toEqual([]);
-  await page.goto(url(td));
+  await page.reload();
   await expect.poll(async () => (await hook<any[]>(page, 'brushPresets')).filter((p) => p.source === 'user').map((p) => p.name)).toEqual(['Only mine']);
 });
 
@@ -187,7 +187,7 @@ test('big document notice is suggested, not automatic', async ({ page }) => {
   expect(await hook(page, 'setViewMode', 'local')).toBe('local');
   await page.locator('[data-bigdoc-dismiss]').click();
   await expect(page.locator('[data-bigdoc-notice]')).toHaveCount(0);
-  await page.goto(url(td));
+  await page.reload();
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   await expect(page.locator('[data-bigdoc-notice]')).toHaveCount(0);
 });

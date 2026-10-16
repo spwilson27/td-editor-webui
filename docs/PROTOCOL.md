@@ -355,3 +355,26 @@ Further v5 details (TD implementation):
 - **Mask resampling.** When an input changes resolution the page stretches that input layer's mask to the new surface size (also those
   restored by undo / redo) and re-sends the mask slot as a full `SURFACE` upload; the new size also appears in the next `doc` (`surfaceW/H`).
   Group masks are document sized: a canvas resize or Follow Input reallocates them and re-sends them the same way.
+
+## 12. Version 10 additions (DESIGN_V8): multiple editors per project
+
+- `ready.protocol` = 10. The `client: "panel"` value is gone (no in-TD panel); every client is `"external"`.
+- **One server per project** (the master editor's). Every per-editor request carries `editor=<editorId>`:
+  - WebSocket: `ws://127.0.0.1:<Port>/ws?editor=<editorId>` (one connection per open editor tab; the page has one).
+  - HTTP: all existing per-editor routes (`/base`, `/surface`, `/view`, `/top`, `/layer`, `/history`, …) take
+    `&editor=<editorId>` next to `token` / `client`. An unknown or inactive editor → `404` (`{"error":"no such editor"}`);
+    WebSocket upgrade for one → TD sends the text message `{"t":"gone"}` and closes the socket (the Web Server DAT cannot
+    close with code `4404`; a client treats `gone` — and the older `error` "no such editor" — followed by a close, or a close with
+    code `4404`, as "this editor does not exist": it must not reconnect to the same editor).
+  - Missing `editor` → the master's own editor (keeps older URLs and bookmarks working).
+- **Editor list**: `GET /editors?token=` → `200` JSON `{ "master": <editorId>, "editors": [ {id, name, path, version,
+  active} … ] }` (project order = path order). Every open WebSocket also receives text message
+  `editors { master, editors: [...] }` on connect and whenever the list changes (create / delete / rename / active /
+  version / master change).
+- **Page URL**: `http://127.0.0.1:<Port>/#token=<token>&e=<editorId>`; `Open in Browser` on a slave opens the master's
+  URL with its own `editorId`. Switching tabs changes `e` (no reload of the page).
+- **Token**: one per project, owned by the master and inherited by the next master on failover (so open pages
+  reconnect without a new token).
+- **Failover / reconnect**: a page whose WebSocket closes keeps retrying the same URL (existing backoff); after a
+  failover the new master serves the same port and token, the page reconnects and re-requests its editor's document
+  (`requestDoc`). If its editor no longer exists the page switches to the master's editor with a notice.

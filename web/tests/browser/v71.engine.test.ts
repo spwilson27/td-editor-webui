@@ -664,3 +664,26 @@ describe('v7.1 copy / paste: review follow-ups', () => {
     expect(e2.history().entries.length).toBe(0);
   });
 });
+
+describe('v10: layer clipboard across editor tabs', () => {
+  it('a clip outlives its engine and pastes into another engine as a foreign document (aux refs to layers that were not copied are dropped, pixels kept)', () => {
+    const e1 = mk();
+    const src = patterned(e1, 'Src');
+    const tgt = patterned(e1, 'Tgt', 2);
+    e1.setEffects(tgt, [fx('displace', { source: 'aux', auxSource: `layer:${src}`, strengthX: 8, strengthY: 4, edge: 'clamp' })]);
+    const before = surf(e1, slotOf(e1, tgt));
+    const clip = e1.copyLayers([tgt]);
+    expect(clip.count).toBe(1);
+    engines.splice(engines.indexOf(e1), 1);
+    e1.dispose(); // the tab switch ends the engine
+    const e2 = mk();
+    const own = patterned(e2, 'Own'); // ids in two engines collide: the dropped ref must not point at this one
+    void own;
+    const [n] = e2.pasteLayers(clip, null, 0);
+    expect(info(e2, n).name).toBe('Tgt copy');
+    expect((info(e2, n).effects[0] as unknown as { auxSource?: unknown }).auxSource).toBeUndefined();
+    expect(surf(e2, slotOf(e2, n))).toEqual(before);
+    e2.releaseClip(clip);
+    expect(clip.count).toBe(0);
+  });
+});

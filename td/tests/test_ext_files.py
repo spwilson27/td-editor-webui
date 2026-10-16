@@ -586,12 +586,12 @@ def test_choose_file_one_pending_dialog_per_client(tmp_path):
     assert asked == ["openProject"] and chosen(e, a)[-1]["requestId"] == "c1"
 
 
-def test_test_path_stub_needs_panelquery_test_1():
-    e, a, asked = choose_env("REAL", Panelquery="")
+def test_test_path_stub_needs_the_test_flag():
+    e, a, asked = choose_env("REAL")
     e.send(a, {"t": "chooseFile", "requestId": "c1", "purpose": "exportPng", "testPath": "/stub"})
     e.pump(2)
     assert asked == ["exportPng"] and chosen(e, a)[-1]["path"] == "REAL"       # ignored without test=1
-    e.o.par.Panelquery.val = "test=1"
+    e.o.storage["reTest"] = 1
     e.send(a, {"t": "chooseFile", "requestId": "c2", "purpose": "exportPng", "testPath": "/stub"})
     e.pump(2)
     assert asked == ["exportPng"] and chosen(e, a)[-1] == {"t": "fileChosen", "requestId": "c2", "path": "/stub"}   # no dialog opened

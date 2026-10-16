@@ -8,11 +8,11 @@ import { FakeTd } from './fakeTd';
 let td: FakeTd;
 test.afterEach(async () => { await td.close(); });
 
-const url = (client = 'panel') => `/?test=1&client=${client}&ws=${encodeURIComponent(td.url)}&token=${td.token}`;
-const open = async (page: Page, client: 'panel' | 'external' = 'panel') => {
+const url = () => `/?test=1&ws=${encodeURIComponent(td.url)}#token=${td.token}`;
+const open = async (page: Page) => {
   td = await FakeTd.start({ w: 160, h: 90, hasInput: true });
   page.on('pageerror', (e) => { throw e; });
-  await page.goto(url(client));
+  await page.goto(url());
   await expect(page.locator('[data-tool]').first()).toBeVisible();
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
   await td.waitFor(() => td.doc !== null);
@@ -172,7 +172,7 @@ test.describe('guides', () => {
     await hook(page, 'addGuide', 'v', 70);
     await td.waitFor(() => td.doc!.guides.h.length === 1 && td.doc!.guides.v.length === 1);
     expect(td.doc!.guides).toEqual({ h: [30], v: [70] });
-    await page.goto(url());
+    await page.reload();
     await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
     await expect.poll(() => hook<any>(page, 'guides')).toEqual({ h: [30], v: [70] });
     expect(td.requestDocs).toBeGreaterThan(0); // a fresh page loads TD's document

@@ -44,7 +44,7 @@ const spec = (over: Partial<LayerSpec> & { id: string }): LayerSpec => ({
 const tdLayers: LayerSpec[] = [spec({ id: 'base', kind: 'input', input: 1 }), spec({ id: 'p1', slot: 1 })];
 const docState = (rev = 7, layers = tdLayers): TdMessage => ({ t: 'docState', rev, layers, docW: 64, docH: 48, guides: { h: [], v: [] }, canvas: { mode: 'input' } });
 const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({
-  t: 'hello', protocol: 9, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
+  t: 'hello', protocol: 10, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
 });
 const dump = (slot: number, w: number, h: number, v: number) =>
   encodeBands({ type: FRAME_SURFACE_DUMP, slot, frameId: 1, docW: w, docH: h, rect: { x: 0, y: 0, w, h }, pixels: new Uint8Array(w * h * 4).fill(v), maxPayload: 1 << 30 }).next().value as Uint8Array;
@@ -84,7 +84,7 @@ function start(prep?: (e: FakeEngine) => void) {
   prep?.(engine);
   status = makeStatus();
   fm = new FetchMock();
-  bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 'tok-123', WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, fetch: fm.fn, raf });
+  bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', token: 'tok-123', WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, fetch: fm.fn, raf });
 }
 const connect = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}) => { sock().open(); sock().tell(hello({ doc: { w: engine.width, h: engine.height }, ...over })); };
 /** A fresh page loads TD's stored document `rev` (one surface slot) and the load completes; the GET /history request is then pending. */
@@ -100,10 +100,10 @@ beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(100000); FakeSocket.all 
 afterEach(() => { bridge?.dispose(); vi.useRealTimers(); });
 
 describe('v7: protocol and activeLayer', () => {
-  it('speaks protocol 9 and rejects a v7 hello', () => {
+  it('speaks protocol 10 and rejects a v7 hello', () => {
     start();
     sock().open();
-    expect(sock().json()[0]).toMatchObject({ t: 'ready', protocol: 9 });
+    expect(sock().json()[0]).toMatchObject({ t: 'ready', protocol: 10 });
     sock().tell(hello({ protocol: 7 }));
     expect(status.notices.at(-1)).toMatch(/Protocol mismatch/);
   });
@@ -660,25 +660,6 @@ describe('v7: review fixes', () => {
     await flush();
     expect(status.cleared).toBe(cleared + 1);
     expect(engine.layerPreviews.get('L1')).toBeNull();
-  });
-
-  it('readTextFile: chooseFile readText with fileTypes; resolves {path,text}, null on cancel, rejects with TD\'s error', async () => {
-    start();
-    connect();
-    await flush();
-    const p = bridge.readTextFile(['cube']);
-    const req = sock().json().find((m) => m.t === 'chooseFile') as Extract<WebMessage, { t: 'chooseFile' }>;
-    expect(req).toMatchObject({ purpose: 'readText', fileTypes: ['cube'] });
-    sock().tell({ t: 'fileChosen', requestId: req.requestId, path: '/a/b.cube', text: 'LUT_3D_SIZE 2' });
-    await expect(p).resolves.toEqual({ path: '/a/b.cube', text: 'LUT_3D_SIZE 2' });
-    const c = bridge.readTextFile();
-    const r2 = sock().json().filter((m) => m.t === 'chooseFile')[1] as Extract<WebMessage, { t: 'chooseFile' }>;
-    sock().tell({ t: 'fileChosen', requestId: r2.requestId, path: null });
-    await expect(c).resolves.toBeNull();
-    const e = bridge.readTextFile(['cube']);
-    const r3 = sock().json().filter((m) => m.t === 'chooseFile')[2] as Extract<WebMessage, { t: 'chooseFile' }>;
-    sock().tell({ t: 'fileChosen', requestId: r3.requestId, path: '/x', error: 'file is larger than 12 MB' });
-    await expect(e).rejects.toThrow('12 MB');
   });
 });
 

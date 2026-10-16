@@ -4,7 +4,7 @@ import {
   type Frame, type TdMessage, type WebMessage,
 } from '../../src/bridge/codec';
 import {
-  BACKPRESSURE_BYTES, SURFACE_FETCH_CONCURRENCY, installLogForwarding, httpOrigin, latencyStats, resolveClient, resolveToken, resolveWsUrl, TOKEN_EXPIRED_MESSAGE,
+  BACKPRESSURE_BYTES, SURFACE_FETCH_CONCURRENCY, installLogForwarding, httpOrigin, latencyStats, resolveToken, resolveWsUrl, TOKEN_EXPIRED_MESSAGE,
   startTdBridge, type Bridge, type Connection, type LatencyStats, type ViewState,
 } from '../../src/bridge/tdBridge';
 import type { LayerSpec } from '../../src/engine/types';
@@ -47,7 +47,7 @@ class FakeSocket {
 }
 
 const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({
-  t: 'hello', protocol: 9, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
+  t: 'hello', protocol: 10, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
 });
 
 interface TestStatus {
@@ -80,7 +80,7 @@ function start(w = 64, h = 48, prep?: (e: FakeEngine) => void) {
   status = makeStatus();
   fm = new FetchMock();
   bridge = startTdBridge(engine, status, {
-    url: 'ws://td:9980/ws', client: 'panel', token: 'tok-123', WebSocketCtor: FakeSocket as unknown as typeof WebSocket,
+    url: 'ws://td:9980/ws', token: 'tok-123', WebSocketCtor: FakeSocket as unknown as typeof WebSocket,
     forwardLogs: false, fetch: fm.fn, raf,
   });
 }
@@ -97,7 +97,7 @@ describe('tdBridge session', () => {
     expect(sock().url).toBe('ws://td:9980/ws');
     expect(sock().binaryType).toBe('arraybuffer');
     sock().open();
-    expect(sock().json()).toEqual([{ t: 'ready', protocol: 9, client: 'panel', version: '0.1.0', token: 'tok-123', fresh: true }]);
+    expect(sock().json()).toEqual([{ t: 'ready', protocol: 10, client: 'external', version: '0.1.0', token: 'tok-123', fresh: true }]);
   });
 
   it('becomes linked on hello and pushes doc + every surface in full when TD has no document', () => {
@@ -431,7 +431,7 @@ describe('tdBridge document load', () => {
     expect(sock().frames()).toEqual([]);
 
     sock().close();
-    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(3000);
     sock().open();
     sock().tell(hello({ hasDocument: true, rev: 3 })); // incomplete reload -> still must load
     expect(sock().json().map((m) => m.t)).toEqual(['ready', 'requestDoc']);
@@ -696,7 +696,7 @@ describe('tdBridge reconnect', () => {
     class Flaky extends FakeSocket { constructor(u: string) { if (fail) throw new Error('blocked'); super(u); } }
     engine = new FakeEngine(64, 48);
     status = makeStatus();
-    bridge = startTdBridge(engine, status, { url: 'ws://td/ws', client: 'panel', token: 't', WebSocketCtor: Flaky as unknown as typeof WebSocket, forwardLogs: false, raf });
+    bridge = startTdBridge(engine, status, { url: 'ws://td/ws', token: 't', WebSocketCtor: Flaky as unknown as typeof WebSocket, forwardLogs: false, raf });
     expect(FakeSocket.all.length).toBe(0);
     fail = false;
     vi.advanceTimersByTime(500);
@@ -729,7 +729,7 @@ describe('tdBridge reconnect', () => {
     old.tell(hello({ active: true }));
     old.onclose?.();
     expect(status.conn[status.conn.length - 1]).toBe('reconnecting');
-    expect(vi.getTimerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(1);   // only the new socket's connect timeout
   });
 
   it('goes back to active (no standby overlay) when the socket drops', () => {
@@ -837,7 +837,7 @@ describe('tdBridge view messages', () => {
     engine.addPixelLayer('Layer 1');
     status = makeStatus();
     fm = new FetchMock();
-    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 't', WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, fetch: fm.fn, raf: () => {} });
+    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', token: 't', WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, fetch: fm.fn, raf: () => {} });
     connectActive();
     bridge.setView(view());
     bridge.setView(view({ zoom: 2 }));
@@ -1000,7 +1000,7 @@ describe('tdBridge base pull (HTTP)', () => {
     fm = new FetchMock();
     engine = new FakeEngine(64, 48);
     status = makeStatus();
-    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 'tok 1', fetch: fm.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
+    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', token: 'tok 1', fetch: fm.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
     connectActive();
   };
 
@@ -1252,6 +1252,13 @@ describe('tdBridge token', () => {
     expect(resolveToken('')).toBe('');
   });
 
+  it('v10: the token comes from the URL hash, which wins over a query token', () => {
+    expect(resolveToken('', '#token=a%2Bb-_9&e=ed2')).toBe('a+b-_9');
+    expect(resolveToken('?token=q', '#token=h&e=x')).toBe('h');
+    expect(resolveToken('?token=q', '#e=x')).toBe('q');
+    expect(resolveToken('', '')).toBe('');
+  });
+
   it('a token rejection shows a persistent message and stops reconnecting', () => {
     start();
     const fatal: string[] = [];
@@ -1279,13 +1286,10 @@ describe('tdBridge token', () => {
 });
 
 describe('tdBridge helpers', () => {
-  it('resolves ws url and client from the query string', () => {
+  it('resolves the ws url from the query string', () => {
     expect(resolveWsUrl('', { protocol: 'http:', host: '127.0.0.1:9980' })).toBe('ws://127.0.0.1:9980/ws');
     expect(resolveWsUrl('', { protocol: 'https:', host: 'h' })).toBe('wss://h/ws');
     expect(resolveWsUrl('?ws=ws://x:1/y', { protocol: 'http:', host: 'h' })).toBe('ws://x:1/y');
-    expect(resolveClient('')).toBe('external');
-    expect(resolveClient('?client=panel')).toBe('panel');
-    expect(resolveClient('?client=weird')).toBe('external');
   });
 
   it('forwards console.error and window errors, rate limited to 20 per second', () => {
@@ -1323,7 +1327,7 @@ describe('tdBridge v4: fonts and TOP import', () => {
     engine = new FakeEngine(64, 48);
     status = Object.assign(makeStatus(), { setFonts(f: string[]) { fonts.push(f); } });
     fonts = [];
-    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 'tok-123', fetch: fm.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
+    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', token: 'tok-123', fetch: fm.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
     connectActive();
   };
   const topFrame = (w: number, h: number, v: number) =>
@@ -1525,7 +1529,7 @@ describe('tdBridge v5: canvas, base size, per-slot sizes, flatten', () => {
     engine = new FakeEngine(64, 48);
     prep?.(engine);
     status = makeStatus();
-    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 'tok-123', fetch: fm.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
+    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', token: 'tok-123', fetch: fm.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
     connectActive(over);
   };
   const last = <T extends WebMessage['t']>(t: T) => sock().json().filter((m) => m.t === t).pop() as Extract<WebMessage, { t: T }>;
@@ -1699,7 +1703,7 @@ describe('tdBridge v5 review fixes', () => {
     prep?.(engine);
     status = makeStatus();
     fm = new FetchMock();
-    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 'tok-123', fetch: fm.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
+    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', token: 'tok-123', fetch: fm.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
     connectActive(over);
   };
   const setCanvases = () => sock().json().filter((m) => m.t === 'setCanvas') as Extract<WebMessage, { t: 'setCanvas' }>[];
@@ -1791,7 +1795,7 @@ describe('tdBridge v6 inputs (per-input BASE)', () => {
     fmv = new FetchMock();
     engine = new FakeEngine(64, 48);
     status = makeStatus();
-    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 't', fetch: fmv.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
+    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', token: 't', fetch: fmv.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
     connectActive({ inputs: [{ input: 1, w: 64, h: 48, connected: true }, { input: 2, w: 32, h: 16, connected: true }] });
   };
   const inputOf = (c: { url: string }) => Number(new URL(c.url).searchParams.get('input'));
@@ -1903,7 +1907,7 @@ describe('tdBridge v6 files and reload', () => {
     engine = new FakeEngine(64, 48);
     prep?.(engine);
     status = makeStatus();
-    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 't', fetch: fmf.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
+    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', token: 't', fetch: fmf.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
     connectActive(over);
   };
   const lastOf = <K extends WebMessage['t']>(t: K) => sock().json().filter((m) => m.t === t).slice(-1)[0] as Extract<WebMessage, { t: K }>;
@@ -2097,17 +2101,16 @@ describe('tdBridge v6 files and reload', () => {
   });
 });
 
-describe('tdBridge v6 chooseFile / placeImageViaTd', () => {
+describe('tdBridge v6 chooseFile', () => {
   let fmc: FetchMock;
   const startC = () => {
     fmc = new FetchMock();
     engine = new FakeEngine(64, 48);
     status = makeStatus();
-    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 't', fetch: fmc.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
+    bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', token: 't', fetch: fmc.fn, WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, raf });
     connectActive();
   };
   const lastChoose = () => sock().json().filter((m) => m.t === 'chooseFile').slice(-1)[0] as Extract<WebMessage, { t: 'chooseFile' }>;
-  const top = (w: number, h: number) => encodeFrame({ type: FRAME_TOP, frameEnd: true, slot: 0, frameId: 1, docW: w, docH: h, x: 0, y: 0, w, h }, new Uint8Array(w * h * 4));
 
   it.each(['saveProject', 'openProject', 'exportPng'] as const)('chooseFile(%s) resolves with the path or null when cancelled', async (purpose) => {
     startC();
@@ -2131,62 +2134,8 @@ describe('tdBridge v6 chooseFile / placeImageViaTd', () => {
     sock().close();
     expect(await p2).toMatch(/Disconnected/);
     await expect(bridge.chooseFile('saveProject')).rejects.toThrow(/Not connected/);
-    await expect(bridge.placeImageViaTd()).rejects.toThrow(/Not connected/);
   });
 
-  it('placeImageViaTd: fileChosen names the layer, topReady fetches /top and imports it', async () => {
-    startC();
-    const p = bridge.placeImageViaTd();
-    const req = lastChoose();
-    expect(req.purpose).toBe('placeImage');
-    sock().tell({ t: 'fileChosen', requestId: req.requestId, path: '/pics/My Photo.png' });
-    expect(fmc.calls).toHaveLength(0);
-    sock().tell({ t: 'topReady', requestId: req.requestId, w: 6, h: 4 });
-    await flushP();
-    expect(fmc.calls.map((c) => c.url)).toEqual([`http://td:9980/top?token=t&client=c1&requestId=${req.requestId}`]);
-    fmc.calls[0].settle(okBytes(top(6, 4)));
-    const id = await p;
-    expect(id).toBeTruthy();
-    expect(engine.imported).toEqual([{ w: 6, h: 4, name: 'My Photo.png', len: 6 * 4 * 4 }]);
-  });
 
-  it('placeImageViaTd: a Windows path is named by its basename; without fileChosen the layer is called Image', async () => {
-    startC();
-    let p = bridge.placeImageViaTd();
-    sock().tell({ t: 'fileChosen', requestId: lastChoose().requestId, path: 'C:\\pics\\cat.jpg' });
-    sock().tell({ t: 'topReady', requestId: lastChoose().requestId, w: 2, h: 2 });
-    await flushP();
-    fmc.calls[0].settle(okBytes(top(2, 2)));
-    await p;
-    p = bridge.placeImageViaTd();
-    sock().tell({ t: 'topReady', requestId: lastChoose().requestId, w: 2, h: 2 });
-    await flushP();
-    fmc.calls[1].settle(okBytes(top(2, 2)));
-    await p;
-    expect(engine.imported.map((i) => i.name)).toEqual(['cat.jpg', 'Image']);
-  });
 
-  it('placeImageViaTd: cancelled resolves null (nothing fetched or imported); topError, disconnect and timeout reject', async () => {
-    startC();
-    const p = bridge.placeImageViaTd();
-    sock().tell({ t: 'fileChosen', requestId: lastChoose().requestId, path: null });
-    await expect(p).resolves.toBeNull();
-    expect(fmc.calls).toHaveLength(0);
-    expect(engine.imported).toEqual([]);
-
-    const p2 = bridge.placeImageViaTd().catch((e: Error) => e.message);
-    sock().tell({ t: 'topError', requestId: lastChoose().requestId, msg: 'unreadable image' });
-    expect(await p2).toBe('unreadable image');
-
-    const p3 = bridge.placeImageViaTd().catch((e: Error) => e.message);
-    await vi.advanceTimersByTimeAsync(299999);
-    sock().tell({ t: 'files', projectFile: '', pngFile: '' });
-    await vi.advanceTimersByTimeAsync(1);
-    expect(await p3).toMatch(/did not answer/);
-
-    const p4 = bridge.placeImageViaTd().catch((e: Error) => e.message);
-    sock().close();
-    expect(await p4).toMatch(/Disconnected/);
-    expect(engine.imported).toEqual([]);
-  });
 });

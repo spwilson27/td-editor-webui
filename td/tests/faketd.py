@@ -134,13 +134,9 @@ class FakeNetwork:
         self.tops = {}
         self.out = FakeInput()
         self.out.path = "/project1/raster_editor/doc/out"
-        self.panel = FakeText()
-        self.panel.path = "/project1/raster_editor/panel_view"
-        self.views = []  # (view, panel_w, panel_h)
         self.thaws = 0
         self.raise_on_apply = False
         self.raise_on_read = False
-        self.raise_on_view = False
         self.created = 0
         self.ticks = 0
         self.input_flags = []
@@ -221,14 +217,6 @@ class FakeNetwork:
 
     def output(self):
         return self.out
-
-    def set_view(self, view, panel_w, panel_h):
-        if self.raise_on_view:
-            raise RuntimeError("view failed")
-        self.views.append((view, panel_w, panel_h))
-
-    def panel_view(self):
-        return self.panel
 
     @property
     def frozen(self):
@@ -428,6 +416,10 @@ class FakeOwner:
         self.switch = FakeSwitch()
         self.ui = FakeText("<html>ui</html>")
         self.path = "/project1/raster_editor"
+        self.name = "raster_editor"
+        self.id = 1001
+        self.tags = {"rasterEditor"}
+        self.isCOMP = True
         self.net = FakeNetwork(lambda: self.ext)
         self.doc_state = FakeText("")
         self.saved = []  # (path, frozen, doc_state) per comp.save() call

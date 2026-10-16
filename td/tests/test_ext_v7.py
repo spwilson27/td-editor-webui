@@ -576,7 +576,7 @@ def test_request_doc_announces_the_newest_preview_frames_again():
 # --------------------------------------------------------------------------- chooseFile readText
 
 def choose_text(e, a, path, rid="r", **extra):
-    e.o.par.Panelquery.val = "test=1"
+    e.o.storage["reTest"] = 1
     e.send(a, {"t": "chooseFile", "requestId": rid, "purpose": "readText", "testPath": path, **extra})
     e.pump(2)
     return e.s.messages(a, "fileChosen")[-1]

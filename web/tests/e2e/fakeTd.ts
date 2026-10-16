@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
   FRAME_BASE, FRAME_LAYER_PREVIEW, FRAME_SURFACE, FRAME_SURFACE_DUMP, FRAME_TOP, FRAME_VIEW, decodeFrame, decodeWebMessage, encodeFrame, encodeMessage, isStale,
-  type Frame, type TdMessage, type WebMessage,
+  type EditorInfo, type EditorList, type Frame, type TdMessage, type WebMessage,
 } from '../../src/bridge/codec';
 import type { BrushPreset, CanvasMode, Guides, LayerSpec } from '../../src/engine/types';
 
@@ -13,7 +13,12 @@ export interface FakeTdOptions {
   /** v6: the TD inputs (default: input 1 at w x h). Several inputs may differ in size. */
   inputs?: { input: number; w: number; h: number }[];
   projectFile?: string; pngFile?: string;
+  /** v10: this editor's id / name / path (default `ed1` / `Editor 1` / `/project1/ed1`). */
+  editorId?: string; name?: string; path?: string;
 }
+
+/** v10: the project shared by the editors served by one fake web server (the master's). */
+interface FakeProject { editors: Map<string, FakeTd>; master: string; host: FakeTd }
 
 /** The stored document (the last `doc` of the active client; v7 adds the document brush presets). */
 export interface FakeDoc { rev: number; layers: LayerSpec[]; guides: Guides; canvas: { mode: CanvasMode }; brushPresets?: BrushPreset[] }
@@ -129,7 +134,22 @@ export class FakeTd {
   private nextFrameId = 1;
   private clientSeq = 0;
 
-  private constructor(private http: Server, private wss: WebSocketServer, private opts: FakeTdOptions) {
+  /** v10 editor identity and project. Only the host editor (the one `start` created) owns the sockets; the others are routed to. */
+  editorId: string;
+  name: string;
+  path: string;
+  editorActive = true;
+  project: FakeProject;
+  /** v10: every request that reached this editor (method + path + `editor` param), to prove nothing was misrouted. */
+  requests: { method: string; path: string; editor: string | null }[] = [];
+  private fixedPort = 0;
+
+  private constructor(private http: Server | null, private wss: WebSocketServer | null, private opts: FakeTdOptions, project?: FakeProject) {
+    this.editorId = opts.editorId ?? 'ed1';
+    this.name = opts.name ?? `Editor ${this.editorId.replace(/^ed/, '')}`;
+    this.path = opts.path ?? `/project1/${this.editorId}`;
+    this.project = project ?? { editors: new Map(), master: this.editorId, host: this };
+    this.project.editors.set(this.editorId, this);
     this.token = opts.token ?? 'tok-e2e';
     this.w = opts.w;
     this.h = opts.h;
@@ -138,19 +158,129 @@ export class FakeTd {
     this.pngFile = opts.pngFile ?? '/tmp/fake.png';
     this.mode = 'input';
     this.active = opts.active ?? true;
-    wss.on('connection', (ws) => this.onConnection(ws));
-    http.on('request', (req, res) => this.onHttp(req, res));
+    if (http && wss) this.attachServer(http, wss);
+  }
+
+  private attachServer(http: Server, wss: WebSocketServer) {
+    this.http = http;
+    this.wss = wss;
+    wss.on('connection', (ws, req) => this.routeConnection(ws, req));
+    http.on('request', (req, res) => this.route(req, res));
   }
 
   static async start(opts: FakeTdOptions): Promise<FakeTd> {
     const http = createServer();
     const wss = new WebSocketServer({ server: http });
     await new Promise<void>((r) => http.listen(0, '127.0.0.1', () => r()));
-    return new FakeTd(http, wss, opts);
+    const td = new FakeTd(http, wss, opts);
+    td.fixedPort = (http.address() as { port: number }).port;
+    return td;
   }
 
-  get port(): number { return (this.http.address() as { port: number }).port; }
+  get port(): number { return this.project.host.fixedPort; }
   get url(): string { return `ws://127.0.0.1:${this.port}/ws`; }
+  /** v10: the page URL hash for this editor. */
+  get hash(): string { return `#token=${this.token}&e=${this.editorId}`; }
+
+  // ---- v10: multiple editors in one project ----
+
+  /** Another editor of the project (own document, own sockets state); served by the same fake server. */
+  addEditor(id: string, opts: Partial<FakeTdOptions> = {}): FakeTd {
+    const host = this.project.host;
+    const ed = new FakeTd(null, null, { w: host.opts.w, h: host.opts.h, token: host.token, hasInput: host.opts.hasInput, maxSendFps: host.opts.maxSendFps, ...opts, editorId: id }, this.project);
+    this.project.host.broadcastEditors();
+    return ed;
+  }
+
+  editor(id: string): FakeTd {
+    const e = this.project.editors.get(id);
+    if (!e) throw new Error(`no fake editor ${id}`);
+    return e;
+  }
+
+  editorList(): EditorList {
+    const editors: EditorInfo[] = [...this.project.editors.values()].map((e) => ({ id: e.editorId, name: e.name, path: e.path, version: '0.8.0', active: e.editorActive }));
+    return { master: this.project.master, editors };
+  }
+
+  /** Every open socket of every editor gets the new list (create / delete / rename / active / master change). */
+  broadcastEditors() {
+    const m: TdMessage = { t: 'editors', ...this.editorList() };
+    for (const e of this.project.editors.values()) e.send(m);
+  }
+
+  /** The editor is deleted in TD: leaves the list, its sockets are closed with 4404. */
+  removeEditor(id: string) {
+    const e = this.editor(id);
+    this.project.editors.delete(id);
+    if (this.project.master === id) this.project.master = [...this.project.editors.keys()][0] ?? '';
+    this.project.host.broadcastEditors();
+    e.client?.close(4404);
+    e.client = null;
+  }
+
+  renameEditor(id: string, name: string) { this.editor(id).name = name; this.project.host.broadcastEditors(); }
+
+  setEditorActive(id: string, active: boolean) {
+    const e = this.editor(id);
+    e.editorActive = active;
+    this.project.host.broadcastEditors();
+    if (!active) { e.client?.close(4404); e.client = null; }
+  }
+
+  setMaster(id: string) { this.project.master = id; this.project.host.broadcastEditors(); }
+
+  private routeTarget(editorParam: string | null): FakeTd | null {
+    const id = editorParam || this.project.master;
+    const e = this.project.editors.get(id);
+    return e && e.editorActive ? e : null;
+  }
+
+  private routeConnection(ws: WebSocket, req: IncomingMessage) {
+    const u = new URL(req.url ?? '', 'http://x');
+    const target = this.routeTarget(u.searchParams.get('editor'));
+    this.requests.push({ method: 'WS', path: u.pathname, editor: u.searchParams.get('editor') });
+    if (!target) { ws.close(4404); return; }
+    target.requests.push({ method: 'WS', path: u.pathname, editor: u.searchParams.get('editor') });
+    target.onConnection(ws);
+  }
+
+  private route(req: IncomingMessage, res: import('node:http').ServerResponse) {
+    const u = new URL(req.url ?? '', 'http://x');
+    if (u.pathname === '/') { res.writeHead(200, { 'Content-Type': 'text/html' }).end(readFileSync(resolve(process.cwd(), '../dist/ui/index.html'))); return; }
+    const cors = FakeTd.corsHeaders(req.headers.origin);
+    if (u.pathname === '/editors') {
+      this.requests.push({ method: req.method ?? 'GET', path: u.pathname, editor: null });
+      if (u.searchParams.get('token') !== this.token) { res.writeHead(403, cors).end(); return; }
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }).end(JSON.stringify(this.editorList()));
+      return;
+    }
+    const target = this.routeTarget(u.searchParams.get('editor'));
+    if (!target) { res.writeHead(404, { ...cors, 'Content-Type': 'application/json' }).end('{"error":"no such editor"}'); return; }
+    target.requests.push({ method: req.method ?? 'GET', path: u.pathname, editor: u.searchParams.get('editor') });
+    target.onHttp(req, res);
+  }
+
+  /** v10 failover tests: the server goes away (all sockets dropped, port closed) ... */
+  async stopServer() {
+    const { http, wss } = this;
+    if (!http || !wss) return;
+    for (const e of this.project.editors.values()) { e.client?.terminate(); e.client = null; }
+    for (const c of wss.clients) c.terminate();
+    http.closeAllConnections();
+    await new Promise<void>((r) => wss.close(() => http.close(() => r())));
+    this.http = null;
+    this.wss = null;
+  }
+
+  /** ... and comes back on the SAME port with the same token and editors (a new master took over). */
+  async startServer() {
+    if (this.http) return;
+    const http = createServer();
+    const wss = new WebSocketServer({ server: http });
+    await new Promise<void>((r, j) => { http.once('error', j); http.listen(this.fixedPort, '127.0.0.1', () => r()); });
+    this.attachServer(http, wss);
+  }
 
   /** TD's rule: CORS headers only for loopback origins (echoed, with Vary: Origin); none otherwise and none for same-origin. */
   static corsHeaders(origin: string | undefined): Record<string, string> {
@@ -160,12 +290,8 @@ export class FakeTd {
     return {};
   }
 
-  private onHttp(req: IncomingMessage, res: import('node:http').ServerResponse) {
+  onHttp(req: IncomingMessage, res: import('node:http').ServerResponse) {
     const u = new URL(req.url ?? '', 'http://x');
-    if (u.pathname === '/') {
-      res.writeHead(200, { 'Content-Type': 'text/html' }).end(readFileSync(resolve(process.cwd(), '../dist/ui/index.html')));
-      return;
-    }
     const cors = FakeTd.corsHeaders(req.headers.origin);
     const q = u.searchParams;
     if (u.pathname === '/top') {
@@ -292,7 +418,7 @@ export class FakeTd {
     this.send({ t: 'base', frameId: inp.stored.id, input, docW: inp.w, docH: inp.h, x: 0, y: 0, w: inp.w, h: inp.h });
   }
 
-  private onConnection(ws: WebSocket) {
+  onConnection(ws: WebSocket) {
     this.client = ws;
     this.connections++;
     this.awaitingRequestDoc = false;
@@ -314,6 +440,7 @@ export class FakeTd {
             return;
           }
           this.send(this.hello());
+          this.send({ t: 'editors', ...this.editorList() });
           this.send({ t: 'files', projectFile: this.projectFile, pngFile: this.pngFile });
           if (this.opts.fonts) this.send({ t: 'fonts', families: this.opts.fonts });
           for (const n of this.inputs.keys()) this.announce(n);
@@ -374,7 +501,7 @@ export class FakeTd {
 
   hello(): TdMessage {
     return {
-      t: 'hello', protocol: 9, doc: { w: this.w, h: this.h, mode: this.mode }, hasInput: this.opts.hasInput ?? false, maxSendFps: this.opts.maxSendFps ?? 30,
+      t: 'hello', protocol: 10, doc: { w: this.w, h: this.h, mode: this.mode }, hasInput: this.opts.hasInput ?? false, maxSendFps: this.opts.maxSendFps ?? 30,
       inputs: this.inputList(),
       active: this.active, clientId: this.clientId, hasDocument: this.doc !== null, rev: this.doc?.rev ?? null,
     };
@@ -424,28 +551,11 @@ export class FakeTd {
   }
 
   /** v6 chooser: what the user "picks" (null = cancel) per purpose, and a log of the requests. */
-  choice: Record<string, string | null> = { placeImage: '/tmp/picked-photo.png', saveProject: '/tmp/chosen.redoc', openProject: '/tmp/chosen.redoc', exportPng: '/tmp/chosen.png' };
+  choice: Record<string, string | null> = { saveProject: '/tmp/chosen.redoc', openProject: '/tmp/chosen.redoc', exportPng: '/tmp/chosen.png' };
   chooseRequests: Extract<WebMessage, { t: 'chooseFile' }>[] = [];
-  /** Size and colour of the image `placeImage` serves, and an error to answer instead (topError). */
-  placeSize = { w: 32, h: 16 };
-  placeColor: [number, number, number, number] = [40, 90, 220, 255];
-  placeFails: string | null = null;
-
-  /** v7 `readText` answer: {path, text}, {path, error} or null (cancelled). */
-  readTextAnswer: { path: string; text?: string; error?: string } | null = { path: '/tmp/grade.cube', text: 'LUT_3D_SIZE 2\n' + Array.from({ length: 8 }, () => '0.5 0.5 0.5').join('\n') + '\n' };
-
   private onChooseFile(m: Extract<WebMessage, { t: 'chooseFile' }>) {
     this.chooseRequests.push(m);
-    if (m.purpose === 'readText') { this.send({ t: 'fileChosen', requestId: m.requestId, path: this.readTextAnswer?.path ?? null, ...(this.readTextAnswer?.text !== undefined ? { text: this.readTextAnswer.text } : {}), ...(this.readTextAnswer?.error !== undefined ? { error: this.readTextAnswer.error } : {}) }); return; }
-    const path = this.choice[m.purpose] ?? null;
-    this.send({ t: 'fileChosen', requestId: m.requestId, path });
-    if (m.purpose !== 'placeImage' || path === null) return;
-    if (this.placeFails) { this.send({ t: 'topError', requestId: m.requestId, msg: this.placeFails }); return; }
-    const { w, h } = this.placeSize;
-    const rgba = new Uint8Array(w * h * 4);
-    for (let i = 0; i < rgba.length; i += 4) rgba.set(this.placeColor, i);
-    this.topSnapshots.set(m.requestId, encodeFrame({ type: FRAME_TOP, frameEnd: true, slot: 0, frameId: 1, docW: w, docH: h, x: 0, y: 0, w, h }, rgba));
-    setTimeout(() => this.send({ t: 'topReady', requestId: m.requestId, w, h }), this.topDelayMs);
+    this.send({ t: 'fileChosen', requestId: m.requestId, path: this.choice[m.purpose] ?? null });
   }
 
   /** Allocate / free surface buffers for the slots a `doc` lists (pixel + mask), like the generated Script TOPs. */
@@ -586,8 +696,6 @@ export class FakeTd {
   }
 
   async close() {
-    for (const c of this.wss.clients) c.terminate();
-    this.http.closeAllConnections();
-    await new Promise<void>((r) => this.wss.close(() => this.http.close(() => r())));
+    await this.project.host.stopServer();
   }
 }

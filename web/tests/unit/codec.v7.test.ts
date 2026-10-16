@@ -17,8 +17,8 @@ const layer = (id: string): LayerSpec => ({
 describe('protocol v7 frames', () => {
   const h = (o: Partial<FrameHeader> = {}): FrameHeader => ({ type: FRAME_LAYER_PREVIEW, frameEnd: true, slot: 0, frameId: 41, docW: 5, docH: 4, x: 0, y: 0, w: 5, h: 4, ...o });
 
-  it('is protocol 9 and LAYER_PREVIEW is frame type 7', () => {
-    expect(PROTOCOL_VERSION).toBe(9);
+  it('is protocol 10 and LAYER_PREVIEW is frame type 7', () => {
+    expect(PROTOCOL_VERSION).toBe(10);
     expect(FRAME_LAYER_PREVIEW).toBe(7);
   });
 

@@ -37,7 +37,7 @@ class FetchMock {
 const flush = () => vi.advanceTimersByTimeAsync(0);
 const raf = (cb: () => void) => setTimeout(cb, 16);
 const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({
-  t: 'hello', protocol: 9, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
+  t: 'hello', protocol: 10, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
 });
 const bytes = (b: Uint8Array, headers: Record<string, string> = {}) => new Response(b as BufferSource, { status: 200, headers });
 
@@ -65,7 +65,7 @@ function start(prep?: (e: FakeEngine) => void) {
   prep?.(engine);
   status = makeStatus();
   fm = new FetchMock();
-  bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', client: 'panel', token: 'tok-123', WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, fetch: fm.fn, raf });
+  bridge = startTdBridge(engine, status, { url: 'ws://td:9980/ws', token: 'tok-123', WebSocketCtor: FakeSocket as unknown as typeof WebSocket, forwardLogs: false, fetch: fm.fn, raf });
 }
 const connect = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}) => { sock().open(); sock().tell(hello({ doc: { w: engine.width, h: engine.height }, ...over })); };
 beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(100000); FakeSocket.all = []; });
@@ -244,14 +244,14 @@ describe('v8: protocol mismatch notices', () => {
     start();
     sock().open();
     sock().tell(hello({ protocol: 7 }));
-    expect(status.notices.at(-1)).toMatch(/Protocol mismatch.*protocol 9.*speaks 7.*update the component/);
+    expect(status.notices.at(-1)).toMatch(/Protocol mismatch.*protocol 10.*speaks 7.*update the component/);
   });
 
-  it('a newer component (protocol 10) tells the user to reload the page', () => {
+  it('a newer component (protocol 11) tells the user to reload the page', () => {
     start();
     sock().open();
-    sock().tell(hello({ protocol: 10 }));
-    expect(status.notices.at(-1)).toMatch(/Protocol mismatch.*protocol 10.*reload the page/);
+    sock().tell(hello({ protocol: 11 }));
+    expect(status.notices.at(-1)).toMatch(/Protocol mismatch.*protocol 11.*reload the page/);
   });
 });
 
@@ -260,13 +260,13 @@ describe('v9: protocol mismatch notices', () => {
     start();
     sock().open();
     sock().tell(hello({ protocol: 8 }));
-    expect(status.notices.at(-1)).toMatch(/Protocol mismatch.*protocol 9.*speaks 8.*update the component/);
+    expect(status.notices.at(-1)).toMatch(/Protocol mismatch.*protocol 10.*speaks 8.*update the component/);
   });
 
-  it('a protocol 9 component links without a notice', () => {
+  it('a protocol 10 component links without a notice', () => {
     start();
     sock().open();
-    sock().tell(hello({ protocol: 9 }));
+    sock().tell(hello({ protocol: 10 }));
     expect(status.notices.filter((n) => /mismatch/i.test(n))).toEqual([]);
   });
 });

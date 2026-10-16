@@ -223,8 +223,6 @@ export function LutField({ vals, fieldKey, onSet }: { vals: Vals; fieldKey: stri
   const [err, setErr] = useState('');
   const file = useRef<HTMLInputElement>(null);
   const area = useRef<HTMLTextAreaElement>(null);
-  const panel = store.clientKind.value === 'panel';
-  const canRead = store.connection.value === 'linked' && !!store.bridge?.readTextFile;
   const load = (t: string, name?: string) => {
     if (t.length > CUBE_MAX_CHARS) { setErr('The .cube file is too large (12 MB limit)'); return; }
     const i = inspectCube(t);
@@ -239,20 +237,11 @@ export function LutField({ vals, fieldKey, onSet }: { vals: Vals; fieldKey: stri
         {!text ? 'No LUT loaded (the filter does nothing)' : info.ok ? `${info.title || 'LUT'} · ${info.size}×${info.size}×${info.size}` : `Unusable LUT: ${info.reason}`}
       </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
-        {!panel && <button data-lut-file style={BTN} onClick={() => file.current?.click()}>Load .cube…</button>}
-        {panel && <button data-lut-td style={`${BTN};opacity:${canRead ? 1 : 0.5}`} aria-disabled={!canRead} title={canRead ? 'TouchDesigner shows a file chooser' : 'Needs the TouchDesigner connection'}
-          onClick={async () => {
-            if (!canRead) return;
-            try {
-              const r = await store.bridge!.readTextFile!(['cube']);
-              if (r) load(r.text, r.path.split(/[\\/]/).pop());
-            } catch (e) { setErr(e instanceof Error ? e.message : 'TouchDesigner could not read the file'); }
-          }}>Load .cube…</button>}
+        <button data-lut-file style={BTN} onClick={() => file.current?.click()}>Load .cube…</button>
         <button data-lut-paste style={BTN} aria-expanded={paste} onClick={() => setPaste(!paste)}>Paste text…</button>
         <button data-lut-clear style={`${BTN};opacity:${text ? 1 : 0.4}`} aria-disabled={!text} onClick={() => { if (text) { setErr(''); onSet({ [fieldKey]: '' }); } }}>Clear</button>
       </div>
-      {!panel && (
-        <input ref={file} type="file" accept=".cube,.txt,text/plain" hidden data-lut-input aria-hidden="true" tabIndex={-1}
+      <input ref={file} type="file" accept=".cube,.txt,text/plain" hidden data-lut-input aria-hidden="true" tabIndex={-1}
           onChange={async (ev) => {
             const input = ev.target as HTMLInputElement, f = input.files?.[0];
             input.value = '';
@@ -260,9 +249,7 @@ export function LutField({ vals, fieldKey, onSet }: { vals: Vals; fieldKey: stri
             if (f.size > CUBE_MAX_CHARS) { setErr('The .cube file is too large (12 MB limit)'); return; }
             try { load(await f.text(), f.name); } catch { setErr('Could not read the file'); }
           }} />
-      )}
       {text.length > LUT_WARN_CHARS && <div data-lut-warn style="color:#f0b45a">Large LUT ({(text.length / 1048576).toFixed(1)} MB): it is stored in the document and sent to TouchDesigner.</div>}
-      {panel && !canRead && <div style="color:#8f8f8f">Panel: paste the contents of a .cube file (needs the TouchDesigner connection for a file chooser).</div>}
       {paste && (
         <div style="display:flex;flex-direction:column;gap:6px">
           <textarea ref={area} data-lut-text aria-label=".cube text" rows={5}

@@ -1,5 +1,6 @@
 import { computed, effect, signal } from '@preact/signals';
 import type { Anchor, BrushSettings, CanvasMode, EditorEngine, LayerInfo, Rect, RGBA, SelectionOptions, SnapOptions, ToolId } from '../engine/types';
+import type { EditorInfo, EditorList } from '../bridge/codec';
 import { NO_LATENCY, type Bridge, type LatencyStats } from '../bridge/tdBridge';
 import { decodeImage } from './importImage';
 import { DEFAULT_SHAPE_OPTIONS, DEFAULT_TEXT_OPTIONS, newTextSpec, type ShapeOptions, type TextOptions } from './specs';
@@ -35,8 +36,8 @@ function saveFlag(key: string, on: boolean) {
 /** A guide being created (from a ruler) or moved: `pos` doc px; `remove` = the pointer is back over the ruler. */
 export interface GuideDrag { axis: 'h' | 'v'; index: number | null; pos: number; remove: boolean }
 
-/** What the store needs from the bridge; Flatten / canvas calls are optional (standalone, tests). */
-export type StoreBridge = Pick<Bridge, 'listTops' | 'importTop'> & Partial<Pick<Bridge, 'renderLayer' | 'renderLayers' | 'setCanvas' | 'saveProject' | 'openProject' | 'exportPng' | 'chooseFile' | 'readTextFile' | 'clearStoredHistory' | 'placeImageViaTd'>>;
+/** What the store needs from the bridge; everything but TOP import is optional (standalone, tests). */
+export type StoreBridge = Pick<Bridge, 'listTops' | 'importTop'> & Partial<Pick<Bridge, 'renderLayer' | 'renderLayers' | 'setCanvas' | 'saveProject' | 'openProject' | 'exportPng' | 'clearStoredHistory'>>;
 
 export const SHAPE_RENDERER_KEY = 'raster-editor.shapeRenderer';
 export type ShapeRenderer = 'sdf' | 'canvas';
@@ -102,7 +103,6 @@ export function createStore() {
 
   // v2: view mode (Local preview vs TouchDesigner output), client kind, latency readouts
   const viewMode = signal<'local' | 'td'>('local');
-  const clientKind = signal<'panel' | 'external'>('external');
   const viewRect = signal({ x: 0, y: 0, w: 0, h: 0 });
   const latency = signal<LatencyStats>(NO_LATENCY);
   const viewLatency = signal<LatencyStats>(NO_LATENCY);
@@ -119,6 +119,14 @@ export function createStore() {
   const docSize = signal({ w: 0, h: 0 });
   const docName = signal('Untitled');
 
+  // v10: the project's editors (tab strip). Empty = standalone / not known yet: no tabs.
+  const editors = signal<EditorInfo[]>([]);
+  const editorMaster = signal('');
+  const editorId = signal(''); // the editor this page is connected to
+  const editorSwitching = signal(false);
+  const switchTarget = signal<{ to: string; waiting: boolean } | null>(null); // v10: "Switching to <name>…"
+  const discardAsk = signal<{ from: string; to: string } | null>(null); // v10: unsent changes while TD is reconnecting
+  const sessionEpoch = signal(0); // bumped when a new editor session (engine) is attached: the App remounts
   const connection = signal<Connection>('reconnecting');
   const active = signal(true);
   const notice = signal('');
@@ -138,10 +146,14 @@ export function createStore() {
     return { ...c, a: Math.round((a / 100) * 255) };
   };
 
-  function setNotice(msg: string) {
+  let heldUntil = 0;
+  function setNotice(msg: string, ms = 4000) {
+    if (/Bridge closed/.test(msg)) return; // v10: an operation of an ended editor session (tab switch) failed; not worth telling the user
+    // v10: a held notice (editor fallback) is not replaced by the bridge's "Loading document" progress of the session that follows it
+    if (ms === 4000 && performance.now() < heldUntil && /^Loading document from TouchDesigner/.test(msg)) return;
     notice.value = msg;
     if (noticeTimer) clearTimeout(noticeTimer);
-    noticeTimer = msg ? setTimeout(() => { notice.value = ''; }, 4000) : null;
+    noticeTimer = msg ? setTimeout(() => { notice.value = ''; }, ms) : null;
   }
 
   const ctx: SliceCtx = {
@@ -178,14 +190,29 @@ export function createStore() {
     snapOptions(): SnapOptions { return { enabled: snapOn.value, guides: true, canvas: true, layers: true, threshold: SNAP_THRESHOLD }; },
     /** Set by the App: opens the Place Image file chooser. */
     openPlace: null as (() => void) | null,
-    colorTab, layerTab, viewMode, clientKind, viewRect, latency, viewLatency, viewAge, tdViewTick, loadingDoc,
-    view, zoom, spaceHeld, docSize, docName, connection, active, notice, fatal, layerPreviews,
+    colorTab, layerTab, viewMode, viewRect, latency, viewLatency, viewAge, tdViewTick, loadingDoc,
+    view, zoom, spaceHeld, docSize, docName, editors, editorMaster, editorId, editorSwitching, switchTarget, discardAsk, sessionEpoch, connection, active, notice, fatal, layerPreviews,
     docVersion, historyVersion, selectionVersion, thumbTick,
     takeover: null as (() => void) | null,
+    /** v10: set by the editor session controller: switch the page to another editor (tab click). Null = standalone. */
+    switchEditor: null as ((id: string) => void) | null,
+    /** v10: a switch starts / ends. Editing is blocked while it is pending. */
+    setSwitching(info: { to: string; waiting: boolean } | null) { switchTarget.value = info; editorSwitching.value = info !== null; if (!info) discardAsk.value = null; },
+    /** v10: ask whether to wait for TD or discard the unsent changes; resolves 'cancel' when `signal` aborts. */
+    askDiscard(from: string, to: string, signal: AbortSignal): Promise<'wait' | 'discard' | 'cancel'> {
+      return new Promise((resolve) => {
+        const done = (v: 'wait' | 'discard' | 'cancel') => { discardAsk.value = null; store.answerDiscard = () => {}; resolve(v); };
+        store.answerDiscard = (v) => done(v);
+        signal.addEventListener('abort', () => done('cancel'), { once: true });
+        if (signal.aborted) { done('cancel'); return; }
+        discardAsk.value = { from, to };
+      });
+    },
+    answerDiscard: ((_v: 'wait' | 'discard') => {}) as (v: 'wait' | 'discard') => void,
+    /** v10: `editors` message / GET /editors. */
+    setEditorList(list: EditorList) { editors.value = list.editors; editorMaster.value = list.master; },
     /** TD view is only possible while linked to TouchDesigner. */
     tdAvailable: computed(() => connection.value === 'linked'),
-    /** Panel client in TD view: the page leaves the document rect transparent so TD's overlay shows through. */
-    tdPanel: computed(() => viewMode.value === 'td' && clientKind.value === 'panel'),
     tdViewSource: () => tdViewSource,
     /** Time of the last Space keydown (incl. auto-repeat); lets a missing keyup be detected. */
     spaceSeenAt: 0,
@@ -643,20 +670,12 @@ export function createStore() {
     async importFiles(files: Iterable<File>): Promise<void> {
       for (const f of files) if (f.type.startsWith('image/')) await store.importBlob(f, f.name || 'Image');
     },
-    /** Panel clients cannot use <input type=file>: TD shows its own chooser (chooseFile → topReady → import). */
-    placeImage() {
-      if (clientKind.peek() !== 'panel') { store.openPlace?.(); return; }
-      const b = bridgeApi;
-      if (!b?.placeImageViaTd || connection.peek() !== 'linked') { setNotice('Place Image needs the TouchDesigner connection in the panel'); return; }
-      b.placeImageViaTd().catch((err) => setNotice(`Place Image failed: ${err instanceof Error ? err.message : String(err)}`));
-    },
-    placeImageTitle(): string | undefined {
-      return clientKind.peek() === 'panel' ? 'Opens a TouchDesigner file chooser. Drag-and-drop works in Open in Browser; use File ▸ Place Image here' : undefined;
-    },
+    /** File ▸ Place Image: the browser's file chooser. */
+    placeImage() { store.openPlace?.(); },
     /** Layer copy / cut / paste / duplicate are not offered while a floating selection or the crop box is open. */
     /** Every guard of the layer keys, for deferred work (the paste fallback timer re-checks them when it fires). */
     layerKeysAllowed(): boolean {
-      return engine !== null && !loadingDoc.peek() && !textEdit.peek() && !topDialog.peek() && !canvasDialog.peek() && !store.fileDialog.peek() && !store.selOpDialog.peek() && !store.layerKeysBlocked();
+      return engine !== null && !loadingDoc.peek() && !editorSwitching.peek() && !textEdit.peek() && !topDialog.peek() && !canvasDialog.peek() && !store.fileDialog.peek() && !store.selOpDialog.peek() && !store.layerKeysBlocked();
     },
     layerKeysBlocked(): boolean { return store.isFloating() || !!store.cropBox.peek(); },
     /**
@@ -664,7 +683,7 @@ export function createStore() {
      * clipboard is pasted. When the clipboard cannot be read (TouchDesigner Web Render) the layer clipboard is used, else the old notice.
      */
     async pasteFromClipboard() {
-      if (!engine || loadingDoc.peek()) return;
+      if (!engine || loadingDoc.peek() || editorSwitching.peek()) return;
       const layersFirst = store.hasLayerClip();
       try {
         // a clipboard read that never answers (permission prompt, TouchDesigner Web Render) must not hang the menu: after 2 s use the layer clipboard
@@ -693,13 +712,41 @@ export function createStore() {
       if (spaceHeld.peek() && now - store.spaceSeenAt > 1000) spaceHeld.value = false;
     },
 
+    // v10: editor sessions (tab switch)
+    /** Before the session is flushed: what the engine holds back (floating selection, Quick Mask, inline text) goes into the document. */
+    commitPending() {
+      if (!engine) return;
+      engine.endGesture?.(false); // an open scrub gesture: keep its value as one undo step
+      if (engine.floating()) engine.commitFloating();
+      if (store.cropBox.peek()) store.applyCrop(); // like Enter
+      if (engine.quickMask()) engine.setQuickMask(false);
+      store.commitText();
+    },
+    /** The old session ends (engine still attached): release the engine-owned layer clipboard, forget everything that belonged to the editor. */
+    endSessionState() {
+      // the layer clipboard is NOT released: its snapshot is engine independent, so layers can be copied in one editor and pasted into another
+      store.clearLayerPreviews();
+      store.setInputs([]);
+      store.setFiles({ projectFile: '', pngFile: '' });
+      store.closeFileDialog();
+      topDialog.value = false;
+      canvasDialog.value = false;
+      store.selOpDialog.value = null;
+      latency.value = NO_LATENCY;
+      viewLatency.value = NO_LATENCY;
+      viewAge.value = null;
+      loadingDoc.value = false;
+    },
+
     // Status
     setConnection: (c: Connection) => {
       connection.value = c;
       if (c !== 'linked' && viewMode.peek() === 'td') store.setViewMode('local'); // TD output is unavailable
     },
     setActive: (a: boolean) => { active.value = a; },
-    setNotice,
+    setNotice: (msg: string) => setNotice(msg),
+    /** v10: a notice that stays 8 s even while the next editor session reports its loading progress. */
+    holdNotice(msg: string, ms = 8000) { heldUntil = performance.now() + ms; setNotice(msg, ms); },
     setFatal: (msg: string) => { fatal.value = msg; },
   };
   return store;

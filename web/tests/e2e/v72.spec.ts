@@ -6,7 +6,7 @@ import { FakeTd } from './fakeTd';
 let td: FakeTd;
 test.afterEach(async () => { await (td as FakeTd | undefined)?.close(); });
 
-const url = () => `/?test=1&client=panel&ws=${encodeURIComponent(td.url)}&token=${td.token}`;
+const url = () => `/?test=1&ws=${encodeURIComponent(td.url)}#token=${td.token}`;
 const open = async (page: Page) => {
   td = await FakeTd.start({ w: 320, h: 200, hasInput: true });
   page.on('pageerror', (e) => { throw e; });

@@ -8,6 +8,10 @@ or hand it to TD directly:
 --dev  DATs point at the repo files (file + syncfile) instead of embedding the text, so edits
        to td/raster_editor/*.py, blend.glsl and dist/ui/index.html reload live. The .tox is not saved.
 
+v8: every editor is complete and can be the project master (only the master runs the Web Server DAT; see
+docs/DESIGN_V8.md). After a rebuild the editor resumes as master when it was one; when the project has no live master the
+rebuilt /project1/raster_editor becomes it (development convenience).
+
 Idempotent: rebuilds the COMP's contents in place, keeping its position, size, connections and the
 document (the `doc` network with its locked surface TOPs + the `doc_state` DAT), which survive every
 rebuild. The clean dist/raster_editor.tox is exported from a throw-away build (no document in it).
@@ -25,7 +29,9 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) if "__file__"
 PARENT = "/project1"
 NAME = "raster_editor"
 TOX_NAME = "_re_tox_build"
-KEEP = ("doc", "doc_state")  # survive rebuilds: the generated network + the stored document
+KEEP = ("doc", "doc_state")  # survive rebuilds: the generated network + the stored document (= registry.DATA_CHILDREN)
+VERSION = "0.8.0"  # stamped into the read-only `Version` parameter
+TAG = "rasterEditor"  # tag every editor COMP carries (registry.TAG)
 SHORTCUT = "RasterEditor"  # parent shortcut: doc/surface_callbacks call parent.RasterEditor.OnSurfaceCook
 
 
@@ -45,7 +51,8 @@ def _run_from_shell():
 
 # --------------------------------------------------------------------------- callback sources
 
-WEBSERVER_CALLBACKS = '''# Web Server DAT callbacks: thin delegation to the RasterEditorExt extension.
+WEBSERVER_CALLBACKS = '''# Web Server DAT callbacks: thin delegation to the RasterEditorExt extension (only the project master's server is active:
+# it routes every connection / request to the editor named by `editor=<id>`).
 def onHTTPRequest(dat, request, response):
     return dat.parent().OnHTTPRequest(request, response) or response
 
@@ -89,31 +96,6 @@ void main() {
 }
 '''
 
-KEYBOARD_CALLBACKS = '''# Keyboard In DAT: forwarded to the web panel while this COMP's panel has focus.
-def onKey(dat, keyInfo):
-    dat.parent().OnKey(keyInfo)
-
-def onShortcut(dat, shortcutName, time):
-    pass
-'''
-
-PANEL_EXEC = '''# Panel Execute DAT: mouse over the COMP's panel -> Web Render TOP (both bottom-left origin).
-def onOffToOn(panelValue):
-    parent().OnPanelValue(panelValue, 1)
-
-def whileOn(panelValue):
-    pass
-
-def onOnToOff(panelValue):
-    parent().OnPanelValue(panelValue, 0)
-
-def whileOff(panelValue):
-    pass
-
-def onValueChange(panelValue, prev):
-    parent().OnPanelValue(panelValue)
-'''
-
 FRAME_EXEC = '''# Execute DAT: drives the extension.
 def onStart():
     parent().Start()
@@ -148,13 +130,16 @@ def onPulse(par):
 # Help text for every custom parameter (shown by TD as the tooltip / help of the parameter). Said in the
 # order: what it does, units / range, default, when to change it.
 HELP = {
-    "Active": "Turns the editor on or off. On (default): the web server runs, the editor panel is shown and the "
-              "output is the edited document. Off: the server is stopped, clients are disconnected and the output "
-              "is the input passed through unchanged. Turn off to save GPU/CPU when the editor is not needed; the "
-              "document is kept.",
-    "Port": "TCP port of the editor's web server on 127.0.0.1 (1024-65535, default 9980). The editor panel and "
-            "Open in Browser connect to it. Change it only if another program already uses 9980, or to run two "
-            "editors in one project; changing it restarts the server and reloads the panel.",
+    "Version": "Informational, read-only: the version of this editor build. Upgrade All Editors replaces every older "
+               "editor in the project with this build.",
+    "Active": "Turns the editor on or off. On (default): the output is the edited document and the editor can be "
+              "opened in a browser. Off: browser tabs of this editor are disconnected and the output is the input "
+              "passed through unchanged; if this editor was the project's master, another active editor takes over "
+              "the web server automatically. The document is kept.",
+    "Port": "TCP port of the project's web server on 127.0.0.1 (1024-65535, default 9980). Used only by the master "
+            "editor (the one that serves all editors of the project; it is whichever editor you pressed Open in "
+            "Browser on first); a slave ignores it. If the port is taken the master uses the next free one (up to "
+            "+50) and shows the URL in Status. Changing it on the master restarts the server.",
     "Docsizemode": "How the document (canvas) size is chosen. Follow Input (default): the document is the size of the "
                    "connected input image; with no input it is Doc Width x Doc Height. Fixed: always Doc Width x "
                    "Doc Height; an input keeps its own resolution and is placed as a movable layer. The editor's "
@@ -184,15 +169,18 @@ HELP = {
                   "CPU; it does not affect the output TOP itself.",
     "Viewmode": "Informational, read-only: whether the active editor currently shows its own preview (Local) or "
                 "TouchDesigner's rendered output (TD). Switch it in the editor's View menu, not here.",
-    "Devurl": "Developer option: URL of a web development server (for example http://localhost:5173/) that the "
-              "panel should load instead of the built-in editor. Leave empty (default) in normal use.",
-    "Panelquery": "Developer option: extra URL query string added to the panel and Open in Browser addresses, "
-                  "for example test=1 to enable the automated-test hook. Leave empty (default) in normal use.",
-    "Openbrowser": "Pulse: opens the editor in your default web browser (a second window onto the same document, "
-                   "authorised with this session's token). The panel stays the active editor until the "
-                   "browser window takes over.",
-    "Reloadui": "Pulse: reloads the editor page in the panel. Use it if the panel looks stuck or after updating "
-                "the editor; the document is kept in TouchDesigner and reloaded.",
+    "Devurl": "Developer option: URL of a web development server (for example http://localhost:5173/) that Open in "
+              "Browser should open instead of the built-in editor page (it connects to this project's server). "
+              "Leave empty (default) in normal use.",
+    "Openbrowser": "Pulse: opens this editor in your default web browser. If the project already has a master editor "
+                   "(a running web server) the browser opens that server's page with this editor's tab selected; "
+                   "otherwise this editor becomes the master and starts the server. All editors of the project "
+                   "appear as tabs of the same page. Changes made in the browser are authorised with the project's "
+                   "token (part of the opened address).",
+    "Upgradeall": "Pulse (Upgrade All Editors): finds every Raster Editor in the project and replaces each one that "
+                  "is OLDER than this editor with this editor's code, UI and network while keeping its document, "
+                  "history, inputs, outputs and parameter values. Newer editors are skipped and listed in a "
+                  "warning. Affected browser tabs reconnect. The result is shown in Status.",
     "Exportpath": "File the Export with Document pulse writes: a .tox (default empty = raster_editor_export.tox next "
                   "to the project file). A relative path is relative to the project folder, a missing .tox ending is "
                   "added, and the folder must already exist.",
@@ -223,24 +211,29 @@ HELP = {
                  "size) to PNG File with straight (non-premultiplied) alpha, as 8-bit RGBA. Written to a temporary "
                  "file and renamed. Refused while the editor is inactive or another file operation is running. "
                  "The result is shown in Status.",
-    "Status": "Informational, read-only: a one-line summary of the editor (which window is active, document size, "
-              "tiles per second received, connected windows, errors). Nothing to set here.",
+    "Status": "Informational, read-only: a one-line summary of the editor (master or slave, which browser window is "
+              "active, document size, tiles per second received, connected windows, errors). Nothing to set here.",
 }
 COMMENT = ("Raster Editor: a layer-based raster editor with a web UI. Wire TOPs into the inputs (a new spare input "
            "appears as you connect, up to 8) or set the document size on the Raster Editor page; Open in Browser "
-           "opens a second window; Save/Open Project and Export PNG are on the same page. Hover a parameter for help.")
+           "opens the editor in your browser (one tab per editor of the project, one web server for all); "
+           "Save/Open Project and Export PNG are on the same page. Hover a parameter for help.")
 
-PARAMS = "Active Port Docw Doch Premultiplied Maxsendfps Maxinputfps Maxviewfps Devurl Panelquery Openbrowser Reloadui Exportdoc Docsizemode Projectfile Saveproject Openproject Pngfile Exportpng"
+PARAMS = "Active Port Docw Doch Premultiplied Maxsendfps Maxinputfps Maxviewfps Devurl Openbrowser Upgradeall Exportdoc Docsizemode Projectfile Saveproject Openproject Pngfile Exportpng"
 
 
 # --------------------------------------------------------------------------- build (inside TD)
 
 
-SOURCES = ("td/raster_editor/protocol.py", "td/raster_editor/frames.py", "td/raster_editor/ext.py",
+SOURCES = ("td/raster_editor/protocol.py", "td/raster_editor/frames.py", "td/raster_editor/registry.py",
+           "td/raster_editor/upgrade.py", "td/raster_editor/ext.py",
            "td/raster_editor/network.py", "td/raster_editor/effects.py", "td/raster_editor/blend.glsl",
            "td/raster_editor/shape.glsl", "dist/ui/index.html")
 EFFECT_DIR = "shared/effects"  # shared with the web preview; every *.glsl becomes a DAT `fx_<stem>` (common, dropShadow, ...)
 MAX_INPUTS = 8
+
+
+OPTIONAL_SOURCES = ()
 
 
 def effect_sources(repo=None):
@@ -258,8 +251,10 @@ def effect_dat_name(rel):
 def read_sources():
     """Read every embedded file up front, before the old COMP is touched."""
     out = {}
-    for rel in SOURCES + tuple(effect_sources()):
+    for rel in SOURCES + tuple(effect_sources()) + OPTIONAL_SOURCES:
         path = os.path.join(REPO, rel)
+        if rel in OPTIONAL_SOURCES and not os.path.isfile(path):
+            continue
         if not os.path.isfile(path):
             hint = " (run `npm run build` in web/ first)" if rel.startswith("dist/") else ""
             raise RuntimeError(f"missing {path}{hint}; the existing COMP was left untouched")
@@ -350,9 +345,12 @@ def build(dev=False, name=NAME, in_place=True):
         comp.nodeX, comp.nodeY = state["x"], state["y"]
     comp.par.w, comp.par.h = state["w"], state["h"]
     comp.par.parentshortcut = SHORTCUT
+    if TAG not in comp.tags:
+        comp.tags.add(TAG)
 
     # --- custom parameters
     page = comp.appendCustomPage("Raster Editor")
+    page.appendStr("Version", label="Version")[0].readOnly = True
     page.appendToggle("Active", label="Active")[0].default = True
     page.appendInt("Port", label="Port")[0].default = 9980
     dm = page.appendMenu("Docsizemode", label="Document Size Mode")[0]
@@ -371,9 +369,8 @@ def build(dev=False, name=NAME, in_place=True):
     vm.default = "local"
     vm.readOnly = True
     page.appendStr("Devurl", label="Dev URL")
-    page.appendStr("Panelquery", label="Panel Query")
     page.appendPulse("Openbrowser", label="Open in Browser")
-    page.appendPulse("Reloadui", label="Reload UI")
+    page.appendPulse("Upgradeall", label="Upgrade All Editors")
     page.appendFile("Exportpath", label="Export Path")
     page.appendPulse("Exportdoc", label="Export with Document")
     page.appendFile("Projectfile", label="Project File")
@@ -382,6 +379,8 @@ def build(dev=False, name=NAME, in_place=True):
     page.appendFile("Pngfile", label="PNG File")
     page.appendPulse("Exportpng", label="Export PNG")
     page.appendStr("Status", label="Status")[0].readOnly = True
+    comp.store("reTemplatePars", sorted(p.name for p in comp.customPars))   # Upgrade All Editors: the build's own parameters / pages
+    comp.store("reTemplatePages", sorted(p.name for p in comp.customPages))
     for pname, lo, hi in (("Port", 1024, 65535), ("Docw", 1, 16384), ("Doch", 1, 16384),
                           ("Maxsendfps", 1, 120), ("Maxinputfps", 1, 120), ("Maxviewfps", 1, 120)):
         p = getattr(comp.par, pname)
@@ -390,6 +389,9 @@ def build(dev=False, name=NAME, in_place=True):
     for pname in ("Active", "Port", "Docw", "Doch", "Premultiplied", "Maxsendfps", "Maxinputfps", "Maxviewfps"):
         getattr(comp.par, pname).val = getattr(comp.par, pname).default
     comp.par.Docsizemode = "input"
+    comp.par.Version.readOnly = False
+    comp.par.Version = VERSION
+    comp.par.Version.readOnly = True
     comp.par.Viewmode = "local"
     for pname, text in HELP.items():
         getattr(comp.par, pname).help = text
@@ -401,6 +403,8 @@ def build(dev=False, name=NAME, in_place=True):
     # --- python modules + html + shader (before the extension is wired)
     text_dat(comp, "protocol", "td/raster_editor/protocol.py", dev, -600, 500, sources)
     text_dat(comp, "frames", "td/raster_editor/frames.py", dev, -600, 400, sources)
+    text_dat(comp, "registry", "td/raster_editor/registry.py", dev, -900, 400, sources)
+    text_dat(comp, "upgrade", "td/raster_editor/upgrade.py", dev, -900, 500, sources)
     text_dat(comp, "network", "td/raster_editor/network.py", dev, -600, 300, sources)
     text_dat(comp, "effects", "td/raster_editor/effects.py", dev, -900, 300, sources)
     for i, rel in enumerate(effect_sources()):  # shader sources shared with the web preview
@@ -456,37 +460,10 @@ def build(dev=False, name=NAME, in_place=True):
     ws_cb.text = WEBSERVER_CALLBACKS
     ws_cb.nodeX, ws_cb.nodeY = -300, 200
 
-    # --- panel
-    wr = comp.create(webrenderTOP, "webrender")
-    wr.nodeX, wr.nodeY = 0, 200
-    wr.par.source = "urlorfile"
-    wr.par.url = "about:blank"
-    wr.par.outputresolution = "custom"
-    wr.par.resolutionw.expr = "parent().par.w"
-    wr.par.resolutionh.expr = "parent().par.h"
-    wr.par.dpiscale = 1
-    wr.par.alwayscook = 1
-    wr.par.maxrenderrate = 60
-    wr.par.transparent = 1  # always on (toggling it reloads the page); the page paints an opaque background in Local mode
-    wr.par.active = 1
-    comp.par.top = "./webrender"
-    comp.par.topfill = "native"
-
-    pe = comp.create(panelexecuteDAT, "panel_exec")
-    pe.nodeX, pe.nodeY = 300, 200
-    pe.text = PANEL_EXEC
-    pe.par.panelvalue = "u v lselect mselect rselect wheel"
-    pe.par.valuechange = 1
-    pe.par.offtoon = 1
-    pe.par.ontooff = 1
-
-    kb = comp.create(keyboardinDAT, "keyboard")
-    kb.nodeX, kb.nodeY = 300, 350
-    kb_cb = op(kb.par.callbacks.eval())
-    kb_cb.name = "keyboard_callbacks"
-    kb_cb.text = KEYBOARD_CALLBACKS
-    kb_cb.nodeX, kb_cb.nodeY = 300, 450
-    kb.par.panels = comp
+    # --- viewer: the component shows its output (editing happens in an external browser)
+    comp.par.top = "./out1"
+    comp.par.topfill = "best"
+    comp.viewer = True
 
     fe = comp.create(executeDAT, "frame_exec")
     fe.nodeX, fe.nodeY = 600, 200
@@ -564,6 +541,8 @@ def main(dev):
     par_exec.par.active = 0
     restore(comp, state)
     comp.Start()
+    if comp.ext.RasterEditorExt._live_master() is None and comp.ext.RasterEditorExt._pending_master() is None:
+        comp.BecomeMaster()  # development: the rebuilt component serves when the project has no live master
     par_exec.par.active = 1
     print("built", comp.path, "dev" if dev else "embedded", "kept", state["kept"])
     return comp

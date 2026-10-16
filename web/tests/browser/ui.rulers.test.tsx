@@ -17,12 +17,11 @@ beforeEach(async () => {
   store.setSnapOn(false);
   store.spaceHeld.value = false;
   store.viewMode.value = 'local';
-  store.clientKind.value = 'external';
   store.setTool('move');
   await mount(<ViewportFrame />, 'display:flex;flex-direction:column;width:640px;height:420px');
   await settle();
 });
-afterEach(() => { unmount(); store.setSnapOn(true); store.setShowGuides(true); store.setShowRulers(true); store.viewMode.value = 'local'; store.clientKind.value = 'external'; });
+afterEach(() => { unmount(); store.setSnapOn(true); store.setShowGuides(true); store.setShowRulers(true); store.viewMode.value = 'local'; });
 
 const vp = () => q('[data-viewport]');
 const top = () => q<HTMLCanvasElement>('[data-ruler=top]');
@@ -185,17 +184,6 @@ describe('guides', () => {
     expect(overPixel(...local(10, 40))[3]).toBe(0);
   });
 
-  it('guides are also drawn in the TouchDesigner panel view, where the document rect is transparent', async () => {
-    engine.addGuide('v', 60);
-    store.clientKind.value = 'panel';
-    store.connection.value = 'linked';
-    store.setViewMode('td');
-    await settle();
-    expect(store.tdPanel.value).toBe(true);
-    expect(overPixel(...local(60, 10)).slice(0, 3)).toEqual(GUIDE_RGB);
-    store.setViewMode('local');
-    store.connection.value = 'reconnecting';
-  });
 
   it('dragging a guide with the Move tool moves it', async () => {
     engine.addGuide('h', 40);

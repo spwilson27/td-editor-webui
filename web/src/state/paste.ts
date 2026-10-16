@@ -6,7 +6,7 @@ import type { Store } from './store';
 /** Ctrl/Cmd+V: image items on the clipboard become a new layer, or (v7.1) the layer clipboard is pasted. Text fields and the text editor keep their own paste. */
 export function installPaste(store: Store, win: Window = window): () => void {
   const onPaste = (e: ClipboardEvent) => {
-    if (isTyping(e.target) || store.textEdit.peek() || store.loadingDoc.peek() || !store.hasEngine()) return;
+    if (isTyping(e.target) || store.textEdit.peek() || store.loadingDoc.peek() || store.editorSwitching.peek() || !store.hasEngine()) return;
     if (store.pasteRecentlyHandled()) { e.preventDefault(); return; } // a late event after the keyboard fallback already pasted this key press
     store.cancelPasteFallback();
     const files = imageFiles(e.clipboardData);

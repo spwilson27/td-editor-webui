@@ -41,10 +41,6 @@ export function FileDialog() {
             onInput={(e) => store.setFilePath((e.target as HTMLInputElement).value)}
             onKeyDown={(e) => { e.stopPropagation(); if (e.key === 'Enter') ok(); else if (e.key === 'Escape') close(); }}
             style="flex:1 1 auto;min-width:0;height:26px;box-sizing:border-box;padding:0 6px;color:#e3e3e3;background:#1f1f1f;border:1px solid #474747;border-radius:4px" />
-          {store.clientKind.value === 'panel' && (
-            <button type="button" data-file-browse disabled={!store.canBrowse()} onClick={() => void store.browseFile()}
-              style="flex:none;height:26px;padding:0 10px;border:1px solid #474747;border-radius:4px;background:#262626;color:#e3e3e3">Browse…</button>
-          )}
           </span>
         </label>
         {d.op === 'saveProject' && (

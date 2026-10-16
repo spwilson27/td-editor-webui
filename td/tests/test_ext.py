@@ -37,6 +37,7 @@ class Env:
         self.x._now = self.clock
         self.x._cache_root = lambda: CACHE_ROOT
         self.x._sync_cache_writes = True
+        self.x._port_free = lambda p: True   # (the real check connects to the port)
         self.x._sync_file_ops = True   # project / PNG workers run inline
         self.o.ext = self.x
         self.n = 0
@@ -202,7 +203,7 @@ def test_http_404_elsewhere_and_when_ui_empty(env):
 def test_test_backchannel_only_with_test_query_and_token(env):
     post = lambda **kw: env.x.OnHTTPRequest(req("POST", "/__test", b'{"x":1}', **kw), {})  # noqa: E731
     assert post(token=env.x.token)["statusCode"] == 404 and env.x.test_result is None
-    env.o.par.Panelquery.val = "test=1"
+    env.o.storage["reTest"] = 1
     assert post()["statusCode"] == 404  # no token
     assert post(token="wrong")["statusCode"] == 404
     assert post(token=env.x.token)["statusCode"] == 204
@@ -215,7 +216,7 @@ def test_first_client_becomes_active_and_gets_hello(env):
     env.pump()
     a = env.connect("external")
     (hello,) = env.s.messages(a, "hello")
-    assert hello["protocol"] == 9 and hello["active"] is True and hello["hasInput"] is False
+    assert hello["protocol"] == 10 and hello["active"] is True and hello["hasInput"] is False
     assert hello["doc"] == {"w": 64, "h": 32, "mode": "input"} and hello["inputs"] == [IN(1)] and "baseSize" not in hello and hello["maxSendFps"] == 30
     assert hello["hasDocument"] is False and hello["rev"] is None
 
@@ -226,15 +227,6 @@ def test_second_client_is_standby(env):
     b = env.connect("external")
     assert env.s.messages(b, "hello")[0]["active"] is False
     assert env.x.active_id == a
-
-
-def test_panel_takes_priority_on_first_connect_after_start(env):
-    env.pump()
-    ext_c = env.connect("external")
-    panel = env.connect("panel")
-    assert env.x.active_id == panel
-    assert env.s.messages(ext_c, "active")[-1]["active"] is False
-    assert env.s.messages(panel, "hello")[0]["active"] is True
 
 
 def test_panel_reconnect_does_not_steal_from_active_external(env):
@@ -886,9 +878,6 @@ def test_input_is_sent_as_banded_base_frames_flipped_and_unpremultiplied(env):
     assert np.abs(wire.astype(int) - expect).max() <= 1
 
 
-
-
-
 def test_unchanged_input_is_not_resent(env):
     env.set_input(64, 32)
     env.pump()
@@ -961,9 +950,6 @@ def test_request_base_without_input_is_noop(env):
     env.send(a, {"t": "requestBase"})
     env.pump(5)
     assert not env.notices(a) and not env.s.binaries
-
-
-
 
 
 def test_input_resize_sends_docsize_and_basesize_new_base_and_keeps_surfaces(env):
@@ -1118,57 +1104,11 @@ def test_doc_par_change_without_input_resizes(env):
     assert (env.x.doc_w, env.x.doc_h) == (10, 10)
 
 
-
-
-
 # ----------------------------------------------------------------------------- mouse / keyboard
 
 class PV:
     def __init__(self, name, val):
         self.name, self.val = name, val
-
-
-def test_mouse_forwarded_unchanged_bottom_left_origin(env):
-    p = env.o.panel
-    p.u.val, p.v.val = 0.25, 0.8
-    env.x.OnPanelValue(PV("u", 0.25))
-    env.x.OnPanelValue(PV("lselect", 1), 1)
-    env.x.OnPanelValue(PV("lselect", 0), 0)
-    mouse = env.o.webrender.mouse
-    assert mouse[0][:2] == (0.25, 0.8)  # v is NOT flipped
-    assert mouse[0][2] == dict(left=False, middle=False, right=False)
-    assert mouse[1][2]["left"] is True and mouse[2][2]["left"] is False
-
-
-def test_fast_click_within_one_frame_still_sends_press_then_release(env):
-    # the panel's current lselect value is already 0 when both edge callbacks run
-    env.o.panel.lselect.val = 0
-    env.x.OnPanelValue(PV("lselect", 0), 1)
-    env.x.OnPanelValue(PV("lselect", 0), 0)
-    assert [m[2]["left"] for m in env.o.webrender.mouse] == [True, False]
-
-
-def test_plain_value_change_of_a_button_is_ignored(env):
-    env.x.OnPanelValue(PV("lselect", 1))
-    assert not env.o.webrender.mouse
-
-
-def test_drag_keeps_button_state_across_moves(env):
-    env.x.OnPanelValue(PV("lselect", 1), 1)
-    env.o.panel.u.val = 0.5
-    env.x.OnPanelValue(PV("u", 0.5))
-    assert env.o.webrender.mouse[-1][2]["left"] is True
-
-
-def test_mouse_buttons_middle_right_and_wheel(env):
-    env.x.OnPanelValue(PV("mselect", 1), 1)
-    env.x.OnPanelValue(PV("rselect", 1), 1)
-    assert env.o.webrender.mouse[-1][2] == dict(left=False, middle=True, right=True)
-    n = len(env.o.webrender.mouse)
-    env.x.OnPanelValue(PV("wheel", 0))
-    assert len(env.o.webrender.mouse) == n
-    env.x.OnPanelValue(PV("wheel", -2.0))
-    assert env.o.webrender.mouse[-1][2] == {"wheel": -2.0}
 
 
 class Key:
@@ -1180,90 +1120,95 @@ class Key:
         self.cmd = mods.get("cmd", False)
 
 
-def test_keyboard_forwarding(env):
-    env.x.OnKey(Key("b", "b"))
-    env.x.OnKey(Key("z", "z", cmd=True))
-    env.x.OnKey(Key("b", "b", state=False))  # release ignored
-    env.x.OnKey(Key("shift"))  # modifier alone ignored
-    env.x.OnKey(Key("lctrl"))
-    env.x.OnKey(Key("space", " "))
-    keys = env.o.webrender.keys
-    assert [k for k, _ in keys] == ["b", "z", "space"]
-    assert keys[1][1] == dict(char="z", shift=False, alt=False, ctrl=False, cmd=True)
-    assert keys[2][1]["char"] == " "
-
-
-def test_input_events_ignored_when_inactive(env):
-    env.o.par.Active.val = 0
-    env.x.OnKey(Key("b", "b"))
-    env.x.OnPanelValue(PV("u", 0))
-    assert not env.o.webrender.keys and not env.o.webrender.mouse
-
-
 # ----------------------------------------------------------------------------- lifecycle / params / status
 
-def test_start_configures_server_and_panel(env):
+def test_start_runs_no_server_until_the_editor_is_master(env):
     env.x.Start()
-    assert env.s.par.active.val == 1 and env.s.par.port.val == 9980
-    assert env.o.webrender.par.url.val == f"http://127.0.0.1:9980/?client=panel&token={env.x.token}"
-    env.pump(30)  # reload scheduled shortly after start
-    assert env.o.webrender.par.reloadsrc.pulses == 1
+    assert env.s.par.active.val == 0 and not env.x.is_master
+    assert env.x.BecomeMaster() is True
+    assert env.s.par.active.val == 1 and env.s.par.port.val == 9980 and env.x.is_master
+    rec = env.x._record()
+    assert rec["path"] == env.o.path and rec["port"] == 9980 and rec["token"] == env.x.token and rec["id"] == env.x.editor_id
 
 
 def test_pump_starts_extension_lazily():
     e = Env()
     assert not e.x._started
     e.pump()
-    assert e.x._started and e.s.par.active.val == 1
+    assert e.x._started and e.s.par.active.val == 0 and e.x.editor_id
 
 
-def test_devurl_and_panelquery(env):
-    env.o.par.Devurl.val = "http://localhost:5173/"
-    env.o.par.Panelquery.val = "test=1"
-    t = env.x.token
-    assert env.x._panel_url() == f"http://localhost:5173/?ws=ws://127.0.0.1:9980/ws&client=panel&token={t}&test=1"
-    env.o.par.Devurl.val = "http://localhost:5173/?a=1"
-    assert env.x._panel_url().startswith("http://localhost:5173/?a=1&ws=")
-    env.o.par.Devurl.val = ""
-    assert env.x._panel_url() == f"http://127.0.0.1:9980/?client=panel&token={t}&test=1"
+def test_page_url_has_token_and_editor_in_the_fragment_and_devurl_adds_ws(env):
+    env.x.BecomeMaster()
+    t, eid = env.x.token, env.x.editor_id
+    assert env.x._page_url(eid) == f"http://127.0.0.1:9980/#token={t}&e={eid}"
+    assert env.x._page_url(eid, test=True) == f"http://127.0.0.1:9980/?test=1#token={t}&e={eid}"
+    assert env.x._page_url(eid, "http://localhost:5173/") == f"http://localhost:5173/?ws=ws://127.0.0.1:9980/ws#token={t}&e={eid}"
+    assert env.x._page_url(eid, "http://localhost:5173/?a=1").startswith("http://localhost:5173/?a=1&ws=")
 
 
-def test_start_closes_stale_sockets_so_clients_reconnect(env):
-    env.s.webSocketConnections.extend(["old1", "old2"])
-    env.x.Start()
-    assert env.s.closed == ["old1", "old2"]
-
-
-def test_active_off_stops_server_and_pump_is_noop(env):
+def test_start_closes_own_sockets_so_clients_reconnect(env):
     env.pump()
-    a = env.connect("panel")
+    a = env.connect("external")
+    env.x.Start()
+    assert env.s.closed == [a] and not env.x.clients
+
+
+def test_active_off_drops_clients_and_hands_the_server_over(env):
+    env.x.BecomeMaster()
+    env.pump()
+    a = env.connect("external")
     env.o.par.Active.val = 0
     env.x.OnParChange(env.o.par.Active)
-    assert env.s.par.active.val == 0 and env.o.webrender.par.active.val == 0
+    assert env.s.par.active.val == 0 and not env.x.is_master      # no other editor: the server stops
     assert not env.x.clients and a in env.s.closed
-    forced = env.o.webrender.forced
+    assert env.x._record()["orphan"] is True and env.x._record()["path"] == ""
     env.pump(3)
-    assert env.o.webrender.forced == forced
     assert env.o.par.Status.eval() == "inactive"
     env.o.par.Active.val = 1
     env.x.OnParChange(env.o.par.Active)
-    assert env.s.par.active.val == 1
+    assert env.s.par.active.val == 1 and env.x.is_master        # the project's server resumes with the first active editor
+    assert env.x.token == env.x._record()["token"]
 
 
-def test_port_change_restarts_server(env):
+def test_port_change_restarts_the_master_server_only(env):
+    env.x.BecomeMaster()
     env.pump()
-    env.connect("panel")
+    env.connect("external")
     env.o.par.Port.val = 9999
     env.x.OnParChange(env.o.par.Port)
-    assert env.s.par.port.val == 9999 and env.s.par.restart.pulses == 1
-    assert "9999" in env.o.webrender.par.url.val and not env.x.clients
+    assert env.s.par.port.val == 9999 and env.x.port_used == 9999 and not env.x.clients and env.x.is_master
+    assert env.x._record()["port"] == 9999
+
+
+def test_port_change_of_a_slave_is_ignored(env):
+    env.pump()
+    env.o.par.Port.val = 9999
+    env.x.OnParChange(env.o.par.Port)
+    assert env.s.par.active.val == 0 and not env.x.is_master
 
 
 def test_pulses(env):
-    env.x.OnParChange(env.o.par.Reloadui)
-    assert env.o.webrender.par.reloadsrc.pulses == 1
-    env.x.OnParChange(env.o.par.Openbrowser)
-    assert env.opened == [f"http://127.0.0.1:9980/?client=external&token={env.x.token}"]
+    env.x.OnParChange(env.o.par.Openbrowser)     # no live master: this editor becomes it, then opens its page
+    t, eid = env.x.token, env.x.editor_id
+    assert env.x.is_master and env.opened == [f"http://127.0.0.1:9980/#token={t}&e={eid}"]
+    env.x.OnParChange(env.o.par.Openbrowser)     # a live master: no second server, same page
+    assert len(env.opened) == 2 and env.opened[1] == env.opened[0]
+
+
+def test_upgradeall_pulse_runs_the_upgrade_module_and_shows_its_report(env):
+    env.o._ops["upgrade"] = types.SimpleNamespace(module=types.SimpleNamespace(upgrade_all=lambda comp: {"warning": "upgraded 2, skipped 1", "upgraded": []}))
+    env.pump()
+    env.x.OnParChange(env.o.par.Upgradeall)
+    env.pump()
+    assert "upgraded 2, skipped 1" in env.o.par.Status.eval()
+
+
+def test_upgradeall_without_the_module_is_reported_not_raised(env):
+    env.pump()
+    env.x.OnParChange(env.o.par.Upgradeall)
+    env.pump()
+    assert "not available" in env.o.par.Status.eval()
 
 
 def test_premultiplied_toggle_reencodes_surfaces_and_resends_input(env):
@@ -1286,24 +1231,13 @@ def test_premultiplied_toggle_reencodes_surfaces_and_resends_input(env):
     assert np.abs(env.dump(a, 2)[1].astype(int) - straight).max() <= 2  # wire content unchanged (8-bit loss)
 
 
-def test_webrender_forced_to_cook_only_when_nothing_pulls_it(env):
-    wr = env.o.webrender
-    env.pump(5)
-    assert wr.forced >= 4  # never pulled -> pump keeps it alive
-    forced = wr.forced
-    for _ in range(5):
-        wr.totalCooks += 1  # a viewer cooks it each frame
-        env.pump()
-    assert wr.forced == forced
-
-
 def test_status_strings(env):
     env.pump()
-    assert env.o.par.Status.eval().startswith("waiting for client")
+    assert env.o.par.Status.eval().startswith("not served · waiting for client")
     a = env.connect("panel")
     env.pump(10)
     s = env.o.par.Status.eval()
-    assert s.startswith("panel active · 64×32 · 0 tiles/s in")
+    assert s.startswith("not served · external active · 64×32 · 0 tiles/s in")
     env.connect("external")
     env.doc(a, DOC, rev=7)
     env.surface(a, 1, (0, 0, 64, 32), wire_img(64, 32))
@@ -1337,8 +1271,8 @@ def test_callback_exceptions_do_not_escape(env, capsys):
     env.x.protocol = None  # sabotage
     env.x.OnWebSocketText("127.0.0.1:1", "{}")
     env.x.OnWebSocketText("127.0.0.1:1", "{}")
-    assert capsys.readouterr().out.count("[raster_editor] OnWebSocketText") == 1
-    assert "OnWebSocketText: AttributeError" in env.x.last_error[0]
+    assert capsys.readouterr().out.count("[raster_editor] _ws_text") == 1
+    assert "_ws_text: AttributeError" in env.x.last_error[0]
 
 
 def test_stats_collected(env):
@@ -1434,22 +1368,24 @@ def test_ready_without_valid_token_is_refused(env, token):
     assert env.s.messages(a, "error") and a in env.s.closed and env.x.active_id is None
 
 
-def test_token_changes_on_every_start(env):
+def test_token_is_the_project_token_and_survives_a_restart(env):
+    env.x.BecomeMaster()
     t = env.x.token
+    assert len(t) >= 16 and env.x._record()["token"] == t
     env.x.Start()
-    assert env.x.token != t and len(env.x.token) >= 16
+    assert env.x.token == t and env.x.is_master
 
 
-@pytest.mark.parametrize("query,enabled", [("test=1", True), ("a=1&test=1", True), ("xtest=1", False),
-                                          ("test=10", False), ("test=0", False), ("", False)])
-def test_backchannel_requires_exact_test_param(env, query, enabled):
-    env.o.par.Panelquery.val = query
+@pytest.mark.parametrize("query,enabled", [(1, True), ("1", True), (0, False), ("", False)])
+def test_backchannel_requires_the_test_storage_flag(env, query, enabled):
+    if query:
+        env.o.storage["reTest"] = query
     r = env.x.OnHTTPRequest(req("POST", "/__test", b"x", token=env.x.token), {})
     assert (r["statusCode"] == 204) is enabled
 
 
 def test_backchannel_body_is_capped(env):
-    env.o.par.Panelquery.val = "test=1"
+    env.o.storage["reTest"] = 1
     r = env.x.OnHTTPRequest(req("POST", "/__test", b"x" * (E.MAX_TEST_BODY + 1), token=env.x.token), {})
     assert r["statusCode"] == 413 and env.x.test_result is None
 
@@ -1483,9 +1419,6 @@ def test_host_header_lookup_is_case_insensitive(env):
     assert env.x.OnHTTPRequest(r, {})["statusCode"] == 403
 
 
-
-
-
 @pytest.mark.parametrize("n_clients", [1, 3])
 def test_every_client_keeps_receiving_complete_frames_under_continuous_input_change(n_clients):
     env = Env()
@@ -1514,12 +1447,6 @@ def test_every_client_keeps_receiving_complete_frames_under_continuous_input_cha
                 assert prev.frame_end
 
 
-
-
-
-
-
-
 def test_premultiplied_toggle_mid_conversion_restarts_it():
     env = Env(tick=0.001)
     big = np.random.RandomState(1).rand(1080, 1920, 4).astype(np.float32)
@@ -1535,9 +1462,6 @@ def test_premultiplied_toggle_mid_conversion_restarts_it():
     env.o.par.Premultiplied.val = 0
     env.x.OnParChange(env.o.par.Premultiplied)
     assert env.x.base.conv is None and env.x.base.pending
-
-
-
 
 
 def test_failed_buffer_allocation_does_not_commit_the_doc(env, monkeypatch):
@@ -1563,29 +1487,6 @@ def test_one_failing_pump_step_does_not_skip_the_rest(env):
     env.o.switch.par.index.val = 0
     env.pump()
     assert env.o.switch.par.index.eval() == 1  # the switch step still ran after the failing upload
-
-
-def test_pointer_moves_coalesce_into_one_call_per_frame(env):
-    env.pump()
-    p = env.o.panel
-    for i in range(5):
-        p.u.val, p.v.val = 0.1 * i, 0.2
-        env.x.OnPanelValue(PV("u", p.u.val))
-        env.x.OnPanelValue(PV("v", p.v.val))
-    assert not env.o.webrender.mouse
-    env.pump()
-    assert len(env.o.webrender.mouse) == 1 and env.o.webrender.mouse[0][:2] == (pytest.approx(0.4), 0.2)
-    env.pump()
-    assert len(env.o.webrender.mouse) == 1  # nothing pending
-
-
-def test_button_edge_flushes_pending_move_first_and_keeps_order(env):
-    p = env.o.panel
-    p.u.val, p.v.val = 0.3, 0.3
-    env.x.OnPanelValue(PV("u", 0.3))
-    env.x.OnPanelValue(PV("lselect", 0), 1)
-    env.x.OnPanelValue(PV("lselect", 0), 0)
-    assert [m[2]["left"] for m in env.o.webrender.mouse] == [False, True, False]
 
 
 def test_dev_module_reload_is_picked_up(env):
@@ -1989,77 +1890,11 @@ def set_output(env, seed=0, w=64, h=32, alpha=None):
     return arr
 
 
-def test_panel_view_td_drives_overlay_and_background_switch(env):
-    env.pump()
-    p = env.connect("panel")
-    net = env.o.net
-    n = len(net.views)
-    env.send(p, vmsg("td"))
-    assert net.views[n:] == [({"mode": "td", "zoom": 2.0, "panX": 5.0, "panY": -3.0, "rect": VIEW_RECT}, 1280, 800)]
-    assert env.o.par.top.eval() == "./panel_view"
-    env.send(p, vmsg("td"))  # unchanged: nothing is rebuilt
-    assert len(net.views) == n + 1
-    env.send(p, vmsg("td", zoom=3.0))
-    assert len(net.views) == n + 2 and net.views[-1][0]["zoom"] == 3.0
-    env.send(p, vmsg("local"))
-    assert net.views[-1][0] is None
-    assert env.o.par.top.eval() == "./webrender"
-    assert env.o.par.Viewmode.eval() == "local"
-
-
-def test_panel_view_follows_panel_resize_and_doc_size(env):
-    env.pump()
-    p = env.connect("panel")
-    env.send(p, vmsg("td"))
-    n = len(env.o.net.views)
-    env.o.par.w.val, env.o.par.h.val = 1000, 700
-    env.pump()
-    assert env.o.net.views[n:] == [(env.o.net.views[-1][0], 1000, 700)] and env.o.net.views[-1][0] is not None
-    env.o.par.Docw.val = 100
-    env.pump()
-    assert len(env.o.net.views) == n + 2  # doc size change re-lays out the overlay
-
-
-def test_panel_disconnect_returns_background_to_webrender(env):
-    env.pump()
-    p = env.connect("panel")
-    env.send(p, vmsg("td"))
-    env.x.OnWebSocketClose(p)
-    assert env.o.net.views[-1][0] is None and env.o.par.top.eval() == "./webrender"
-
-
-def test_active_off_returns_background_to_webrender(env):
-    env.pump()
-    p = env.connect("panel")
-    env.send(p, vmsg("td"))
-    env.o.par.Active.val = 0
-    env.x.OnParChange(env.o.par.Active)
-    assert env.o.par.top.eval() == "./webrender"
-
-
-def test_panel_view_does_not_start_the_external_stream(env):
-    env.pump()
-    p = env.connect("panel")
-    env.send(p, vmsg("td"))
-    set_output(env)
-    env.pump(10)
-    assert not env.s.messages(p, "view") and env.o.net.out.readbacks == 0
-
-
-def test_external_view_message_does_not_touch_the_panel_overlay(env):
-    env.pump()
-    env.connect("panel")
-    e = env.connect("external")
-    n = len(env.o.net.views)
-    env.send(e, vmsg("td"))
-    assert len(env.o.net.views) == n and env.o.par.top.eval() == "./webrender"
-
-
 def test_bad_view_message_replies_error(env):
     env.pump()
     p = env.connect("panel")
     env.send(p, {"t": "view", "mode": "td", "zoom": "x"})
-    assert env.s.messages(p, "error") and not any(v is not None for v, _, _ in env.o.net.views)
+    assert env.s.messages(p, "error")
 
 
 def test_viewmode_mirrors_the_active_clients_choice(env):
@@ -2185,18 +2020,6 @@ def test_get_view_requires_subscription_token_and_loopback(env):
     assert r["Access-Control-Allow-Origin"] == "http://localhost:5173" and r["Vary"] == "Origin"
     r = env.x.OnHTTPRequest(req(uri="/view", pars={"token": env.x.token, "client": cid}, Origin="http://evil.example"), {})
     assert "Access-Control-Allow-Origin" not in r and r["Cache-Control"] == "no-store"
-
-
-def test_panel_client_cannot_fetch_the_view_stream(env):
-    env.pump()
-    p = env.connect("panel")
-    e = env.connect("external")
-    set_output(env)
-    env.send(e, vmsg("td"))
-    env.send(p, vmsg("td"))
-    env.pump(10)
-    assert env.x.out.msg is not None
-    assert env.get("/view", client=env.x.clients[p].cid)["statusCode"] == 404
 
 
 def test_one_view_notice_outstanding_and_newest_frame_served():
@@ -2740,18 +2563,6 @@ def test_savetox_in_progress_is_not_thawed_by_the_pump():
 
 
 # ----------------------------------------------------------------------------- S1..S4
-
-def test_panel_key_is_only_remembered_after_the_overlay_was_applied():
-    e = Env()
-    e.pump()
-    p = e.connect("panel")
-    e.o.net.raise_on_view = True
-    e.send(p, vmsg("td"))
-    e.pump(2)   # fails in the message handler (guarded) and in the pump step
-    assert e.o.par.top.eval() == "./webrender"
-    e.o.net.raise_on_view = False
-    e.pump(2)   # the next pump retries because the key was not stored
-    assert e.o.par.top.eval() == "./panel_view"
 
 
 def test_surface_uploads_are_budgeted_per_pump_but_at_least_one():
@@ -3469,6 +3280,7 @@ def test_stored_text_document_survives_a_restart(env):
 def test_active_off_stop_and_port_change_release_every_import_and_held_image():
     for how in ("off", "stop", "port"):
         e = Env()
+        e.x.BecomeMaster()
         e.pump()
         a, b = e.connect("external"), e.connect("external")
         install_tops(e, FakeTop("/project1/t", 6, 4, array=tops_img(6, 4)))
@@ -4240,13 +4052,14 @@ def test_every_http_response_closes_the_connection():
 
 def test_on_destroy_td_quiets_everything_the_destruction_could_wait_for():
     e = settled_env()
+    e.x.BecomeMaster()
     c2 = e.connect("external")
     install_tops(e, FakeTop("/project1/t", 6, 4, array=tops_img(6, 4)))
     e.send(c2, {"t": "importTop", "requestId": "r", "path": "/project1/t"})
     e.s.webSocketConnections[:] = [e.a, c2]
     e.x.onDestroyTD()
     assert set(e.s.closed) == {e.a, c2}   # every WebSocket peer closed by us
-    assert e.o.server.par.active.val == 0 and e.o.webrender.par.active.val == 0
+    assert e.o.server.par.active.val == 0 and not e.x.is_master
     assert not e.x.clients and e.x.active_id is None
     assert e.x._imp is None and not e.x._imp_queue and not e.x._tops_held
     assert json.loads(e.o.doc_state.text)["rev"] == 6   # the pending document state was stored
@@ -4268,19 +4081,20 @@ def test_on_destroy_td_survives_failing_operators_and_is_idempotent(capsys):
     e = settled_env()
     e.o.server.webSocketClose = lambda c: (_ for _ in ()).throw(RuntimeError("dead"))
     e.o.server.webSocketConnections.append("127.0.0.1:9")
-    e.o._ops["webrender"] = None            # an operator that is already gone
+    e.o._ops["webserver"] = None            # an operator that is already gone
     e.x._save_undo_cache = lambda: (_ for _ in ()).throw(OSError("disk full"))
     e.x.onDestroyTD()
     e.x.onDestroyTD()
     out = capsys.readouterr().out
-    assert "onDestroyTD/panel" in out and "onDestroyTD/undo cache" in out
-    assert e.o.server.par.active.val == 0
+    assert "onDestroyTD/server" in out and "onDestroyTD/undo cache" in out
+    assert e.x._destroyed
 
 
 # ----------------------------------------------------------------------------- undo of a delete / re-initialised extension
 
 def test_on_destroy_td_of_an_old_instance_after_reinit_does_not_touch_the_server():
     e = settled_env()
+    e.x.BecomeMaster()
     e.o.ext = types.SimpleNamespace(RasterEditorExt=object())   # TD built the new instance first
     e.x.onDestroyTD()
     assert e.o.server.par.active.val == 1 and not e.s.closed and e.x.clients and e.x._started and not e.x._destroyed

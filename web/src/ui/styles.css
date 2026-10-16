@@ -1,5 +1,4 @@
 html,body{margin:0;background:#1c1c1c}
-html[data-td-panel],html[data-td-panel] body{background:transparent}
 #app button{font:inherit;color:inherit;border:0;background:none;cursor:pointer;padding:0}
 #app .ib{display:inline-flex;align-items:center;justify-content:center;border-radius:5px}
 #app .ib:hover{background:#3a3a3a}

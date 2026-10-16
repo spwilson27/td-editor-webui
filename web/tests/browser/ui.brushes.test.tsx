@@ -175,14 +175,6 @@ describe('Brushes panel: presets', () => {
     expect(names('user')).toEqual(['Filed', 'Filed']);
   });
 
-  it('a panel client has no file chooser for presets (paste / copy instead)', async () => {
-    store.clientKind.value = 'panel';
-    q('[data-preset-import]').click();
-    await settle();
-    expect(document.querySelector('[data-preset-file]')).toBeNull();
-    expect(document.querySelector('input[data-preset-file-input]')).toBeNull();
-    store.clientKind.value = 'external';
-  });
 
   it('storage that throws neither breaks the panel nor loses the preset for this session', async () => {
     const orig = Storage.prototype.setItem;

@@ -199,16 +199,6 @@ describe('store: v2 view mode, masks, adjustments', () => {
     expect(engine.previewEnabled).toBe(true);
   });
 
-  it('only a panel client in TD view is transparent', () => {
-    store.setConnection('linked');
-    store.setViewMode('td');
-    expect(store.tdPanel.value).toBe(false);
-    store.clientKind.value = 'panel';
-    expect(store.tdPanel.value).toBe(true);
-    store.setViewMode('local');
-    expect(store.tdPanel.value).toBe(false);
-  });
-
   it('opens the Effects tab only when an adjustment layer is created; not on selection, undo or delete', () => {
     const adj = store.addAdjustment('blur');
     expect(store.layerTab.value).toBe('fx'); // an adjustment is an FX stack

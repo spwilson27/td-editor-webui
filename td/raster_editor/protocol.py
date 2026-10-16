@@ -1,4 +1,4 @@
-"""TD <-> web wire protocol (docs/PROTOCOL.md, version 9). Pure python, no TD or numpy needed.
+"""TD <-> web wire protocol (docs/PROTOCOL.md, version 10). Pure python, no TD or numpy needed.
 
 Binary frames: 24-byte little-endian header + RGBA8 straight-alpha payload (top row first).
 JSON messages: text frames with a string field ``t``.
@@ -10,7 +10,7 @@ import re
 import struct
 from typing import Iterator, NamedTuple, Optional, Tuple
 
-PROTOCOL_VERSION = 9
+PROTOCOL_VERSION = 10
 APP_VERSION = "0.5.0"  # written to .redoc meta.json
 MAGIC = b"REF1"
 HEADER_SIZE = 24
@@ -304,6 +304,19 @@ def file_result(request_id, op: str, ok: bool, path: str, msg=None) -> str:
 def reload_msg(rev) -> str:
     """The stored document was replaced (Open Project): drop the document and reload it with requestDoc."""
     return encode_json({"t": "reload", "rev": rev})
+
+
+def editors_msg(master: str, editors) -> str:
+    """v10: the project's editors ``[{id, name, path, version, active}]`` (path order) and the master's id; sent on connect and on every change."""
+    return encode_json({"t": "editors", "master": str(master), "editors": [
+        {"id": str(e["id"]), "name": str(e["name"]), "path": str(e["path"]), "version": str(e.get("version", "")),
+         "active": bool(e.get("active"))} for e in editors]})
+
+
+def gone() -> str:
+    """v10: sent on a WebSocket whose ``editor=`` does not exist / is inactive, right before TD closes it (the Web Server DAT cannot
+    close with code 4404)."""
+    return encode_json({"t": "gone"})
 
 
 def files_msg(project_file: str, png_file: str) -> str:

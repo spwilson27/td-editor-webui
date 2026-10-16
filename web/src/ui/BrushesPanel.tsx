@@ -136,7 +136,6 @@ function ImportExport() {
   const [msg, setMsg] = useState('');
   const file = useRef<HTMLInputElement>(null);
   const area = useRef<HTMLTextAreaElement>(null);
-  const panel = store.clientKind.value === 'panel';
   const open = (m: 'export' | 'import') => {
     if (mode === m) { setMode(null); return; }
     setMode(m);
@@ -177,13 +176,11 @@ function ImportExport() {
               ? <button data-preset-download style={BTN} onClick={download}>Download file</button>
               : <>
                 <button data-preset-apply style={BTN} onClick={() => doImport(area.current?.value ?? text)}>Import text</button>
-                {!panel && <button data-preset-file style={BTN} onClick={() => file.current?.click()}>Choose file…</button>}
+                <button data-preset-file style={BTN} onClick={() => file.current?.click()}>Choose file…</button>
               </>}
           </div>
-          {!panel && (
-            <input ref={file} type="file" accept=".json,application/json" hidden data-preset-file-input aria-hidden="true" tabIndex={-1}
+          <input ref={file} type="file" accept=".json,application/json" hidden data-preset-file-input aria-hidden="true" tabIndex={-1}
               onChange={async (ev) => { const i = ev.target as HTMLInputElement, f = i.files?.[0]; i.value = ''; if (f) { if (f.size > MAX_IMPORT_BYTES) { setMsg('That file is too large to be a preset file'); return; } try { doImport(await f.text()); } catch { setMsg('Could not read the file'); } } }} />
-          )}
         </div>
       )}
       {msg && <div data-preset-msg style="color:#f0b45a">{msg}</div>}

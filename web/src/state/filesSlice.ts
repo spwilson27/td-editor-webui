@@ -56,23 +56,6 @@ export function createFilesSlice(ctx: SliceCtx) {
       if (cur) fileDialog.value = { ...cur, busy: false, result };
       return result;
     },
-    /** Browse… is enabled when idle and the bridge can choose a file (the dialog shows it for panel clients only). */
-    canBrowse(): boolean {
-      const d = fileDialog.peek();
-      return !!d && !d.busy && !!(ctx.bridge() as { chooseFile?: unknown } | null)?.chooseFile;
-    },
-    async browseFile() {
-      const d = fileDialog.peek(), b = ctx.bridge() as { chooseFile?: (op: FileOp) => Promise<string | null> } | null;
-      if (!d || d.busy || !b?.chooseFile) return;
-      try {
-        const p = await b.chooseFile(d.op);
-        const cur = fileDialog.peek();
-        if (p && cur) fileDialog.value = { ...cur, path: p, result: null };
-      } catch (err) {
-        const cur = fileDialog.peek();
-        if (cur) fileDialog.value = { ...cur, result: { op: cur.op, ok: false, path: cur.path, msg: err instanceof Error ? err.message : String(err) } };
-      }
-    },
     /** A fileResult that did not come from this page's dialog (TD pulses): shown as a notice. */
     onFileResult(r: FileResult) {
       const cur = fileDialog.peek();

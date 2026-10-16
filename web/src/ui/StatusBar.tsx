@@ -34,7 +34,7 @@ function LatencyReadout() {
   if (store.connection.value !== 'linked') return null;
   const stroke: LatencyStats = store.latency.value, vl = store.viewLatency.value, age = store.viewAge.value;
   const td = store.viewMode.value === 'td';
-  const ext = td && store.clientKind.value === 'external';
+  const ext = td;
   return (
     <span data-status="latency" title={stroke.n ? `median ${fmt(stroke.median)}, p95 ${fmt(stroke.p95)} over ${stroke.n} strokes` : 'no samples yet'}>
       stroke → TD {stroke.n ? fmt(stroke.median) : '—'}

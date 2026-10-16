@@ -8,7 +8,7 @@ let td: FakeTd;
 test.afterEach(async () => { await (td as FakeTd | undefined)?.close(); });
 
 const REVIEW = resolve(process.cwd(), '../dist/review');
-const url = () => `/?test=1&client=panel&ws=${encodeURIComponent(td.url)}&token=${td.token}`;
+const url = () => `/?test=1&ws=${encodeURIComponent(td.url)}#token=${td.token}`;
 const open = async (page: Page) => {
   td = await FakeTd.start({ w: 160, h: 90, hasInput: true });
   page.on('pageerror', (e) => { throw e; });
