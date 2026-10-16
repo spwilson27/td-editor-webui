@@ -146,7 +146,7 @@ Filters are data-driven; see [docs/FILTERS.md](docs/FILTERS.md) for the spec for
 ## Releasing
 
 1. Everything green: pytest, typecheck, unit, browser, e2e, and at least `td_workers.py --tier smoke` (ideally the full suite).
-2. Bump `VERSION` in `td/build_component.py` (stamped into the read-only `Version` parameter; **Upgrade All Editors compares it** and only replaces editors older than the one you are using). Note: at the time of writing `VERSION` still reads `0.8.0` although `v0.9.0` is tagged; bump it for the next release. Bump `PROTOCOL_VERSION` per the section above if the wire format changed.
+2. Bump `VERSION` in `td/build_component.py` (stamped into the read-only `Version` parameter; **Upgrade All Editors compares it** and only replaces editors older than the one you are using). Bump `PROTOCOL_VERSION` per the section above if the wire format changed.
 3. Rebuild the UI (`cd web && npm run build`) and the component in an isolated TD (`td/build_component.py`); commit `dist/ui/index.html` and `dist/raster_editor.tox` together with the sources. Run the live Upgrade steps (48, 59) so older editors still upgrade.
 4. Add `docs/DESIGN_Vn.md` and the PROTOCOL/TD_COMPONENT sections; update `docs/README.md`.
 5. Commit with a message in the style `vN: <summary>` and tag locally: `git tag vX.Y.Z`. Tags so far: v0.1.0 ... v0.9.0. Pushing (`git push --tags`) is a separate, deliberate step.

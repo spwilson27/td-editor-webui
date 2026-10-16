@@ -4,7 +4,7 @@
 
 Builds a scratch box /project1/_upg_box holding three editors (loaded with loadTox into the box, renamed):
   _upg_old     the v0.7.3 component (default: `git show v0.7.3:dist/raster_editor.tox`, written to the scratchpad)
-  _upg_new     the current build (dist/raster_editor.tox); when it has no ``Version`` parameter yet one is added (0.8.0) and a
+  _upg_new     the current build (dist/raster_editor.tox); when it has no ``Version`` parameter yet one is added (the build's VERSION) and a
                marker line is appended to its extension so the replacement is observable
   _upg_newer   another copy with Version 9.0.0 (must be skipped and listed)
 puts a document (input / pixel layer with a drop shadow / pixel layer with a mask) into the old one through a fake web client,
@@ -28,6 +28,16 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+
+
+def _build_version():
+    import re
+    with open(os.path.join(ROOT, "td", "build_component.py")) as f:
+        m = re.search(r'^VERSION = "([^"]+)"', f.read(), re.M)
+    return m.group(1) if m else ""
+
+
+NEW_VERSION = _build_version()  # what an upgrade stamps (td/build_component.py VERSION)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "td", "raster_editor"))
 
@@ -209,7 +219,7 @@ print(json.dumps({'ext': hash(r.op('RasterEditorExt').text), 'n': len(r.children
         load(new_tox, NEWER, PORTS[NEWER])
         load(new_tox, MASTER, PORTS[MASTER])
         td(f"""
-for p, ver in ((%r, '0.8.0'), (%r, '9.0.0'), (%r, '0.7.9')):
+for p, ver in ((%r, %r), (%r, '9.0.0'), (%r, '0.7.9')):
     c = op(p)
     if not hasattr(c.par, 'Version'):
         pg = [g for g in c.customPages if g.name == 'Raster Editor'][0]
@@ -226,7 +236,7 @@ c.store('_upg_marker', 'keep-me')
 c.create('nullTOP', 'my_user_null')
 c.appendCustomPage('Mine').appendFloat('Gain')
 c.par.Gain = 0.25
-""" % (NEW, NEWER, MASTER, MASTER))
+""" % (NEW, NEW_VERSION, NEWER, MASTER, MASTER))
         for p in (OLD, NEW, NEWER, MASTER):
             if not ready(p, 20):
                 raise RuntimeError(f"{p} did not start")
@@ -301,7 +311,7 @@ print(json.dumps({{'done': first['done'], 'pending': first['pending']}}))""", 60
         w = wiring(OLD)
         check("wiring intact", w == wires_before and w["in"] == [BOX + "/_upg_in"] and w["out"] == [BOX + "/_upg_down"], str(w))
         check("downstream null still fed", td_json(f"print(json.dumps([k.owner.path for k in op({BOX!r}+'/_upg_down').inputConnectors[0].connections]))") == [OLD])
-        check("Version updated + tag", after["version"] == "0.8.0" and "rasterEditor" in after["tags"], f"{after['version']} {after['tags']}")
+        check("Version updated + tag", after["version"] == NEW_VERSION and "rasterEditor" in after["tags"], f"{after['version']} {after['tags']}")
         check("code replaced from the source", after["ext_marker"] and not before["ext_marker"])
         check("parameter values / expression / storage kept",
               after["pars"] == before["pars"] and after["expr"] == "20 + 5" and after["store"] == "keep-me", str(after["pars"]))
@@ -321,7 +331,7 @@ print(json.dumps({{'done': first['done'], 'pending': first['pending']}}))""", 60
               minfo2["eid"] == minfo["eid"] and minfo2["err"] == "None" and minfo2["started"] and minfo2["mmaster"]
               and minfo2["mport"] == minfo["port"], str(minfo2))
         check("slave: document + surfaces identical, Version updated",
-              mafter["doc_state"] == mbefore["doc_state"] and mafter["surfaces"] == mbefore["surfaces"] and mafter["version"] == "0.8.0",
+              mafter["doc_state"] == mbefore["doc_state"] and mafter["surfaces"] == mbefore["surfaces"] and mafter["version"] == NEW_VERSION,
               f"{mafter['layers']} {mafter['version']}")
         mt = td_json(f"print(json.dumps(op({MASTER!r}).op('RasterEditorExt').text == op({NEW!r}).op('RasterEditorExt').text))")
         check("slave: code replaced from the source", mt is True)

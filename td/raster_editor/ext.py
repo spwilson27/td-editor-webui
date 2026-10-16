@@ -30,7 +30,6 @@ from urllib.parse import parse_qs
 import numpy as np
 
 CLIENT_KINDS = ("external",)  # v10: no in-TD panel; every client is an external browser
-VERSION_FALLBACK = "0.8.0"
 RECORD_KEY = "rasterEditorMaster"  # root storage: {path, id, port, token, orphan} of the project master
 PORT_FALLBACK = 50  # a busy master port: try the next ones up to +50
 SCAN_PERIOD_S = 5.0  # master: editor list poll (renames have no callback; create / delete / Active / Start are event driven)

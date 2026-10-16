@@ -951,6 +951,14 @@ def op_exists():
         return False
 
 
+def component_version():
+    """The VERSION the build stamps into the component's read-only `Version` parameter (td/build_component.py)."""
+    import re
+    src = open(os.path.join(ROOT, "td", "build_component.py")).read()
+    m = re.search(r'^VERSION = "([^"]+)"', src, re.M)
+    return m.group(1) if m else ""
+
+
 def s1_build(args):
     pre = td_json("""
 c = op('/project1/raster_editor')
@@ -975,7 +983,7 @@ print(json.dumps({'state': comp.op('doc_state').text, 'kids': sorted(x.name for 
 """)
     kept = post["state"] == pre["state"] and set(pre["kids"]) <= set(post["kids"])
     vers = td("print(comp.par.Version.eval(), 'rasterEditor' in comp.tags, comp.op('webrender') is None, comp.par.top.eval())").split()
-    ok = info["exists"] and not info["bad"] and info["ext"] and kept and vers[0] == "0.8.0" and vers[1] == "True" and vers[2] == "True"
+    ok = info["exists"] and not info["bad"] and info["ext"] and kept and vers[0] == component_version() and vers[1] == "True" and vers[2] == "True"
     note = (f"doc_state ({len(pre['state'])} chars) and {len(pre['kids'])} surface TOPs preserved across the rebuild: {kept}"
             if pre["state"] or pre["kids"] else "no document to preserve (first build)")
     return ok, note if ok else json.dumps(info) + " " + note
@@ -5466,7 +5474,7 @@ print(json.dumps({{'doc_state': hashlib.md5(c.op('doc_state').text.encode()).hex
 
 def s59_upgrade_all(args):
     """Upgrade All Editors through the real pulse: a v0.7.3 component with a document is replaced by this build (document, surfaces
-    and output identical, Version 0.8.0) while a newer (9.0.0) editor is skipped and named in the warning."""
+    and output identical, Version = the build's VERSION) while a newer (9.0.0) editor is skipped and named in the warning."""
     os.makedirs(OUT_DIR, exist_ok=True)
     old_tox = os.path.join(OUT_DIR, "v0.7.3.tox")
     r = subprocess.run(["git", "show", "v0.7.3:dist/raster_editor.tox"], cwd=ROOT, capture_output=True)
@@ -5521,9 +5529,9 @@ o.Start()
             t = td("print(op('/project1/_v8_src').par.Status.eval())").strip()
             if "newer" in t and t not in seen:
                 seen.append(t)
-            return (lambda s: s and s["version"] == "0.8.0" and s["started"])(snapshot_ed("/project1/_v8_old"))
+            return (lambda s: s and s["version"] == component_version() and s["started"])(snapshot_ed("/project1/_v8_old"))
         done = wait_for(upgraded_old, 40, 0.5)
-        mdone = wait_for(lambda: (lambda s: s and s["version"] == "0.8.0" and s["started"])(snapshot_ed("/project1/_v8_mst")), 40, 0.5)
+        mdone = wait_for(lambda: (lambda s: s and s["version"] == component_version() and s["started"])(snapshot_ed("/project1/_v8_mst")), 40, 0.5)
         mst_info = wait_for(lambda: td_json("x = op('/project1/_v8_mst').ext.RasterEditorExt; print(json.dumps({'master': x.is_master, 'run': x._server_running(), 'err': x.last_error and x.last_error[0]}))"), 15)
         mafter = snapshot_ed("/project1/_v8_mst")
         mrec2 = master_info()
@@ -5552,7 +5560,7 @@ print(list(mx.ws_log)[-12:], m, [ (c.ready, c.kind) for c in x.clients.values()]
         same_doc = bool(after) and all(after[k] == before[k] for k in ("doc_state", "layers", "surfaces", "out"))
         tagged = td("print('rasterEditor' in op('/project1/_v8_old').tags, op('/project1/_v8_old').ext.RasterEditorExt.is_master)").split()
         own = td("print(comp.par.Version.eval(), comp.ext.RasterEditorExt._started)").split()
-        ok = bool(done and same_doc and newer_ver == "9.0.0" and status_txt and tagged[0] == "True" and tagged[1] == "False" and own[0] == "0.8.0"
+        ok = bool(done and same_doc and newer_ver == "9.0.0" and status_txt and tagged[0] == "True" and tagged[1] == "False" and own[0] == component_version()
                   and mdone and m_same and m_role and em2 and page_ok)
         return ok, (f"MASTER target: upgraded {bool(mdone)} still master on same port/token {m_role} {mst_info}, document identical {m_same}, "
                     f"a client reconnected {bool(em2)}, page reconnected {page_ok}\n        old before {before['version']} -> after {after and after['version']}; document/surfaces/output identical: {same_doc}; "
