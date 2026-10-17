@@ -49,7 +49,7 @@ class FakeSocket {
 }
 
 const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({
-  t: 'hello', protocol: 11, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
+  t: 'hello', protocol: 12, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
 });
 
 interface TestStatus {
@@ -97,7 +97,7 @@ describe('tdBridge session', () => {
     expect(sock().url).toBe('ws://td:9980/ws');
     expect(sock().binaryType).toBe('arraybuffer');
     sock().open();
-    expect(sock().json()).toEqual([{ t: 'ready', protocol: 11, client: 'external', version: '0.1.0', token: 'tok-123', fresh: true }]);
+    expect(sock().json()).toEqual([{ t: 'ready', protocol: 12, client: 'external', version: '0.1.0', token: 'tok-123', fresh: true }]);
   });
 
   it('becomes linked on hello and pushes doc + every surface in full when TD has no document', () => {
@@ -793,7 +793,7 @@ describe('tdBridge latency', () => {
   });
 });
 
-describe('tdBridge view messages (protocol 11)', () => {
+describe('tdBridge view messages (protocol 12)', () => {
   const view = (o: Partial<ViewState> = {}): ViewState => ({ mode: 'local', zoom: 1, panX: 10, panY: 20, rect: { x: 5, y: 6, w: 700, h: 500 }, ...o });
   const views = () => sock().json().filter((m) => m.t === 'view');
 

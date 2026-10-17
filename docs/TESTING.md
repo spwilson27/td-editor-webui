@@ -56,7 +56,7 @@ Entry point (isolated, parallel; never touches an open project):
 .venv/bin/python scripts/td_workers.py                            # full suite on up to 3 private TD instances (~3-7 min)
 .venv/bin/python scripts/td_workers.py --only 12 --workers 1      # a single step, e.g. a timing step on an idle instance
 .venv/bin/python scripts/td_workers.py --tier affected            # steps mapped from `git diff --name-only HEAD`, plus smoke
-.venv/bin/python scripts/td_workers.py --no-timing                # skip timing-budget steps 7, 8, 12, 16
+.venv/bin/python scripts/td_workers.py --no-timing                # skip timing-budget steps 7, 8, 12, 16, 62
 ```
 
 `scripts/validate_td.py` is the per-process step runner (`--only`, `--tier`, `--no-timing`, `--skip-ui`, `--json`, `--td-conn <connection file>`)

@@ -30,6 +30,8 @@ export function installTestHook(store: Store, win: Window = window): void {
     addMask: (layerId: string) => store.engine.addMask(layerId),
     setPaintTarget: (layerId: string, target: PaintTarget) => store.engine.setPaintTarget(layerId, target),
     setViewMode: (m: 'local' | 'td') => { store.setViewMode(m); return store.viewMode.peek(); },
+    /** v12 (DESIGN_V10): idle / Keep live state of the page. */
+    streams: () => ({ paused: store.streamsPaused.peek(), idle: store.idle.peek(), keepLive: store.keepLive.peek() }),
     latency: () => ({ strokeToTd: store.latency.peek(), strokeToView: store.viewLatency.peek(), viewAgeMs: store.viewAge.peek(), mode: store.viewMode.peek() }),
     docSpec: () => store.engine.docSpec(),
     // v11: the TD view. `tdViewPixel(x, y)` re-draws the compositor at the current view and reads the screen pixel of document pixel (x, y).

@@ -414,3 +414,13 @@ Further v5 details (TD implementation):
 - In `auto`, TD sends fast frames while changes happen and one exact frame ~200 ms after the last change (also after a
   viewport change in auto/exact). `exact` sends only exact frames (on change, rate-limited); `fast` only fast frames.
 - Protocol < 11 clients keep the v3 `view` notice + `GET /view` raw path.
+
+## 14. Version 12 additions (DESIGN_V10): idle-aware streaming
+
+- `ready.protocol` = 12.
+- Web → TD `streams {paused: bool}` (default `false` after `ready`). While `paused` TD sends that client no BASE notices or
+  frames, no VIEW_FAST / VIEW_EXACT frames or `viewExact` notices, and no `layerPreview` notices, and does no readback or
+  encode work for it. Its subscriptions (view mode, quality, viewport, preview layers) are kept.
+- On `streams {paused: false}` TD sends fresh state promptly: the newest BASE frame notice per input, a fast frame and (auto /
+  exact quality) an exact refresh (a full frame if the client's exact buffer may be stale), and current layer previews.
+- Protocol < 12 clients are never paused.

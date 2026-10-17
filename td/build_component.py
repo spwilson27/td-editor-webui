@@ -30,7 +30,7 @@ PARENT = "/project1"
 NAME = "raster_editor"
 TOX_NAME = "_re_tox_build"
 KEEP = ("doc", "doc_state")  # survive rebuilds: the generated network + the stored document (= registry.DATA_CHILDREN)
-VERSION = "0.9.1"  # stamped into the read-only `Version` parameter
+VERSION = "0.10.0"  # stamped into the read-only `Version` parameter
 TAG = "rasterEditor"  # tag every editor COMP carries (registry.TAG)
 SHORTCUT = "RasterEditor"  # parent shortcut: doc/surface_callbacks call parent.RasterEditor.OnSurfaceCook
 

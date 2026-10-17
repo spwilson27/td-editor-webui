@@ -22,7 +22,7 @@ const row = (page: Page, id: string) => page.locator(`[data-layer="${id}"]`);
 
 test('fake TD speaks protocol 9: ready carries 9 and no mismatch notice appears', async ({ page }) => {
   await open(page);
-  expect(td.messages.find((m) => m.t === 'ready')).toMatchObject({ protocol: 11 });
+  expect(td.messages.find((m) => m.t === 'ready')).toMatchObject({ protocol: 12 });
   await expect(page.locator('[data-status=connection]')).toContainText('TouchDesigner linked');
 });
 

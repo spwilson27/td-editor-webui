@@ -29,5 +29,6 @@ Each records the decisions of its milestone (Q&A table), architecture changes an
 | [DESIGN_V7.md](DESIGN_V7.md) | v7: layer panel, groups, flatten, multi-select, unified adjustments (protocols 8, 9) |
 | [DESIGN_V8.md](DESIGN_V8.md) | v8: multiple editors per project, master/slave, Upgrade All Editors (protocol 10) |
 | [DESIGN_V9.md](DESIGN_V9.md) | v9: fast TD preview and exact refine (protocol 11) |
+| [DESIGN_V10.md](DESIGN_V10.md) | v10: idle-aware streaming, Keep live (protocol 12) |
 
 New milestone: add `DESIGN_Vn.md` before implementing, then a numbered section in PROTOCOL.md and TD_COMPONENT.md, and a row here.

@@ -1,4 +1,4 @@
-"""TD <-> web wire protocol (docs/PROTOCOL.md, version 11). Pure python, no TD or numpy needed.
+"""TD <-> web wire protocol (docs/PROTOCOL.md, version 12). Pure python, no TD or numpy needed.
 
 Binary frames: 24-byte little-endian header + RGBA8 straight-alpha payload (top row first).
 JSON messages: text frames with a string field ``t``.
@@ -10,7 +10,7 @@ import re
 import struct
 from typing import Iterator, NamedTuple, Optional, Tuple
 
-PROTOCOL_VERSION = 11
+PROTOCOL_VERSION = 12
 MIN_PROTOCOL = 10  # oldest client protocol TD still serves (a v10 client keeps the v3 `view` notice + GET /view path)
 APP_VERSION = "0.5.0"  # written to .redoc meta.json
 MAGIC = b"REF1"
@@ -502,6 +502,11 @@ def view_td(quality: str = "auto", viewport=None) -> str:
     device pixels per document pixel."""
     return encode_json({"t": "view", "mode": "td", "quality": quality,
                         "viewport": viewport or {"x": 0, "y": 0, "w": 1280, "h": 720, "scale": 1}})
+
+
+def streams(paused: bool) -> str:
+    """web -> TD (v12): the page is idle (hidden tab / no input): stop BASE, view and layer-preview streams for this client."""
+    return encode_json({"t": "streams", "paused": bool(paused)})
 
 
 def view_ack(frame_id: int) -> str:
@@ -1068,6 +1073,13 @@ def parse_view11(msg: dict) -> dict:
         lim = {"x": (-1e7, 1e7), "y": (-1e7, 1e7), "w": (1e-3, 1e6), "h": (1e-3, 1e6), "scale": (1e-3, 64.0)}
         vp = {k: min(lim[k][1], max(lim[k][0], float(vp[k]))) for k in lim}
     return {"mode": mode, "quality": q, "viewport": vp}
+
+
+def parse_streams(msg: dict) -> bool:
+    paused = msg.get("paused")
+    if not isinstance(paused, bool):
+        raise ProtocolError("bad streams")
+    return paused
 
 
 def parse_view_ack(msg: dict) -> int:

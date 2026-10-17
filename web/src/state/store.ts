@@ -18,6 +18,7 @@ import { CLIP_MARKER, createLayersSlice } from './layersSlice';
 import { BIG_DOC_KEY } from './brushes';
 import { peekTdViewGl, sharedTdViewGl } from '../ui/tdViewGl';
 import type { ViewSink } from '../bridge/tdViewClient';
+import { loadKeepLive, saveKeepLive } from './idle';
 import { defaultEffect, effectLabel } from './effectDefaults';
 
 /** Per-viewer view toggles (v4). Guides themselves live in the document. */
@@ -120,6 +121,9 @@ export function createStore() {
   /** v11: which kind of TD frame is on screen (null = none yet / Local view). */
   const viewShown = signal<'fast' | 'exact' | null>(null);
   const loadingDoc = signal(false);
+  /** v12 (DESIGN_V10): the page is idle (hidden tab / no input for IDLE_MS), and the per-viewer "Keep live" override. */
+  const idle = signal(false);
+  const keepLive = signal(loadKeepLive());
   let lastActiveId: string | null = null;
   let autoFx: string | null = null; // the adjustment layer whose activation switched the panel to Effects
 
@@ -226,7 +230,7 @@ export function createStore() {
     snapOptions(): SnapOptions { return { enabled: snapOn.value, guides: true, canvas: true, layers: true, threshold: SNAP_THRESHOLD }; },
     /** Set by the App: opens the Place Image file chooser. */
     openPlace: null as (() => void) | null,
-    colorTab, layerTab, viewMode, viewRect, latency, viewLatency, viewAge, tdViewTick, viewQuality, viewShown, loadingDoc,
+    colorTab, layerTab, viewMode, viewRect, latency, viewLatency, viewAge, tdViewTick, viewQuality, viewShown, loadingDoc, idle, keepLive,
     view, zoom, spaceHeld, docSize, docName, editors, editorMaster, editorId, editorSwitching, switchTarget, discardAsk, sessionEpoch, connection, active, notice, fatal, layerPreviews,
     docVersion, historyVersion, selectionVersion, thumbTick,
     takeover: null as (() => void) | null,
@@ -248,6 +252,10 @@ export function createStore() {
     /** v10: `editors` message / GET /editors. */
     setEditorList(list: EditorList) { editors.value = list.editors; editorMaster.value = list.master; },
     /** TD view is only possible while linked to TouchDesigner. */
+    /** v12: TD should not stream to this page. */
+    streamsPaused: computed(() => idle.value && !keepLive.value),
+    setIdle(v: boolean) { idle.value = v; },
+    setKeepLive(on: boolean) { keepLive.value = on; saveKeepLive(on); },
     tdAvailable: computed(() => connection.value === 'linked'),
     /** v11: the TD view compositor as the bridge's frame sink. */
     tdViewSink: tdSink,

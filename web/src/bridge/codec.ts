@@ -1,4 +1,4 @@
-// Pure encode/decode of docs/PROTOCOL.md (version 11). No sockets here.
+// Pure encode/decode of docs/PROTOCOL.md (version 12). No sockets here.
 import type { BrushPreset, CanvasMode, Guides, LayerSpec } from '../engine/types';
 import type { FileOp, FileResult } from '../state/filesSlice';
 import type { InputItem } from '../state/inputsSlice';
@@ -7,7 +7,7 @@ export const MAGIC = [0x52, 0x45, 0x46, 0x31]; // "REF1"
 export const HEADER_BYTES = 24;
 export const MAX_BAND_PAYLOAD = 2 * 1024 * 1024;
 export type RenderMode = 'flatten' | 'mergeDown';
-export const PROTOCOL_VERSION = 11;
+export const PROTOCOL_VERSION = 12;
 export const FRAME_BASE = 1;
 export const FRAME_SURFACE = 3;
 export const FRAME_SURFACE_DUMP = 4;
@@ -157,6 +157,7 @@ export type WebMessage =
   | { t: 'requestDoc' }
   | { t: 'view'; mode: 'local' }
   | { t: 'view'; mode: 'td'; quality: ViewQuality; viewport: ViewportReport } // v11
+  | { t: 'streams'; paused: boolean } // v12: idle page: TD stops BASE / view / layer-preview streams for this client
   | { t: 'viewAck'; frameId: number } // v11: a VIEW_FAST frame was decoded
   | { t: 'viewExactReset' } // v11: the exact buffer is missing / has another size: send a full exact frame
   | { t: 'takeover' }
@@ -381,6 +382,8 @@ export function decodeWebMessage(text: string): WebMessage | null {
         ? { t: 'view', mode: 'td', quality: o.quality as ViewQuality, viewport: { x: r.x, y: r.y, w: r.w, h: r.h, scale: r.scale } }
         : null;
     }
+    case 'streams':
+      return typeof o.paused === 'boolean' ? { t: 'streams', paused: o.paused } : null;
     case 'viewAck':
       return isNum(o.frameId) ? { t: 'viewAck', frameId: o.frameId } : null;
     case 'viewExactReset':

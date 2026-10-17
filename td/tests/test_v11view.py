@@ -275,7 +275,7 @@ def test_hello_echoes_the_clients_protocol_and_rejects_others():
     v = V()
     a, b = v.connect(11), v.connect(10)
     assert v.env.s.messages(a, "hello")[0]["protocol"] == 11 and v.env.s.messages(b, "hello")[0]["protocol"] == 10
-    for bad in (9, 12, "11", True, None):
+    for bad in (9, 13, "11", True, None):
         c = v.env.connect("external", protocol=bad)
         assert v.env.s.messages(c, "error") and v.env.s.messages(c, "hello") == []
 

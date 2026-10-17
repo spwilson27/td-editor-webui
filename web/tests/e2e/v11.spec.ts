@@ -1,7 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import { FakeTd } from './fakeTd';
 
-// v11 (protocol 11): the fast (JPEG over the WebSocket) and exact (deflate RGBA, tiles) TD view, against the fake TD.
+// v11 (protocol 12): the fast (JPEG over the WebSocket) and exact (deflate RGBA, tiles) TD view, against the fake TD.
 let td: FakeTd;
 test.beforeEach(async () => { td = await FakeTd.start({ w: 160, h: 90 }); });
 test.afterEach(async () => { await td.close(); });
@@ -37,7 +37,7 @@ async function enterTd(page: Page) {
 
 test('subscribe: view {mode td, quality auto, viewport}; the selector sits next to the Local/TD switch', async ({ page }) => {
   await enterTd(page);
-  expect(td.messages.find((m) => m.t === 'ready')).toMatchObject({ protocol: 11 });
+  expect(td.messages.find((m) => m.t === 'ready')).toMatchObject({ protocol: 12 });
   expect(td.lastView).toMatchObject({ t: 'view', mode: 'td', quality: 'auto', viewport: { x: 0, y: 0, w: 160, h: 90 } });
   const sel = quality(page);
   await expect(sel).toHaveValue('auto');

@@ -30,6 +30,26 @@ function ViewToggle() {
   );
 }
 
+/** v12: "Keep live" (never idle, also with a hidden tab) and the "Paused (idle)" badge while TD's streams to this page are paused. */
+function KeepLive() {
+  const on = store.keepLive.value, paused = store.streamsPaused.value && store.connection.value === 'linked';
+  return (
+    <span style="display:flex;align-items:center;gap:6px">
+      <button data-keep-live aria-pressed={on} title="Keep TouchDesigner streaming to this page even when it is idle or in a background tab"
+        onClick={() => store.setKeepLive(!on)}
+        style={`height:18px;padding:0 8px;border-radius:3px;border:1px solid #3a3a3a;font:inherit;color:${on ? '#ffffff' : '#b5b5b5'};background:${on ? '#3f3f3f' : '#1f1f1f'}`}>
+        Keep live
+      </button>
+      {paused && (
+        <span data-status="paused" title="No input for a while (or the tab is hidden): TouchDesigner stopped streaming frames to this page. Any input resumes."
+          style="padding:0 6px;border-radius:3px;background:#1f1f1f;color:#e0a030">
+          Paused (idle)
+        </span>
+      )}
+    </span>
+  );
+}
+
 const QUALITIES: { id: 'auto' | 'fast' | 'exact'; label: string; title: string }[] = [
   { id: 'auto', label: 'Auto', title: 'Low-latency frames while anything changes, then one exact frame when it settles' },
   { id: 'fast', label: 'Low latency', title: 'Always the fast, approximate (JPEG) preview' },
@@ -90,6 +110,7 @@ export function StatusBar() {
       <span>Layer: <b data-status="layer" style="color:#e3e3e3;font-weight:500">{layer ? layer.name : '—'}</b></span>
       <ViewToggle />
       <ViewQuality />
+      <KeepLive />
       <LatencyReadout />
       <span data-status="connection" style="display:flex;align-items:center;gap:6px">
         <span aria-hidden="true" style={`width:7px;height:7px;border-radius:50%;background:${conn.dot}`} />{conn.label}

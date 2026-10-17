@@ -70,6 +70,8 @@ export interface Bridge {
   readonly editor?: string;
   /** v11: send the current view again (TD then streams a fresh frame). */
   refreshView?(): void;
+  /** v12: the page is idle (hidden / no input): TD stops BASE, view and layer-preview streams for this client. Edit uploads and history flushes are unaffected. */
+  setStreamsPaused?(paused: boolean): void;
   /** Report viewport state; sent to TD at most once per animation frame. */
   setView(v: ViewState): void;
   /** v4: the importable TOPs of the TD project. Rejects when not linked, on a timeout or when TD answers with an error. */
@@ -286,6 +288,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
 
   const isOpen = () => ws !== null && ws.readyState === 1;
   const canSend = () => active && authoritative && !loading && !loadPending;
+  let streamsPaused = false; // v12: what the page wants; TD's per-client flag starts false after `ready`
   const sendJson = (m: WebMessage) => { if (isOpen()) ws!.send(encodeMessage(m)); };
 
   /** Per-slot surface sizes (v5): a layer's surface, a mask has its layer's size. Cached per spec rev. */
@@ -784,7 +787,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
 
   // ---- viewport state ----
 
-  /** The wire form of the page's view (protocol 11): local = unsubscribed; td = quality + the visible document rect. null = nothing to say yet. */
+  /** The wire form of the page's view (protocol 12): local = unsubscribed; td = quality + the visible document rect. null = nothing to say yet. */
   function wireView(v: ViewState): Extract<WebMessage, { t: 'view' }> | null {
     if (v.mode === 'local') return { t: 'view', mode: 'local' };
     const dpr = opts.dpr?.() ?? (typeof devicePixelRatio === 'number' ? devicePixelRatio : 1);
@@ -870,6 +873,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
           if (needsLoad) beginLoad();
           else pushAll();
         }
+        if (streamsPaused) sendJson({ t: 'streams', paused: true });
         if (viewState) sendView();
         break;
       }
@@ -1363,6 +1367,11 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
     takeover: () => {
       if (isOpen()) sendJson({ t: 'takeover' });
       else status.setNotice('Not connected to TouchDesigner');
+    },
+    setStreamsPaused(paused) {
+      if (paused === streamsPaused) return;
+      streamsPaused = paused;
+      if (isOpen()) sendJson({ t: 'streams', paused });
     },
     refreshView() {
       if (viewState && isOpen()) sendView(true); // re-subscribe: TD answers with a fresh frame (after a GPU context restore)

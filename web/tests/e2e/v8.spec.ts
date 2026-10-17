@@ -62,7 +62,7 @@ test('tab strip: one tab per editor (label = name, tooltip = path), the hash edi
   expect(a.connections).toBe(0);
   expect(c.connections).toBe(0);
   expect(a.requests.some((r) => r.path === '/editors')).toBe(true);
-  expect(b.messages[0]).toMatchObject({ t: 'ready', protocol: 11, client: 'external', token: a.token });
+  expect(b.messages[0]).toMatchObject({ t: 'ready', protocol: 12, client: 'external', token: a.token });
 });
 
 test('no e= in the hash: the master\'s editor opens and the hash gets e=<master>', async ({ page }) => {

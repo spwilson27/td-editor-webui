@@ -1,5 +1,6 @@
 import { effect } from '@preact/signals';
 import { render } from 'preact';
+import { IDLE_MS, createIdleDetector } from './state/idle';
 import { createEditorController, type EditorSession, type SessionHooks } from './bridge/editorSessions';
 import { startMockBridge, useMockBridge } from './bridge/mockBridge';
 import { resolveToken, resolveWsUrl, httpOrigin, startTdBridge, type BridgeStatus } from './bridge/tdBridge';
@@ -53,6 +54,7 @@ function startSession(editor: string, token: string, hooks: SessionHooks): Edito
   const bridge = startTdBridge(engine, status, { editor, token });
   store.takeover = bridge.takeover;
   store.bridge = bridge;
+  const stopStreams = effect(() => { bridge.setStreamsPaused?.(store.streamsPaused.value); });
   const stopView = effect(() => {
     const v = store.view.value, r = store.viewRect.value;
     store.docSize.value; // the visible document rect depends on the document size
@@ -65,6 +67,7 @@ function startSession(editor: string, token: string, hooks: SessionHooks): Edito
     end() {
       live = false;
       stopView();
+      stopStreams();
       store.endSessionState(); // the old engine is still attached here
       bridge.dispose();
       store.bridge = null;
@@ -74,10 +77,17 @@ function startSession(editor: string, token: string, hooks: SessionHooks): Edito
   };
 }
 
+/** `?test=1&idleMs=N` shortens the idle timeout for end-to-end tests. */
+function idleMsFromQuery(search: string): number {
+  const p = new URLSearchParams(search), n = Number(p.get('idleMs'));
+  return p.get('test') === '1' && n > 0 ? n : IDLE_MS;
+}
+
 function boot() {
   installKeyboard(store);
   installPaste(store);
   installDropGuard();
+  createIdleDetector(store.setIdle, undefined, idleMsFromQuery(location.search)); // v12: idle page -> TD pauses its streams (lives as long as the page)
   const root = document.getElementById('app')!;
 
   if (useMockBridge(location.search, import.meta.env.DEV)) {

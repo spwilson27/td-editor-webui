@@ -37,7 +37,7 @@ class FetchMock {
 const flush = () => vi.advanceTimersByTimeAsync(0);
 const raf = (cb: () => void) => setTimeout(cb, 16);
 const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({
-  t: 'hello', protocol: 11, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
+  t: 'hello', protocol: 12, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
 });
 const bytes = (b: Uint8Array, headers: Record<string, string> = {}) => new Response(b as BufferSource, { status: 200, headers });
 
@@ -244,14 +244,14 @@ describe('v8: protocol mismatch notices', () => {
     start();
     sock().open();
     sock().tell(hello({ protocol: 7 }));
-    expect(status.notices.at(-1)).toMatch(/Protocol mismatch.*protocol 11.*speaks 7.*update the component/);
+    expect(status.notices.at(-1)).toMatch(/Protocol mismatch.*protocol 12.*speaks 7.*update the component/);
   });
 
-  it('a newer component (protocol 12) tells the user to reload the page', () => {
+  it('a newer component (protocol 13) tells the user to reload the page', () => {
     start();
     sock().open();
-    sock().tell(hello({ protocol: 12 }));
-    expect(status.notices.at(-1)).toMatch(/Protocol mismatch.*protocol 12.*reload the page/);
+    sock().tell(hello({ protocol: 13 }));
+    expect(status.notices.at(-1)).toMatch(/Protocol mismatch.*protocol 13.*reload the page/);
   });
 });
 
@@ -260,13 +260,13 @@ describe('v9: protocol mismatch notices', () => {
     start();
     sock().open();
     sock().tell(hello({ protocol: 8 }));
-    expect(status.notices.at(-1)).toMatch(/Protocol mismatch.*protocol 11.*speaks 8.*update the component/);
+    expect(status.notices.at(-1)).toMatch(/Protocol mismatch.*protocol 12.*speaks 8.*update the component/);
   });
 
-  it('a protocol 11 component links without a notice', () => {
+  it('a protocol 12 component links without a notice', () => {
     start();
     sock().open();
-    sock().tell(hello({ protocol: 11 }));
+    sock().tell(hello({ protocol: 12 }));
     expect(status.notices.filter((n) => /mismatch/i.test(n))).toEqual([]);
   });
 });

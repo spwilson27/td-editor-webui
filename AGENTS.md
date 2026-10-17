@@ -38,7 +38,7 @@ Setup from scratch: `python3 -m venv .venv && .venv/bin/pip install -r requireme
 - Protocol changes touch both sides: `web/src/bridge/codec.ts` and `td/raster_editor/protocol.py`, then `scripts/make_fixtures.py`, tests on both sides, version bump (see DEVELOPMENT.md).
 - Changing `td/raster_editor/*`, `shared/effects/*` or `web/src/**` that the component embeds requires rebuilding `dist/ui` and `dist/raster_editor.tox` before a release.
 - Runtime-created operators inside the COMP: names start with `_` and tag `reRuntime`.
-- Timing-only live failures (steps 7, 8, 12, 16 and load-sensitive perf tests) are not regressions until they fail alone on an idle machine.
+- Timing-only live failures (steps 7, 8, 12, 16, 62 and load-sensitive perf tests) are not regressions until they fail alone on an idle machine.
 
 ## Where the important code lives
 | Path | What |

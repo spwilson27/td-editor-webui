@@ -15,7 +15,7 @@ const entry = (name: string) => manifest.messages.find((m) => m.name === name)!;
 const fast = (name: string): ViewFastFrame => { const r = decodeViewFrame(load(`${name}.bin`)); if (!r.ok || r.frame.kind !== 'fast') throw new Error(name); return r.frame; };
 const exact = (name: string): ViewExactFrame => { const r = decodeViewFrame(load(`${name}.bin`)); if (!r.ok || r.frame.kind !== 'exact') throw new Error(name); return r.frame; };
 
-describe('view fixtures (protocol 11)', () => {
+describe('view fixtures (protocol 12)', () => {
   it('view_fast: header fields, rect and both JPEGs byte-for-byte', () => {
     const m = entry('view_fast'), f = fast('view_fast');
     expect(f).toMatchObject({ frameId: m.frameHeader.frameId, appliedFrameId: m.applied, pw: m.pw, ph: m.ph });

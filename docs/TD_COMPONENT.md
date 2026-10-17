@@ -3,9 +3,9 @@
 Target: TouchDesigner 2025.32820 (Python 3.11, numpy available). Verified API notes are
 at the end; check anything else against the live TD through `scripts/td_call.py`.
 
-**Status: current as of tag v0.9.0 (protocol 11).** Sections 1–4 describe the current component (v8 layout: multiple editors,
+**Status: current as of v0.10.0 (protocol 12).** Sections 1–4 describe the current component (v8 layout: multiple editors,
 master/slave, no in-TD panel; v11 view stream in §3/§13). Section 4 build commands: `td/build_component.py [--dev]`. Sections 5
-onwards are an append-only record per protocol version (API notes, v3–v11 additions): where they mention the Web Render panel,
+onwards are an append-only record per protocol version (API notes, v3–v12 additions): where they mention the Web Render panel,
 `Panelquery` or `Reloadui`, the v8 rules in sections 1–3 win. How to build, test and release: `DEVELOPMENT.md`; index of all docs: `docs/README.md`.
 
 ## 1. Network inside the COMP (v8)
@@ -415,3 +415,28 @@ Wire format: `PROTOCOL.md` section 13 (golden files `docs/fixtures/view_*.bin` +
   (the `vx` pipe), `vxenc` (worker time per exact job).
 - **Tests**: `td/tests/test_v11view.py` (codecs vs the golden fixtures, tile diffs, state machine on fakes, router); live: `scripts/validate_td.py`
   step 7 (needs OpenCV inside TD only; JPEG content is decoded in TD, the exact buffer is compared band by band with `out1`).
+
+## 14. Protocol v12 additions (DESIGN_V10): idle-aware streaming (`ext.py`, `protocol.py`)
+
+Wire format: `PROTOCOL.md` section 14.
+
+- `_Client.paused` (default false, only ever set for `protocol >= 12` clients) is toggled by `streams {paused}`. A paused client is
+  excluded from every per-frame image stream; its subscriptions (view mode, quality, viewport, active layer) are kept.
+  - **BASE**: `_poll_base` only reads back / converts / publishes when some ready client is not paused (`_streaming_ids`); the cheap
+    cook-count change detection keeps running, so the first resumed tick reads the newest picture. `_notify_clients` sends no notices to
+    paused clients.
+  - **VIEW (v11)**: `_view11_subscribers` excludes paused clients. With none left `_poll_view11` takes its no-subscriber branch: the
+    client's fast-view GPU nodes are destroyed, the exact pipe is reset and nothing is cooked, read back or encoded.
+  - **Layer previews**: `_poll_layer_previews` runs only while an *unpaused* active editor exists, otherwise the pipes are dropped
+    (exactly the no-client case); no `layerPreview` notices go to a paused client.
+  - Result: when every client is paused the per-pump work equals the no-client case. `GetCounters()` returns monotonic counters
+    (`inreadback`, `vxreadback`, `lpreadback`, `vreadback`, `fastframes`, `exactframes`, `basenotices`, `lpnotices`) used by the tests and by
+    validation step 62 to show that nothing was read back or encoded while paused.
+- **Resume** (`streams {paused:false}`): BASE notice state is cleared so the newest BASE frame of every input is announced (held until the
+  stream publishes a frame newer than the one stored when the page was paused, so a stale frame is not announced first); the view client
+  is marked changed (fast dirty, exact dirty, rate limit reset, `v_showing` cleared: auto / exact quality send an exact refresh, a full
+  frame when the client's exact buffer may be stale, i.e. frames were in flight); layer preview notices are re-sent.
+- Disconnecting while paused needs no cleanup beyond the usual (the flag lives on the client object).
+- **Tests**: `td/tests/test_v12idle.py` (fake TD: paused client gets nothing and counters stay flat, resume, mixed clients, old protocol);
+  live: `scripts/validate_td.py` step 62 (real page + fake clients).
+

@@ -3,10 +3,10 @@ import { PROTOCOL_VERSION, decodeEditorList, decodeTdMessage, decodeWebMessage, 
 import { buildHash, editorsUrl, parseHash, requestQuery, withEditor } from '../../src/bridge/urls';
 
 describe('v10 codec', () => {
-  it('is protocol 11; ready is external only', () => {
-    expect(PROTOCOL_VERSION).toBe(11);
-    expect(decodeWebMessage(encodeMessage({ t: 'ready', protocol: 11, client: 'external', version: '1', token: 't', fresh: true }))).toMatchObject({ t: 'ready', protocol: 11, client: 'external' });
-    expect(decodeWebMessage('{"t":"ready","protocol":11,"client":"panel","version":"1"}')).toBeNull(); // the panel client is gone
+  it('is protocol 12; ready is external only', () => {
+    expect(PROTOCOL_VERSION).toBe(12);
+    expect(decodeWebMessage(encodeMessage({ t: 'ready', protocol: 12, client: 'external', version: '1', token: 't', fresh: true }))).toMatchObject({ t: 'ready', protocol: 12, client: 'external' });
+    expect(decodeWebMessage('{"t":"ready","protocol":12,"client":"panel","version":"1"}')).toBeNull(); // the panel client is gone
   });
 
   it('decodes the editors message; incomplete entries are dropped, defaults filled', () => {

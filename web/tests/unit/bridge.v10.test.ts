@@ -42,7 +42,7 @@ const spec = (over: Partial<LayerSpec> & { id: string }): LayerSpec => ({
 const tdLayers: LayerSpec[] = [spec({ id: 'base', kind: 'input', input: 1 }), spec({ id: 'p1', slot: 1 })];
 const docState = (rev = 7): TdMessage => ({ t: 'docState', rev, layers: tdLayers, docW: 64, docH: 48, guides: { h: [], v: [] }, canvas: { mode: 'input' } });
 const hello = (over: Partial<Extract<TdMessage, { t: 'hello' }>> = {}): TdMessage => ({
-  t: 'hello', protocol: 11, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
+  t: 'hello', protocol: 12, doc: { w: 64, h: 48 }, hasInput: false, maxSendFps: 30, active: true, clientId: 'c1', hasDocument: false, rev: null, ...over,
 });
 const frameBytes = (type: number, slot: number, w: number, h: number, v: number) =>
   encodeBands({ type: type as typeof FRAME_BASE, slot, frameId: 1, docW: w, docH: h, rect: { x: 0, y: 0, w, h }, pixels: new Uint8Array(w * h * 4).fill(v), maxPayload: 1 << 30 }).next().value as Uint8Array;
@@ -93,10 +93,10 @@ describe('v10: editor parameter on the WebSocket URL', () => {
     expect(sock().url).toBe('ws://127.0.0.1:1234/ws?x=1&editor=a+b%26c');
   });
 
-  it('ready: protocol 11, client external; the bridge reports its editor', () => {
+  it('ready: protocol 12, client external; the bridge reports its editor', () => {
     start('ed2');
     sock().open();
-    expect(sock().json()[0]).toEqual({ t: 'ready', protocol: 11, client: 'external', version: '0.1.0', token: 'tok-123', fresh: true });
+    expect(sock().json()[0]).toEqual({ t: 'ready', protocol: 12, client: 'external', version: '0.1.0', token: 'tok-123', fresh: true });
     expect(bridge.editor).toBe('ed2');
   });
 });
@@ -453,5 +453,33 @@ describe('v10 review: flush result and unsent edits', () => {
     fm.to('/top')[0]?.settle(bytes(frameBytes(FRAME_TOP, 0, 4, 4, 9)));
     expect(await err).toBe('Bridge closed');
     expect(status.notices.length).toBe(notices);
+  });
+});
+
+describe('v12: streams {paused}', () => {
+  const streams = () => sock().json().filter((m) => m.t === 'streams');
+  it('sends streams only on change, while connected; edit uploads and doc messages are unaffected', async () => {
+    start('ed2');
+    connect();
+    await flush();
+    expect(streams()).toEqual([]);
+    bridge.setStreamsPaused!(true);
+    bridge.setStreamsPaused!(true);
+    expect(streams()).toEqual([{ t: 'streams', paused: true }]);
+    bridge.setStreamsPaused!(false);
+    expect(streams()).toEqual([{ t: 'streams', paused: true }, { t: 'streams', paused: false }]);
+  });
+
+  it('a page that is idle before the socket opens pauses right after hello; a reconnect repeats it', async () => {
+    start('ed2');
+    bridge.setStreamsPaused!(true);
+    sock().open();
+    expect(streams()).toEqual([]); // nothing before TD answered the ready
+    sock().tell(hello({ doc: { w: engine.width, h: engine.height } }));
+    expect(streams()).toEqual([{ t: 'streams', paused: true }]);
+    sock().close(1006);
+    await vi.advanceTimersByTimeAsync(6000);
+    connect();
+    expect(streams()).toEqual([{ t: 'streams', paused: true }]);
   });
 });

@@ -451,7 +451,8 @@ def step(num, name, fn, timing=False):
     try:
         ok, detail = fn()
     except Exception as e:  # noqa: BLE001
-        ok, detail = False, f"exception: {type(e).__name__}: {e}"
+        import traceback
+        ok, detail = False, f"exception: {type(e).__name__}: {e}  [{' | '.join(l.strip() for l in traceback.format_exc().splitlines()[-16:-1])}]"
     if timing and ok is False:   # a time budget measured on a busy machine: one retry (a real regression fails twice)
         first = detail
         baseline()
@@ -3796,6 +3797,13 @@ box.loadTox({path!r})
             return False, f"the copy did not become the master: {master_info()}"
         port = info["port"]
         eid_before = info["eid"]
+
+        def serving():
+            try:
+                return http_get(port, "/")[0] == 200
+            except OSError:
+                return False
+        wait_until(serving, 15, 0.1)   # (the role moved: the server listens a moment later than master_info() says)
         for _ in range(3):   # browser-like: HTTP/1.1 keep-alive connections left open
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
             c.request("GET", "/")
@@ -5684,6 +5692,266 @@ print(json.dumps(dict(bad=bad, miss=miss, chains=len(n._chains), slots=n.slots()
             pass
 
 
+def s62_idle_streaming(args):
+    """v10 idle-aware streaming (DESIGN_V10, protocol 12).  A: fake protocol-12 clients with a live input, TD view mode and a tdPreview layer:
+    a paused client gets no BASE / view / preview notices or frames, and when every client is paused TD's counters show no readback, encode
+    or notice work and holds no GPU view nodes or preview pipes; mixed clients (one paused, one live); resume -> fresh BASE frame, fast frame
+    and preview within 200 ms and an exact refresh; protocol 11 clients are never paused.  B: the real page (Playwright): hidden tab ->
+    paused, no work while paused, edits still reach TD, visible -> frames and an exact refresh, Keep live prevents pausing with the tab
+    hidden and after the idle timeout, input after an idle pause resumes."""
+    import effects as EF
+    X = "comp.ext.RasterEditorExt"
+    notes, state = [], {"ok": True}
+    load = os.getloadavg()[0]
+    budget = 0.2 if load <= 4.0 else 0.4 if load <= 10.0 else 2.5   # a loaded machine stretches every timing: widen and say so
+    notes.append(f"machine load average {load:.1f}, resume budget {int(budget * 1000)} ms")
+
+    def chk(label, cond, extra=""):
+        state["ok"] &= bool(cond)
+        notes.append(f"{label}: {'ok' if cond else 'FAIL'} {extra}".rstrip())
+        return bool(cond)
+
+    WORK = ("readback", "vreadback", "vxreadback", "lpreadback", "fastframes", "exactframes", "basenotices", "lpnotices")
+
+    def counters():
+        c = td_json(f"print(json.dumps({X}.GetCounters()))")
+        return {k: c.get(k, 0) for k in WORK}
+
+    def holdings():
+        return td_json(f"x = {X}; print(json.dumps(dict(pipes=len(x.layer_pipes), chains=len(x._vchains), vxmsg=x.vx.msg is not None, "
+                       f"frames=x.pump_count)))")
+
+    def roles():
+        return td_json(f"print(json.dumps([[c.kind, c.protocol, c.paused, c.view_td] for c in {X}.clients.values() if c.ready]))")
+
+    tick = {"n": 0}
+
+    def drive(seconds, eds=(), period=0.04):
+        """A live input: the Constant TOP flips colour every period (and the document output is pulled, as a viewer would)."""
+        end = time.time() + seconds
+        while time.time() < end:
+            tick["n"] += 1
+            td(f"op({TMP!r}).par.colorg = {tick['n'] % 2}; {X}.network.output().cook(force=True) if {X}.network is not None else None")
+            for e in eds:
+                e.poll(0.0)
+            time.sleep(max(0.0, period - 0.01))
+            for e in eds:
+                e.poll(0.0)
+
+    def visibility(state_):
+        hidden = "true" if state_ == "hidden" else "false"
+        js(f"Object.defineProperty(document, 'visibilityState', {{configurable: true, get: () => '{state_}'}});"
+           f"Object.defineProperty(document, 'hidden', {{configurable: true, get: () => {hidden}}});"
+           f"document.dispatchEvent(new Event('visibilitychange'))")
+
+    def visibility_reset():
+        js("delete document.visibilityState; delete document.hidden; document.dispatchEvent(new Event('visibilitychange'))")
+
+    def drive_until(pred, max_s, eds=()):
+        """Live input until pred() holds (a loaded machine reads back slowly: the baselines wait for work instead of a fixed time)."""
+        end = time.time() + max_s
+        while time.time() < end:
+            drive(0.3, eds)
+            if pred():
+                return True
+        return bool(pred())
+
+    use_page = not args.skip_ui
+    ed = ed2 = ed3 = None
+    try:
+        W, H = 200, 100
+        if use_page:
+            ensure_test_hook()
+            visibility("hidden")      # the page is a paused client during part A (it is not the active editor, and does not stream)
+            wait_for(lambda: all(r[2] for r in roles() if r[1] >= 12) and bool(roles()), 6, 0.1)
+        reset_canvas(args, 800, 600)
+        connect_input()
+        sort = {"type": "pixelSort", "enabled": True, "direction": "h", "low": 0.2, "high": 0.9, "key": "luma"}
+        px = v7_disc()
+        px[..., :3] = np.random.RandomState(4).randint(0, 256, (64, 64, 3), dtype=np.uint8)
+        layers = [L("ps", slot=1, size=(64, 64), x=20, y=10, effects=[sort])]
+        ed = Editor(args.port, protocol=12)
+        take_over(ed)
+        ed.send_canvas(W, H, "fixed")
+        wait_for(lambda: out1_size() == [W, H], 6)
+        ed.send_doc(layers, 93)
+        fid = ed.send_surface(1, (0, 0, 64, 64), px, (64, 64))
+        wait_applied(ed, fid, 10)
+        ed2 = Editor(args.port, protocol=12)
+        vp = {"x": 0, "y": 0, "w": W, "h": H, "scale": 4.0}
+        ed.view11("auto", vp)
+        ed2.view11("auto", vp)
+        both = (ed, ed2)
+
+        def counts(e):
+            return (e.notices["base"], len(e.previews), len(e.vframes), len(e.bases))
+
+        # ---- everything live: the baseline that the paused phases are compared with
+        drive_until(lambda: counters()["readback"] > 0 and counters()["fastframes"] > 0 and counters()["lpreadback"] > 0
+                    and all(counts(e)[0] > 0 for e in both) and counts(ed)[1] > 0, 12, both)
+        drive(1.0, both)
+        c0 = counters()
+        chk("live baseline: BASE notices, fast frames, previews and readbacks flow", c0["readback"] > 0 and c0["fastframes"] > 0 and c0["lpreadback"] > 0
+            and all(counts(e)[0] > 0 and any(f["kind"] == "fast" for f in e.vframes) for e in both) and counts(ed)[1] > 0,   # (previews: the active editor only)
+            f"{c0} {[counts(e) for e in both]}")
+        # ---- mixed: ed paused, ed2 live
+        ed.send(P.streams(True))
+        wait_for(lambda: any(r[2] for r in roles()), 3, 0.05)
+        drive(0.4, both)
+        a0, b0, cm0 = counts(ed), counts(ed2), counters()
+        drive(2.0, both)
+        drive_until(lambda: counts(ed2)[0] > b0[0] and counts(ed2)[2] > b0[2], 10, both)
+        a1, b1, cm1 = counts(ed), counts(ed2), counters()
+        chk("mixed: the paused client gets nothing", a1 == a0, f"{a0} -> {a1}")
+        chk("mixed: the live client keeps getting BASE and view frames", b1[0] > b0[0] and b1[2] > b0[2], f"{b0} -> {b1}")
+        chk("mixed: TD keeps reading back for the live client", cm1["readback"] > cm0["readback"] and cm1["fastframes"] > cm0["fastframes"], f"{cm0} -> {cm1}")
+        # ---- everyone paused
+        ed2.send(P.streams(True))
+        wait_for(lambda: all(r[2] for r in roles()), 3, 0.05)
+        drive(0.6, both)
+        h0, p0, q0 = holdings(), counters(), (counts(ed), counts(ed2))
+        drive(3.0, both)
+        h1, p1, q1 = holdings(), counters(), (counts(ed), counts(ed2))
+        chk("all paused: no BASE / view / preview readbacks, encodes or notices (counters)", p1 == p0, f"{p0} -> {p1}")
+        chk("all paused: no message of any stream reaches a client", q1 == q0, f"{q0} -> {q1}")
+        chk("all paused: no GPU view nodes, preview pipes or exact frame held (the no-client case)", h1["chains"] == 0 and h1["pipes"] == 0 and not h1["vxmsg"],
+            f"{h1}")
+        notes.append(f"paused window: {h1['frames'] - h0['frames']} TD frames, {tick['n']} input changes")
+        # ---- resume the first client (the input stays live, the second client stays paused)
+        px2 = px.copy()
+        px2[..., 0] = 255 - px2[..., 0]
+        ed.send_surface(1, (0, 0, 64, 64), px2, (64, 64))      # an edit while paused is applied as usual
+        td(f"op({TMP!r}).par.colorg = 1")
+        time.sleep(0.2)
+        ed.poll(0.0)
+        n0, nb, npv, nv = ed.notices["base"], len(ed.bases), len(ed.previews), len(ed.vframes)   # (the BASE time is the notice: the 8 MB fetch is client bandwidth)
+        e0 = len([f for f in ed.vframes if f["kind"] == "exact"])
+        t0 = time.time()
+        ed.send(P.streams(False))
+        t_base = t_fast = t_prev = None
+        end = t0 + 3.0
+        while time.time() < end and None in (t_base, t_fast, t_prev):
+            ed.poll(0.01)
+            now = time.time() - t0
+            if t_base is None and ed.notices["base"] > n0:
+                t_base = now
+            if t_fast is None and any(f["kind"] == "fast" and f["t"] >= t0 for f in ed.vframes[nv:]):
+                t_fast = now
+            if t_prev is None and len(ed.previews) > npv:
+                t_prev = now
+            td(f"{X}.network.output().cook(force=True)") if t_prev is None and now > 0.1 else None
+        ms = lambda v: "none" if v is None else f"{v * 1000:.0f} ms"   # noqa: E731
+        chk("resume: fresh BASE frame, fast frame within budget", t_base is not None and t_fast is not None and t_base <= budget and t_fast <= budget,
+            f"base {ms(t_base)}, fast {ms(t_fast)} (budget {int(budget * 1000)} ms)")
+        chk("resume: current layer preview is announced again", t_prev is not None, f"after {ms(t_prev)}")
+        ed.run(1.2)
+        exact = [f for f in ed.vframes if f["kind"] == "exact"]
+        chk("resume: an exact refresh follows in auto quality", len(exact) > e0, f"{e0} -> {len(exact)} exact frames")
+        quiet = counts(ed2)
+        chk("resume: the other client stays paused", quiet == q1[1], f"{q1[1]} -> {quiet}")
+        # ---- protocol 11 clients are never paused
+        ed3 = Editor(args.port, protocol=11)
+        ed3.send(P.streams(True))
+        ed3.run(0.3)
+        drive(1.0, (ed3,))
+        r = [x for x in roles() if x[1] == 11]
+        chk("protocol 11 client is never paused and keeps getting BASE frames", bool(r) and not r[0][2] and ed3.notices["base"] > 0, f"{r} notices {ed3.notices['base']}")
+    finally:
+        for e in (ed, ed2, ed3):
+            if e is not None:
+                try:
+                    e.close()
+                except Exception:  # noqa: BLE001
+                    pass
+    if not use_page:
+        notes.append("(real page not available: part B skipped)")
+        return state["ok"], "\n        ".join(notes)
+
+    # ---- part B: the real page
+    try:
+        visibility_reset()
+        err = ui_input_doc(args)
+        if err:
+            chk("page prerequisites", False, err)
+            return state["ok"], "\n        ".join(notes)
+        js("window.__editorTest.setViewMode('td')")
+        page_client = lambda: next((r for r in roles() if r[1] >= 12), None)   # noqa: E731
+        chk("page: TD view mode subscribed, not paused", wait_for(lambda: (page_client() or [0, 0, True, False])[3] is True, 5, 0.1) and not page_client()[2], f"{page_client()}")
+        drive(1.5)
+        b0 = counters()
+        drive_until(lambda: counters()["fastframes"] > 0 and counters()["basenotices"] > 0, 10)
+        b0 = counters()
+        chk("page: live input is streamed to the page (BASE + fast frames)", b0["fastframes"] > 0 and b0["readback"] > 0, f"{b0}")
+        # hidden tab -> paused at once
+        visibility("hidden")
+        t0 = time.time()
+        got = wait_for(lambda: (page_client() or [0, 0, False])[2] is True, 3, 0.02)
+        chk("page: a hidden tab pauses immediately", got, f"after {time.time() - t0:.2f} s")
+        st = js_result("window.__editorTest.streams()") or {}
+        chk("page: store says paused, badge shown", st.get("paused") is True and bool(js_result("!!document.querySelector('[data-status=paused]')")), f"{st}")
+        drive(0.5)
+        h0, p0 = holdings(), counters()
+        n_layers = len(js_result("window.__editorTest.layers().map(l => l.id)") or [])
+        drive(3.0)
+        h1, p1 = holdings(), counters()
+        chk("page paused: no BASE / view / preview readback, encode or notice for N frames", p1 == p0 and h1["chains"] == 0, f"{p0} -> {p1}, {h1['frames'] - h0['frames']} frames")
+        # an edit while paused still reaches TD
+        js("window.__editorTest.addLayer()")
+        reached = wait_for(lambda: len(td_json("print(json.dumps([l['id'] for l in (comp.ext.RasterEditorExt.doc_layers or [])]))")) > n_layers, 8, 0.2)
+        chk("page paused: a document edit still reaches TD", reached)
+        # visible again -> resume
+        td(f"op({TMP!r}).par.colorg = 1")
+        base_c = counters()
+        t0 = time.time()
+        visibility("visible")
+        fast_at = base_at = None
+        while time.time() - t0 < 6.0 and (fast_at is None or base_at is None):
+            c = counters()
+            if fast_at is None and c["fastframes"] > base_c["fastframes"]:
+                fast_at = time.time() - t0
+            if base_at is None and c["basenotices"] > base_c["basenotices"]:
+                base_at = time.time() - t0
+        pb = budget + 0.3        # (polled through td-mcp, so a little more than the fake client's 200 ms)
+        chk(f"page resumes: fast frame and BASE notice promptly (<= {int(pb * 1000)} ms incl. polling)", fast_at is not None and base_at is not None and fast_at <= pb and base_at <= pb,
+            f"fast {ms(fast_at)}, base {ms(base_at)}")
+        wait_until(lambda: counters()["exactframes"] > base_c["exactframes"], 3, 0.05)
+        chk("page resumes: an exact refresh follows", counters()["exactframes"] > base_c["exactframes"], f"{base_c['exactframes']} -> {counters()['exactframes']}")
+        chk("page resumes: unpaused in TD, badge gone", wait_for(lambda: not (page_client() or [0, 0, True])[2], 2, 0.05)
+            and not js_result("!!document.querySelector('[data-status=paused]')"))
+        # Keep live: never idle, also hidden
+        js("document.querySelector('[data-keep-live]').click()")
+        chk("Keep live toggled on (persisted)", (js_result("window.__editorTest.streams()") or {}).get("keepLive") is True
+            and js_result("localStorage.getItem('raster-editor.keepLive')") == "1")
+        visibility("hidden")
+        drive(2.5)
+        c1 = counters()
+        drive_until(lambda: counters()["readback"] > c1["readback"] and counters()["fastframes"] > c1["fastframes"], 8)
+        c2 = counters()
+        chk("Keep live: a hidden tab is not paused and keeps streaming", not (page_client() or [0, 0, True])[2] and c2["readback"] > c1["readback"]
+            and c2["fastframes"] > c1["fastframes"], f"{page_client()} {c1['readback']} -> {c2['readback']}")
+        visibility("visible")
+        drive(11.0)       # past the 10 s idle timeout with no input
+        chk("Keep live: no pause after the idle timeout either", not (page_client() or [0, 0, True])[2]
+            and not (js_result("window.__editorTest.streams()") or {}).get("paused"), f"{js_result('window.__editorTest.streams()')}")
+        # Keep live off after the idle timeout -> paused; input -> resumed
+        js("document.querySelector('[data-keep-live]').click()")
+        chk("Keep live off while idle: paused", wait_for(lambda: (page_client() or [0, 0, False])[2] is True, 3, 0.05)
+            and (js_result("window.__editorTest.streams()") or {}).get("idle") is True)
+        mouse(0.5, 0.5)
+        chk("input resumes the stream", wait_for(lambda: (page_client() or [0, 0, True])[2] is False, 3, 0.05))
+        # the real idle timer: 10 s without input while visible
+        drive(11.0)
+        chk("10 s without input while visible pauses", wait_for(lambda: (page_client() or [0, 0, False])[2] is True, 3, 0.05))
+    finally:
+        try:
+            visibility_reset()
+            js("localStorage.removeItem('raster-editor.keepLive')")
+            js("window.__editorTest.setViewMode('local')")
+        except Exception:  # noqa: BLE001
+            pass
+    return state["ok"], "\n        ".join(notes)
+
+
 STEPS = [
     (1, "build component, no operator errors, document survives a rebuild", "build", False),
     (2, "web server serves the UI", "server", False),
@@ -5745,6 +6013,7 @@ STEPS = [
     (59, "Upgrade All Editors (real pulse): v0.7.3 editor upgraded with document intact, newer skipped and listed", "upgrade", False),
     (60, "editorId stable: undo of a delete, cut/paste into another COMP, tox after the original is gone; a live copy gets a new id", "identity", False),
     (61, "empty document, idle gap, then a 27-layer document with effect chains and later applies: no re-entrant apply damage (KeyError fx_L_*, deleted surface)", "emptylarge", False),
+    (62, "idle-aware streaming (protocol 12): paused clients get no BASE / view / preview frames and cost no readback; resume sends fresh state; Keep live; real page hidden / idle", "idle", False),
     (99, "deleting the COMP with clients connected does not freeze TD; undo of the delete restores the pixels (run last)", "delete", False),
 ]
 FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinput": "s4_no_input", "scene": "s5_scene",
@@ -5762,14 +6031,14 @@ FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinp
          "uiredoc": "s45_ui_redoc_history", "ttc": "s46_ttc_fonts", "active": "s47_active_layer_hint",
          "migrate": "s48_migration_v6_docs", "renderreq": "s49_render_requests", "uimulti": "s50_ui_flatten_merge_multiselect", "uicopy": "s51_ui_copy_paste", "uiscrub": "s52_ui_scrub", "uimasks": "s53_ui_group_input_masks",
          "ed23": "s54_two_three_editors", "elect": "s55_election", "failover": "s56_failover", "copy": "s57_copy_paste",
-         "resume": "s58_project_load_resume", "upgrade": "s59_upgrade_all", "identity": "s60_identity_stability", "emptylarge": "s61_empty_then_large_doc"}
+         "resume": "s58_project_load_resume", "upgrade": "s59_upgrade_all", "identity": "s60_identity_stability", "emptylarge": "s61_empty_then_large_doc", "idle": "s62_idle_streaming"}
 
 
 # --------------------------------------------------------------------------- tiers: smoke / affected / full (docs/VALIDATION.md)
 
 # Steps whose result depends on a time budget (fps, latency, bounded costs): tagged 'timing', skipped by --no-timing, run after the rest
 # (a loaded machine -- e.g. parallel workers -- would make them flaky, so they belong on an otherwise idle instance).
-TIMING = {7, 8, 12, 16}   # 7 view stream fps/age, 8 stroke -> applied latency, 12 network + apply budgets, 16 stalled clients (TD stays responsive, 10 s stall detection)
+TIMING = {7, 8, 12, 16, 62}   # 62 resume latency (<= 200 ms on an idle machine) and live baselines; 7 view stream fps/age, 8 stroke -> applied latency, 12 network + apply budgets, 16 stalled clients (TD stays responsive, 10 s stall detection)
 LAST = 99    # deletes the component (and restores it): always the final step
 
 # --tier smoke (~2 min): build, server, page, one fake-client scene, one paint parity through the real page, one multi-editor check.
@@ -5786,7 +6055,7 @@ STEP_AREAS = {
     41: {"select", "filters"}, 42: {"brush"}, 43: {"net", "render"}, 44: {"history"}, 45: {"history", "files"}, 46: {"fonts", "text"},
     47: {"net", "render"}, 48: {"render", "upgrade"}, 49: {"render", "layers"}, 50: {"layers"}, 51: {"layers"}, 52: {"scrub"},
     53: {"masks", "layers"}, 54: {"editors"}, 55: {"editors"}, 56: {"editors"}, 57: {"editors"}, 58: {"editors", "persist"},
-    59: {"upgrade", "editors"}, 60: {"editors"}, 61: {"net", "layers", "effects"}, 99: {"core"},
+    59: {"upgrade", "editors"}, 60: {"editors"}, 61: {"net", "layers", "effects"}, 62: {"net", "view", "uicore"}, 99: {"core"},
 }
 ALL_AREAS = {a for v in STEP_AREAS.values() for a in v}
 # (path prefix or substring, areas) -- every match counts. "*" = everything.

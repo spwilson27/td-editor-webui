@@ -106,6 +106,10 @@ export class FakeTd {
   topFetches: string[] = [];
   /** Hold topReady for this long (a slow readback). */
   topDelayMs = 0;
+  // ---- v12 idle-aware streaming: `streams {paused}` ----
+  streamsPaused = false;
+  /** Every `streams` message received, in order. */
+  streamMessages: boolean[] = [];
   // ---- v11 view stream ----
   viewSubscribed = false;
   lastView: Extract<WebMessage, { t: 'view' }> | null = null;
@@ -425,7 +429,7 @@ export class FakeTd {
 
   private announceLayer(layerId: string) {
     const f = this.layerFrames.get(layerId);
-    if (!this.client || !f || !this.active || this.layerPending.has(layerId)) return;
+    if (!this.client || this.streamsPaused || !f || !this.active || this.layerPending.has(layerId)) return;
     this.layerPending.add(layerId);
     this.layerNotices.push({ layerId, frameId: f.id });
     this.send({ t: 'layerPreview', layerId, frameId: f.id });
@@ -433,7 +437,7 @@ export class FakeTd {
 
   private announce(input: number) {
     const inp = this.inputs.get(input);
-    if (!this.client || !inp || !inp.stored) return;
+    if (!this.client || this.streamsPaused || !inp || !inp.stored) return;
     if (inp.pending) return; // one un-fetched notice per client and input; the stored frame is simply newer
     inp.pending = true;
     this.noticesSent.push(inp.stored.id);
@@ -448,6 +452,7 @@ export class FakeTd {
     for (const i of this.inputs.values()) i.pending = false;
     this.layerPending.clear();
     this.viewSubscribed = false;
+    this.streamsPaused = false; // TD's per-client flag starts false after `ready`
     this.unacked.clear(); this.fastPending = false; this.needFullExact = true; this.exactClient = null;
     if (this.exactTimer) { clearTimeout(this.exactTimer); this.exactTimer = null; }
     this.clientId = `client-${++this.clientSeq}`;
@@ -499,6 +504,12 @@ export class FakeTd {
           this.viewSubscribed = m.mode === 'td';
           if (m.mode === 'td') { this.viewQuality = m.quality; this.viewport = m.viewport; this.viewChanged(); } else { this.viewport = null; if (this.exactTimer) { clearTimeout(this.exactTimer); this.exactTimer = null; } }
         }
+        if (m.t === 'streams') {
+          this.streamMessages.push(m.paused);
+          const was = this.streamsPaused;
+          this.streamsPaused = m.paused;
+          if (was && !m.paused) this.resumeStreams();
+        }
         if (m.t === 'viewAck') { this.acks.push(m.frameId); this.unacked.delete(m.frameId); if (this.fastPending) { this.fastPending = false; this.sendFast(); } }
         if (m.t === 'viewExactReset') { this.exactResets++; this.needFullExact = true; this.scheduleExact(0); }
         if (m.t === 'takeover') { this.active = true; this.send({ t: 'active', active: true }); }
@@ -529,7 +540,7 @@ export class FakeTd {
 
   hello(): TdMessage {
     return {
-      t: 'hello', protocol: 11, doc: { w: this.w, h: this.h, mode: this.mode }, hasInput: this.opts.hasInput ?? false, maxSendFps: this.opts.maxSendFps ?? 30,
+      t: 'hello', protocol: 12, doc: { w: this.w, h: this.h, mode: this.mode }, hasInput: this.opts.hasInput ?? false, maxSendFps: this.opts.maxSendFps ?? 30,
       inputs: this.inputList(),
       active: this.active, clientId: this.clientId, hasDocument: this.doc !== null, rev: this.doc?.rev ?? null,
     };
@@ -664,9 +675,19 @@ export class FakeTd {
 
   /** TD's output changed (a surface was applied, the viewport moved, a test set the image): fast frames now, an exact one after idle. */
   viewChanged() {
-    if (!this.client || !this.viewSubscribed) return;
+    if (!this.client || !this.viewSubscribed || this.streamsPaused) return;
     if (this.viewQuality !== 'exact') this.sendFast();
     if (this.viewQuality !== 'fast') this.scheduleExact(this.exactDelayMs);
+  }
+
+  /** v12: resume sends fresh state: the newest BASE notice per input, a fast frame + exact refresh, current layer previews. */
+  private resumeStreams() {
+    for (const i of this.inputs.values()) i.pending = false;
+    for (const input of this.inputs.keys()) this.announce(input);
+    this.layerPending.clear();
+    for (const id of this.layerFrames.keys()) this.announceLayer(id);
+    this.needFullExact = true; // the exact buffer may be stale
+    this.viewChanged();
   }
 
   /** A test sets the exact output image (document sized, straight RGBA). */
@@ -678,7 +699,7 @@ export class FakeTd {
   }
 
   sendFast() {
-    if (!this.client || !this.viewSubscribed) return;
+    if (!this.client || !this.viewSubscribed || this.streamsPaused) return;
     if (this.unacked.size >= 2) { this.fastPending = true; return; }
     const id = this.nextViewId++;
     this.unacked.add(id);
@@ -704,7 +725,7 @@ export class FakeTd {
   }
 
   sendExact() {
-    if (!this.client || !this.viewSubscribed || this.viewQuality === 'fast') return;
+    if (!this.client || !this.viewSubscribed || this.streamsPaused || this.viewQuality === 'fast') return;
     const img = this.exactSource();
     const { w, h } = this;
     const id = this.nextViewId++;
