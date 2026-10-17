@@ -387,6 +387,8 @@ class RasterEditorExt:
         self._net_mod = None
         self._fx_mod = None
         self.network = None
+        self._net_busy = False      # inside a network.apply(): Pump() must not run (re-entrant frame callback)
+        self.pump_reentered = 0
         self.frozen = False
         for pipe in self.bases.values():
             pipe.reset()
@@ -1877,7 +1879,7 @@ class RasterEditorExt:
         self._track_bounds(slots, fresh, resized, unknown, masks)
         if self.network is not None and (layers != self.doc_layers or not self._net_applied):
             self._push_hints(layers)
-            self.network.apply(layers, self.doc_w, self.doc_h)
+            self._net_apply(layers)
             self._network_applied()
         self.surfaces.update(fresh)
         self.surfaces.update(resized)
@@ -2788,7 +2790,7 @@ class RasterEditorExt:
         if self.network is None or not self._net_applied or self.doc_layers is None or self._restore_pending or self._held:
             return
         if self._push_hints(self.doc_layers):
-            self.network.apply(self.doc_layers, self.doc_w, self.doc_h)
+            self._net_apply(self.doc_layers)
 
     # ------------------------------------------------------------------ v7: history persistence (POST/GET /history)
 
@@ -3500,6 +3502,11 @@ class RasterEditorExt:
     # ------------------------------------------------------------------ pump (each frame start)
 
     def Pump(self):
+        if self._net_busy:
+            # TouchDesigner ran the frame callbacks in-line while network.apply() was creating an operator: the document is half
+            # built and doc_layers is still the previous one.  Skip this frame's pump (the next one is a normal frame).
+            self.pump_reentered += 1
+            return
         t0 = self._now()
         self.pump_count += 1
         try:
@@ -3598,12 +3605,20 @@ class RasterEditorExt:
             out.append(lay)
         return out
 
+    def _net_apply(self, layers):
+        """network.apply with Pump() disabled for its duration (see Pump)."""
+        was, self._net_busy = self._net_busy, True
+        try:
+            self.network.apply(layers, self.doc_w, self.doc_h)
+        finally:
+            self._net_busy = was
+
     def _apply_network(self):
         if self.network is None:
             return
         t = self._now()
         layers = self.doc_layers if self.doc_layers is not None else self._default_layers()
-        self.network.apply(layers, self.doc_w, self.doc_h)
+        self._net_apply(layers)
         self._network_applied()
         self.stats["apply"].append(self._now() - t)
 

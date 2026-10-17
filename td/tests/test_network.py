@@ -4224,3 +4224,73 @@ def test_surfaceless_input_mask_is_allocated_at_the_live_input_size(both):
     del comp.in1.width, comp.in1.height
     net.apply([inp("i", 1, opacity=0.9, mask={"slot": 7, "enabled": True})], W, H)
     assert net.surface_size(7) == (W, H)                                    # unknown input size: the document's (as protocol.slot_sizes)
+
+
+# --------------------------------------------------------------------------- re-entrant frame callbacks / empty document then a big one
+
+
+def _big_fx_doc():
+    layers = [base()]
+    for i in range(8):
+        layers.append(px("p%d" % i, i + 1, surfaceW=16, surfaceH=8, effects=[shadow()] if i % 2 == 0 else []))
+    return layers
+
+
+def _assert_consistent(net, layers):
+    """Every planned node exists and is valid, every effect chain has an output and a generation (the _wire() KeyError)."""
+    assert all(o.valid for o in net._ops.values())
+    for alias, (lid, *_rest) in net._fx_todo.items():
+        assert alias in net._fx_out and alias in net._gen and lid in net._chains
+    assert sorted(net.slots()) == sorted(l["slot"] for l in layers if l.get("slot"))
+
+
+def test_empty_document_then_big_effect_document_after_idle_frames(env):
+    net, comp, log, clock = env
+    net.apply([base()], W, H)
+    for _ in range(300):                # ~8 s of idle frames
+        clock.t += 0.034
+        net.tick()
+    doc = _big_fx_doc()
+    net.apply(doc, W, H)
+    _assert_consistent(net, doc)
+    net.apply(doc[:3], W, H)             # and the later applies keep working
+    net.apply(doc, W, H)
+    _assert_consistent(net, doc)
+
+
+def test_reentrant_apply_and_tick_from_a_frame_callback_during_create_are_ignored(env):
+    """TouchDesigner can run the frame callbacks (the extension's Pump: _sync_doc_size / _sync_hints -> apply() of the PREVIOUS
+    document, tick()) in-line while apply() creates an operator.  That nested apply dropped the surfaces and effect chains the outer
+    one was creating ('s1 has been deleted', KeyError 'fx_L_p4' in _wire)."""
+    net, comp, log, clock = env
+    old = [base()]
+    net.apply(old, W, H)
+    for _ in range(60):
+        clock.t += 0.2
+        net.tick()
+    fired = []
+    holder = net.doc
+    orig = holder.create
+
+    def create(optype, name):
+        c = orig(optype, name)
+        if optype in ("scriptTOP", "glslTOP") and len(fired) < 40:
+            fired.append(name)
+            net.apply(old, W, H + 8)     # Pump -> _sync_doc_size: previous layers (the doc size differs, so it is not a no-op)
+            net.tick()
+            clock.t += 3.0
+        return c
+    holder.create = create
+    doc = _big_fx_doc()
+    net.apply(doc, W, H)
+    holder.create = orig
+    assert fired and net._counters["reentrant"] >= 1
+    _assert_consistent(net, doc)
+    for _ in range(80):
+        clock.t += 0.2
+        net.tick()
+    _assert_consistent(net, doc)
+    net.apply(doc, W, H)
+    net.apply(doc[:2], W, H)
+    net.apply(doc, W, H)
+    _assert_consistent(net, doc)

@@ -5605,6 +5605,85 @@ def s60_identity_stability(args):
         drop_v8()
 
 
+def s61_empty_then_large_doc(args):
+    """An EMPTY document, then (after an idle gap) a 27-layer document with effect chains, then more applies.  Bug (found by the idle
+    profiler, docs/PERF_IDLE.md): creating an operator inside network.apply() could make TD run the frame callbacks in-line, i.e. the
+    extension's Pump re-applied the previous (empty) document in the middle of the outer apply: KeyError 'fx_L_p4' in network._wire,
+    then 'Operator .../doc/s1 has been deleted'.  Runs in a scratch editor; every apply must succeed and leave a consistent network."""
+    e = f"op({COMP!r}).ext.RasterEditorExt"      # the master editor: a scratch slave editor never showed the in-line pump
+    notes = []
+
+    def lay(i, **kw):
+        d = dict(id=f"p{i}", kind="pixel", parentId=None, name=f"p{i}", visible=True, opacity=1.0, blend="normal", x=0, y=0, sx=1.0, sy=1.0,
+                 rot=0, kx=0, ky=0, effects=[], surfaceW=None, surfaceH=None, slot=i + 1, mask=None, adjustment=None, text=None, shape=None)
+        d.update(kw)
+        return d
+
+    fxs = {4: [{"type": "blur", "enabled": True, "radius": 6.0}],
+           9: [{"type": "dropShadow", "enabled": True, "blur": 6.0, "dx": 8.0, "dy": 8.0, "opacity": 0.7, "color": {"r": 0, "g": 0, "b": 0, "a": 255}}],
+           13: [{"type": "posterize", "enabled": True, "levels": 6}], 17: [{"type": "blur", "enabled": True, "radius": 3.0}]}
+    big = []
+    for i in range(20):
+        big.append(lay(i, surfaceW=1920, surfaceH=1080, effects=fxs.get(i, []), blend="multiply" if i % 5 == 1 else "normal",
+                       mask={"slot": 100 + i, "enabled": True} if i in (3, 7) else None))
+        if i == 8:
+            big.append(lay(50, id="a_hue", kind="adjustment", slot=None, adjustment={"type": "hueSaturation", "hue": 20, "saturation": 1.2, "value": 1.0}))
+    for l in big:
+        l["surfaceW"], l["surfaceH"] = (1920, 1080) if l["kind"] == "pixel" else (None, None)
+
+    def apply(layers, rev):
+        r = td(f"""
+import json
+x = {e}
+m = json.loads({json.dumps(json.dumps({"rev": rev, "layers": layers}))})
+rev, layers = x.protocol.parse_doc(m, x._fx())
+x._apply_doc(rev, layers)
+print("ok", len(layers))
+""", 60)
+        return r.strip()
+
+    def check(layers):
+        out = td(f"""
+import json
+x = {e}; n = x.network
+bad = [k for k, o in n._ops.items() if not o.valid]
+miss = [a for a in n._fx_todo if a not in n._fx_out or a not in n._gen]
+print(json.dumps(dict(bad=bad, miss=miss, chains=len(n._chains), slots=n.slots(), reentered=getattr(x, 'pump_reentered', 0), err=n.fx_error, fail=len(n._fx_fail))))
+""", 60)
+        return json.loads(out.strip().splitlines()[-1])
+
+    try:
+        ok = True
+        try:
+            r0 = apply([], 1)
+            time.sleep(9.0)                       # the idle gap the bug needed (the first pumps/ticks top up the spare pool meanwhile)
+            r1 = apply(big, 2)
+            c1 = check(big)
+            ok1 = r1.startswith("ok") and not c1["bad"] and not c1["miss"] and c1["chains"] == 5 and len(c1["slots"]) == 22 and not c1["fail"]
+            notes.append(f"empty ({r0}), 9 s idle, 27-layer document with effects: {r1[:60]}; chains {c1['chains']}, slots {len(c1['slots'])}, "
+                         f"invalid ops {c1['bad']}, unwired chains {c1['miss']}, nested pumps skipped {c1['reentered']}: {ok1}")
+            r2 = apply([], 3)
+            time.sleep(4.0)
+            r3 = apply(big, 4)
+            time.sleep(1.0)
+            big2 = [dict(l, opacity=0.5) if l["id"] == "p2" else l for l in big]
+            r4 = apply(big2, 5)
+            c2 = check(big2)
+            ok2 = all(r.startswith("ok") for r in (r2, r3, r4)) and not c2["bad"] and not c2["miss"] and c2["chains"] == 5 and len(c2["slots"]) == 22
+            notes.append(f"later applies (empty, 4 s, large, changed): {[r[:40] for r in (r2, r3, r4)]}; chains {c2['chains']}, slots {len(c2['slots'])}, "
+                         f"invalid ops {c2['bad']}, unwired chains {c2['miss']}: {ok2}")
+            ok = ok1 and ok2
+        except Exception as ex:      # noqa: BLE001 - the failure IS the finding
+            ok = False
+            notes.append("apply failed: " + str(ex)[-700:])
+        return ok, "\n        ".join(notes)
+    finally:
+        try:
+            apply([], 9)                          # leave the master with an empty document
+        except Exception:      # noqa: BLE001
+            pass
+
+
 STEPS = [
     (1, "build component, no operator errors, document survives a rebuild", "build", False),
     (2, "web server serves the UI", "server", False),
@@ -5665,6 +5744,7 @@ STEPS = [
     (58, "project load: the saved master resumes (same port + token), no other editor serves", "resume", False),
     (59, "Upgrade All Editors (real pulse): v0.7.3 editor upgraded with document intact, newer skipped and listed", "upgrade", False),
     (60, "editorId stable: undo of a delete, cut/paste into another COMP, tox after the original is gone; a live copy gets a new id", "identity", False),
+    (61, "empty document, idle gap, then a 27-layer document with effect chains and later applies: no re-entrant apply damage (KeyError fx_L_*, deleted surface)", "emptylarge", False),
     (99, "deleting the COMP with clients connected does not freeze TD; undo of the delete restores the pixels (run last)", "delete", False),
 ]
 FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinput": "s4_no_input", "scene": "s5_scene",
@@ -5682,7 +5762,7 @@ FUNCS = {"build": "s1_build", "server": "s2_server", "panel": "s3_panel", "noinp
          "uiredoc": "s45_ui_redoc_history", "ttc": "s46_ttc_fonts", "active": "s47_active_layer_hint",
          "migrate": "s48_migration_v6_docs", "renderreq": "s49_render_requests", "uimulti": "s50_ui_flatten_merge_multiselect", "uicopy": "s51_ui_copy_paste", "uiscrub": "s52_ui_scrub", "uimasks": "s53_ui_group_input_masks",
          "ed23": "s54_two_three_editors", "elect": "s55_election", "failover": "s56_failover", "copy": "s57_copy_paste",
-         "resume": "s58_project_load_resume", "upgrade": "s59_upgrade_all", "identity": "s60_identity_stability"}
+         "resume": "s58_project_load_resume", "upgrade": "s59_upgrade_all", "identity": "s60_identity_stability", "emptylarge": "s61_empty_then_large_doc"}
 
 
 # --------------------------------------------------------------------------- tiers: smoke / affected / full (docs/VALIDATION.md)
@@ -5706,7 +5786,7 @@ STEP_AREAS = {
     41: {"select", "filters"}, 42: {"brush"}, 43: {"net", "render"}, 44: {"history"}, 45: {"history", "files"}, 46: {"fonts", "text"},
     47: {"net", "render"}, 48: {"render", "upgrade"}, 49: {"render", "layers"}, 50: {"layers"}, 51: {"layers"}, 52: {"scrub"},
     53: {"masks", "layers"}, 54: {"editors"}, 55: {"editors"}, 56: {"editors"}, 57: {"editors"}, 58: {"editors", "persist"},
-    59: {"upgrade", "editors"}, 60: {"editors"}, 99: {"core"},
+    59: {"upgrade", "editors"}, 60: {"editors"}, 61: {"net", "layers", "effects"}, 99: {"core"},
 }
 ALL_AREAS = {a for v in STEP_AREAS.values() for a in v}
 # (path prefix or substring, areas) -- every match counts. "*" = everything.

@@ -861,6 +861,7 @@ class DocNetwork:
         self._clock = clock
         self.doc = comp.op("doc") or comp.create("baseCOMP", "doc")
         self._ops = {}        # name -> operator (every node we manage, incl. surfaces pending destroy)
+        self._applying = False   # inside apply(): re-entrant apply() / tick() calls are ignored
         self._gen = {}        # name -> generation (bumped whenever the operator behind a name changes)
         self._gen_counter = 0
         self._cache = {}      # name -> {"type", "pars", "inputs", "bypass", "pos"}
@@ -909,7 +910,7 @@ class DocNetwork:
         self._declared = {}            # set_inputs(): fallback for inputs whose COMP connector is not readable
         self._scanned = False
         self._counters = {"created": 0, "destroyed": 0, "par_sets": 0, "connects": 0,
-                          "disconnects": 0, "recycled": 0, "applies": 0, "unknown": 0, "forced": 0}
+                          "disconnects": 0, "recycled": 0, "applies": 0, "unknown": 0, "forced": 0, "reentrant": 0}
         self._last = {}
         self._last_ms = 0.0
         self._chains = {}      # layer id -> effects.EffectChain
@@ -928,6 +929,20 @@ class DocNetwork:
     # ------------------------------------------------------------------ public API
 
     def apply(self, layers, doc_w, doc_h):
+        if self._applying:
+            # Re-entrant call.  Creating an operator inside apply() can make TouchDesigner run the frame callbacks in-line (seen
+            # after the main thread sat idle), i.e. the extension's Pump, which re-applies the PREVIOUS document while this one is half
+            # built: it dropped the surfaces / effect chains the outer apply was creating ("s1 has been deleted", KeyError fx_L_p4).
+            # The outer apply is authoritative; the next pump applies whatever is pending.
+            self._counters["reentrant"] += 1
+            return
+        self._applying = True
+        try:
+            self._apply(layers, doc_w, doc_h)
+        finally:
+            self._applying = False
+
+    def _apply(self, layers, doc_w, doc_h):
         t0 = time.perf_counter()
         self._last_apply_t = self._clock()
         counters0 = dict(self._counters)
@@ -962,7 +977,9 @@ class DocNetwork:
     def tick(self):
         """Housekeeping, cheap, call once per frame: destroys ONE expired surface (2 s grace) or ONE
         garbage node, otherwise tops up the spare GLSL pool by one node (a few ms at most).  First it finishes
-        pending text measurements (``MEASURE_BUDGET`` cooks per tick)."""
+        pending text measurements (``MEASURE_BUDGET`` cooks per tick).  Does nothing while apply() runs (re-entrant call)."""
+        if self._applying:
+            return
         if self._text_todo and self._text_due():
             self._refresh_texts()
             return

@@ -4451,3 +4451,26 @@ def test_surfaceless_input_mask_uses_the_live_input_size_in_the_slot_and_the_net
     env.send(a, {"t": "setCanvas", "w": 128, "h": 64, "mode": "fixed"})   # a canvas change keeps the input mask at the input's size
     env.pump()
     assert env.x.surfaces[5].shape == (24, 48, 4)
+
+
+def test_pump_is_skipped_while_the_network_applies(env):
+    """TD runs the frame callbacks in-line when apply() creates an operator: that nested Pump re-applied the previous document and
+    removed the surfaces being created (network.py 'fx_L_p4' KeyError / 's1 has been deleted')."""
+    env.pump()
+    a = env.connect("panel")
+    net = env.o.net
+    seen = []
+    real = net.apply
+
+    def apply(layers, w, h):
+        before = len(net.applies)
+        pumps = env.x.pump_count
+        env.x.Pump()                      # the in-line frame callback
+        seen.append((env.x.pump_count == pumps, len(net.applies) == before))
+        return real(layers, w, h)
+    net.apply = apply
+    env.doc(a, DOC, rev=7)
+    net.apply = real
+    assert seen and all(s == (True, True) for s in seen) and env.x.pump_reentered >= 1
+    env.pump(3)                           # normal frames resume
+    assert env.x.pump_count > 0 and env.x.doc_rev == 7
