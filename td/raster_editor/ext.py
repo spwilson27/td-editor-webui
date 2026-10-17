@@ -46,7 +46,8 @@ LOOPBACK_ORIGIN = re.compile(r"^http://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
 LOOPBACK = ("127.0.0.1", "::1", "[::1]", "localhost")
 CONVERT_BUDGET_S = 0.004  # input / output -> wire conversion time per pump (per stream)
 STALL_S = 10.0  # a client that has not fetched its last `base` / `view` notice for this long is 'stalled'
-RESUME_HOLD_S = 0.12  # v12: a resumed client is told the NEWEST BASE / preview frame: a stored outdated one is held back this long while its successor is produced
+PAUSE_CHAIN_KEEP_S = 60.0  # v12: a paused client keeps its fast-view GPU nodes this long (a quick resume must not create operators inside Pump)
+RESUME_HOLD_S = 0.06  # v12: a resumed client is told the NEWEST BASE / preview frame: a stored outdated one is held back this long while its successor is produced
 EARLY_MAX_BYTES = 96 * 1024 * 1024  # SURFACE frames kept for a doc that has not arrived yet (replayed after it)
 EARLY_MAX_FRAMES = 512  # ... per slot
 STATUS_PERIOD_S = 0.25
@@ -147,10 +148,16 @@ class _Notice:
         self.stalled = False
         self.hold = None
 
+    def rearm(self):
+        """Forget a notice that was sent but not fetched (and a stall), keep what the client has already fetched."""
+        self.outstanding = None
+        self.stalled = False
+        self.hold = None
+
 
 class _Client:
     __slots__ = ("id", "cid", "kind", "ready", "active", "seq", "fresh", "bases", "view", "view_msg", "view_td",
-                 "fid_pending", "fid_applied", "reloading", "active_layer", "lp", "protocol", "paused",
+                 "fid_pending", "fid_applied", "reloading", "active_layer", "lp", "protocol", "paused", "paused_at", "resume_t", "resume_marks",
                  "vq", "vp", "vserial", "v_inflight", "v_fid", "v_q", "v_tok", "v_changed", "v_fast_dirty", "v_exact_dirty",
                  "v_showing", "v_prev", "v_prev_applied", "v_next_at", "v_next_exact", "v_big", "v_vserial_seen", "v_unacked_since", "v_eq", "v_acked", "v_nfast")
 
@@ -172,6 +179,9 @@ class _Client:
         self.active_layer = None  # v7: the layer id the editor named in `activeLayer`
         self.lp = {}  # v7: layer id -> _Notice of its LAYER_PREVIEW stream
         self.protocol = 10  # hello.protocol of the client (>= 11: fast / exact view frames over the WebSocket)
+        self.paused_at = 0.0  # when it paused (its fast-view GPU chain is kept PAUSE_CHAIN_KEEP_S)
+        self.resume_t = None  # when it resumed; resume_marks = {"base": s, "fast": s, "preview": s}: seconds from then to the first of each (GetResumeMarks)
+        self.resume_marks = {}
         self.paused = False  # v12 `streams {paused}`: idle page, no BASE / view / layer-preview work for it (never set for protocol < 12)
         # --- v11 view stream state (DESIGN_V9)
         self.vq = "auto"  # auto | fast | exact (what the client asked for)
@@ -395,6 +405,8 @@ class RasterEditorExt:
         self._fx_mod = None
         self.network = None
         self._net_busy = False      # inside a network.apply(): Pump() must not run (re-entrant frame callback)
+        self._pumping = False       # inside Pump(): creating an operator there (view chain, input ops, pool top-up) can run the callbacks in-line
+        self._deferred_doc = None   # a document that arrived while network.apply() ran: applied by the next network tick
         self.pump_reentered = 0
         self.frozen = False
         for pipe in self.bases.values():
@@ -760,7 +772,7 @@ class RasterEditorExt:
         self._route = {}
         self._blocked_n, self._blocked_until = 0, 0.0
         self._set_record({"path": str(self.o.path), "id": self.editor_id, "port": port, "token": token, "orphan": False,
-                          "failed": [] if user else list(rec.get("failed") or [])})
+                          "failed": [] if user else list(rec.get("failed") or []), "serving": False})   # (`serving` once it accepts connections)
         self.port_used = port
         self._rescan(force=True)
         busy = f" (port {ports[0]} busy)" if port != ports[0] else ""
@@ -939,6 +951,7 @@ class RasterEditorExt:
         if self._takeover is not None and now >= self._retry_at:
             self.BecomeMaster(takeover=True)
         if self.is_master:
+            self._mark_serving()
             if now >= self._scan_at:
                 self._rescan(force=True)
             if now >= self._health_at:
@@ -963,6 +976,17 @@ class RasterEditorExt:
             cand = self._successor(skip_ids=rec.get("failed") or ())
             if cand is self:
                 self.BecomeMaster(takeover=True)
+
+    def _mark_serving(self):
+        """The master's record says `serving: false` from the moment the Web Server DAT is switched on until a connect to the port
+        succeeds (a cheap probe each pump, only while it is false): readers can wait for `serving` instead of racing the bind."""
+        rec = self._record()
+        if not rec or rec.get("serving", True) or rec.get("path") != str(self.o.path):
+            return
+        port = rec.get("port")
+        if port and not self._port_free(int(port)):   # (connect succeeds = something listens: our server)
+            rec["serving"] = True
+            self._set_record(rec)
 
     BIND_ERROR = re.compile(r"bind|address already in use|in use|eaddrinuse|cannot assign|permission denied", re.I)
 
@@ -1864,6 +1888,11 @@ class RasterEditorExt:
     def _apply_doc(self, rev, layers, guides=None, brush_presets=None, unknown=()):
         """Apply a layer stack: allocate / revive / resize the surface buffers it names (each at its own surface
         size), diff-apply it to the generated network, remember it (stored to `doc_state` in the next pump)."""
+        if self._net_busy:
+            # A nested call (TD ran the frame callbacks in-line while network.apply() created an operator): the outer apply is half
+            # done, so this document waits; the network tick applies it right after.
+            self._deferred_doc = (rev, layers, guides, brush_presets, unknown)
+            return
         t0 = self._now()
         P = self.protocol
         layers = self._fill_input_sizes(layers)
@@ -1888,8 +1917,10 @@ class RasterEditorExt:
         self._track_bounds(slots, fresh, resized, unknown, masks)
         if self.network is not None and (layers != self.doc_layers or not self._net_applied):
             self._push_hints(layers)
-            self._net_apply(layers)
-            self._network_applied()
+            if self._net_apply(layers):
+                self._network_applied()
+            else:
+                self._net_applied = False   # skipped (re-entrant): the network tick applies this document again
         self.surfaces.update(fresh)
         self.surfaces.update(resized)
         for s in [s for s in self.surfaces if s not in slots]:
@@ -3077,10 +3108,18 @@ class RasterEditorExt:
 
     def _pause_client(self, c):
         """Nothing more is announced to it; the streams stop being produced once no unpaused client wants them (the per-frame steps
-        look at `_streaming_ids` / `_view11_subscribers`). Whatever it was told and has not fetched yet is forgotten."""
+        look at `_streaming_ids` / `_view11_subscribers`). A notice it was sent and has not fetched is forgotten; what it fetched stays."""
         for nt in list(c.bases.values()) + list(c.lp.values()) + [c.view]:
-            nt.clear()
+            nt.rearm()
         c.v_fast_dirty = c.v_exact_dirty = False
+        c.paused_at = self._now()
+        if not self._streaming_ids():
+            # nobody wants BASE frames any more: a read in flight (or half converted) would be announced as news after a resume
+            for pipe in self.bases.values():
+                if pipe.inflight is not None or pipe.conv is not None:
+                    pipe.inflight = None
+                    pipe.conv = None
+                    pipe.pending = True   # read again after a resume
 
     @staticmethod
     def _pipe_stale(pipe):
@@ -3088,21 +3127,20 @@ class RasterEditorExt:
         return pipe.pending or pipe.conv is not None or pipe.inflight is not None
 
     def _resume_client(self, c):
-        """Fresh state, promptly: the newest BASE frame of every input and the current layer previews are announced again (a stored frame
-        that is already out of date is held back until the newer one is published); a TD view client gets a fast frame and an exact refresh
-        (a full frame when its exact buffer may be stale: frames were still in flight)."""
+        """Fresh state, promptly. BASE / preview: whatever the client has not fetched is announced by the normal notice pass (a stored
+        frame that is out of date is held back RESUME_HOLD_S while its successor is produced); frames it already fetched are not sent again.
+        A TD view client gets a fast frame and an exact refresh (a full frame when its exact buffer may be stale: frames were in flight)."""
+        now = self._now()
+        c.resume_t, c.resume_marks = now, {}
         for i, pipe in self.bases.items():
             nt = c.notice(i)
-            nt.clear()
             if self._pipe_stale(pipe):
-                nt.hold = (pipe.fid, self._now() + RESUME_HOLD_S)
+                nt.hold = (pipe.fid, now + RESUME_HOLD_S)
         for lid, pipe in self.layer_pipes.items():
             nt = c.lp.setdefault(lid, _Notice())
-            nt.clear()
             if self._pipe_stale(pipe):
-                nt.hold = (pipe.fid, self._now() + RESUME_HOLD_S)
+                nt.hold = (pipe.fid, now + RESUME_HOLD_S)
         if c.view_td and c.protocol >= 11:
-            now = self._now()
             if c.v_inflight or c.view.stalled:
                 c.v_prev = None
                 c.v_prev_applied = None
@@ -3117,6 +3155,14 @@ class RasterEditorExt:
             c.v_changed = now
             c.v_fast_dirty = c.v_exact_dirty = True
             c.v_big = None
+
+    def _mark_resume(self, c, kind):
+        if c.resume_t is not None and kind not in c.resume_marks:
+            c.resume_marks[kind] = self._now() - c.resume_t
+
+    def GetResumeMarks(self):
+        """{client cid: seconds from the last resume to the first BASE notice / fast frame / preview notice sent}."""
+        return {c.cid: dict(c.resume_marks) for c in self.clients.values() if c.resume_t is not None}
 
     def _on_view_ack(self, c, msg):
         try:
@@ -3163,6 +3209,17 @@ class RasterEditorExt:
         except Exception:  # noqa: BLE001
             return 0.0
 
+    def _prune_chains(self, now, live):
+        """Fast-view GPU nodes of clients that left the TD view go; a PAUSED client keeps its chain PAUSE_CHAIN_KEEP_S (a resume then
+        sends its fast frame without creating operators inside Pump). Idle chains cost no per-frame Python work."""
+        for cid in list(self._vchains):
+            if cid in live:
+                continue
+            c = self.clients.get(cid)
+            if c is not None and c.paused and c.view_td and now - c.paused_at < PAUSE_CHAIN_KEEP_S:
+                continue
+            self._drop_vchain(cid)
+
     def _fast_clients(self, subs, now=0.0):
         """Ids of the clients that get fast frames: asked for them, OpenCV is there, and a GPU chain is free (clients that
         already own one keep it; the others take the free ones in connection order)."""
@@ -3178,16 +3235,15 @@ class RasterEditorExt:
 
     def _poll_view11(self, now):
         subs = self._view11_subscribers()
+        self._prune_chains(now, {c.id for c in subs})
         if not subs:
-            for cid in list(self._vchains):
-                self._drop_vchain(cid)
             self._vfail.clear()
             if self.vx.msg is not None or self.vx.conv is not None or self.vx.inflight is not None or self._vx_frame is not None:
                 self.vx.reset()
                 self._vx_frame = None
             return
         want = self._fast_clients(subs, now)
-        for cid in [k for k in self._vchains if k not in want]:
+        for cid in [k for k in self._vchains if k not in want and k in {c.id for c in subs}]:
             self._drop_vchain(cid)
         for cid in [k for k in self._vfail if k not in self.clients]:
             del self._vfail[cid]
@@ -3276,6 +3332,10 @@ class RasterEditorExt:
             chain = None
         if chain is None:
             used = {ch["n"] for ch in self._vchains.values()}
+            if len(used) > VIEW_MAX_CHAINS:   # (paused clients' kept chains must not starve a live one)
+                for cid in [k for k in self._vchains if k != c.id and self.clients.get(k) is not None and self.clients[k].paused]:
+                    self._drop_vchain(cid)
+                used = {ch["n"] for ch in self._vchains.values()}
             chain = self._make_vchain(next(n for n in range(VIEW_MAX_CHAINS + 1) if n not in used), src)
             if chain is None:
                 raise RuntimeError("the fast view nodes could not be created")
@@ -3300,6 +3360,7 @@ class RasterEditorExt:
         c.v_showing = "fast"
         c.v_nfast += 1
         self.counters["fastframes"] += 1
+        self._mark_resume(c, "fast")
         t3 = self._now()
         self.stats["vfastcap"].append(t1 - t0)
         self.stats["vfastenc"].append(t2 - t1)
@@ -3578,17 +3639,20 @@ class RasterEditorExt:
     # ------------------------------------------------------------------ pump (each frame start)
 
     def Pump(self):
-        if self._net_busy:
+        if self._net_busy or self._pumping:
             # TouchDesigner ran the frame callbacks in-line while network.apply() was creating an operator: the document is half
             # built and doc_layers is still the previous one.  Skip this frame's pump (the next one is a normal frame).
             self.pump_reentered += 1
             return
         t0 = self._now()
         self.pump_count += 1
+        self._pumping = True
         try:
             self._pump(t0)
         except Exception as e:  # noqa: BLE001
             self._report("Pump", e)
+        finally:
+            self._pumping = False
         try:
             if t0 >= self._status_at:
                 self._update_status(t0)
@@ -3637,6 +3701,9 @@ class RasterEditorExt:
                 self._dirty.update(self.surfaces)
 
     def _tick_network(self, now):
+        if self._deferred_doc is not None and not self._net_busy:
+            args, self._deferred_doc = self._deferred_doc, None
+            self._apply_doc(*args)
         if self._restore_pending and self._net_applied and now >= self._restore_retry_at:
             self._restore_retry_at = now + 1.0
             self._finish_restore()
@@ -3685,7 +3752,7 @@ class RasterEditorExt:
         """network.apply with Pump() disabled for its duration (see Pump)."""
         was, self._net_busy = self._net_busy, True
         try:
-            self.network.apply(layers, self.doc_w, self.doc_h)
+            return self.network.apply(layers, self.doc_w, self.doc_h) is not False
         finally:
             self._net_busy = was
 
@@ -3694,8 +3761,10 @@ class RasterEditorExt:
             return
         t = self._now()
         layers = self.doc_layers if self.doc_layers is not None else self._default_layers()
-        self._net_apply(layers)
-        self._network_applied()
+        if self._net_apply(layers):
+            self._network_applied()
+        else:
+            self._net_applied = False
         self.stats["apply"].append(self._now() - t)
 
     # --- TD inputs (v6: in1..in8 In TOPs, always one spare unconnected connector)
@@ -4525,6 +4594,7 @@ class RasterEditorExt:
                     msg = P.base_notice(pipe.fid, *pipe.size, i)
                 self._send(c.id, msg)
                 self.counters["basenotices"] += 1
+                self._mark_resume(c, "base")
                 n.outstanding = pipe.fid
                 n.sent_at = now
         for lid, pipe in sorted(self.layer_pipes.items()):
@@ -4545,6 +4615,7 @@ class RasterEditorExt:
                     msg = P.layer_preview_notice(lid, pipe.fid, *pipe.size)
                 self._send(c.id, msg)
                 self.counters["lpnotices"] += 1
+                self._mark_resume(c, "preview")
                 n.outstanding = pipe.fid
                 n.sent_at = now
         if self.out.msg is not None:

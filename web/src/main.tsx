@@ -87,7 +87,7 @@ function boot() {
   installKeyboard(store);
   installPaste(store);
   installDropGuard();
-  createIdleDetector(store.setIdle, undefined, idleMsFromQuery(location.search)); // v12: idle page -> TD pauses its streams (lives as long as the page)
+  createIdleDetector(store.setIdle, { busy: store.tdBusy }, idleMsFromQuery(location.search)); // v12: idle page -> TD pauses its streams (lives as long as the page)
   const root = document.getElementById('app')!;
 
   if (useMockBridge(location.search, import.meta.env.DEV)) {

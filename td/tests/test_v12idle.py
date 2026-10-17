@@ -10,7 +10,7 @@ import ext as E
 import frames
 import protocol as P
 from faketd import FakeTop
-from test_ext import Env
+from test_ext import Env, L
 from test_ext_v7 import PIXSORT, H, W, fetch_layer, notices as lp_notices, preview_img, setup_preview
 from test_v11view import DH, DW, V, apply_exact, want_wire
 
@@ -97,14 +97,134 @@ def E_wire(bands):
     return np.concatenate([np.frombuffer(p, np.uint8).reshape(h.h, h.w, 4) for h, p in bands])
 
 
-def test_resume_of_an_unchanged_input_announces_the_stored_frame_again():
+def test_resume_of_an_unchanged_input_does_not_send_the_frame_the_client_already_fetched():
     env, (a,) = base_env()
     n0 = len(env.notices(a))
     pause(env, a)
     env.pump(10)
     pause(env, a, False)
+    env.pump(6)
+    assert len(env.notices(a)) == n0 and env.x.GetCounters()["basenotices"] == n0
+
+
+def test_resume_announces_a_frame_whose_notice_was_never_fetched():
+    env = Env()
+    env.autofetch = False                                              # the page never pulled the frame
+    env.pump()
+    a = env.connect("external", protocol=12)
+    env.set_input(32, 16, 1)
+    env.pump(6)
+    n0 = len(env.notices(a))
+    assert n0 == 1
+    pause(env, a)
     env.pump(4)
+    pause(env, a, False)
+    env.pump(6)
     assert len(env.notices(a)) == n0 + 1
+
+
+def test_pause_in_the_middle_of_a_readback_does_not_announce_the_stale_read_after_resume():
+    env, (a,) = base_env()
+    env.set_input(32, 16, 50)
+    env.pump(1)                                                        # a read of the new picture is in flight / half converted
+    pipe = env.x.bases[1]
+    assert pipe.inflight is not None or pipe.conv is not None or pipe.pending
+    pause(env, a)
+    assert pipe.inflight is None and pipe.conv is None and pipe.pending
+    fid = pipe.fid
+    newest = env.set_input(32, 16, 51)
+    env.pump(4)
+    pause(env, a, False)
+    env.pump(12)
+    last = max(env.bases(a))
+    assert last > fid
+    assert (E_wire(env.bases(a)[last]) == frames.WireConverter().to_wire(newest, True)).all()    # what the client holds is the newest picture
+
+
+def test_pausing_one_of_two_clients_leaves_the_read_in_flight_alone():
+    env, (a, b) = base_env(2)
+    env.set_input(32, 16, 60)
+    env.pump(1)
+    pipe = env.x.bases[1]
+    before = (pipe.inflight, pipe.conv)
+    pause(env, a)
+    assert (pipe.inflight, pipe.conv) == before
+
+
+def test_serving_flag_of_the_master_record():
+    env = Env()
+    env.x._port_free = lambda p: True                                    # nothing listens yet
+    env.x._become_master(False, False, True)
+    assert env.x._record()["serving"] is False
+    env.pump(2)
+    assert env.x._record()["serving"] is False
+    env.x._port_free = lambda p: False                                   # the connect succeeds
+    env.pump(2)
+    assert env.x._record()["serving"] is True
+
+
+# ----------------------------------------------------------------------------- re-entrancy (reviewer findings)
+
+def test_nested_pump_during_a_fast_frame_is_skipped():
+    v, c = view_v()
+    seen = []
+    orig = v.x._capture_fast
+
+    def nested(chain, pw, ph, premult):
+        before = v.x.pump_count
+        v.x.Pump()                                   # TD ran the frame callbacks in-line while a view operator was created / read
+        seen.append((before, v.x.pump_count))
+        return orig(chain, pw, ph, premult)
+    v.x._capture_fast = nested
+    n = v.x.pump_reentered
+    v.out(123)
+    v.pump(3)
+    assert seen and all(b == a for b, a in seen)
+    assert v.x.pump_reentered > n
+    assert v.x._pumping is False                      # the flag is released
+
+
+def test_a_document_arriving_inside_network_apply_is_deferred_not_lost_or_marked_applied():
+    env = Env()
+    env.pump()
+    a = env.connect("panel")
+    A = [L("p1", slot=1, surfaceW=64, surfaceH=32)]
+    B = [L("p1", slot=1, surfaceW=64, surfaceH=32), L("p2", slot=2, surfaceW=64, surfaceH=32)]
+    net = env.o.net
+    orig = net.apply
+    done = []
+
+    def nested_apply(layers, w, h):
+        if not done:
+            done.append(1)
+            env.send(a, {"t": "doc", "rev": 2, "layers": B})        # the in-line frame callback delivers a newer document mid-apply
+        return orig(layers, w, h)
+    net.apply = nested_apply
+    env.send(a, {"t": "doc", "rev": 1, "layers": A})
+    assert env.x.doc_rev == 1 and env.x._deferred_doc is not None   # B waits
+    env.pump(3)
+    assert env.x._deferred_doc is None and env.x.doc_rev == 2
+    assert [l["id"] for l in env.x.doc_layers] == ["p1", "p2"] and 2 in net.tops and env.x._net_applied
+
+
+def test_a_skipped_network_apply_leaves_the_document_unapplied_and_is_retried():
+    env = Env()
+    env.pump()
+    a = env.connect("panel")
+    net = env.o.net
+    orig = net.apply
+    calls = []
+
+    def skip_once(layers, w, h):
+        calls.append(1)
+        if len(calls) == 1:
+            return False                              # network.apply: a re-entrant call was skipped
+        return orig(layers, w, h)
+    net.apply = skip_once
+    env.send(a, {"t": "doc", "rev": 1, "layers": [L("p1", slot=1, surfaceW=64, surfaceH=32)]})
+    assert env.x._net_applied is False
+    env.pump(60)
+    assert env.x._net_applied is True and len(calls) >= 2
 
 
 def test_pause_and_resume_are_idempotent():
@@ -245,7 +365,7 @@ def view_v(quality="auto"):
     return v, c
 
 
-def test_paused_view_client_gets_no_frames_no_captures_no_exact_work_and_loses_its_gpu_nodes():
+def test_paused_view_client_gets_no_frames_no_captures_no_exact_work_and_keeps_its_gpu_nodes_for_a_while():
     v, c = view_v()
     assert v.frames(c, "fast") and v.frames(c, "exact")
     pause(v.env, c)
@@ -257,7 +377,7 @@ def test_paused_view_client_gets_no_frames_no_captures_no_exact_work_and_loses_i
     v.pump(30)
     assert len(v.frames(c)) == nf and len(v.captures) == caps
     assert v.env.o.net.out.readbacks == rb
-    assert v.destroyed and not v.x._vchains                             # no GPU chain is kept for a paused client
+    assert not v.destroyed and len(v.x._vchains) == 1                    # the GPU chain is kept for a quick resume (no operator creation in Pump)
     after = v.x.GetCounters()
     for k in ("fastframes", "exactframes", "vxreadback", "vreadback", "readback"):
         assert after.get(k, 0) == cnt.get(k, 0)
@@ -335,7 +455,7 @@ def test_view_mixed_clients_one_paused_one_live():
         v.out(90 + i)
         v.pump(3)
     assert len(v.frames(a)) == na and len(v.frames(b)) > nb
-    assert list(v.x._vchains) == [b]
+    assert set(v.x._vchains) == {a, b}                                  # (a's chain is kept for the grace period)
 
 
 def test_protocol_11_view_client_ignores_streams():
@@ -368,4 +488,101 @@ def test_all_view_clients_paused_equals_no_client_view_work():
         v.pump(3)
         none.pump(3)
     assert v.env.o.net.out.readbacks == none.env.o.net.out.readbacks == 0
-    assert v.x.GetCounters() == cnt and not v.x._vchains and not none.x._vchains
+    assert v.x.GetCounters() == cnt and not none.x._vchains
+
+
+# ----------------------------------------------------------------------------- fast-view chain grace period
+
+def test_resume_reuses_the_kept_chain_and_creates_no_operators_inside_pump():
+    v, c = view_v()
+    pause(v.env, c)
+    v.pump(5)
+    made = len(v.chains)
+    v.out(5)
+    v.pump(3)
+    pause(v.env, c, False)
+    v.pump(2)
+    assert len(v.chains) == made and not v.destroyed
+    assert v.x.GetResumeMarks()[v.x.clients[c].cid].get("fast") is not None
+
+
+def test_a_chain_is_dropped_after_the_grace_period_and_rebuilt_on_resume():
+    v, c = view_v()
+    pause(v.env, c)
+    v.pump(3)
+    assert v.x._vchains
+    v.env.clock.advance(E.PAUSE_CHAIN_KEEP_S + 1)
+    v.pump(2)
+    assert not v.x._vchains and v.destroyed
+    made = len(v.chains)
+    pause(v.env, c, False)
+    v.pump(3)
+    assert len(v.chains) == made + 1 and v.frames(c, "fast")
+
+
+def test_a_client_that_disconnects_while_paused_loses_its_chain():
+    v, c = view_v()
+    pause(v.env, c)
+    v.pump(2)
+    v.env.x.OnWebSocketClose(c)
+    v.pump(2)
+    assert not v.x._vchains
+
+
+def test_kept_paused_chains_do_not_starve_live_clients():
+    v = V()
+    cs = [v.connect(12) for _ in range(E.VIEW_MAX_CHAINS)]
+    v.out(1)
+    for cid in cs:
+        v.view(cid, "fast", {"x": 0, "y": 0, "w": DW, "h": DH, "scale": 1})
+    v.pump(10)
+    assert len(v.x._vchains) == E.VIEW_MAX_CHAINS
+    pause(v.env, cs[0])
+    extra = v.connect(12)
+    v.view(extra, "fast", {"x": 0, "y": 0, "w": DW, "h": DH, "scale": 1})
+    v.out(2)
+    v.pump(10)
+    assert v.frames(extra, "fast")
+
+
+# ----------------------------------------------------------------------------- more coverage
+
+def test_canvas_resize_while_paused_resumes_with_a_full_frame_of_the_new_size():
+    v, c = view_v()
+    pause(v.env, c)
+    v.pump(3)
+    v.env.o.par.Docw.val, v.env.o.par.Doch.val = 120, 90
+    arr = np.random.RandomState(9).rand(90, 120, 4).astype(np.float32)
+    arr[..., 3] = 1.0
+    v.env.o.net.out.set_image(arr)
+    v.pump(10)
+    n = len(v.frames(c, "exact"))
+    pause(v.env, c, False)
+    v.pump(40)
+    ex = v.frames(c, "exact")
+    assert len(ex) > n and (ex[-1][1]["docW"], ex[-1][1]["docH"]) == (120, 90) and ex[-1][1]["kind"] == 0
+    assert (apply_exact(None, ex[-1][1]) == want_wire(arr)).all()
+
+
+def test_pausing_a_stalled_client_and_resuming_clears_the_stall():
+    v, c = view_v()
+    for i in range(400):
+        v.out(i)
+        v.pump(1, ack=False)
+    cl = v.x.clients[c]
+    assert cl.view.stalled
+    pause(v.env, c)
+    assert not cl.view.stalled
+    v.pump(5)
+    pause(v.env, c, False)
+    v.pump(40)
+    assert not cl.view.stalled and cl.v_unacked_since is None
+    assert v.frames(c, "fast")[-1][1]["frameId"] > 0 and v.frames(c, "exact")
+
+
+def test_paused_clients_status_and_streams_before_ready_is_ignored():
+    env = Env()
+    env.pump()
+    c = env.connect("external", ready=False)
+    pause(env, c)
+    assert not env.x.clients[c].paused

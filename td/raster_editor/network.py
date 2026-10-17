@@ -929,18 +929,20 @@ class DocNetwork:
     # ------------------------------------------------------------------ public API
 
     def apply(self, layers, doc_w, doc_h):
+        """True when the stack was applied, False when the call was skipped because an apply is already running (re-entrant)."""
         if self._applying:
             # Re-entrant call.  Creating an operator inside apply() can make TouchDesigner run the frame callbacks in-line (seen
             # after the main thread sat idle), i.e. the extension's Pump, which re-applies the PREVIOUS document while this one is half
             # built: it dropped the surfaces / effect chains the outer apply was creating ("s1 has been deleted", KeyError fx_L_p4).
             # The outer apply is authoritative; the next pump applies whatever is pending.
             self._counters["reentrant"] += 1
-            return
+            return False
         self._applying = True
         try:
             self._apply(layers, doc_w, doc_h)
         finally:
             self._applying = False
+        return True
 
     def _apply(self, layers, doc_w, doc_h):
         t0 = time.perf_counter()

@@ -70,4 +70,48 @@ describe('idle detector', () => {
     vi.advanceTimersByTime(IDLE_MS * 2);
     expect(changes).toEqual([]);
   });
+
+  it('dragover counts as input', () => {
+    make();
+    vi.advanceTimersByTime(IDLE_MS - 1000);
+    win.fire('dragover');
+    vi.advanceTimersByTime(IDLE_MS - 1000);
+    expect(changes).toEqual([]);
+    vi.advanceTimersByTime(1000);
+    expect(changes).toEqual([true]);
+  });
+
+  it('pending TD work is activity: the timer re-arms instead of going idle, idle follows once it is done', () => {
+    let busy = true;
+    const d = createIdleDetector((v) => changes.push(v), { doc: doc as unknown as IdleEnv['doc'], win: win as unknown as IdleEnv['win'], busy: () => busy });
+    vi.advanceTimersByTime(IDLE_MS * 3);
+    expect(d.idle()).toBe(false);
+    busy = false;
+    vi.advanceTimersByTime(IDLE_MS);
+    expect(changes).toEqual([true]);
+  });
+
+  it('input only stores a timestamp: a pointermove storm does not touch the timer', () => {
+    const calls: number[] = [];
+    const real = globalThis.setTimeout;
+    const d = createIdleDetector((v) => changes.push(v), { doc: doc as unknown as IdleEnv['doc'], win: win as unknown as IdleEnv['win'], setTimeout: (fn, ms) => { calls.push(ms); return real(fn, ms); } });
+    for (let i = 0; i < 500; i++) { vi.advanceTimersByTime(10); win.fire('pointermove'); }
+    expect(calls.length).toBe(1);                       // 5 s of movement: still the single armed timer
+    vi.advanceTimersByTime(IDLE_MS - 5000 - 1);
+    expect(d.idle()).toBe(false);                      // ...and it re-armed for the rest when it expired (the last move was just now)
+    vi.advanceTimersByTime(IDLE_MS + 1);
+    expect(d.idle()).toBe(true);
+    expect(calls.length).toBeLessThanOrEqual(3);
+  });
+
+  it('a visibilitychange to visible while the page is already active and the timer armed changes nothing and re-arms from now', () => {
+    const d = make();
+    vi.advanceTimersByTime(IDLE_MS - 1000);
+    doc.fire('visibilitychange');                      // (still visible)
+    expect(changes).toEqual([]);
+    vi.advanceTimersByTime(IDLE_MS - 1);
+    expect(d.idle()).toBe(false);
+    vi.advanceTimersByTime(1);
+    expect(changes).toEqual([true]);
+  });
 });

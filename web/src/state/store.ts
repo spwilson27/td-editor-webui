@@ -46,7 +46,7 @@ function saveFlag(key: string, on: boolean) {
 export interface GuideDrag { axis: 'h' | 'v'; index: number | null; pos: number; remove: boolean }
 
 /** What the store needs from the bridge; everything but TOP import is optional (standalone, tests). */
-export type StoreBridge = Pick<Bridge, 'listTops' | 'importTop'> & Partial<Pick<Bridge, 'renderLayer' | 'renderLayers' | 'refreshView' | 'setCanvas' | 'saveProject' | 'openProject' | 'exportPng' | 'clearStoredHistory'>>;
+export type StoreBridge = Pick<Bridge, 'listTops' | 'importTop'> & Partial<Pick<Bridge, 'renderLayer' | 'renderLayers' | 'refreshView' | 'setCanvas' | 'saveProject' | 'openProject' | 'exportPng' | 'clearStoredHistory' | 'busy'>>;
 
 export const SHAPE_RENDERER_KEY = 'raster-editor.shapeRenderer';
 export type ShapeRenderer = 'sdf' | 'canvas';
@@ -251,11 +251,13 @@ export function createStore() {
     answerDiscard: ((_v: 'wait' | 'discard') => {}) as (v: 'wait' | 'discard') => void,
     /** v10: `editors` message / GET /editors. */
     setEditorList(list: EditorList) { editors.value = list.editors; editorMaster.value = list.master; },
-    /** TD view is only possible while linked to TouchDesigner. */
     /** v12: TD should not stream to this page. */
     streamsPaused: computed(() => idle.value && !keepLive.value),
     setIdle(v: boolean) { idle.value = v; },
     setKeepLive(on: boolean) { keepLive.value = on; saveKeepLive(on); },
+    /** v12: pending TD work (document load, import / render / merge request, file op) counts as activity for the idle detector. */
+    tdBusy: () => loadingDoc.peek() || (store.bridge?.busy?.() ?? false),
+    /** TD view is only possible while linked to TouchDesigner. */
     tdAvailable: computed(() => connection.value === 'linked'),
     /** v11: the TD view compositor as the bridge's frame sink. */
     tdViewSink: tdSink,

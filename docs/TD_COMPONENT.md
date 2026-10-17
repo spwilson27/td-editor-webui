@@ -426,7 +426,8 @@ Wire format: `PROTOCOL.md` section 14.
     cook-count change detection keeps running, so the first resumed tick reads the newest picture. `_notify_clients` sends no notices to
     paused clients.
   - **VIEW (v11)**: `_view11_subscribers` excludes paused clients. With none left `_poll_view11` takes its no-subscriber branch: the
-    client's fast-view GPU nodes are destroyed, the exact pipe is reset and nothing is cooked, read back or encoded.
+    exact pipe is reset and nothing is cooked, read back or encoded. The client's fast-view GPU nodes are kept for `PAUSE_CHAIN_KEEP_S`
+    (60 s) so a resume sends its fast frame without creating operators inside Pump, then freed (kept chains yield to live clients).
   - **Layer previews**: `_poll_layer_previews` runs only while an *unpaused* active editor exists, otherwise the pipes are dropped
     (exactly the no-client case); no `layerPreview` notices go to a paused client.
   - Result: when every client is paused the per-pump work equals the no-client case. `GetCounters()` returns monotonic counters
@@ -440,3 +441,10 @@ Wire format: `PROTOCOL.md` section 14.
 - **Tests**: `td/tests/test_v12idle.py` (fake TD: paused client gets nothing and counters stay flat, resume, mixed clients, old protocol);
   live: `scripts/validate_td.py` step 62 (real page + fake clients).
 
+
+Hardening that came with it: `Pump()` returns early when already pumping (operator creation in a view chain, input ops or the pool top-up can
+run the frame callbacks in-line) as well as during `network.apply()`; `network.apply()` returns False when skipped, and a document that
+arrives inside an apply is deferred (`_deferred_doc`) and applied by the next network tick instead of being marked applied; a pause mid-readback
+drops the in-flight BASE read; frames a client already fetched are not announced again on resume; the master record carries
+`serving: false` until a connect to the port succeeds (`_mark_serving`), so readers can wait for it; `GetResumeMarks()` reports the
+TD-side seconds from a resume to the first BASE notice / fast frame / preview notice.

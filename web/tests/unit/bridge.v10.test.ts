@@ -482,4 +482,20 @@ describe('v12: streams {paused}', () => {
     connect();
     expect(streams()).toEqual([{ t: 'streams', paused: true }]);
   });
+
+  it('streams is never sent before ready: ready is the first message, streams follows the hello', async () => {
+    start('ed2');
+    bridge.setStreamsPaused!(true);                    // idle before the socket even opens
+    sock().open();
+    const types = () => sock().json().map((m) => m.t);
+    expect(types()).toEqual(['ready']);
+    sock().tell(hello({ doc: { w: engine.width, h: engine.height } }));
+    const t = types();
+    expect(t.indexOf('streams')).toBeGreaterThan(t.indexOf('ready'));
+  });
+
+  it('busy(): false when idle', () => {
+    start('ed2');
+    expect(bridge.busy!()).toBe(false);
+  });
 });

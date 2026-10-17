@@ -70,6 +70,8 @@ export interface Bridge {
   readonly editor?: string;
   /** v11: send the current view again (TD then streams a fresh frame). */
   refreshView?(): void;
+  /** v12: TD work is pending (TOP import / render / merge in flight, project open / save): the idle detector counts it as activity. */
+  busy?(): boolean;
   /** v12: the page is idle (hidden / no input): TD stops BASE, view and layer-preview streams for this client. Edit uploads and history flushes are unaffected. */
   setStreamsPaused?(paused: boolean): void;
   /** Report viewport state; sent to TD at most once per animation frame. */
@@ -1368,6 +1370,7 @@ export function startTdBridge(engine: EditorEngine, status: BridgeStatus, opts: 
       if (isOpen()) sendJson({ t: 'takeover' });
       else status.setNotice('Not connected to TouchDesigner');
     },
+    busy: () => inflight.size > 0 || pendingFiles.size > 0 || pendingTops.size > 0,
     setStreamsPaused(paused) {
       if (paused === streamsPaused) return;
       streamsPaused = paused;

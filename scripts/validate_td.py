@@ -3799,11 +3799,15 @@ box.loadTox({path!r})
         eid_before = info["eid"]
 
         def serving():
+            rec = master_info() or {}
+            if not rec.get("serving", True):
+                return False       # (the record says `serving` once the extension saw the Web Server DAT accept a connection)
             try:
                 return http_get(port, "/")[0] == 200
             except OSError:
                 return False
-        wait_until(serving, 15, 0.1)   # (the role moved: the server listens a moment later than master_info() says)
+        if not wait_until(serving, 15, 0.1):
+            return False, f"the copy became the master but its server never answered on port {port}: {master_info() and {k: v for k, v in master_info().items() if k != 'token'}}"
         for _ in range(3):   # browser-like: HTTP/1.1 keep-alive connections left open
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
             c.request("GET", "/")
@@ -5814,8 +5818,8 @@ def s62_idle_streaming(args):
         h1, p1, q1 = holdings(), counters(), (counts(ed), counts(ed2))
         chk("all paused: no BASE / view / preview readbacks, encodes or notices (counters)", p1 == p0, f"{p0} -> {p1}")
         chk("all paused: no message of any stream reaches a client", q1 == q0, f"{q0} -> {q1}")
-        chk("all paused: no GPU view nodes, preview pipes or exact frame held (the no-client case)", h1["chains"] == 0 and h1["pipes"] == 0 and not h1["vxmsg"],
-            f"{h1}")
+        chk("all paused: no preview pipes or exact frame held (the no-client case); fast-view GPU nodes are kept for the grace period", h1["pipes"] == 0
+            and not h1["vxmsg"], f"{h1}")
         notes.append(f"paused window: {h1['frames'] - h0['frames']} TD frames, {tick['n']} input changes")
         # ---- resume the first client (the input stays live, the second client stays paused)
         px2 = px.copy()
@@ -5830,16 +5834,19 @@ def s62_idle_streaming(args):
         ed.send(P.streams(False))
         t_base = t_fast = t_prev = None
         end = t0 + 3.0
-        while time.time() < end and None in (t_base, t_fast, t_prev):
-            ed.poll(0.01)
+        while time.time() < end and None in (t_base, t_fast):    # (a tight loop: no td-mcp round trip inside the measurement)
+            ed.poll(0.005)
             now = time.time() - t0
             if t_base is None and ed.notices["base"] > n0:
                 t_base = now
             if t_fast is None and any(f["kind"] == "fast" and f["t"] >= t0 for f in ed.vframes[nv:]):
                 t_fast = now
-            if t_prev is None and len(ed.previews) > npv:
-                t_prev = now
-            td(f"{X}.network.output().cook(force=True)") if t_prev is None and now > 0.1 else None
+        while time.time() < end and t_prev is None:     # (the harness pulls the document output for the preview chain, as a viewer would)
+            ed.poll(0.01)
+            if len(ed.previews) > npv:
+                t_prev = time.time() - t0
+            else:
+                td(f"{X}.network.output().cook(force=True)")
         ms = lambda v: "none" if v is None else f"{v * 1000:.0f} ms"   # noqa: E731
         chk("resume: fresh BASE frame, fast frame within budget", t_base is not None and t_fast is not None and t_base <= budget and t_fast <= budget,
             f"base {ms(t_base)}, fast {ms(t_fast)} (budget {int(budget * 1000)} ms)")
@@ -5894,26 +5901,22 @@ def s62_idle_streaming(args):
         n_layers = len(js_result("window.__editorTest.layers().map(l => l.id)") or [])
         drive(3.0)
         h1, p1 = holdings(), counters()
-        chk("page paused: no BASE / view / preview readback, encode or notice for N frames", p1 == p0 and h1["chains"] == 0, f"{p0} -> {p1}, {h1['frames'] - h0['frames']} frames")
+        chk("page paused: no BASE / view / preview readback, encode or notice for N frames", p1 == p0, f"{p0} -> {p1}, {h1['frames'] - h0['frames']} frames")
         # an edit while paused still reaches TD
         js("window.__editorTest.addLayer()")
         reached = wait_for(lambda: len(td_json("print(json.dumps([l['id'] for l in (comp.ext.RasterEditorExt.doc_layers or [])]))")) > n_layers, 8, 0.2)
         chk("page paused: a document edit still reaches TD", reached)
         # visible again -> resume
-        td(f"op({TMP!r}).par.colorg = 1")
+        td(f"op({TMP!r}).par.colorg = {1 - tick['n'] % 2}")      # the input changed while the page was paused
         base_c = counters()
-        t0 = time.time()
         visibility("visible")
-        fast_at = base_at = None
-        while time.time() - t0 < 6.0 and (fast_at is None or base_at is None):
-            c = counters()
-            if fast_at is None and c["fastframes"] > base_c["fastframes"]:
-                fast_at = time.time() - t0
-            if base_at is None and c["basenotices"] > base_c["basenotices"]:
-                base_at = time.time() - t0
-        pb = budget + 0.3        # (polled through td-mcp, so a little more than the fake client's 200 ms)
-        chk(f"page resumes: fast frame and BASE notice promptly (<= {int(pb * 1000)} ms incl. polling)", fast_at is not None and base_at is not None and fast_at <= pb and base_at <= pb,
-            f"fast {ms(fast_at)}, base {ms(base_at)}")
+        # TD measures it itself (receipt of `streams {paused: false}` -> first BASE notice / fast frame sent): no td-mcp round trip in the number
+        marks = {}
+        wait_until(lambda: bool(marks.update(next(iter((td_json(f"print(json.dumps({X}.GetResumeMarks()))") or {}).values()), {})) or ("fast" in marks and "base" in marks)),
+                   6, 0.05)
+        fast_at, base_at = marks.get("fast"), marks.get("base")
+        chk(f"page resumes: fast frame and BASE notice promptly (<= {int(budget * 1000)} ms, TD side)", fast_at is not None and base_at is not None
+            and fast_at <= budget and base_at <= budget, f"fast {ms(fast_at)}, base {ms(base_at)}")
         wait_until(lambda: counters()["exactframes"] > base_c["exactframes"], 3, 0.05)
         chk("page resumes: an exact refresh follows", counters()["exactframes"] > base_c["exactframes"], f"{base_c['exactframes']} -> {counters()['exactframes']}")
         chk("page resumes: unpaused in TD, badge gone", wait_for(lambda: not (page_client() or [0, 0, True])[2], 2, 0.05)
