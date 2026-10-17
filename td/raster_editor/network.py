@@ -15,7 +15,7 @@ Network shape (all names inside ``doc``)::
                               pool of spare nodes is made in tick() and handed out / taken back by apply().
     fx_<id>_*      effect chain nodes of a layer (effects.EffectChain), also an adjustment layer's stack
     out            nullTOP    result (input = last root blend)
-    blend_glsl, surface_callbacks   text DATs (shader, Script TOP callbacks)
+    blend_glsl, merge_glsl, surface_callbacks   text DATs (shader, the same shader with RE_MERGE_UNROLLED for the Multi TOPs, Script TOP callbacks)
 
 v6 performance network (``optimize=True``, docs/DESIGN_V6.md 2.1): layers that provably add nothing get no pass (hidden, opacity 0,
 empty, off canvas, adjustment without drawing effects); runs of up to 8 plain layers are ONE ``mrg_L_<first id>`` GLSL Multi TOP (blend.glsl uAdjust
@@ -125,7 +125,9 @@ WARM_IDLE_S = 1.0             # spare nodes are pre-cooked (shader compile ~15 m
 ADJ_MERGED_CODE = 8           # blend.glsl uAdjust of a merged pass
 
 # reserved (non layer) node names inside doc
-RESERVED = ("blend_glsl", "shape_glsl", "text_measure", "surface_callbacks", "blank", "out", "warm_in")
+MERGE_DAT = "merge_glsl"      # shader DAT of the GLSL Multi TOPs: blend.glsl with RE_MERGE_UNROLLED defined (constant sampler indices)
+MERGE_DEFINE = "#define RE_MERGE_UNROLLED 1\n"
+RESERVED = ("blend_glsl", MERGE_DAT, "shape_glsl", "text_measure", "surface_callbacks", "blank", "out", "warm_in")
 EMPTY_HINT = ()               # set_content_bounds(): the layer has no visible pixels
 MAX_INPUTS = 8
 
@@ -1369,6 +1371,14 @@ class DocNetwork:
             self._ops["blend_glsl"] = dat
             self._cache["blend_glsl"] = {"type": "textDAT", "pars": {}, "inputs": [], "bypass": False, "pos": None}
             dat.nodeX, dat.nodeY = -900, 200
+        if MERGE_DAT not in self._ops:
+            dat = doc.op(MERGE_DAT) or doc.create("textDAT", MERGE_DAT)
+            want = MERGE_DEFINE + self._blend_glsl
+            if dat.text != want:
+                dat.text = want
+            self._ops[MERGE_DAT] = dat
+            self._cache[MERGE_DAT] = {"type": "textDAT", "pars": {}, "inputs": [], "bypass": False, "pos": None}
+            dat.nodeX, dat.nodeY = -900, 400
         if "shape_glsl" not in self._ops:
             dat = doc.op("shape_glsl") or doc.create("textDAT", "shape_glsl")
             if dat.text != self._shape_glsl:
@@ -2081,7 +2091,7 @@ class DocNetwork:
                 vals += [(0.0, 0.0, 0.0, 0.0)] * (MERGE_MAX - len(vals))
                 pars = {"vec0name": "uParams", "vec0valuex": 0.0, "vec0valuey": 1.0, "vec0valuez": 0.0,
                         "vec0valuew": float(ADJ_MERGED_CODE),
-                        "inputfiltertype": "nearest", "inputextenduv": "hold", "pixeldat": "blend_glsl", "format": fmt}
+                        "inputfiltertype": "nearest", "inputextenduv": "hold", "pixeldat": MERGE_DAT, "format": fmt}
                 for k, v in enumerate(vals):
                     pars["vec%dname" % (4 + k)] = "uL%d" % k
                     for c_, comp_ in zip(v, "xyzw"):
@@ -2468,7 +2478,7 @@ class DocNetwork:
         self._counters["created"] += 1
         self._note_companions(op)
         cache = {"type": "glslmultiTOP", "pars": {}, "inputs": [], "bypass": False, "pos": None}
-        pars = {"pixeldat": "blend_glsl", "format": FMT_BLEND, "vec0name": "uParams", "vec1name": "uXform",
+        pars = {"pixeldat": MERGE_DAT, "format": FMT_BLEND, "vec0name": "uParams", "vec1name": "uXform",
                 "vec2name": "uA", "vec3name": "uB"}
         for k in range(MERGE_MAX):
             pars["vec%dname" % (4 + k)] = "uL%d" % k
@@ -2619,6 +2629,7 @@ class DocNetwork:
             multi = cache.get("type") == "glslmultiTOP" or op.OPType == "glslmultiTOP"
             canon = {"pixeldat": "blend_glsl", "format": FMT_BLEND, "vec0name": "uParams", "vec1name": "uXform"}
             if multi:
+                canon["pixeldat"] = MERGE_DAT
                 for k in range(MERGE_MAX):
                     canon["vec%dname" % (4 + k)] = "uL%d" % k
                 canon.update({"vec2name": "uA", "vec3name": "uB"})

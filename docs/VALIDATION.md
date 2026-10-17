@@ -76,8 +76,43 @@ Options: `--workers N`, `--tier smoke|affected|full`, `--only 5,7`, `--no-timing
 | Editor web ports | Not safe to leave to the fallback when instances build at once (see 2.); worker i serves on 9990 + 20 i. |
 | Wall time, full suite | attach (the user's TD, one at a time): ~15-20 min. `--workers 1` isolated: 374-427 s. `--workers 3`: 186-206 s (shards estimate 118 s, ran ~125 s; tail ~55 s incl. relaunch). |
 
-Results differ run to run for a few steps (14, 19, 20, 52, and the budget step 12 under load); the same failures appear with 1 and 3
-workers, so they are not sharding artefacts.
+**Why steps used to fail only under load (fixed).** Two causes, neither a product bug:
+
+- *Idle page (steps 24, 34, 43, 53, earlier 14/19/20/52 in part).* Since v10 a page that saw no pointer / key input for 10 s asks TD to pause
+  its streams (no BASE frames, view frames or layer previews). The validation page is driven with scripted `eval` only (not input), so
+  after a few slow steps (machine load) it was idle: its composite lacked the TD input layer / the tdPreview render and the parity
+  comparison failed, while the same step run alone, right after the page loaded, passed. The reproduction is deterministic (steps 2, 3, 13,
+  18, 20, 21, 23, 26, 28, 33, 34 in one instance). Fix: `validate_td.PAGE_IDLE_MS` -- the test page URL carries `?idleMs=3600000` (honoured only
+  with `?test=1`), so test pages never idle. Step 62 (the idle step) sets it back to the real 10 s and restores it afterwards.
+- *Budgets measured with a contended GPU / CPU (step 12).* See below.
+
+**Step 12 budgets under load.** Contention (other TD instances, the browser, Ableton, the compositor) only ever *adds* to a measured cook
+or apply time, so a budget that asks "can this be done in X ms" is checked with a low statistic, not the median: the summed `gpuCookTime`
+of the 20-layer network is the **best of 60 frames** (the second lowest, so a single glitch frame cannot pass; frames in which a node of the
+network did not cook are dropped first, as their time is missing from the sum) after 6 warm-up frames; the property-edit apply time is the
+**lower decile (p10)** of 30 homogeneous edits (best of up to 3 blocks); the structural apply time (adds cost several times a removal, so the decile would only see the
+removals) is the **median of a block of 10, best of up to 3 blocks**. The median, the load average before / after and the heaviest nodes
+are still printed. The budgets themselves (4 ms GPU, 2 ms / 10 ms apply) are unchanged. Measured on a 16-core Apple Silicon machine
+at load average 6-10 with Ableton and three other TDs running: GPU best 0.84 ms (median 1.6 ms); before the shader change below the same
+network summed 3.2 ms (median) on an idle-ish machine and 6.7-13 ms (median) under load.
+
+**Other load-sensitive steps (made deterministic, same principle: a budget measures the code, not the machine's other work).**
+Step 47 compares the layers the recooked passes composite (merged run of 6 vs the active layer's own pass: deterministic) instead of
+`gpuCookTime`, which TD reads back from asynchronous GPU timer queries (a cooked node can read 0.0, its successor the wait) and which, now
+that the merged pass is cheap, differs by less than the noise; GPU time is still printed. Step 19 budgets the p95 of the per-step / per-pump
+times (`GetStats` has `p95`) and holds the single worst sample to a gross-stall bound (400 ms): one OS scheduling stall reached 92 ms.
+Step 20 settles the page and repeats an import that the page voided with "The document changed during the import" (a late canvas / document
+load of the previous promotion; by design the user imports again). Steps 7 and 8 scale their time budgets by how much slower TD's own frame
+was than the nominal one while measuring (TD pumps 7-22 fps when the machine is saturated; step 8 counts latency in TD frames, so it uses the
+real frame time; step 7 divides the fast-frame fps floor and multiplies the edit -> display / exact latency limits by that stretch, 1.0 on a
+machine that keeps up). `ui_ready` waits up to 30 s (it returns as soon as the page agrees with TD).
+
+**Merged-pass shader (the real optimisation).** The merged pass (`blend.glsl` uAdjust 8, a GLSL *Multi* TOP with 16 inputs) indexed
+`sTD2DInputs[1 + i]` with a loop variable. On the Metal-backed GL driver a non-constant sampler-array index makes the pass ~2.5x slower
+(m2 / m3 of the step-12 network: 1.4 ms -> 0.3-0.6 ms each, interleaved A/B in one instance). The shader now has an unrolled form with
+constant indices (`#ifdef RE_MERGE_UNROLLED`, one macro per slot, identical maths). A plain GLSL TOP has only as many `sTD2DInputs`
+as wired inputs, so a constant index past them does not compile there: the network keeps a second shader DAT `merge_glsl` (= `blend_glsl` with
+`#define RE_MERGE_UNROLLED 1` in front) for the Multi TOPs and `blend_glsl` for everything else (component 0.10.1).
 
 `--attach` keeps today's behaviour for debugging a single step in the user's own TD (it builds, drives and removes its temporary operators
 there).

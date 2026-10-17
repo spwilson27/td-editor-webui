@@ -74,6 +74,10 @@ def test_creates_doc_and_text_dats(env):
     doc = comp.op("doc")
     assert doc is not None and doc.OPType == "baseCOMP"
     assert doc.op("blend_glsl").text == GLSL
+    # the Multi TOPs' shader: the same source with the unrolled merged pass switched on (a plain GLSL TOP has fewer inputs: a constant
+    # sampler index past them would not compile there)
+    assert doc.op("merge_glsl").text == "#define RE_MERGE_UNROLLED 1\n" + GLSL
+    assert "#ifdef RE_MERGE_UNROLLED" in GLSL
     assert "OnSurfaceCook" in doc.op("surface_callbacks").text
     assert "parent.RasterEditor" in doc.op("surface_callbacks").text
 
@@ -3427,7 +3431,8 @@ def test_adopted_and_leftover_nodes_get_the_canonical_vector_names_and_every_pla
     assert {"blend_L_lv", "xf_L_a", "blend_L_hs"} <= set(adopted)
     for name in adopted:
         pv = net2._ops[name].par.value
-        assert (pv("vec0name"), pv("vec1name"), pv("pixeldat")) == ("uParams", "uXform", "blend_glsl"), name
+        assert (pv("vec0name"), pv("vec1name"), pv("pixeldat")) == (
+            "uParams", "uXform", "merge_glsl" if name.startswith("mrg_L_") else "blend_glsl"), name
         if name.startswith("mrg_L_"):
             assert pv("vec11name") == "uL7" and pv("vec4name") == "uL0", name
         else:

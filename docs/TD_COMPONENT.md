@@ -3,7 +3,7 @@
 Target: TouchDesigner 2025.32820 (Python 3.11, numpy available). Verified API notes are
 at the end; check anything else against the live TD through `scripts/td_call.py`.
 
-**Status: current as of v0.10.0 (protocol 12).** Sections 1–4 describe the current component (v8 layout: multiple editors,
+**Status: current as of v0.10.1 (protocol 12).** Sections 1–4 describe the current component (v8 layout: multiple editors,
 master/slave, no in-TD panel; v11 view stream in §3/§13). Section 4 build commands: `td/build_component.py [--dev]`. Sections 5
 onwards are an append-only record per protocol version (API notes, v3–v12 additions): where they mention the Web Render panel,
 `Panelquery` or `Reloadui`, the v8 rules in sections 1–3 win. How to build, test and release: `DEVELOPMENT.md`; index of all docs: `docs/README.md`.

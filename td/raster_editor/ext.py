@@ -4778,11 +4778,13 @@ class RasterEditorExt:
         return dict(self.counters)
 
     def GetStats(self):
-        """Milliseconds: median / worst over the last 300 samples."""
+        """Milliseconds: median / lower decile (``p10``: what the code costs when the machine is not contended) / ``p95`` (a
+        bound that one scheduling stall of the machine does not break) / worst over the last 300 samples."""
         out = {}
         for k, d in self.stats.items():
             xs = [x * 1000.0 for x in d]
-            out[k] = {"n": len(xs), "median": _median(xs), "max": max(xs) if xs else 0.0}
+            out[k] = {"n": len(xs), "median": _median(xs), "max": max(xs) if xs else 0.0,
+                      "p10": sorted(xs)[len(xs) // 10] if xs else 0.0, "p95": sorted(xs)[min(len(xs) - 1, int(len(xs) * 0.95))] if xs else 0.0}
         try:
             if self.network is not None:
                 out["network"] = self.network.stats()

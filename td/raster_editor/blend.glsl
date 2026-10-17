@@ -230,6 +230,46 @@ vec4 composeOver(vec4 below, vec4 src, int mode, float opacity, float m) {
     return res;
 }
 
+// The merged pass has two forms of the same maths.  RE_MERGE_UNROLLED is defined by the network for the GLSL *Multi* TOP shader
+// (DocNetwork 'merge_glsl' = this file with that define on top; the node always has 16 inputs): every slot indexes the sampler
+// array with a CONSTANT, which is ~2.5x faster on the Metal-backed GL driver than a loop-variable index (validation step 12).
+// A plain GLSL TOP has only as many sTD2DInputs as it has wired inputs (a constant index past them fails to compile), so
+// its shader keeps the loop (merged() is never called there: uAdjust 8 is only set on Multi nodes).
+#ifdef RE_MERGE_UNROLLED
+// One merged-pass slot (a macro: I must be a literal).
+#define MERGED_SLOT(I, U) \
+    { \
+        vec4 u = U; \
+        if (u.y > 0.0) { \
+            ivec2 d = pd - ivec2(floor(u.zw + 0.5)); \
+            ivec2 msz = textureSize(sTD2DInputs[1 + I], 0); \
+            if (d.x >= 0 && d.y >= 0 && d.x < msz.x && d.y < msz.y) { \
+                vec4 src = texelFetch(sTD2DInputs[1 + I], ivec2(d.x, msz.y - 1 - d.y), 0); \
+                if (src.a > 0.0) { \
+                    int code = int(u.x + 0.5); \
+                    int mi = code >> 4; \
+                    float m = 1.0; \
+                    if (mi > 0) { \
+                        ivec2 mSize = textureSize(sTD2DInputs[mi], 0); \
+                        m = (d.x < mSize.x && d.y < mSize.y) ? texelFetch(sTD2DInputs[mi], ivec2(d.x, mSize.y - 1 - d.y), 0).r : 0.0; \
+                    } \
+                    acc = composeOver(acc, src, code & 15, clamp(u.y, 0.0, 1.0), m); \
+                } \
+            } \
+        } \
+    }
+
+void merged() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec4 acc = texelFetch(sTD2DInputs[0], p, 0);
+    ivec2 outSize = textureSize(sTD2DInputs[0], 0);
+    ivec2 pd = ivec2(p.x, outSize.y - 1 - p.y);
+    MERGED_SLOT(0, uL0) MERGED_SLOT(1, uL1) MERGED_SLOT(2, uL2) MERGED_SLOT(3, uL3)
+    MERGED_SLOT(4, uL4) MERGED_SLOT(5, uL5) MERGED_SLOT(6, uL6) MERGED_SLOT(7, uL7)
+    fragColor = TDOutputSwizzle(acc);
+}
+
+#else
 vec4 slotParams(int i) {
     if (i == 0) return uL0;
     if (i == 1) return uL1;
@@ -266,6 +306,8 @@ void merged() {
     }
     fragColor = TDOutputSwizzle(acc);
 }
+
+#endif
 
 void main() {
     if (uParams.w > 7.5) { merged(); return; }
